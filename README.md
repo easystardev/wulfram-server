@@ -2,11 +2,6 @@
 
 A Python server emulator for Wulfram 2, implementing server-authoritative physics.
 
-## Download the Game
-
-<!-- TODO: Add download link -->
-**Game download:** [LINK NEEDED]
-
 ## Current Status
 
 ### Working
