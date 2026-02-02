@@ -1,0 +1,18 @@
+# Spawn sequence test - run when client is waiting after construction timeout
+# Try different packet combinations to complete spawn
+
+state
+
+# Option 1: Just PLAYER with spectator=false
+send PLAYER 1337 spectator=false
+
+# Option 2: Full spawn sequence
+#send ADD_TO_ROSTER 1337 1337 Player 2
+#send UPDATE_STATS 1337 2
+#send UPDATE_ARRAY_TANK 1337 0 2
+#send PLAYER_INFO 1337 0 100 50 100
+#send PLAYER 1337 spectator=false
+#send REINCARNATE 17 "Welcome!"
+#send BIRTH_NOTICE 1337
+
+state

@@ -1,0 +1,22 @@
+# Team selection debugging - run when on team selection screen
+# Test if player list state affects clicks
+
+state
+
+# Check if sending these affects click behavior
+# (toggle auto_join_team off first to stay on team select)
+
+# Test 1: Send team info again
+send TEAM_INFO
+
+# Test 2: Send empty update array
+send UPDATE_ARRAY_EMPTY 0
+
+# Test 3: Try forcing REINCARNATE as if click worked
+# Code meanings from decomp:
+#   1 = need password?
+#   2 = spawn acknowledged
+#   17 = spawn success
+#send REINCARNATE 2 "Spawning..."
+
+state

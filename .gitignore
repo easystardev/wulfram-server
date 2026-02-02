@@ -1,0 +1,6 @@
+
+# Trace logs (too large for git)
+traces/
+__pycache__/
+*.pyc
+server.pid
