@@ -104,6 +104,10 @@ class WulframServer:
         except ValueError:
             self.viewpoint_timeout = 1.0
         try:
+            self.multi_spawn_offset = float(os.environ.get("WULFRAM_MULTI_SPAWN_OFFSET", "120.0"))
+        except ValueError:
+            self.multi_spawn_offset = 120.0
+        try:
             self.weapon_id = int(os.environ.get("WULFRAM_WEAPON_ID", "0"))
         except ValueError:
             self.weapon_id = 0
@@ -115,9 +119,15 @@ class WulframServer:
         # If disabled, the client drifts into red-screen health after ~5-10s.
         # Only turn off when UPDATE_ARRAY local-state is proven stable long-term.
         self.tank_vitals = os.environ.get("WULFRAM_TANK_VITALS", "1") == "1"
-        # Local-player state in UPDATE_ARRAY can include weapon-specific ammo bits we don't emit yet.
-        # Keep it opt-in to avoid bitstream misalignment/freezes.
-        self.update_local_state = os.environ.get("WULFRAM_UPDATE_LOCAL_STATE", "1") == "1"
+        # Periodically refresh TankPacket vitals to keep health stable in multi-client.
+        self.tank_vitals_heartbeat = os.environ.get("WULFRAM_TANK_VITALS_HEARTBEAT", "1") == "1"
+        try:
+            self.tank_vitals_interval = float(os.environ.get("WULFRAM_TANK_VITALS_INTERVAL", "1.0"))
+        except ValueError:
+            self.tank_vitals_interval = 1.0
+        # Local-player state in UPDATE_ARRAY has caused HUD/health issues in multi-client.
+        # Keep it opt-in; rely on TankPacket vitals heartbeat by default.
+        self.update_local_state = os.environ.get("WULFRAM_UPDATE_LOCAL_STATE", "0") == "1"
         self.player_info_local_state = os.environ.get("WULFRAM_PLAYER_INFO_LOCAL_STATE", "0") == "1"
         # Local-state weapon type (entity type index). Default is 0 (tank).
         # Override if needed for testing.
@@ -134,6 +144,7 @@ class WulframServer:
             self.local_state_ammo_mask = int(os.environ.get("WULFRAM_LOCAL_STATE_AMMO_MASK", "0"))
         except ValueError:
             self.local_state_ammo_mask = 0
+        self.local_state_ammo_from_behavior = os.environ.get("WULFRAM_LOCAL_STATE_AMMO_FROM_BEHAVIOR", "0") == "1"
         self.local_state_ammo_override = (
             "WULFRAM_LOCAL_STATE_AMMO_BITS" in os.environ
             or "WULFRAM_LOCAL_STATE_AMMO_MASK" in os.environ
@@ -166,7 +177,9 @@ class WulframServer:
         print(
             "[CONFIG] update_local_state="
             f"{int(self.update_local_state)} player_info_local_state={int(self.player_info_local_state)} "
-            f"tank_vitals={int(self.tank_vitals)} local_state_weapon_type={self.local_state_weapon_type}"
+            f"tank_vitals={int(self.tank_vitals)} local_state_weapon_type={self.local_state_weapon_type} "
+            f"ammo_from_behavior={int(self.local_state_ammo_from_behavior)} "
+            f"vitals_heartbeat={int(self.tank_vitals_heartbeat)}"
         )
 
         # Aim/movement configuration (shared across clients)
@@ -230,6 +243,9 @@ class WulframServer:
         if self.local_state_ammo_override:
             return self.local_state_ammo_bits, self.local_state_ammo_mask
 
+        if not self.local_state_ammo_from_behavior:
+            return 0, 0
+
         weapon_type = self._get_local_state_weapon_type(ctx)
         active_bits = 0
         if 0 <= weapon_type < len(self.behavior_weapon_caps):
@@ -275,6 +291,120 @@ class WulframServer:
         if self.up_axis == "z":
             return (pos[0], pos[1], pos[2] + self.pos_offset)
         return (pos[0], pos[1] + self.pos_offset, pos[2])
+
+    def _snapshot_clients(self):
+        """Return a snapshot list of all clients (thread-safe)."""
+        with self.clients_lock:
+            return list(self.clients.values())
+
+    def _snapshot_in_game_clients(self):
+        """Return a snapshot list of in-game clients (thread-safe)."""
+        return [c for c in self._snapshot_clients() if c.session and c.session.in_game]
+
+    def _send_packet_to_client(self, ctx: ClientContext, payload: bytes, *, prefer_tcp: bool = True) -> None:
+        """Send payload to a client, preferring TCP and falling back to UDP."""
+        sent = False
+        if prefer_tcp and ctx.tcp_handler:
+            try:
+                ctx.tcp_handler.send(payload, log=False)
+                sent = True
+            except Exception as tcp_err:
+                print(f"[MULTI] Client {ctx.client_id}: TCP send failed ({tcp_err})")
+        if not sent and self.udp_handler and ctx.session.udp_addr:
+            self.udp_handler.send_to(payload, ctx.session.udp_addr)
+
+    def _send_roster_entry(self, target_ctx: ClientContext, player_ctx: ClientContext) -> None:
+        """Send ADD_TO_ROSTER for player_ctx to target_ctx (once)."""
+        if not target_ctx.tcp_handler:
+            return
+        player_id = player_ctx.session.player_id or player_ctx.entity_id
+        if player_id in target_ctx.known_roster_ids:
+            return
+        name = player_ctx.session.username or f"Player{player_ctx.client_id}"
+        team = player_ctx.session.team_id or 1
+        target_ctx.tcp_handler.send(build_add_to_roster(
+            player_id=player_id,
+            entity_id=player_id,
+            name=name,
+            team=team,
+        ))
+        target_ctx.known_roster_ids.add(player_id)
+        print(f"[MULTI] Sent roster {name} (id={player_id}) -> client {target_ctx.client_id}")
+
+    def _send_entity_create(self, target_ctx: ClientContext, player_ctx: ClientContext) -> None:
+        """Send UPDATE_ARRAY entity creation for player_ctx to target_ctx (once)."""
+        if not target_ctx.session.translation_ack_received:
+            return
+        entity_id = player_ctx.session.entity_id or player_ctx.entity_id
+        if entity_id in target_ctx.known_entity_ids:
+            return
+        team = player_ctx.session.team_id or 1
+        pos = self._to_client_pos(player_ctx.player_pos)
+        tick = self._get_network_tick(target_ctx)
+        packet = build_update_array_create_tank(
+            tick=tick,
+            entity_id=entity_id,
+            entity_type=player_ctx.entity_type,
+            team=team,
+            pos=pos,
+            include_health=False,
+            is_manned=False,
+        )
+        self._send_packet_to_client(target_ctx, packet, prefer_tcp=True)
+        target_ctx.known_entity_ids.add(entity_id)
+        print(f"[MULTI] Sent entity create id={entity_id} -> client {target_ctx.client_id}")
+
+    def _ensure_multiplayer_visibility(self, ctx: ClientContext) -> None:
+        """Ensure ctx sees other players and vice versa once translation is ready."""
+        if not ctx.session.translation_ack_received:
+            return
+        for other in self._snapshot_in_game_clients():
+            if other is ctx:
+                continue
+            # Always try to exchange roster entries (idempotent).
+            self._send_roster_entry(ctx, other)
+            if other.session.translation_ack_received:
+                self._send_roster_entry(other, ctx)
+            # Entity creation requires target translation ack.
+            self._send_entity_create(ctx, other)
+            if other.session.translation_ack_received:
+                self._send_entity_create(other, ctx)
+
+    def _sync_clients_on_spawn(self, ctx: ClientContext) -> None:
+        """Ensure new spawns are visible to all in-game clients."""
+        others = [c for c in self._snapshot_in_game_clients() if c is not ctx]
+        for other in others:
+            # Roster entries both directions
+            self._send_roster_entry(other, ctx)
+            self._send_roster_entry(ctx, other)
+            # Entity creation both directions
+            self._send_entity_create(other, ctx)
+            self._send_entity_create(ctx, other)
+
+    def _send_remote_player_updates(self, ctx: ClientContext, tick: int, *, prefer_tcp: bool = True) -> None:
+        """Send other players' transforms to a client."""
+        for other in self._snapshot_in_game_clients():
+            if other is ctx:
+                continue
+            entity_id = other.session.entity_id or other.entity_id
+            if entity_id not in ctx.known_entity_ids:
+                continue
+            send_pos = self._to_client_pos(other.player_pos)
+            payload = build_update_array_player_update(
+                tick,
+                entity_id,
+                pos=send_pos,
+                vel=other.player_vel,
+                rot=(
+                    other.player_pose.get("roll", 0.0),
+                    0.0,
+                    other.player_yaw,
+                ),
+                include_local_state=False,
+                include_entity_vitals=False,
+                is_manned=False,
+            )
+            self._send_packet_to_client(ctx, payload, prefer_tcp=prefer_tcp)
 
     def _create_client_context(self, client_addr: tuple) -> ClientContext:
         """Create a new ClientContext with unique IDs and initialized systems."""
@@ -806,6 +936,10 @@ class WulframServer:
             spawn_pos = (pos[0], pos[1], self.spawn_height)
         else:
             spawn_pos = (pos[0], 5.0, pos[2])
+
+        # Offset spawn to avoid overlapping tanks in multi-client tests.
+        if ctx.client_id > 1 and self.multi_spawn_offset:
+            spawn_pos = (spawn_pos[0] + (ctx.client_id - 1) * self.multi_spawn_offset, spawn_pos[1], spawn_pos[2])
         ctx.player_pos = spawn_pos
         ctx.player_pose["pos"] = spawn_pos
         ctx.player_yaw = 0.0
@@ -820,7 +954,7 @@ class WulframServer:
 
         # Roster (already sent during login, but ensure it's there for name display)
         if not ctx.session.roster_sent:
-            name = ctx.session.username or "Player"
+            name = ctx.session.username or f"Player{ctx.client_id}"
             print(f"[SPAWN] Sending ADD_TO_ROSTER for {name}")
             ctx.tcp_handler.send(build_add_to_roster(
                 player_id=net_id, entity_id=net_id, name=name, team=team_id
@@ -831,8 +965,9 @@ class WulframServer:
         # It does NOT send UPDATE_STATS or REINCARNATE before TankPacket!
         # Those are only sent in response to team switch requests.
 
-        # Send TankPacket with vitals and full health/energy
-        print(f"[SPAWN] Sending UDP TankPacket (vitals={int(self.tank_vitals)})")
+        # Send TankPacket (vitals only if TRANSLATION has been applied).
+        include_spawn_vitals = self.tank_vitals and ctx.session.translation_ack_received
+        print(f"[SPAWN] Sending UDP TankPacket (vitals={int(include_spawn_vitals)})")
         send_pos = self._to_client_pos(spawn_pos)
         tank_packet = build_udp_tank_packet_wf(
             net_id=net_id,
@@ -840,7 +975,7 @@ class WulframServer:
             team_id=team_id,
             pos=send_pos,
             vel=vel,
-            include_vitals=self.tank_vitals,
+            include_vitals=include_spawn_vitals,
             weapon_id=self.weapon_id,
             health_mult_bits=1,   # Wulf-forge uses 1
             energy_mult_bits=1,   # Wulf-forge uses 1
@@ -873,6 +1008,25 @@ class WulframServer:
                 time.sleep(0.05)
             if not ctx.session.translation_ack_received:
                 print("[SPAWN] WARNING: TRANSLATION_ACK not received before PLAYER_INFO")
+        # If we spawned without vitals, send a vitals refresh once TRANSLATION is ready.
+        if self.tank_vitals and not include_spawn_vitals and ctx.session.translation_ack_received:
+            vitals_packet = build_udp_tank_packet_wf(
+                net_id=net_id,
+                unit_type=unit_type,
+                team_id=team_id,
+                pos=send_pos,
+                vel=vel,
+                include_vitals=True,
+                weapon_id=self.weapon_id,
+                health_mult_bits=1,
+                energy_mult_bits=1,
+            )
+            if self.udp_handler and ctx.session.udp_addr:
+                self.udp_handler.send_to(vitals_packet, ctx.session.udp_addr)
+                print(f"[SPAWN] Sent UDP TankPacket vitals refresh to {ctx.session.udp_addr}")
+            else:
+                ctx.tcp_handler.send(vitals_packet)
+                print("[SPAWN] Sent TCP TankPacket vitals refresh (no UDP addr)")
 
         # PLAYER_INFO tells the client "this is your controllable entity"
         # Without this, client won't send VIEWPOINT_INFO (0x35)
@@ -916,6 +1070,9 @@ class WulframServer:
         ctx.session.in_game = True
         ctx.session.transition_to(Phase.IN_GAME)
 
+        # Sync roster/entity visibility with other in-game clients.
+        self._sync_clients_on_spawn(ctx)
+
         if FEATURES.tick_loop_enabled and (ctx.tick_thread is None or not ctx.tick_thread.is_alive()):
             ctx.tick_thread = threading.Thread(target=self._tick_loop, args=(ctx,), daemon=True)
             ctx.tick_thread.start()
@@ -935,6 +1092,9 @@ class WulframServer:
             spawn_pos = (100.0, 100.0, self.spawn_height)
         else:
             spawn_pos = (100.0, 5.0, 100.0)
+
+        if ctx.client_id > 1 and self.multi_spawn_offset:
+            spawn_pos = (spawn_pos[0] + (ctx.client_id - 1) * self.multi_spawn_offset, spawn_pos[1], spawn_pos[2])
 
         send_pos = self._to_client_pos(spawn_pos)
         tank_packet = build_udp_tank_packet_wf(
@@ -1500,7 +1660,7 @@ class WulframServer:
         """Send packet to spawn a projectile entity."""
         # Build UPDATE_ARRAY packet to create the projectile entity
         tick = self._get_network_tick(ctx)
-        packet = build_projectile_spawn_packet(
+        packet_local = build_projectile_spawn_packet(
             proj,
             tick,
             include_local_state=self.projectile_local_stats,
@@ -1510,15 +1670,34 @@ class WulframServer:
             entity_config=self.projectile_config,
             is_static=self.projectile_static,
         )
+        packet_remote = packet_local
+        if self.projectile_local_stats:
+            packet_remote = build_projectile_spawn_packet(
+                proj,
+                tick,
+                include_local_state=False,
+                weapon_id=self.weapon_id,
+                health=1.0,
+                fuel=1.0,
+                entity_config=self.projectile_config,
+                is_static=self.projectile_static,
+            )
 
         # Send via UDP
-        if self.udp_handler and addr:
-            self.udp_handler.send_to(packet, addr)
-            print(f"[WEAPON] Sent projectile spawn via UDP: id={proj.entity_id}")
+        sent_count = 0
+        if self.udp_handler:
+            for target in self._snapshot_in_game_clients():
+                if not target.session.udp_addr or not target.session.translation_ack_received:
+                    continue
+                packet = packet_local if target is ctx else packet_remote
+                self.udp_handler.send_to(packet, target.session.udp_addr)
+                sent_count += 1
+        if sent_count:
+            print(f"[WEAPON] Sent projectile spawn via UDP: id={proj.entity_id} targets={sent_count}")
         if self.debug_projectiles:
             print(f"[PROJ-SPAWN] id={proj.entity_id} type={proj.entity_type} config={self.projectile_config} static={int(self.projectile_static)}")
             if os.environ.get("WULFRAM_DEBUG_PROJECTILE_HEX", "0") == "1":
-                print(f"[PROJ-HEX] id={proj.entity_id} len={len(packet)} hex={packet.hex()}")
+                print(f"[PROJ-HEX] id={proj.entity_id} len={len(packet_local)} hex={packet_local.hex()}")
 
         # Send chat message with projectile position for debugging
         pos_msg = f"FIRE! pos=({proj.pos[0]:.1f},{proj.pos[1]:.1f},{proj.pos[2]:.1f}) vel=({proj.vel[0]:.1f},{proj.vel[1]:.1f},{proj.vel[2]:.1f})"
@@ -1822,7 +2001,7 @@ class WulframServer:
 
                 # Send position update
                 tick = self._get_network_tick(ctx)
-                update_pkt = build_projectile_update_packet(
+                update_pkt_local = build_projectile_update_packet(
                     proj,
                     tick,
                     dt,
@@ -1831,9 +2010,24 @@ class WulframServer:
                     health=1.0,
                     fuel=1.0,
                 )
+                update_pkt_remote = update_pkt_local
+                if self.projectile_local_stats:
+                    update_pkt_remote = build_projectile_update_packet(
+                        proj,
+                        tick,
+                        dt,
+                        include_local_state=False,
+                        weapon_id=self.weapon_id,
+                        health=1.0,
+                        fuel=1.0,
+                    )
 
-                if self.udp_handler and addr:
-                    self.udp_handler.send_to(update_pkt, addr)
+                if self.udp_handler:
+                    for target in self._snapshot_in_game_clients():
+                        if not target.session.udp_addr or not target.session.translation_ack_received:
+                            continue
+                        pkt = update_pkt_local if target is ctx else update_pkt_remote
+                        self.udp_handler.send_to(pkt, target.session.udp_addr)
 
                 if i % 15 == 0:  # Log every 0.5 sec at 30Hz
                     print(f"[PROJ] id={proj.entity_id} pos=({proj.pos[0]:.1f},{proj.pos[1]:.1f},{proj.pos[2]:.1f}) vel=({proj.vel[0]:.0f},{proj.vel[1]:.0f},{proj.vel[2]:.0f}) tick={tick}")
@@ -2148,6 +2342,9 @@ class WulframServer:
                     time.sleep(0.05)
                     continue
 
+                # Once translation is ready, make sure this client sees others and vice versa.
+                self._ensure_multiplayer_visibility(ctx)
+
                 # Update simulated heading/position from inputs
                 self._update_player_heading(ctx)
                 self._update_player_aim(ctx)
@@ -2261,6 +2458,33 @@ class WulframServer:
                 # Always send via UDP as well for reliability
                 if self.send_updates_udp and self.udp_handler and ctx.session.udp_addr:
                     self.udp_handler.send_to(payload, ctx.session.udp_addr)
+
+                # Periodic TankPacket vitals refresh to stabilize HUD health/energy.
+                if self.tank_vitals and self.tank_vitals_heartbeat and ctx.session.udp_addr:
+                    now = time.monotonic()
+                    if (now - ctx.last_vitals_send) >= self.tank_vitals_interval:
+                        ctx.last_vitals_send = now
+                        vitals_packet = build_udp_tank_packet_wf(
+                            net_id=ctx.session.entity_id,
+                            unit_type=ctx.entity_type,
+                            team_id=ctx.session.team_id or 1,
+                            pos=self._to_client_pos(ctx.player_pos),
+                            vel=ctx.player_vel,
+                            include_vitals=True,
+                            weapon_id=self.weapon_id,
+                            health_mult_bits=1,
+                            energy_mult_bits=1,
+                        )
+                        if self.udp_handler and ctx.session.udp_addr:
+                            self.udp_handler.send_to(vitals_packet, ctx.session.udp_addr)
+
+                # Send other players' transforms to this client (multiplayer visibility).
+                if self.send_player_updates:
+                    self._send_remote_player_updates(
+                        ctx,
+                        tick,
+                        prefer_tcp=(self.send_updates_tcp and not tcp_failed),
+                    )
 
                 # Track last sent player state for projectile alignment diagnostics.
                 # Use player_pos if send_pos not set (heartbeat-only mode)

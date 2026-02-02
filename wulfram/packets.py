@@ -652,6 +652,7 @@ def build_update_array_player_update(tick: int, entity_id: int,
                                      *,
                                      include_local_state: bool = True,
                                      include_entity_vitals: bool = False,
+                                     is_manned: bool = True,
                                      weapon_id: int = 0,
                                      health: float = 1.0,
                                      fuel: float = 1.0,
@@ -692,7 +693,7 @@ def build_update_array_player_update(tick: int, entity_id: int,
 
     bw.write_bits(8, 1)           # 1 entity
     bw.write_bits(32, entity_id)  # OID
-    bw.write_bits(1, 1)           # is_manned = True (player vehicle)
+    bw.write_bits(1, 1 if is_manned else 0)  # is_manned (player vehicle)
 
     # Update mask: POS | VEL | ROT (+ SPEED_SCALE/FUEL)
     update_mask = 0b0000001110
@@ -790,7 +791,8 @@ def _compress_rotation(value: float, max_val: float = 6.3, range_val: float = 12
 def build_update_array_create_tank(tick: int, entity_id: int, entity_type: int, team: int,
                                     pos: Tuple[float, float, float], behavior_type: int = 0,
                                     include_interp: bool = False, interp_bits: int = 16,
-                                    include_health: bool = True) -> bytes:
+                                    include_health: bool = True,
+                                    is_manned: bool = True) -> bytes:
     """
     Build UPDATE_ARRAY that creates a tank entity with position inline.
 
@@ -815,7 +817,7 @@ def build_update_array_create_tank(tick: int, entity_id: int, entity_type: int, 
 
     # Entity header (matches wulf-forge update_array.py EntitySerializer.serialize)
     bw.write_bits(32, entity_id)   # net_id (OID)
-    bw.write_bits(1, 1)            # is_manned = True
+    bw.write_bits(1, 1 if is_manned else 0)  # is_manned
 
     # Presence flags: bit 0 (creation) + bit 1 (position) + bit 3 (rotation)
     # Binary: 0b0000001011 = 11 decimal

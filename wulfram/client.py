@@ -92,6 +92,13 @@ class ClientContext:
     # Viewpoint tracking
     viewpoint_count: int = 0
 
+    # Multiplayer sync tracking (per receiving client)
+    known_entity_ids: set = field(default_factory=set)
+    known_roster_ids: set = field(default_factory=set)
+
+    # Health/vitals heartbeat tracking
+    last_vitals_send: float = field(default_factory=time.monotonic)
+
     def __post_init__(self):
         """Initialize time-based fields after creation."""
         now = time.monotonic()
@@ -99,6 +106,7 @@ class ClientContext:
         self.last_heading_update = now
         self.last_position_update = now
         self.last_action_dump_time = now
+        self.last_vitals_send = now
 
     def reset(self):
         """Reset client state for reconnection."""
@@ -107,6 +115,8 @@ class ClientContext:
             self.ping_stop_event.set()
         if self.session:
             self.session.reset()
+        self.known_entity_ids.clear()
+        self.known_roster_ids.clear()
 
     def update_player_pos(self, pos: tuple):
         """Update player position in both pose dict and legacy field."""

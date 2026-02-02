@@ -147,7 +147,7 @@ def send_initial_game_data(server: "WulframServer", ctx: "ClientContext"):
 
     # ADD_TO_ROSTER
     if not session.roster_sent:
-        name = session.username or "Player"
+        name = session.username or f"Player{ctx.client_id}"
         tcp.send(build_add_to_roster(
             player_id=session.player_id,
             entity_id=session.player_id,
