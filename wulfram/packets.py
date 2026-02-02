@@ -6,7 +6,7 @@ Pure functions that return packet payloads - no I/O.
 import struct
 import time
 import math
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 from .codec import BitWriter, pack_fixed16, frame_packet
 
 
@@ -42,6 +42,13 @@ class PacketType:
     UPDATE_ARRAY = 0x0E
     WORLD_STATS = 0x16
     PING_REQUEST = 0x0B
+
+
+# BEHAVIOR packet layout (used to derive weapon slot capability counts)
+BEHAVIOR_HEADER_SIZE = 95
+BEHAVIOR_WEAPON_UNITS = 4
+BEHAVIOR_WEAPON_SLOTS = 13
+BEHAVIOR_WEAPON_SLOT_SIZE = 45
 
 
 # Packet name lookup for logging
@@ -1073,6 +1080,46 @@ def build_behavior_packet() -> bytes:
         packet += b'\x00' * padding_needed
 
     return bytes(packet)
+
+
+def get_behavior_weapon_capability_counts(packet: Optional[bytes] = None) -> List[Tuple[int, int, int, int]]:
+    """
+    Return per-weapon-type capability counts derived from the BEHAVIOR packet.
+
+    Each entry is (ammo_capable_count, fire_capable_count, active_capable_count, cooldown_capable_count)
+    across enabled slots for that weapon type.
+    """
+    if packet is None:
+        packet = build_behavior_packet()
+    if not packet:
+        return []
+
+    offset = 0
+    if packet[0] == PacketType.BEHAVIOR:
+        offset = 1
+
+    offset += BEHAVIOR_HEADER_SIZE
+    counts: List[Tuple[int, int, int, int]] = []
+
+    for _unit in range(BEHAVIOR_WEAPON_UNITS):
+        ammo = fire = active = cooldown = 0
+        for _slot in range(BEHAVIOR_WEAPON_SLOTS):
+            if offset + 5 > len(packet):
+                return counts
+            enabled = packet[offset] != 0
+            if enabled:
+                if packet[offset + 1]:
+                    ammo += 1
+                if packet[offset + 2]:
+                    fire += 1
+                if packet[offset + 3]:
+                    active += 1
+                if packet[offset + 4]:
+                    cooldown += 1
+            offset += BEHAVIOR_WEAPON_SLOT_SIZE
+        counts.append((ammo, fire, active, cooldown))
+
+    return counts
 
 
 def build_translation_packet() -> bytes:

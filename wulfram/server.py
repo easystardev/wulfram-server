@@ -32,6 +32,7 @@ from .packets import (
     build_chat_message, build_add_to_roster, build_player_info,
     build_birth_notice, build_game_clock, build_reincarnate,
     build_update_array_create_tank, build_update_array_player_update,
+    get_behavior_weapon_capability_counts,
 )
 from . import handlers
 
@@ -110,6 +111,10 @@ class WulframServer:
             print(f"[WEAPON] Invalid weapon_id={self.weapon_id}, defaulting to 0")
             self.weapon_id = 0
         self.projectile_aim_source = os.environ.get("WULFRAM_PROJECTILE_AIM_SOURCE", "auto").lower()
+        # TankPacket vitals are REQUIRED to keep the HUD health/fuel stable.
+        # If disabled, the client drifts into red-screen health after ~5-10s.
+        # Only turn off when UPDATE_ARRAY local-state is proven stable long-term.
+        self.tank_vitals = os.environ.get("WULFRAM_TANK_VITALS", "1") == "1"
         # Local-player state in UPDATE_ARRAY can include weapon-specific ammo bits we don't emit yet.
         # Keep it opt-in to avoid bitstream misalignment/freezes.
         self.update_local_state = os.environ.get("WULFRAM_UPDATE_LOCAL_STATE", "1") == "1"
@@ -129,6 +134,10 @@ class WulframServer:
             self.local_state_ammo_mask = int(os.environ.get("WULFRAM_LOCAL_STATE_AMMO_MASK", "0"))
         except ValueError:
             self.local_state_ammo_mask = 0
+        self.local_state_ammo_override = (
+            "WULFRAM_LOCAL_STATE_AMMO_BITS" in os.environ
+            or "WULFRAM_LOCAL_STATE_AMMO_MASK" in os.environ
+        )
         # Turret angle bits for local state (if weapon def flags require them).
         try:
             self.local_state_turret_bits = int(os.environ.get("WULFRAM_LOCAL_STATE_TURRET_BITS", "16"))
@@ -144,6 +153,21 @@ class WulframServer:
             self.local_state_turret_range = 12.6
         self.local_state_primary_override = os.environ.get("WULFRAM_LOCAL_STATE_PRIMARY_TURRET", "").strip()
         self.local_state_secondary_override = os.environ.get("WULFRAM_LOCAL_STATE_SECONDARY_TURRET", "").strip()
+
+        # Derive per-weapon capability counts from the BEHAVIOR packet.
+        # Used to size local-state ammo/active-slot bitmasks correctly.
+        self.behavior_weapon_caps = get_behavior_weapon_capability_counts()
+        if not self.behavior_weapon_caps:
+            self.behavior_weapon_caps = [(0, 0, 0, 0)] * 4
+        if self.update_local_state:
+            print(f"[LOCAL-STATE] Weapon capability counts (ammo/fire/active/cooldown): {self.behavior_weapon_caps}")
+        if not self.tank_vitals:
+            print("[WARN] WULFRAM_TANK_VITALS=0 can cause red health overlay after ~5-10s.")
+        print(
+            "[CONFIG] update_local_state="
+            f"{int(self.update_local_state)} player_info_local_state={int(self.player_info_local_state)} "
+            f"tank_vitals={int(self.tank_vitals)} local_state_weapon_type={self.local_state_weapon_type}"
+        )
 
         # Aim/movement configuration (shared across clients)
         self.use_slot_aim = os.environ.get("WULFRAM_USE_SLOT_AIM", "0") == "1"
@@ -203,7 +227,15 @@ class WulframServer:
 
     def _get_local_state_ammo_bits(self, ctx: ClientContext) -> tuple:
         """Return (ammo_bits, ammo_mask) for local player state."""
-        return self.local_state_ammo_bits, self.local_state_ammo_mask
+        if self.local_state_ammo_override:
+            return self.local_state_ammo_bits, self.local_state_ammo_mask
+
+        weapon_type = self._get_local_state_weapon_type(ctx)
+        active_bits = 0
+        if 0 <= weapon_type < len(self.behavior_weapon_caps):
+            active_bits = self.behavior_weapon_caps[weapon_type][2]
+        active_mask = (1 << active_bits) - 1 if active_bits > 0 else 0
+        return active_bits, active_mask
 
     def _get_local_state_turret_bits(self, ctx: ClientContext) -> tuple:
         """
@@ -212,9 +244,10 @@ class WulframServer:
         """
         weapon_type = self._get_local_state_weapon_type(ctx)
 
-        # Defaults based on decomp: entity type 0 -> primary turret flag, type 1 -> secondary turret flag.
-        primary_flag = (weapon_type == 0)
-        secondary_flag = (weapon_type == 1)
+        # Default turret bits OFF. Our inferred turret flags have caused bitstream
+        # misalignment and client crashes; only enable via explicit overrides.
+        primary_flag = False
+        secondary_flag = False
 
         if self.local_state_primary_override:
             primary_flag = self.local_state_primary_override not in ("0", "false", "False")
@@ -275,6 +308,10 @@ class WulframServer:
 
         # Create weapon system for this client
         ctx.weapon_system = WeaponSystem()
+        # Use a per-client projectile ID range to avoid colliding with player OIDs.
+        # Keep IDs within 16-bit-ish limits (some client arrays appear indexed by OID).
+        # Collisions (e.g., projectile id == player id) can crash the client.
+        ctx.weapon_system.next_entity_id = max(ctx.weapon_system.next_entity_id, 20000 + (client_id * 1000))
         ctx.weapon_system.on_chain_gun_fire = lambda pos, rot, team, name=None: self._on_chain_gun_fire(ctx, pos, rot, team, name)
         ctx.weapon_system.on_projectile_spawn = lambda proj: self._on_projectile_spawn(ctx, proj)
 
@@ -741,6 +778,10 @@ class WulframServer:
             team_id=team_id,
             pos=pos,
             vel=vel,
+            include_vitals=self.tank_vitals,
+            weapon_id=self.weapon_id,
+            health_mult_bits=1,
+            energy_mult_bits=1,
         )
         self.udp_handler.send_to(payload, addr)
 
@@ -791,7 +832,7 @@ class WulframServer:
         # Those are only sent in response to team switch requests.
 
         # Send TankPacket with vitals and full health/energy
-        print(f"[SPAWN] Sending UDP TankPacket (vitals=True, full health/energy)")
+        print(f"[SPAWN] Sending UDP TankPacket (vitals={int(self.tank_vitals)})")
         send_pos = self._to_client_pos(spawn_pos)
         tank_packet = build_udp_tank_packet_wf(
             net_id=net_id,
@@ -799,7 +840,7 @@ class WulframServer:
             team_id=team_id,
             pos=send_pos,
             vel=vel,
-            include_vitals=True,  # Match wulf-forge: vitals with health=1
+            include_vitals=self.tank_vitals,
             weapon_id=self.weapon_id,
             health_mult_bits=1,   # Wulf-forge uses 1
             energy_mult_bits=1,   # Wulf-forge uses 1
@@ -835,20 +876,29 @@ class WulframServer:
 
         # PLAYER_INFO tells the client "this is your controllable entity"
         # Without this, client won't send VIEWPOINT_INFO (0x35)
+        weapon_type = self._get_local_state_weapon_type(ctx)
+        ammo_bits, ammo_mask = self._get_local_state_ammo_bits(ctx)
+        pt_bits, pt_angle, st_bits, st_angle = self._get_local_state_turret_bits(ctx)
+        if self.player_info_local_state:
+            print(
+                "[LOCAL-STATE] PLAYER_INFO "
+                f"weapon={weapon_type} ammo_bits={ammo_bits} "
+                f"pt_bits={pt_bits} st_bits={st_bits}"
+            )
         player_info_pkt = build_player_info(
             entity_oid=net_id,
             vehicle_type=unit_type,
             pos=send_pos,
             include_local_state=self.player_info_local_state,
-            weapon_id=self._get_local_state_weapon_type(ctx),
+            weapon_id=weapon_type,
             health=1.0,
             fuel=1.0,
-            ammo_count_bits=self.local_state_ammo_bits,
-            ammo_count=self.local_state_ammo_mask,
-            primary_turret_bits=self._get_local_state_turret_bits(ctx)[0],
-            primary_turret_angle=self._get_local_state_turret_bits(ctx)[1],
-            secondary_turret_bits=self._get_local_state_turret_bits(ctx)[2],
-            secondary_turret_angle=self._get_local_state_turret_bits(ctx)[3],
+            ammo_count_bits=ammo_bits,
+            ammo_count=ammo_mask,
+            primary_turret_bits=pt_bits,
+            primary_turret_angle=pt_angle,
+            secondary_turret_bits=st_bits,
+            secondary_turret_angle=st_angle,
             turret_max=self.local_state_turret_max,
             turret_range=self.local_state_turret_range,
         )
@@ -875,7 +925,7 @@ class WulframServer:
         """
         Absolutely minimal spawn - just TankPacket (wulf-forge style).
 
-        Uses include_vitals=True with health=1, energy=1 to match wulf-forge.
+        Uses include_vitals per WULFRAM_TANK_VITALS (defaults off while investigating).
         TRANSLATION quantizers define 5/10/10 bits which matches TankPacket format.
         """
         print(f"[SPAWN] Minimal WF: client={ctx.client_id} net_id={net_id} team={team_id}")
@@ -893,7 +943,7 @@ class WulframServer:
             team_id=team_id,
             pos=send_pos,
             vel=(0.0, 0.0, 0.0),
-            include_vitals=True,  # Wulf-forge uses True with health=1, energy=1
+            include_vitals=self.tank_vitals,
             weapon_id=self.weapon_id,
             health_mult_bits=1,
             energy_mult_bits=1,
@@ -901,7 +951,7 @@ class WulframServer:
 
         if self.udp_handler:
             self.udp_handler.send_to(tank_packet, addr)
-            print(f"[SPAWN] Sent minimal TankPacket (no vitals) to {addr}")
+            print(f"[SPAWN] Sent minimal TankPacket (vitals={int(self.tank_vitals)}) to {addr}")
 
     def _handle_udp_chat(self, ctx: Optional[ClientContext], data: bytes, addr: tuple):
         """Handle UDP COMM_REQ (0x20) for /s spawn."""
@@ -1105,7 +1155,7 @@ class WulframServer:
                     pos=send_pos,
                     vel=(0.0, 0.0, 0.0),
                     flags=1,
-                    include_vitals=True,
+                    include_vitals=self.tank_vitals,
                     health=1.0,
                     energy=1.0
                 ))
@@ -1144,7 +1194,7 @@ class WulframServer:
             pos=send_pos,
             vel=(0.0, 0.0, 0.0),
             flags=1,
-            include_vitals=True,
+            include_vitals=self.tank_vitals,
             health=1.0,
             energy=1.0
         ))
