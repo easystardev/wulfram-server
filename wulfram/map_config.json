@@ -1,0 +1,8 @@
+{
+  "crossroads": {
+    "grid_rows": 127,
+    "grid_cols": 127,
+    "scale": 1.0,
+    "allow_large_grid": false
+  }
+}
