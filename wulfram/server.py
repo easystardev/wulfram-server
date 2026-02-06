@@ -93,7 +93,7 @@ class WulframServer:
         except ValueError:
             self.spawn_delay_seconds = 6.0
         # Team-select should not implicitly spawn by default; wait for explicit spawn-point selection.
-        self.spawn_on_team_select = os.environ.get("WULFRAM_SPAWN_ON_TEAM_SELECT", "0") == "1"
+        self.spawn_on_team_select = os.environ.get("WULFRAM_SPAWN_ON_TEAM_SELECT", "1") == "1"
         self.team_switch_send_reincarnate = os.environ.get("WULFRAM_TEAM_SWITCH_REINCARNATE", "1") == "1"
         try:
             self.spawn_force_after = float(os.environ.get("WULFRAM_SPAWN_FORCE_AFTER", "12.0"))
@@ -173,9 +173,10 @@ class WulframServer:
         self.remote_update_is_manned = os.environ.get("WULFRAM_REMOTE_IS_MANNED", "0") == "1"
         # Combine local + remote updates into a single UPDATE_ARRAY per tick.
         self.combine_update_arrays = os.environ.get("WULFRAM_COMBINE_UPDATE_ARRAYS", "0") == "1"
-        # Local stats in projectile packets can desync the UPDATE_ARRAY bitstream if ammo/turret bits are missing.
-        # Default to disabled unless explicitly enabled.
-        self.projectile_local_stats = os.environ.get("WULFRAM_PROJECTILE_LOCAL_STATS", "0") == "1"
+        # Local stats in projectile packets: owner-only local-state helps keep HUD vitals
+        # stable while projectile UPDATE_ARRAY traffic is active. Remote peers still receive
+        # include_local_state=0 packets.
+        self.projectile_local_stats = os.environ.get("WULFRAM_PROJECTILE_LOCAL_STATS", "1") == "1"
         self.debug_projectiles = (
             os.environ.get("WULFRAM_DEBUG_PROJECTILES", "0") == "1"
             or os.environ.get("WULFRAM_DEBUG_AIM", "0") == "1"
@@ -250,9 +251,26 @@ class WulframServer:
             self.weapon_id = 0
         self.projectile_aim_source = os.environ.get("WULFRAM_PROJECTILE_AIM_SOURCE", "auto").lower()
         self.projectiles_enabled = os.environ.get("WULFRAM_PROJECTILES_ENABLED", "1") == "1"
+        # Projectile update mode:
+        # 0=no updates after spawn, 1=5Hz, 2=15Hz (default), 3=30Hz
+        try:
+            self.projectile_update_mode = int(os.environ.get("WULFRAM_PROJECTILE_UPDATE_MODE", "2"))
+        except ValueError:
+            self.projectile_update_mode = 2
+        if self.projectile_update_mode < 0 or self.projectile_update_mode > 3:
+            self.projectile_update_mode = 2
         # TankPacket vitals are optional once UPDATE_ARRAY local-state is correct.
-        # Keep enabled for compatibility while we stabilize local-state fields.
-        self.tank_vitals = os.environ.get("WULFRAM_TANK_VITALS", "1") == "1"
+        # In practice, stale shell env with WULFRAM_TANK_VITALS=0 regresses into
+        # red-overlay flicker. Keep a fail-safe ON unless explicitly allowed.
+        tank_vitals_raw = os.environ.get("WULFRAM_TANK_VITALS", "1").strip().lower()
+        self.tank_vitals = tank_vitals_raw in ("1", "true", "on", "yes")
+        self.allow_tank_vitals_off = os.environ.get("WULFRAM_ALLOW_TANK_VITALS_OFF", "0") == "1"
+        if not self.tank_vitals and not self.allow_tank_vitals_off:
+            print(
+                "[VITALS] WULFRAM_TANK_VITALS=0 detected; forcing vitals ON for stability. "
+                "Set WULFRAM_ALLOW_TANK_VITALS_OFF=1 to keep vitals disabled."
+            )
+            self.tank_vitals = True
         # Map configuration (WORLD_STATS + spawn points).
         # Default to Wulf-Forge's startup map ("crossroads").
         self.map_name = os.environ.get("WULFRAM_MAP_NAME", "crossroads")
@@ -354,7 +372,9 @@ class WulframServer:
             self.tick_rate_hz = float(os.environ.get("WULFRAM_TICK_RATE_HZ", "10.0"))
         except ValueError:
             self.tick_rate_hz = 10.0
-        self.update_on_change = os.environ.get("WULFRAM_UPDATE_ON_CHANGE", "1") == "1"
+        # Keep steady full-rate updates by default; sparse/on-change updates have
+        # shown intermittent HUD red-overlay regressions during active gameplay.
+        self.update_on_change = os.environ.get("WULFRAM_UPDATE_ON_CHANGE", "0") == "1"
         try:
             self.update_heartbeat_interval = float(os.environ.get("WULFRAM_UPDATE_HEARTBEAT", "1.0"))
         except ValueError:
@@ -472,26 +492,11 @@ class WulframServer:
             local_state_safe = self.local_state_turret_bits > 0 and (
                 self.local_state_secondary_override not in ("0", "false", "False")
             )
-        wf_payload_safe = True
-        if not self.wf_local_state_turrets and self.local_state_weapon_type in (
-            *LOCAL_STATE_PRIMARY_TURRET_TYPES,
-            *LOCAL_STATE_SECONDARY_TURRET_TYPES,
-        ):
-            wf_payload_safe = False
-        if (
-            self.update_local_state_mode == "wf"
-            and not self.allow_unsafe_local_state
-            and not wf_payload_safe
-        ):
-            # "wf" mode sends minimal local-state by design. For Tank (weapon_type=0),
-            # the client expects at least primary turret bits in local-state payload.
-            # Sending minimal payload without those bits can desync HUD vitals.
-            print(
-                "[LOCAL-STATE] Disabling wf local-state: required turret bits missing "
-                "(set WULFRAM_WF_LOCAL_TURRETS=1 or WULFRAM_ALLOW_UNSAFE_LOCAL_STATE=1)."
-            )
-            self.update_local_state_mode = "off"
-            self.update_local_state = False
+        # Empirical behavior: minimal "wf" local-state (weapon + health + energy only)
+        # keeps HUD vitals stable even without turret/ammo bits. Do not auto-disable wf.
+        # Keep strict safety checks for auto/force modes, which include richer payloads.
+        if self.update_local_state_mode == "wf" and not self.wf_local_state_turrets:
+            print("[LOCAL-STATE] wf mode: using minimal local-state payload (turret bits omitted)")
         elif self.update_local_state_mode not in ("off", "wf") and not self.allow_unsafe_local_state and not local_state_safe:
             print(
                 "[LOCAL-STATE] Unsafe local-state config; disabling local-state. "
@@ -540,6 +545,12 @@ class WulframServer:
         # Tick selection: default to server tick for stability across multiple clients.
         self.use_client_ticks = os.environ.get("WULFRAM_USE_CLIENT_TICKS", "0") == "1"
         print(f"[CONFIG] use_client_ticks={int(self.use_client_ticks)}")
+        print(
+            "[CONFIG] projectiles_enabled="
+            f"{int(self.projectiles_enabled)} projectile_update_mode={self.projectile_update_mode} "
+            f"projectile_local_stats={int(self.projectile_local_stats)} "
+            f"projectile_spawn_snap={int(self.projectile_spawn_snap)}"
+        )
 
         # Aim/movement configuration (shared across clients)
         self.use_slot_aim = os.environ.get("WULFRAM_USE_SLOT_AIM", "0") == "1"
@@ -2554,11 +2565,13 @@ class WulframServer:
         """Send packet to spawn a projectile entity."""
         # Build UPDATE_ARRAY packet to create the projectile entity
         tick = self._get_network_tick(ctx)
+        # Local-state weapon field is an entity-type index, not selected weapon slot.
+        local_state_weapon = self._get_local_state_weapon_type(ctx)
         packet_local = build_projectile_spawn_packet(
             proj,
             tick,
             include_local_state=self.projectile_local_stats,
-            weapon_id=self.weapon_id,
+            weapon_id=local_state_weapon,
             health=1.0,
             fuel=1.0,
             entity_config=self.projectile_config,
@@ -2570,7 +2583,7 @@ class WulframServer:
                 proj,
                 tick,
                 include_local_state=False,
-                weapon_id=self.weapon_id,
+                weapon_id=local_state_weapon,
                 health=1.0,
                 fuel=1.0,
                 entity_config=self.projectile_config,
@@ -2874,7 +2887,7 @@ class WulframServer:
             # Mode 1: Low rate updates (5 Hz)
             # Mode 2: Medium rate updates (15 Hz)
             # Mode 3: High rate updates (30 Hz)
-            update_mode = 2  # 15 Hz updates
+            update_mode = self.projectile_update_mode
 
             if update_mode == 0:
                 # No updates - just wait for lifetime then clean up
@@ -2905,7 +2918,7 @@ class WulframServer:
                     tick,
                     dt,
                     include_local_state=self.projectile_local_stats,
-                    weapon_id=self.weapon_id,
+                    weapon_id=self._get_local_state_weapon_type(ctx),
                     health=1.0,
                     fuel=1.0,
                 )
@@ -2916,7 +2929,7 @@ class WulframServer:
                         tick,
                         dt,
                         include_local_state=False,
-                        weapon_id=self.weapon_id,
+                        weapon_id=self._get_local_state_weapon_type(ctx),
                         health=1.0,
                         fuel=1.0,
                     )

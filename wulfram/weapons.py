@@ -165,7 +165,9 @@ class WeaponSystem:
         self.aim_pitch_invert = os.environ.get("WULFRAM_AIM_PITCH_INVERT", "0") == "1"
 
         # Projectile spawn tuning via hardpoints (shape data).
-        self.projectile_spawn_mode = os.environ.get("WULFRAM_PROJECTILE_SPAWN_MODE", "hardpoint").lower()
+        # Hardpoint data is useful for tuning but not yet stable across maps/models.
+        # Default to simple forward offset from authoritative server pose.
+        self.projectile_spawn_mode = os.environ.get("WULFRAM_PROJECTILE_SPAWN_MODE", "offset").lower()
         self.projectile_hardpoint_name = os.environ.get("WULFRAM_PROJECTILE_HARDPOINT", "gun").strip()
         try:
             self.projectile_spawn_offset = float(os.environ.get("WULFRAM_PROJECTILE_SPAWN_OFFSET", "2.0"))
