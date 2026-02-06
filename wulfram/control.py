@@ -1337,11 +1337,11 @@ Examples:
             unit_type=unit_type,
             team_id=team_id,
             pos=(x, y, z),
-            vel=(vx, vy, vz),
+            rot=(vx, vy, vz),
             include_vitals=True,
             weapon_id=0,
-            health_mult_bits=1,  # Full health (wulf-forge uses 1, not 1023!)
-            energy_mult_bits=1,  # Full energy (wulf-forge uses 1, not 1023!)
+            health=1.0,
+            energy=1.0,
         )
         # Log hex for debugging
         print(f"[TANK-HEX] len={len(payload)} hex={payload.hex().upper()}")
@@ -1353,7 +1353,7 @@ Examples:
 
         return (f"Sent UDP TANK (wf) + CommMessage to {self.session.udp_addr}: "
                 f"entity={entity_id} team={team_id} unit={unit_type} "
-                f"pos=({x:.1f},{y:.1f},{z:.1f}) vel=({vx:.1f},{vy:.1f},{vz:.1f})")
+                f"pos=({x:.1f},{y:.1f},{z:.1f}) rot=({vx:.1f},{vy:.1f},{vz:.1f})")
 
     # Packet builders with args
     def _build_player(self, entity_id: str = "1337", spectator: str = "true") -> bytes:

@@ -77,7 +77,9 @@ class ClientContext:
     last_client_tick: int = 0
     tick_offset: Optional[int] = None
     last_sent_tick: int = 0
+    tick_lock: threading.Lock = field(default_factory=threading.Lock)
     last_sent_player_state: Optional[dict] = None
+    ground_level_override: Optional[float] = None
 
     # Active projectiles for this client
     active_projectiles: list = field(default_factory=list)
@@ -98,6 +100,12 @@ class ClientContext:
 
     # Health/vitals heartbeat tracking
     last_vitals_send: float = field(default_factory=time.monotonic)
+    last_view_update_send: float = field(default_factory=time.monotonic)
+    # Update throttling (server-authoritative snapshots)
+    last_update_send: float = field(default_factory=time.monotonic)
+    last_sent_pos: tuple = field(default_factory=lambda: (0.0, 0.0, 0.0))
+    last_sent_vel: tuple = field(default_factory=lambda: (0.0, 0.0, 0.0))
+    last_sent_yaw: float = 0.0
 
     def __post_init__(self):
         """Initialize time-based fields after creation."""
@@ -107,6 +115,11 @@ class ClientContext:
         self.last_position_update = now
         self.last_action_dump_time = now
         self.last_vitals_send = now
+        self.last_view_update_send = now
+        self.last_update_send = now
+        self.last_sent_pos = self.player_pos
+        self.last_sent_vel = self.player_vel
+        self.last_sent_yaw = self.player_yaw
 
     def reset(self):
         """Reset client state for reconnection."""

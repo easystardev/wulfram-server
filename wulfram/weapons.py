@@ -14,6 +14,11 @@ from typing import Optional, Tuple, Callable, List
 from enum import IntEnum
 
 from .codec import BitReader
+from .packets import (
+    VEC_POS_MAX, VEC_POS_RANGE,
+    VEC_VEL_MAX, VEC_VEL_RANGE,
+    VEC_ROT_MAX, VEC_ROT_RANGE,
+)
 
 
 class BehaviorSlot(IntEnum):
@@ -805,7 +810,7 @@ def build_projectile_spawn_packet(
     health: float = 1.0,
     fuel: float = 1.0,
     entity_config: int = 0,
-    is_static: bool = False,
+    is_static: bool = True,
 ) -> bytes:
     """
     Build UPDATE_ARRAY packet to spawn a projectile entity.
@@ -823,7 +828,7 @@ def build_projectile_spawn_packet(
         - 8 bits: unit_type
         - 8 bits: team_id
         - 8 bits: team_id again
-        - 1 bit: is_teleport
+        - 1 bit: is_teleport (spawn snap/teleport; should be 1 on entity create)
       - If POS bit:
         - 4 bits: precision_header (3 = max quality)
         - 16 bits each: x, y, z compressed
@@ -856,18 +861,20 @@ def build_projectile_spawn_packet(
     # Update mask: 10 bits
     # Bit 0 = DEFINITION (create entity)
     # Bit 1 = POS (position data)
-    # Bit 2 = VEL (velocity data)
-    # Bit 3 = ROT (rotation data) - needed for oriented sprite rendering
-    update_mask = 0b0000001111  # DEFINITION | POS | VEL | ROT
+    # Wulf-forge-style creation uses DEFINITION | POS only.
+    update_mask = 0b0000000011  # DEFINITION | POS
     bw.write_bits(10, update_mask)
 
     # Bank selector: 16 bits (0 for bank 0)
     bw.write_bits(16, 0)
 
     # --- DEFINITION block (bit 0 set) ---
-    # Decomp: unit_type, entity_config, team_id, is_static
+    # Decomp: unit_type, team_id, team_id, is_static (wulf-forge default)
+    # NOTE: "is_static" behaves like a spawn-time snap/teleport flag. Wulf-forge sets it
+    # to 1 on entity creation; leaving it 0 for moving entities can destabilize the client.
     bw.write_bits(8, proj.entity_type & 0xFF)
-    bw.write_bits(8, entity_config & 0xFF)
+    config_val = entity_config if entity_config not in (None, 0) else proj.team
+    bw.write_bits(8, config_val & 0xFF)
     bw.write_bits(8, proj.team & 0xFF)
     bw.write_bits(1, 1 if is_static else 0)
 
@@ -928,64 +935,18 @@ def build_projectile_spawn_packet(
     pos_raw = []
     pos_dec = []
     for v in proj.pos:
-        compressed = compress_value(v, 8192.0, 16384.0)
+        compressed = compress_value(v, VEC_POS_MAX, VEC_POS_RANGE)
         pos_raw.append(compressed)
         if debug_quant:
-            pos_dec.append(decode_value(compressed, 8192.0, 16384.0, 16))
-        bw.write_bits(16, compressed)
-
-    # Velocity: 4-bit header + 16 bits × 3
-    # wulf-forge VEC_VEL: max=200, range=400 (covers ±200)
-    bw.write_bits(4, 15)  # priority=15 for max precision
-    vel_raw = []
-    vel_dec = []
-    for v in proj.vel:
-        compressed = compress_value(v, 200.0, 400.0, total_bits=16)
-        vel_raw.append(compressed)
-        if debug_quant:
-            vel_dec.append(decode_value(compressed, 200.0, 400.0, 16))
-        bw.write_bits(16, compressed)
-
-    # Rotation: 4-bit header + 16 bits × 3
-    # wulf-forge VEC_ROT: max=6.3, range=12.6 (covers ±2π radians)
-    rot_from_vel = os.environ.get("WULFRAM_PROJECTILE_ROT_FROM_VEL", "1") == "1"
-    if rot_from_vel:
-        vx, vy, vz = proj.vel
-        up_axis = os.environ.get("WULFRAM_UP_AXIS", "z").lower()
-        if up_axis == "z":
-            yaw = math.atan2(vy, vx) if (vx != 0.0 or vy != 0.0) else 0.0
-            horiz = math.hypot(vx, vy)
-            pitch = math.atan2(vz, horiz) if horiz != 0.0 else 0.0
-        else:
-            yaw = math.atan2(vz, vx) if (vx != 0.0 or vz != 0.0) else 0.0
-            horiz = math.hypot(vx, vz)
-            pitch = math.atan2(vy, horiz) if horiz != 0.0 else 0.0
-        rot = (0.0, pitch, yaw)
-    else:
-        rot = (0.0, 0.0, 0.0)
-
-    bw.write_bits(4, 15)  # priority=15 for 16 bits per component
-    rot_raw = []
-    rot_dec = []
-    for v in rot:
-        compressed = compress_value(v, 6.3, 12.6)
-        rot_raw.append(compressed)
-        if debug_quant:
-            rot_dec.append(decode_value(compressed, 6.3, 12.6, 16))
+            pos_dec.append(decode_value(compressed, VEC_POS_MAX, VEC_POS_RANGE, 16))
         bw.write_bits(16, compressed)
 
     if debug_quant:
         pos_fmt = ", ".join(f"{v:.2f}" for v in proj.pos)
-        vel_fmt = ", ".join(f"{v:.2f}" for v in proj.vel)
-        rot_fmt = ", ".join(f"{v:.3f}" for v in rot)
         pos_dec_fmt = ", ".join(f"{v:.2f}" for v in pos_dec)
-        vel_dec_fmt = ", ".join(f"{v:.2f}" for v in vel_dec)
-        rot_dec_fmt = ", ".join(f"{v:.3f}" for v in rot_dec)
         print(
             f"[PROJ-QUANT] spawn id={proj.entity_id} tick={tick} "
-            f"pos=({pos_fmt}) raw={pos_raw} dec=({pos_dec_fmt}) "
-            f"vel=({vel_fmt}) raw={vel_raw} dec=({vel_dec_fmt}) "
-            f"rot=({rot_fmt}) raw={rot_raw} dec=({rot_dec_fmt})"
+            f"pos=({pos_fmt}) raw={pos_raw} dec=({pos_dec_fmt})"
         )
 
     return b'\x0E' + tick_bytes + bw.get_bytes()
@@ -1070,14 +1031,14 @@ def build_projectile_update_packet(
     # wulf-forge VEC_POS: max=8192, range=16384
     bw.write_bits(4, 15)
     for v in proj.pos:
-        compressed = compress_value(v, 8192.0, 16384.0, total_bits=16)
+        compressed = compress_value(v, VEC_POS_MAX, VEC_POS_RANGE, total_bits=16)
         bw.write_bits(16, compressed)
 
     # Velocity: 4-bit header + 16 bits × 3
-    # wulf-forge VEC_VEL: max=200, range=400
+    # wulf-forge VEC_VEL: max=1000, range=2000
     bw.write_bits(4, 15)
     for v in proj.vel:
-        compressed = compress_value(v, 200.0, 400.0, total_bits=16)
+        compressed = compress_value(v, VEC_VEL_MAX, VEC_VEL_RANGE, total_bits=16)
         bw.write_bits(16, compressed)
 
     # Rotation: 4-bit header + 16 bits × 3 (REQUIRED for non-static entities!)
@@ -1100,7 +1061,7 @@ def build_projectile_update_packet(
 
     bw.write_bits(4, 15)
     for v in rot:
-        compressed = compress_value(v, 6.3, 12.6)
+        compressed = compress_value(v, VEC_ROT_MAX, VEC_ROT_RANGE)
         bw.write_bits(16, compressed)
 
     return b'\x0E' + tick_bytes + bw.get_bytes()

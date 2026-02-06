@@ -6,12 +6,63 @@ Pure functions that return packet payloads - no I/O.
 import struct
 import time
 import math
+import os
 from typing import Optional, Tuple, List
 from .codec import BitWriter, pack_fixed16, frame_packet
 
 
 # Server tick clock - ticks relative to server start (matches wulf-forge)
 _SERVER_START = time.monotonic()
+
+# Behavior packet feature toggles (wulf-forge-inspired).
+BEHAVIOR_THRUSTERS = os.environ.get("WULFRAM_BEHAVIOR_THRUSTERS", "1") == "1"
+BEHAVIOR_ACTIVE_EXTRAS = os.environ.get("WULFRAM_BEHAVIOR_ACTIVE_EXTRAS", "1") == "1"
+_RAW_HEALTH_MODE = os.environ.get("WULFRAM_HEALTH_RAW_MODE", "wulf").strip().lower()
+_ALLOW_LINEAR_HEALTH = os.environ.get("WULFRAM_ALLOW_LINEAR_HEALTH", "0") == "1"
+if _RAW_HEALTH_MODE in ("linear", "lin") and not _ALLOW_LINEAR_HEALTH:
+    # Linear encoding makes 1.0 -> 0x3FF, which the client decodes as *zero* health.
+    # Only allow linear when explicitly opted-in.
+    print("[WARN] WULFRAM_HEALTH_RAW_MODE=linear ignored; forcing wulf encoding. Set WULFRAM_ALLOW_LINEAR_HEALTH=1 to override.")
+    HEALTH_RAW_MODE = "wulf"
+elif _RAW_HEALTH_MODE:
+    HEALTH_RAW_MODE = _RAW_HEALTH_MODE
+else:
+    HEALTH_RAW_MODE = "wulf"
+
+def _read_float_env(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except ValueError:
+        return float(default)
+
+# Health/energy quantizer scaling. Default is normalized 0..1.
+HEALTH_MAX = _read_float_env("WULFRAM_HEALTH_MAX", 1.0)
+HEALTH_RANGE = _read_float_env("WULFRAM_HEALTH_RANGE", HEALTH_MAX)
+ENERGY_MAX = _read_float_env("WULFRAM_ENERGY_MAX", HEALTH_MAX)
+ENERGY_RANGE = _read_float_env("WULFRAM_ENERGY_RANGE", ENERGY_MAX)
+HEALTH_NORMALIZED = os.environ.get("WULFRAM_HEALTH_NORMALIZED", "1") == "1"
+ENTITY_VITALS_MODE = os.environ.get("WULFRAM_ENTITY_VITALS_MODE", "health").strip().lower()
+# Behavior packet physics defaults.
+# Keep these aligned with wulf-forge packets.toml to avoid client-side
+# divergence while we stabilize spawn + controls.
+BEHAVIOR_GROUND_FRICTION = _read_float_env("WULFRAM_BEHAVIOR_GROUND_FRICTION", 0.8)
+BEHAVIOR_TURN_RATE = _read_float_env("WULFRAM_BEHAVIOR_TURN_RATE", 0.05)
+BEHAVIOR_SUSPENSION_DAMPENING = _read_float_env("WULFRAM_BEHAVIOR_SUSP_DAMPENING", 1.3)
+BEHAVIOR_MAX_ALTITUDE = _read_float_env("WULFRAM_BEHAVIOR_MAX_ALTITUDE", 3.25)
+BEHAVIOR_GRAVITY_PCT = _read_float_env("WULFRAM_BEHAVIOR_GRAVITY_PCT", 1.0)
+# Vector quantizer defaults (match wulf-forge unless overridden).
+VEC_POS_MAX = _read_float_env("WULFRAM_VEC_POS_MAX", 8192.0)
+VEC_POS_RANGE = _read_float_env("WULFRAM_VEC_POS_RANGE", 16384.0)
+VEC_VEL_MAX = _read_float_env("WULFRAM_VEC_VEL_MAX", 1000.0)
+VEC_VEL_RANGE = _read_float_env("WULFRAM_VEC_VEL_RANGE", 2000.0)
+VEC_ROT_MAX = _read_float_env("WULFRAM_VEC_ROT_MAX", 6.3)
+VEC_ROT_RANGE = _read_float_env("WULFRAM_VEC_ROT_RANGE", 12.6)
+VEC_SPIN_MAX = _read_float_env("WULFRAM_VEC_SPIN_MAX", 200.0)
+VEC_SPIN_RANGE = _read_float_env("WULFRAM_VEC_SPIN_RANGE", 400.0)
+# Turret angles in UPDATE_ARRAY local-state may use a dynamic quantizer header.
+# If the client expects a header (e.g., rot quantizer), set bits/priority here.
+LOCAL_STATE_TURRET_HEADER_BITS = int(os.environ.get("WULFRAM_LOCAL_STATE_TURRET_HEADER_BITS", "0"))
+LOCAL_STATE_TURRET_PRIORITY = int(os.environ.get("WULFRAM_LOCAL_STATE_TURRET_PRIORITY", "15"))
 
 def get_ticks() -> int:
     """Get current tick count (ms since server start), matching wulf-forge."""
@@ -42,6 +93,7 @@ class PacketType:
     UPDATE_ARRAY = 0x0E
     WORLD_STATS = 0x16
     PING_REQUEST = 0x0B
+    VIEW_UPDATE = 0x0F
 
 
 # BEHAVIOR packet layout (used to derive weapon slot capability counts)
@@ -57,6 +109,7 @@ PACKET_NAMES = {
     0x09: "ACTION_DUMP",
     0x0A: "ACTION_UPDATE",
     0x0B: "PING_REQUEST",
+    0x0F: "VIEW_UPDATE",
     0x0E: "UPDATE_ARRAY",
     0x13: "HELLO",
     0x16: "WORLD_STATS",
@@ -133,8 +186,7 @@ def build_identified_udp() -> bytes:
 
 def build_login_status(code: int, is_donor: bool = False) -> bytes:
     """Build LOGIN_STATUS packet."""
-    # Code is sent directly - donor flag handled elsewhere
-    return b'\x22\x01' + struct.pack("B", code)
+    return b'\x22' + (b'\x01' if is_donor else b'\x00') + struct.pack("B", code)
 
 
 def build_player(entity_id: int, spectator: bool = True) -> bytes:
@@ -175,7 +227,7 @@ def build_team_info() -> bytes:
 
 
 def build_world_stats(
-    map_name: str = "bpass",  # Match wulf-forge default
+    map_name: str = "crossroads",  # Wulf-forge default; override via WULFRAM_MAP_NAME
     grid_rows: int = 1,       # Match wulf-forge (flag byte)
     grid_cols: int = 1,       # Match wulf-forge (map_id byte)
     scale: float = 1.0,
@@ -213,11 +265,11 @@ def build_add_to_roster(player_id: int, entity_id: int, name: str, team: int, cl
     """
     Build ADD_TO_ROSTER packet.
 
-    Format from Wulf-Forge (working):
+    Format aligned to current Wulf-Forge:
     - u32 account_id (player_id)
-    - u32 team (NOT entity_id! Wulf-Forge puts team here as u32)
-    - u16 kills
-    - u16 deaths
+    - u32 unknown (currently 0)
+    - u16 team
+    - u16 unknown/deaths
     - string name
     - string nametag/clan
     - u16 kills2
@@ -229,15 +281,15 @@ def build_add_to_roster(player_id: int, entity_id: int, name: str, team: int, cl
     clan_bytes = (clan + '\x00').encode('ascii')
     payload = b'\x1A'
     payload += struct.pack(">I", player_id)
-    payload += struct.pack(">I", team)          # Wulf-Forge puts team in second u32!
-    payload += struct.pack(">H", 0)             # kills (u16)
-    payload += struct.pack(">H", 0)             # deaths (u16)
+    payload += struct.pack(">I", 0)             # unknown
+    payload += struct.pack(">H", team & 0xFFFF) # team
+    payload += struct.pack(">H", 2)             # unknown/deaths
     payload += struct.pack(">H", len(name_bytes)) + name_bytes
     payload += struct.pack(">H", len(clan_bytes)) + clan_bytes
-    payload += struct.pack(">H", 0)             # kills2 (u16)
-    payload += struct.pack(">H", 0)             # deaths2 (u16)
-    payload += pack_fixed16(0.0)                # Score as fixed16.16 (4 bytes)
-    payload += struct.pack(">I", 0)             # unknown
+    payload += struct.pack(">H", 2)             # kills2 (u16)
+    payload += struct.pack(">H", 2)             # deaths2 (u16)
+    payload += pack_fixed16(6.9)                # Score as fixed16.16 (4 bytes)
+    payload += struct.pack(">I", 2)             # unknown
     return payload
 
 
@@ -322,11 +374,12 @@ def build_chat_message(message: str, source_id: int = 0, target_id: int = 0) -> 
 
 
 def build_player_info(entity_oid: int, vehicle_type: int, pos: Tuple[float, float, float],
-                      vel: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+                      rot: Tuple[float, float, float] = (0.0, 0.0, 0.0),
                       *, include_local_state: bool = False,
                       weapon_id: int = 0,
                       health: float = 1.0,
                       fuel: float = 1.0,
+                      properties: int = 0,
                       ammo_count_bits: int = 0,
                       ammo_count: int = 0,
                       primary_turret_bits: int = 0,
@@ -345,14 +398,11 @@ def build_player_info(entity_oid: int, vehicle_type: int, pos: Tuple[float, floa
     - u32 frame_id (32 bits)
     - u8 properties (8 bits)
     - 3x fixed16 position (96 bits)
-    - 3x fixed16 velocity (96 bits)
+    - 3x fixed16 rotation (96 bits)
 
     Client uses bit-based reading (read_u32 = read_bits(32)), so we use BitWriter.
     """
     bw = BitWriter()
-
-    # Packet type (8 bits)
-    bw.write_bits(8, 0x18)
 
     # Entity OID (32 bits)
     bw.write_bits(32, entity_oid)
@@ -372,6 +422,7 @@ def build_player_info(entity_oid: int, vehicle_type: int, pos: Tuple[float, floa
         secondary_turret_angle=secondary_turret_angle,
         turret_max=turret_max,
         turret_range=turret_range,
+        include_ammo_turrets=include_local_state,
     )
 
     # Vehicle type (32 bits) - 0-4 are valid tank types
@@ -380,8 +431,8 @@ def build_player_info(entity_oid: int, vehicle_type: int, pos: Tuple[float, floa
     # Frame ID (32 bits)
     bw.write_bits(32, entity_oid)  # Use OID as frame ID
 
-    # Properties (8 bits)
-    bw.write_bits(8, 0)
+    # Properties / config byte (8 bits)
+    bw.write_bits(8, properties & 0xFF)
 
     # Position (3x fixed16.16 = 3x 32 bits)
     x, y, z = pos
@@ -389,13 +440,14 @@ def build_player_info(entity_oid: int, vehicle_type: int, pos: Tuple[float, floa
     bw.write_bits(32, int(y * 65536.0) & 0xFFFFFFFF)
     bw.write_bits(32, int(z * 65536.0) & 0xFFFFFFFF)
 
-    # Velocity (3x fixed16.16 = 3x 32 bits)
-    vx, vy, vz = vel
-    bw.write_bits(32, int(vx * 65536.0) & 0xFFFFFFFF)
-    bw.write_bits(32, int(vy * 65536.0) & 0xFFFFFFFF)
-    bw.write_bits(32, int(vz * 65536.0) & 0xFFFFFFFF)
+    # Rotation (3x fixed16.16 = 3x 32 bits)
+    rx, ry, rz = rot
+    bw.write_bits(32, int(rx * 65536.0) & 0xFFFFFFFF)
+    bw.write_bits(32, int(ry * 65536.0) & 0xFFFFFFFF)
+    bw.write_bits(32, int(rz * 65536.0) & 0xFFFFFFFF)
 
-    return bw.get_bytes()
+    # Opcode is not part of the bitstream; prepend it separately.
+    return b'\x18' + bw.get_bytes()
 
 
 def build_udp_tank_packet_wf(
@@ -403,13 +455,15 @@ def build_udp_tank_packet_wf(
     unit_type: int,
     team_id: int,
     pos: Tuple[float, float, float],
-    vel: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+    rot: Tuple[float, float, float] = (0.0, 0.0, 0.0),
     *,
     tick: Optional[int] = None,
     include_vitals: bool = False,  # Try False: skip local_state quantizer reads entirely
     weapon_id: int = 0,
-    health_mult_bits: int = 1,  # Wulf-forge default (not 1023!)
-    energy_mult_bits: int = 1,  # Wulf-forge default (not 1023!)
+    health: float = 1.0,
+    energy: float = 1.0,
+    health_mult_bits: Optional[int] = None,
+    energy_mult_bits: Optional[int] = None,
     include_firing_mask: bool = False,
     firing_mask_13bits: int = 0,
     include_extras: bool = False,
@@ -427,7 +481,7 @@ def build_udp_tank_packet_wf(
     - u32 net_id
     - u8 team_id
     - 3x fixed16 position
-    - 3x fixed16 velocity
+    - 3x fixed16 rotation
     """
     if tick is None:
         tick = get_ticks()
@@ -437,6 +491,10 @@ def build_udp_tank_packet_wf(
 
     bw.write_bits(1, 1 if include_vitals else 0)
     if include_vitals:
+        if health_mult_bits is None:
+            health_mult_bits = _encode_health_bits(health, total_bits=10)
+        if energy_mult_bits is None:
+            energy_mult_bits = _encode_health_bits(energy, total_bits=10, max_val=ENERGY_MAX, range_val=ENERGY_RANGE)
         bw.write_bits(5, weapon_id & 0x1F)
         bw.write_bits(10, health_mult_bits & 0x3FF)
         bw.write_bits(10, energy_mult_bits & 0x3FF)
@@ -452,7 +510,7 @@ def build_udp_tank_packet_wf(
 
     for value in pos:
         bw.write_bits(32, int(value * 65536.0) & 0xFFFFFFFF)
-    for value in vel:
+    for value in rot:
         bw.write_bits(32, int(value * 65536.0) & 0xFFFFFFFF)
 
     return b'\x18' + bw.get_bytes()
@@ -462,11 +520,11 @@ def build_tank(entity_type: int, oid: int, pos: Tuple[float, float, float],
                rot: Tuple[float, float, float] = (0.0, 0.0, 0.0)) -> bytes:
     """Build TANK/PLAYER_INFO packet for spawning vehicles (legacy)."""
     # Use new PLAYER_INFO format
-    return build_player_info(oid, entity_type, pos)
+    return build_player_info(oid, entity_type, pos, rot=rot)
 
 
 def build_tank_packet(net_id: int, unit_type: int, pos: Tuple[float, float, float],
-                      vel: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+                      rot: Tuple[float, float, float] = (0.0, 0.0, 0.0),
                       flags: int = 1, include_vitals: bool = True,
                       health: float = 1.0, energy: float = 1.0) -> bytes:
     """
@@ -480,7 +538,7 @@ def build_tank_packet(net_id: int, unit_type: int, pos: Tuple[float, float, floa
     - int32 net_id
     - byte flags
     - 3x fixed16 position
-    - 3x fixed16 velocity
+    - 3x fixed16 rotation
     """
     import time
     ticks = int(time.monotonic() * 1000) & 0xFFFFFFFF
@@ -496,13 +554,9 @@ def build_tank_packet(net_id: int, unit_type: int, pos: Tuple[float, float, floa
     if include_vitals:
         # Weapon ID (5 bits)
         bw.write_bits(5, 0)
-        # Health multiplier (10 bits) - uses quantizer encoding
-        # Wulf-forge uses raw value 1 = 100% health (NOT health * 1023!)
-        # The quantizer decodes: value = max - ((raw-1) * range) / denom
-        # So raw=1 -> max, raw=1023 -> min
-        bw.write_bits(10, 1)   # Health = 100% (raw value 1)
-        # Energy multiplier (10 bits) - same quantizer encoding
-        bw.write_bits(10, 1)   # Energy = 100% (raw value 1)
+        # Health/Energy (10 bits) - encoding depends on HEALTH_RAW_MODE
+        bw.write_bits(10, _encode_health_bits(health, total_bits=10))
+        bw.write_bits(10, _encode_health_bits(energy, total_bits=10, max_val=ENERGY_MAX, range_val=ENERGY_RANGE))
 
     # Unit type (32 bits)
     bw.write_bits(32, unit_type)
@@ -519,11 +573,11 @@ def build_tank_packet(net_id: int, unit_type: int, pos: Tuple[float, float, floa
     bw.write_bits(32, int(y * 65536.0) & 0xFFFFFFFF)
     bw.write_bits(32, int(z * 65536.0) & 0xFFFFFFFF)
 
-    # Velocity (3x fixed16.16)
-    vx, vy, vz = vel
-    bw.write_bits(32, int(vx * 65536.0) & 0xFFFFFFFF)
-    bw.write_bits(32, int(vy * 65536.0) & 0xFFFFFFFF)
-    bw.write_bits(32, int(vz * 65536.0) & 0xFFFFFFFF)
+    # Rotation (3x fixed16.16)
+    rx, ry, rz = rot
+    bw.write_bits(32, int(rx * 65536.0) & 0xFFFFFFFF)
+    bw.write_bits(32, int(ry * 65536.0) & 0xFFFFFFFF)
+    bw.write_bits(32, int(rz * 65536.0) & 0xFFFFFFFF)
 
     return b'\x18' + bw.get_bytes()
 
@@ -549,7 +603,8 @@ def _write_local_player_state(bw: BitWriter, include: bool,
                               secondary_turret_bits: int = 0,
                               secondary_turret_angle: float = 0.0,
                               turret_max: float = 6.3,
-                              turret_range: float = 12.6) -> None:
+                              turret_range: float = 12.6,
+                              include_ammo_turrets: bool = True) -> None:
     """
     Write local player state block used by UPDATE_ARRAY and PLAYER_INFO.
 
@@ -561,6 +616,10 @@ def _write_local_player_state(bw: BitWriter, include: bool,
     - fuel/energy (quantizer index 8 => 10 bits)
     - ammo bitmask bits (size comes from ammo slot state pool; 0 for our current config)
     - optional primary/secondary turret angles (bit width depends on weapon def flags)
+
+    AzureFishy decomp notes:
+    - WeaponDef_init_by_entity_type sets +0x170 for Tank (entity type 0) => primary turret angle REQUIRED.
+    - Scout (entity type 1) sets +0x68 => secondary turret angle REQUIRED.
     """
     if not include:
         bw.write_bits(1, 0)
@@ -568,15 +627,22 @@ def _write_local_player_state(bw: BitWriter, include: bool,
 
     bw.write_bits(1, 1)
     bw.write_bits(5, weapon_id & 0x1F)
-    bw.write_bits(10, _compress_value(health, 1.0, 1.0, total_bits=10))
-    bw.write_bits(10, _compress_value(fuel, 1.0, 1.0, total_bits=10))
-    if ammo_count_bits:
+    bw.write_bits(10, _encode_health_bits(health, total_bits=10))
+    bw.write_bits(10, _encode_health_bits(fuel, total_bits=10, max_val=ENERGY_MAX, range_val=ENERGY_RANGE))
+    # Ammo slot bitmask: only write if behavior-derived bit count is nonzero.
+    # The client uses ammo_slot_state_pool[weapon_type].active_bits to decide
+    # how many bits to read. Writing bits when the count is zero desyncs.
+    if include_ammo_turrets and ammo_count_bits > 0:
         bw.write_bits(ammo_count_bits, ammo_count & ((1 << ammo_count_bits) - 1))
 
     # Turret angles (if weapon def flags indicate they exist)
-    if primary_turret_bits:
+    if include_ammo_turrets and primary_turret_bits:
+        if LOCAL_STATE_TURRET_HEADER_BITS > 0:
+            bw.write_bits(LOCAL_STATE_TURRET_HEADER_BITS, LOCAL_STATE_TURRET_PRIORITY & ((1 << LOCAL_STATE_TURRET_HEADER_BITS) - 1))
         bw.write_bits(primary_turret_bits, _compress_value(primary_turret_angle, turret_max, turret_range, total_bits=primary_turret_bits))
-    if secondary_turret_bits:
+    if include_ammo_turrets and secondary_turret_bits:
+        if LOCAL_STATE_TURRET_HEADER_BITS > 0:
+            bw.write_bits(LOCAL_STATE_TURRET_HEADER_BITS, LOCAL_STATE_TURRET_PRIORITY & ((1 << LOCAL_STATE_TURRET_HEADER_BITS) - 1))
         bw.write_bits(secondary_turret_bits, _compress_value(secondary_turret_angle, turret_max, turret_range, total_bits=secondary_turret_bits))
 
 
@@ -619,6 +685,7 @@ def build_update_array_heartbeat(tick: int, entity_id: int, include_health: bool
         secondary_turret_angle=secondary_turret_angle,
         turret_max=turret_max,
         turret_range=turret_range,
+        include_ammo_turrets=include_health,
     )
 
     # Include 1 entity (the player) - client may ignore health when entity_count=0
@@ -645,11 +712,45 @@ def _compress_value(val: float, max_val: float, range_val: float, total_bits: in
     return int(scaled) + 1
 
 
+def _encode_health_bits(value: float, total_bits: int = 10, *, max_val: Optional[float] = None,
+                        range_val: Optional[float] = None) -> int:
+    """
+    Encode health/energy for local-state + TankPacket vitals.
+
+    Modes:
+    - "linear": value 0..1 mapped to [0, 2^bits-1]
+    - "wulf": wulf-forge quantizer (raw=1 -> max)
+    """
+    if value is None:
+        value = 0.0
+    max_val = HEALTH_MAX if max_val is None else max_val
+    range_val = HEALTH_RANGE if range_val is None else range_val
+    value = float(value)
+    if HEALTH_NORMALIZED and max_val > 0:
+        value = value * max_val
+    if max_val > 0:
+        value = max(0.0, min(max_val, value))
+    else:
+        value = max(0.0, value)
+    if HEALTH_RAW_MODE in ("wulf", "wulfforge"):
+        return _compress_value(value, max_val, range_val, total_bits=total_bits)
+    denom = (1 << total_bits) - 1
+    if denom <= 0:
+        return 0
+    if max_val <= 0:
+        return 0
+    scaled = value / max_val
+    return int(round(scaled * denom)) & denom
+
+
 def build_update_array_player_update(tick: int, entity_id: int,
                                      pos: Tuple[float, float, float],
                                      vel: Tuple[float, float, float],
                                      rot: Tuple[float, float, float] = (0.0, 0.0, 0.0),
                                      *,
+                                     include_pos: bool = True,
+                                     include_vel: bool = True,
+                                     include_rot: bool = True,
                                      include_local_state: bool = True,
                                      include_entity_vitals: bool = False,
                                      is_manned: bool = True,
@@ -696,7 +797,13 @@ def build_update_array_player_update(tick: int, entity_id: int,
     bw.write_bits(1, 1 if is_manned else 0)  # is_manned (player vehicle)
 
     # Update mask: POS | VEL | ROT (+ SPEED_SCALE/FUEL)
-    update_mask = 0b0000001110
+    update_mask = 0
+    if include_pos:
+        update_mask |= (1 << 1)
+    if include_vel:
+        update_mask |= (1 << 2)
+    if include_rot:
+        update_mask |= (1 << 3)
     if include_entity_vitals:
         update_mask |= (1 << 5)  # speed scale
         update_mask |= (1 << 7)  # fuel
@@ -705,32 +812,278 @@ def build_update_array_player_update(tick: int, entity_id: int,
     # Bank selector
     bw.write_bits(16, 0)
 
-    # Position vector (bank 0, 16-bit precision) - must match wulf-forge VEC_POS config
-    # max=8192, range=16384 (min=-8192)
-    bw.write_bits(4, 15)
-    for v in pos:
-        bw.write_bits(16, _compress_value(v, 8192.0, 16384.0, total_bits=16))
+    if include_pos:
+        # Position vector (bank 0, 16-bit precision) - must match TRANSLATION VEC_POS config.
+        bw.write_bits(4, 15)
+        for v in pos:
+            bw.write_bits(16, _compress_value(v, VEC_POS_MAX, VEC_POS_RANGE, total_bits=16))
 
-    # Velocity vector (bank 0, 16-bit precision) - wulf-forge VEC_VEL config
-    # max=200, range=400 (min=-200)
-    bw.write_bits(4, 15)
-    for v in vel:
-        bw.write_bits(16, _compress_value(v, 200.0, 400.0, total_bits=16))
+    if include_vel:
+        # Velocity vector (bank 0, 16-bit precision) - must match TRANSLATION VEC_VEL config.
+        bw.write_bits(4, 15)
+        for v in vel:
+            bw.write_bits(16, _compress_value(v, VEC_VEL_MAX, VEC_VEL_RANGE, total_bits=16))
 
-    # Rotation vector (bank 0, 16-bit precision) - wulf-forge VEC_ROT config
-    # max=6.3, range=12.6 (covers ±2π radians)
-    bw.write_bits(4, 15)
-    for v in rot:
-        bw.write_bits(16, _compress_value(v, 6.3, 12.6, total_bits=16))
+    if include_rot:
+        # Rotation vector (bank 0, 16-bit precision) - wulf-forge VEC_ROT config
+        # max=6.3, range=12.6 (covers ±2π radians)
+        bw.write_bits(4, 15)
+        for v in rot:
+            bw.write_bits(16, _compress_value(v, 6.3, 12.6, total_bits=16))
 
     if include_entity_vitals:
-        bw.write_bits(10, _compress_value(speed_scale, 1.0, 1.0, total_bits=10))  # speed scale
-        bw.write_bits(10, _compress_value(fuel, 1.0, 1.0, total_bits=10))         # fuel fraction
+        if ENTITY_VITALS_MODE in ("health", "vitals"):
+            bw.write_bits(10, _encode_health_bits(speed_scale, total_bits=10))
+            bw.write_bits(10, _encode_health_bits(fuel, total_bits=10, max_val=ENERGY_MAX, range_val=ENERGY_RANGE))
+        else:
+            bw.write_bits(10, _compress_value(speed_scale, 1.0, 1.0, total_bits=10))  # speed scale
+            bw.write_bits(10, _compress_value(fuel, 1.0, 1.0, total_bits=10))         # fuel fraction
 
     return b'\x0E' + tick_bytes + bw.get_bytes()
 
 
-def _compress_position(value: float, max_val: float = 8192.0, range_val: float = 16384.0,
+def build_view_update_player_update(tick: int, entity_id: int,
+                                    pos: Tuple[float, float, float],
+                                    vel: Tuple[float, float, float],
+                                    rot: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+                                    *,
+                                    include_pos: bool = True,
+                                    include_vel: bool = True,
+                                    include_rot: bool = True,
+                                    include_local_state: bool = True,
+                                    include_entity_vitals: bool = False,
+                                    is_manned: bool = True,
+                                    weapon_id: int = 0,
+                                    health: float = 1.0,
+                                    fuel: float = 1.0,
+                                    speed_scale: float = 1.0,
+                                    ammo_count_bits: int = 0,
+                                    ammo_count: int = 0,
+                                    primary_turret_bits: int = 0,
+                                    primary_turret_angle: float = 0.0,
+                                    secondary_turret_bits: int = 0,
+                                    secondary_turret_angle: float = 0.0,
+                                    turret_max: float = 6.3,
+                                    turret_range: float = 12.6,
+                                    timestamp: Optional[int] = None) -> bytes:
+    """
+    Build VIEW_UPDATE packet (0x0F) with player position/velocity updates.
+
+    Mirrors build_update_array_player_update but includes the VIEW_UPDATE
+    header (timestamp + tick) used by the client for interpolation.
+    """
+    if timestamp is None:
+        timestamp = get_ticks()
+    header = struct.pack(">I", timestamp) + struct.pack(">I", tick)
+    bw = BitWriter()
+
+    _write_local_player_state(
+        bw,
+        include_local_state,
+        weapon_id=weapon_id,
+        health=health,
+        fuel=fuel,
+        ammo_count_bits=ammo_count_bits,
+        ammo_count=ammo_count,
+        primary_turret_bits=primary_turret_bits,
+        primary_turret_angle=primary_turret_angle,
+        secondary_turret_bits=secondary_turret_bits,
+        secondary_turret_angle=secondary_turret_angle,
+        turret_max=turret_max,
+        turret_range=turret_range,
+    )
+
+    bw.write_bits(8, 1)           # 1 entity
+    bw.write_bits(32, entity_id)  # OID
+    bw.write_bits(1, 1 if is_manned else 0)  # is_manned (player vehicle)
+
+    update_mask = 0
+    if include_pos:
+        update_mask |= (1 << 1)
+    if include_vel:
+        update_mask |= (1 << 2)
+    if include_rot:
+        update_mask |= (1 << 3)
+    if include_entity_vitals:
+        update_mask |= (1 << 5)
+        update_mask |= (1 << 7)
+    bw.write_bits(10, update_mask)
+
+    bw.write_bits(16, 0)
+
+    if include_pos:
+        bw.write_bits(4, 15)
+        for v in pos:
+            bw.write_bits(16, _compress_value(v, VEC_POS_MAX, VEC_POS_RANGE, total_bits=16))
+
+    if include_vel:
+        bw.write_bits(4, 15)
+        for v in vel:
+            bw.write_bits(16, _compress_value(v, VEC_VEL_MAX, VEC_VEL_RANGE, total_bits=16))
+
+    if include_rot:
+        bw.write_bits(4, 15)
+        for v in rot:
+            bw.write_bits(16, _compress_value(v, 6.3, 12.6, total_bits=16))
+
+    if include_entity_vitals:
+        if ENTITY_VITALS_MODE in ("health", "vitals"):
+            bw.write_bits(10, _encode_health_bits(speed_scale, total_bits=10))
+            bw.write_bits(10, _encode_health_bits(fuel, total_bits=10, max_val=ENERGY_MAX, range_val=ENERGY_RANGE))
+        else:
+            bw.write_bits(10, _compress_value(speed_scale, 1.0, 1.0, total_bits=10))
+            bw.write_bits(10, _compress_value(fuel, 1.0, 1.0, total_bits=10))
+
+    return b'\x0F' + header + bw.get_bytes()
+
+
+def _write_update_array_entity(bw: "BitWriter",
+                               *,
+                               entity_id: int,
+                               is_manned: bool,
+                               pos: Tuple[float, float, float],
+                               vel: Tuple[float, float, float],
+                               rot: Tuple[float, float, float],
+                               include_pos: bool,
+                               include_vel: bool,
+                               include_rot: bool,
+                               include_entity_vitals: bool = False,
+                               speed_scale: float = 1.0,
+                               fuel: float = 1.0) -> None:
+    """Write a single entity update block to an UPDATE_ARRAY bitstream."""
+    bw.write_bits(32, entity_id)  # OID
+    bw.write_bits(1, 1 if is_manned else 0)
+
+    update_mask = 0
+    if include_pos:
+        update_mask |= (1 << 1)
+    if include_vel:
+        update_mask |= (1 << 2)
+    if include_rot:
+        update_mask |= (1 << 3)
+    if include_entity_vitals:
+        update_mask |= (1 << 5)  # speed scale
+        update_mask |= (1 << 7)  # fuel
+    bw.write_bits(10, update_mask)
+
+    bw.write_bits(16, 0)  # Bank selector
+
+    if include_pos:
+        bw.write_bits(4, 15)
+        for v in pos:
+            bw.write_bits(16, _compress_value(v, VEC_POS_MAX, VEC_POS_RANGE, total_bits=16))
+
+    if include_vel:
+        bw.write_bits(4, 15)
+        for v in vel:
+            bw.write_bits(16, _compress_value(v, VEC_VEL_MAX, VEC_VEL_RANGE, total_bits=16))
+
+    if include_rot:
+        bw.write_bits(4, 15)
+        for v in rot:
+            bw.write_bits(16, _compress_value(v, VEC_ROT_MAX, VEC_ROT_RANGE, total_bits=16))
+
+    if include_entity_vitals:
+        if ENTITY_VITALS_MODE in ("health", "vitals"):
+            bw.write_bits(10, _encode_health_bits(speed_scale, total_bits=10))
+            bw.write_bits(10, _encode_health_bits(fuel, total_bits=10, max_val=ENERGY_MAX, range_val=ENERGY_RANGE))
+        else:
+            bw.write_bits(10, _compress_value(speed_scale, 1.0, 1.0, total_bits=10))
+            bw.write_bits(10, _compress_value(fuel, 1.0, 1.0, total_bits=10))
+
+
+def build_update_array_multi(tick: int,
+                             *,
+                             include_local_state: bool,
+                             weapon_id: int = 0,
+                             health: float = 1.0,
+                             fuel: float = 1.0,
+                             ammo_count_bits: int = 0,
+                             ammo_count: int = 0,
+                             primary_turret_bits: int = 0,
+                             primary_turret_angle: float = 0.0,
+                             secondary_turret_bits: int = 0,
+                             secondary_turret_angle: float = 0.0,
+                             turret_max: float = 6.3,
+                             turret_range: float = 12.6,
+                             entities: Optional[list] = None) -> bytes:
+    """Build UPDATE_ARRAY packet with multiple entity updates."""
+    tick_bytes = struct.pack(">I", tick)
+    bw = BitWriter()
+
+    _write_local_player_state(
+        bw,
+        include_local_state,
+        weapon_id=weapon_id,
+        health=health,
+        fuel=fuel,
+        ammo_count_bits=ammo_count_bits,
+        ammo_count=ammo_count,
+        primary_turret_bits=primary_turret_bits,
+        primary_turret_angle=primary_turret_angle,
+        secondary_turret_bits=secondary_turret_bits,
+        secondary_turret_angle=secondary_turret_angle,
+        turret_max=turret_max,
+        turret_range=turret_range,
+        include_ammo_turrets=include_local_state,
+    )
+
+    entities = entities or []
+    bw.write_bits(8, len(entities))
+    for ent in entities:
+        _write_update_array_entity(bw, **ent)
+
+    return b'\x0E' + tick_bytes + bw.get_bytes()
+
+
+def build_view_update_multi(tick: int,
+                            *,
+                            include_local_state: bool,
+                            weapon_id: int = 0,
+                            health: float = 1.0,
+                            fuel: float = 1.0,
+                            ammo_count_bits: int = 0,
+                            ammo_count: int = 0,
+                            primary_turret_bits: int = 0,
+                            primary_turret_angle: float = 0.0,
+                            secondary_turret_bits: int = 0,
+                            secondary_turret_angle: float = 0.0,
+                            turret_max: float = 6.3,
+                            turret_range: float = 12.6,
+                            entities: Optional[list] = None,
+                            timestamp: Optional[int] = None) -> bytes:
+    """Build VIEW_UPDATE (0x0F) packet with a timestamp + update array payload."""
+    if timestamp is None:
+        timestamp = get_ticks()
+    header = struct.pack(">I", timestamp) + struct.pack(">I", tick)
+    bw = BitWriter()
+
+    _write_local_player_state(
+        bw,
+        include_local_state,
+        weapon_id=weapon_id,
+        health=health,
+        fuel=fuel,
+        ammo_count_bits=ammo_count_bits,
+        ammo_count=ammo_count,
+        primary_turret_bits=primary_turret_bits,
+        primary_turret_angle=primary_turret_angle,
+        secondary_turret_bits=secondary_turret_bits,
+        secondary_turret_angle=secondary_turret_angle,
+        turret_max=turret_max,
+        turret_range=turret_range,
+        include_ammo_turrets=include_local_state,
+    )
+
+    entities = entities or []
+    bw.write_bits(8, len(entities))
+    for ent in entities:
+        _write_update_array_entity(bw, **ent)
+
+    return b'\x0F' + header + bw.get_bytes()
+
+
+def _compress_position(value: float, max_val: float = VEC_POS_MAX, range_val: float = VEC_POS_RANGE,
                        total_bits: int = 16) -> Tuple[int, int]:
     """
     Compress a position value using Wulf-Forge's quantization scheme.
@@ -779,7 +1132,7 @@ def _compress_wulfforge(value: float, max_val: float, range_val: float, total_bi
     return raw_val
 
 
-def _compress_rotation(value: float, max_val: float = 6.3, range_val: float = 12.6,
+def _compress_rotation(value: float, max_val: float = VEC_ROT_MAX, range_val: float = VEC_ROT_RANGE,
                        total_bits: int = 16) -> Tuple[int, int]:
     """
     Compress a rotation value using Wulf-Forge's quantization scheme.
@@ -792,6 +1145,9 @@ def build_update_array_create_tank(tick: int, entity_id: int, entity_type: int, 
                                     pos: Tuple[float, float, float], behavior_type: int = 0,
                                     include_interp: bool = False, interp_bits: int = 16,
                                     include_health: bool = True,
+                                    include_entity_vitals: bool = False,
+                                    health: float = 1.0,
+                                    fuel: float = 1.0,
                                     is_manned: bool = True) -> bytes:
     """
     Build UPDATE_ARRAY that creates a tank entity with position inline.
@@ -812,7 +1168,7 @@ def build_update_array_create_tank(tick: int, entity_id: int, entity_type: int, 
     bw = BitWriter()
 
     # Header (bitstream starts here)
-    _write_local_player_state(bw, include_health)
+    _write_local_player_state(bw, include_health, include_ammo_turrets=False)
     bw.write_bits(8, 1)            # 1 entity
 
     # Entity header (matches wulf-forge update_array.py EntitySerializer.serialize)
@@ -822,6 +1178,10 @@ def build_update_array_create_tank(tick: int, entity_id: int, entity_type: int, 
     # Presence flags: bit 0 (creation) + bit 1 (position) + bit 3 (rotation)
     # Binary: 0b0000001011 = 11 decimal
     presence_flags = 0b0000001011
+    if include_entity_vitals:
+        # Wulf-forge marks HEALTH (bit 5); include ENERGY (bit 7) as a stable pair.
+        presence_flags |= (1 << 5)
+        presence_flags |= (1 << 7)
     bw.write_bits(10, presence_flags)
 
     # CRITICAL: Bank selector (16 bits) - wulf-forge puts this AFTER presence flags!
@@ -829,11 +1189,13 @@ def build_update_array_create_tank(tick: int, entity_id: int, entity_type: int, 
     bw.write_bits(16, 0)           # Bank selector = 0
 
     # --- CREATION BLOCK (Bit 0 / DEFINITION) ---
-    # Wulf-forge uses 8-bit fields for unit type and team IDs (quantizer[2] and [3])
+    # Wulf-forge uses 8-bit fields for unit type and team IDs (quantizer[2] and [3]).
+    # The second team byte is usually the same as team_id; keep behavior_type only when non-zero.
     bw.write_bits(8, entity_type & 0xFF)   # unit_type (8 bits, quantizer[2])
-    bw.write_bits(8, team & 0xFF)          # team_id (8 bits, quantizer[3])
-    bw.write_bits(8, team & 0xFF)          # team_id_also/state (8 bits, quantizer[3])
-    bw.write_bits(1, 1)                    # is_teleport_or_snap = True (force position)
+    config_val = behavior_type if behavior_type else team
+    bw.write_bits(8, config_val & 0xFF)    # team_id / entity_config
+    bw.write_bits(8, team & 0xFF)          # team_id (quantizer[3])
+    bw.write_bits(1, 1)                    # is_static = True (force position)
 
     # --- POSITION VECTORS (Bit 1 / POS) ---
     # Each component: 4-bit header + 16 bits of data at max priority.
@@ -848,6 +1210,11 @@ def build_update_array_create_tank(tick: int, entity_id: int, entity_type: int, 
     for _ in range(3):
         _, quantized = _compress_rotation(0.0)
         bw.write_bits(16, quantized)
+
+    # --- ENTITY VITALS (Bits 5 & 7) ---
+    if include_entity_vitals:
+        bw.write_bits(10, _encode_health_bits(health, total_bits=10))
+        bw.write_bits(10, _encode_health_bits(fuel, total_bits=10, max_val=ENERGY_MAX, range_val=ENERGY_RANGE))
 
     return b'\x0E' + tick_bytes + bw.get_bytes()
 
@@ -890,6 +1257,7 @@ def build_update_array_spawn_points(tick: int, spawn_points: list) -> bytes:
     for sp in spawn_points:
         oid = sp['oid']
         team = sp['team']
+        config = sp.get('config', team)
         x, y, z = sp.get('x', 100.0), sp.get('y', 10.0), sp.get('z', 100.0)
 
         # Entity header (matches wulf-forge format)
@@ -906,9 +1274,9 @@ def build_update_array_spawn_points(tick: int, spawn_points: list) -> bytes:
         # --- DEFINITION block (bit 0) ---
         # Unit type 27 = Repair Pad (spawn point)
         bw.write_bits(8, 27)                   # unit_type = 27 (Repair Pad)
+        bw.write_bits(8, config & 0xFF)        # entity_config / variant
         bw.write_bits(8, team & 0xFF)          # team_id
-        bw.write_bits(8, team & 0xFF)          # team_id_also/state
-        bw.write_bits(1, 1)                    # is_teleport_or_snap = True
+        bw.write_bits(1, 1)                    # is_static = True (repair pad)
 
         # --- POSITION block (bit 1) ---
         # Wulf-forge VEC_POS config: head=4, total=16, max=8192, range=16384
@@ -921,10 +1289,59 @@ def build_update_array_spawn_points(tick: int, spawn_points: list) -> bytes:
         # Position values using wulf-forge exact formula
         # Range: -8192 to +8192 (max=8192, range=16384)
         for coord in (x, y, z):
-            quantized = _compress_wulfforge(coord, max_val=8192.0, range_val=16384.0, total_bits=16)
+            quantized = _compress_wulfforge(coord, max_val=VEC_POS_MAX, range_val=VEC_POS_RANGE, total_bits=16)
             bw.write_bits(16, quantized)
 
     return b'\x0E' + tick_bytes + bw.get_bytes()
+
+
+def build_view_update_spawn_points(tick: int,
+                                   spawn_points: list,
+                                   *,
+                                   include_local_state: bool = False,
+                                   weapon_id: int = 0,
+                                   health: float = 1.0,
+                                   fuel: float = 1.0,
+                                   timestamp: Optional[int] = None) -> bytes:
+    """Build VIEW_UPDATE (0x0F) with spawn point entities."""
+    if timestamp is None:
+        timestamp = get_ticks()
+    header = struct.pack(">I", timestamp) + struct.pack(">I", tick)
+    bw = BitWriter()
+
+    _write_local_player_state(
+        bw,
+        include_local_state,
+        weapon_id=weapon_id,
+        health=health,
+        fuel=fuel,
+        include_ammo_turrets=include_local_state,
+    )
+
+    bw.write_bits(8, len(spawn_points))
+
+    for sp in spawn_points:
+        oid = sp['oid']
+        team = sp['team']
+        config = sp.get('config', team)
+        x, y, z = sp.get('x', 100.0), sp.get('y', 10.0), sp.get('z', 100.0)
+
+        bw.write_bits(32, oid)
+        bw.write_bits(1, 0)
+        bw.write_bits(10, 0x03)  # DEFINITION | POS
+        bw.write_bits(16, 0)     # Bank selector
+
+        bw.write_bits(8, 27)          # unit_type = Repair Pad
+        bw.write_bits(8, config & 0xFF)
+        bw.write_bits(8, team & 0xFF)
+        bw.write_bits(1, 1)           # spawn snap
+
+        bw.write_bits(4, 15)
+        for coord in (x, y, z):
+            quantized = _compress_wulfforge(coord, max_val=VEC_POS_MAX, range_val=VEC_POS_RANGE, total_bits=16)
+            bw.write_bits(16, quantized)
+
+    return b'\x0F' + header + bw.get_bytes()
 
 
 def build_behavior_packet() -> bytes:
@@ -941,15 +1358,16 @@ def build_behavior_packet() -> bytes:
     - Padding to target_size (3116 bytes)
     """
     payload = bytearray()
+    behavior_log = os.environ.get("WULFRAM_BEHAVIOR_LOG", "0") == "1"
 
     # ========== SECTION 1: Header (95 bytes) ==========
     # Matches wulf-forge BehaviorHeader defaults
     payload.append(0x00)                  # spawn_related (wulf-forge default: 0)
     payload += pack_fixed16(5.0)          # timeout
-    payload += pack_fixed16(100.0)        # dbl_6792F8
-    payload += pack_fixed16(100.0)        # velocity_q
-    payload += pack_fixed16(100.0)        # dbl_679308
-    payload += pack_fixed16(100.0)        # dbl_679310
+    payload += pack_fixed16(10.0)         # dbl_6792F8 (wulf-forge default)
+    payload += pack_fixed16(10.0)         # velocity_q (wulf-forge default)
+    payload += pack_fixed16(10.0)         # dbl_679308 (wulf-forge default)
+    payload += pack_fixed16(10.0)         # dbl_679310 (wulf-forge default)
 
     payload += struct.pack(">I", 20)      # total_team_size
     payload += struct.pack(">I", 25000)   # glimpse_ms
@@ -996,10 +1414,11 @@ def build_behavior_packet() -> bytes:
     # - Zeroing all data for disabled slots
     # - Enabling only slot 4 (without slot 0)
     # - Enabling slots 0 and 1 (consecutive)
+    enable_slot0 = os.environ.get("WULFRAM_BEHAVIOR_SLOT0", "0") == "1"
     TANK_SLOT_CONFIG = {
         # slot: [enabled, ammo_capable, fire_capable, active_capable, cooldown_capable]
-        0:  [1, 0, 0, 0, 0],  # Slot 0: Chain gun - ONLY WORKING SLOT
-    }
+        0:  [1, 0, 0, 0, 0],  # Slot 0: Chain gun (optional)
+    } if enable_slot0 else {}
 
     for _unit in range(4):
         for _slot in range(13):
@@ -1036,9 +1455,9 @@ def build_behavior_packet() -> bytes:
         payload += pack_fixed16(4.0)      # accel
         payload += struct.pack(">I", 700) # engine_torque
         payload += struct.pack(">I", 550) # suspension_stiffness
-        payload += pack_fixed16(0.35)     # ground_friction (reduced for smoother sliding)
-        payload += pack_fixed16(0.4)      # turn_rate (increased for responsive steering)
-        payload += pack_fixed16(2.0)      # suspension_dampening
+        payload += pack_fixed16(BEHAVIOR_GROUND_FRICTION)      # ground_friction (wulf-forge packets.toml)
+        payload += pack_fixed16(BEHAVIOR_TURN_RATE)            # turn_rate (wulf-forge packets.toml)
+        payload += pack_fixed16(BEHAVIOR_SUSPENSION_DAMPENING) # suspension_dampening (wulf-forge packets.toml)
         payload += struct.pack(">I", 0)   # unknown_int_30
         payload += struct.pack(">I", 33000)  # mass
 
@@ -1046,28 +1465,105 @@ def build_behavior_packet() -> bytes:
 
     # ========== SECTION 5: Hardpoints ==========
     # 4 hardpoint blocks, each with count + optional data + trailing fixed16
-    # wulf-forge uses count=0 for all blocks, so just count(4 bytes) + fixed16(4 bytes) each
-    for _ in range(4):
-        payload += struct.pack(">I", 0)   # count = 0
-        payload += pack_fixed16(0.0)      # trailing fixed16
+    # wulf-forge now emits thruster hardpoints for tank/scout (count=2).
+    section5_start = len(payload)
 
-    section5_size = 4 * 8  # 4 blocks × (4 + 4) = 32 bytes
+    def _write_hardpoint_block(count: int, is_thruster: bool) -> None:
+        payload.extend(struct.pack(">I", count))
+        if count > 0:
+            for i in range(count):
+                if is_thruster:
+                    wing_width = 2.0
+                    lateral_bias = 0.0
+                    forward_bias = 0.0
+                    if i % 2 == 1:
+                        x_pos = wing_width + lateral_bias
+                    else:
+                        x_pos = -wing_width + lateral_bias
+                    y_pos = forward_bias
+                    z_pos = -0.5
+                    nx, ny, nz = 0.0, 0.0, -0.75
+                else:
+                    x_pos = 1.5 if (i % 2 == 1) else -1.5
+                    y_pos = 2.0
+                    z_pos = 0.5
+                    nx, ny, nz = 0.0, 1.0, 0.0
+
+                payload.extend(pack_fixed16(float(x_pos)))
+                payload.extend(pack_fixed16(float(y_pos)))
+                payload.extend(pack_fixed16(float(z_pos)))
+                payload.extend(pack_fixed16(float(nx)))
+                payload.extend(pack_fixed16(float(ny)))
+                payload.extend(pack_fixed16(float(nz)))
+                payload.extend(struct.pack(">I", 0))
+
+        if is_thruster:
+            payload.extend(pack_fixed16(-5.0))
+        else:
+            payload.extend(pack_fixed16(0.0))
+
+    if BEHAVIOR_THRUSTERS:
+        # Match current wulf-forge behavior packet layout:
+        # send thruster hardpoints for all four team/vehicle variants.
+        _write_hardpoint_block(2, True)   # Red tank
+        _write_hardpoint_block(2, True)   # Blue tank
+        _write_hardpoint_block(2, True)   # Red scout
+        _write_hardpoint_block(2, True)   # Blue scout
+    else:
+        for _ in range(4):
+            _write_hardpoint_block(0, False)
+
+    section5_size = len(payload) - section5_start
     assert len(payload) == 2975 + section5_size, f"After Section 5: expected {2975 + section5_size}, got {len(payload)}"
 
-    # ========== SECTION 6: Active Vehicle Physics (84 bytes) ==========
-    # 3 vehicles × 28 bytes each (matching wulf-forge active_vehicles_count=3)
-    # Format: 7 fixed16 values × 4 bytes = 28 bytes per vehicle
-    # CRITICAL: gravity_pct enables physics!
-    for _ in range(3):
-        payload += pack_fixed16(4.5)      # turn_adjust
-        payload += pack_fixed16(85.0)     # move_adjust
-        payload += pack_fixed16(69.7)     # strafe_adjust
-        payload += pack_fixed16(80.0)     # max_velocity
-        payload += pack_fixed16(2000.0)   # low_fuel_level
-        payload += pack_fixed16(5.0)      # max_altitude (wulf-forge default)
-        payload += pack_fixed16(0.5)      # gravity_pct - ENABLES PHYSICS!
+    # ========== SECTION 6: Active Vehicle Physics ==========
+    # Vehicle-specific sizes (tank=7, scout=9, bomber=11 fixed16 values).
+    section6_start = len(payload)
+    for i in range(3):
+        if not BEHAVIOR_ACTIVE_EXTRAS:
+            payload += pack_fixed16(4.5)      # turn_adjust
+            payload += pack_fixed16(85.0)     # move_adjust
+            payload += pack_fixed16(69.7)     # strafe_adjust
+            payload += pack_fixed16(80.0)     # max_velocity
+            payload += pack_fixed16(2000.0)   # low_fuel_level
+            payload += pack_fixed16(BEHAVIOR_MAX_ALTITUDE)  # max_altitude (wulf-forge packets.toml)
+            payload += pack_fixed16(BEHAVIOR_GRAVITY_PCT)   # gravity_pct (wulf-forge packets.toml)
+            continue
 
-    section6_size = 3 * 28  # 84 bytes
+        if i == 0:
+            payload += pack_fixed16(4.5)      # turn_adjust
+            payload += pack_fixed16(85.0)     # move_adjust
+            payload += pack_fixed16(69.7)     # strafe_adjust
+            payload += pack_fixed16(80.0)     # max_velocity
+            payload += pack_fixed16(2000.0)   # low_fuel_level
+            payload += pack_fixed16(BEHAVIOR_MAX_ALTITUDE)  # max_altitude (wulf-forge packets.toml)
+            payload += pack_fixed16(BEHAVIOR_GRAVITY_PCT)   # gravity_pct (wulf-forge packets.toml)
+        elif i == 1:
+            payload += pack_fixed16(4.5)      # turn_adjust
+            payload += pack_fixed16(85.0)     # move_forward_adjust
+            payload += pack_fixed16(38.0)     # move_backward_adjust
+            payload += pack_fixed16(72.0)     # strafe_adjust
+            payload += pack_fixed16(85.0)     # max_velocity
+            payload += pack_fixed16(2000.0)   # low_fuel_level
+            payload += pack_fixed16(4.9)      # max_altitude
+            payload += pack_fixed16(3.5)      # max_speed_height_pickup
+            payload += pack_fixed16(BEHAVIOR_GRAVITY_PCT)   # gravity_pct (wulf-forge packets.toml)
+        else:
+            payload += pack_fixed16(-2.5132741233144)  # ax_mag
+            payload += pack_fixed16(2.35619449060725)  # ay_mag
+            payload += pack_fixed16(80.0)              # forward_mag
+            payload += pack_fixed16(45.0)              # low_airspeed
+            payload += pack_fixed16(0.5)               # angfac
+            payload += pack_fixed16(70.0)              # turn_low
+            payload += pack_fixed16(110.0)             # turn_high
+            payload += pack_fixed16(340.0)             # turn_zero
+            payload += pack_fixed16(1000.0)            # very_high
+            payload += pack_fixed16(1800.0)            # ceiling
+            payload += pack_fixed16(2000.0)            # low_fuel_level
+
+    section6_size = len(payload) - section6_start
+    expected_section6 = 84 if not BEHAVIOR_ACTIVE_EXTRAS else (7 + 9 + 11) * 4
+    assert section6_size == expected_section6, f"Section 6 size mismatch: got {section6_size}, expected {expected_section6}"
     current_size = 2975 + section5_size + section6_size
     assert len(payload) == current_size, f"After Section 6: expected {current_size}, got {len(payload)}"
 
@@ -1080,7 +1576,13 @@ def build_behavior_packet() -> bytes:
     padding_needed = target_size - len(packet)
     if padding_needed > 0:
         packet += b'\x00' * padding_needed
-
+    if behavior_log:
+        print(
+            "[BEHAVIOR] "
+            f"thrusters={int(BEHAVIOR_THRUSTERS)} extras={int(BEHAVIOR_ACTIVE_EXTRAS)} "
+            f"section5={section5_size} section6={section6_size} "
+            f"payload_len={len(payload)} packet_len={len(packet)}"
+        )
     return bytes(packet)
 
 
@@ -1157,8 +1659,8 @@ def build_translation_packet() -> bytes:
     scalar_configs[2] = (8, 0, "0.0", "0.0")   # unit type (8 bits) - wulf-forge uses 8!
     scalar_configs[3] = (8, 0, "0.0", "0.0")   # team id (8 bits) - wulf-forge uses 8!
     scalar_configs[4] = (8, 0, "0.0", "0.0")   # unit type in cargo (8 bits)
-    scalar_configs[5] = (10, 0, "1.0", "1.0")  # health (10 bits)
-    scalar_configs[8] = (10, 0, "1.0", "1.0")  # energy (10 bits)
+    scalar_configs[5] = (10, 0, f"{HEALTH_MAX}", f"{HEALTH_RANGE}")  # health (10 bits)
+    scalar_configs[8] = (10, 0, f"{ENERGY_MAX}", f"{ENERGY_RANGE}")  # energy (10 bits)
     scalar_configs[13] = (8, 0, "1.0", "1.0")  # extra A
     scalar_configs[14] = (8, 0, "1.0", "1.0")  # extra B
 
@@ -1170,10 +1672,10 @@ def build_translation_packet() -> bytes:
     # MUST MATCH what we actually write in UPDATE_ARRAY packets!
     # Using 16 bits for all vectors (matching wulf-forge's actual encoding)
     vector_templates = [
-        (4, 16, "8192.0", "16384.0"),  # position: 16 bits, range -8192 to +8192
-        (4, 16, "200.0", "400.0"),     # velocity: 16 bits, range -200 to +200
-        (4, 16, "6.3", "12.6"),        # rotation: 16 bits, range -6.3 to +6.3
-        (4, 16, "10.0", "20.0"),       # spin: 16 bits, range -10 to +10
+        (4, 16, f"{VEC_POS_MAX}", f"{VEC_POS_RANGE}"),   # position
+        (4, 16, f"{VEC_VEL_MAX}", f"{VEC_VEL_RANGE}"),   # velocity
+        (4, 16, f"{VEC_ROT_MAX}", f"{VEC_ROT_RANGE}"),   # rotation
+        (4, 16, f"{VEC_SPIN_MAX}", f"{VEC_SPIN_RANGE}"), # spin
     ]
 
     for _ in range(3):

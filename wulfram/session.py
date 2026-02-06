@@ -53,6 +53,7 @@ class Session:
 
     # Packet sequencing
     behavior_sent: bool = False
+    translation_sent: bool = False
     roster_sent: bool = False
     world_stats_sent: bool = False
     want_updates_received: bool = False
@@ -64,6 +65,8 @@ class Session:
     delayed_spawn_team: int = 0
     want_updates_handled_time: float = 0.0
     suppress_want_updates_payload: bool = False
+    input_ready: bool = False
+    input_ready_time: float = 0.0
 
     # UDP tracking
     udp_addr: Optional[tuple] = None
@@ -90,6 +93,7 @@ class Session:
         self.in_game = False
         self.pending_spawn_team_id = 0
         self.behavior_sent = False
+        self.translation_sent = False
         self.roster_sent = False
         self.world_stats_sent = False
         self.want_updates_received = False
@@ -97,6 +101,8 @@ class Session:
         self.want_updates_handled = False
         self.want_updates_handled_time = 0.0
         self.suppress_want_updates_payload = False
+        self.input_ready = False
+        self.input_ready_time = 0.0
         self.udp_addr = None
         self.udp_verified = False
         self.udp_outgoing_seq = 0
@@ -154,10 +160,12 @@ class Features:
     send_load_status: bool = False
     send_behavior_packet: bool = True  # Re-enabled
     send_translation_packet: bool = True  # Required for quantizers
-    send_spawn_points: bool = True  # ENABLED - Repair Pads (unit type 27)
+    send_spawn_points: bool = False  # Wulf-forge baseline: no spawn point entities
     send_player_on_login: bool = True
     send_world_stats_on_login: bool = True
-    auto_join_team: bool = True  # Re-enabled for testing UDP spawn
+    # Default off: auto-spawn can trigger before world collision data is ready and crash the client.
+    # Spawn should come from explicit REINCARNATE flow (team switch + spawn point selection).
+    auto_join_team: bool = False
     tick_loop_enabled: bool = True  # ENABLED - sends health/energy heartbeat
     send_update_array_empty: bool = False  # DISABLED - heartbeat is preferred
     wulfforge_compat: bool = False  # When True, minimize to wulf-forge behavior

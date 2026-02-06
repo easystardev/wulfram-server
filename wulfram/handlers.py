@@ -13,9 +13,9 @@ from .packets import (
     build_login_status, build_player, build_team_info,
     build_world_stats, build_bps_response, build_chat_message,
     build_add_to_roster, build_update_stats, build_tank_packet,
-    build_update_array_empty, build_update_array_spawn_points,
+    build_update_array_empty, build_update_array_spawn_points, build_view_update_spawn_points, build_view_update_multi, get_ticks,
     build_behavior_packet, build_translation_packet, build_game_clock,
-    build_motd,
+    build_motd, build_reincarnate,
 )
 
 if TYPE_CHECKING:
@@ -125,25 +125,16 @@ def send_initial_game_data(server: "WulframServer", ctx: "ClientContext"):
     # LOGIN_STATUS(8) after TEAM_INFO
     tcp.send(build_login_status(8, is_donor=True))
 
-    # PLAYER with spectator=False
+    # PLAYER with spectator=True to keep client in team-select/Mode3 initialization.
     if session.player_id == 0:
         session.player_id = ctx.entity_id
-        tcp.send(build_player(entity_id=session.player_id, spectator=False))
+        tcp.send(build_player(entity_id=session.player_id, spectator=True))
 
     # GameClock
     tcp.send(build_game_clock())
 
     # MOTD
     tcp.send(build_motd("Welcome to Wulfram!"))
-
-    # Behavior packet
-    if FEATURES.send_behavior_packet and not session.behavior_sent:
-        tcp.send(build_behavior_packet())
-        session.behavior_sent = True
-
-    # TRANSLATION
-    if FEATURES.send_translation_packet:
-        tcp.send(build_translation_packet())
 
     # ADD_TO_ROSTER
     if not session.roster_sent:
@@ -152,9 +143,64 @@ def send_initial_game_data(server: "WulframServer", ctx: "ClientContext"):
             player_id=session.player_id,
             entity_id=session.player_id,
             name=name,
-            team=1
+            team=session.team_id if session.team_id else 0
         ))
         session.roster_sent = True
+
+
+def _broadcast_update_stats(server: "WulframServer", account_id: int, team_id: int) -> int:
+    """Broadcast UPDATE_STATS to all connected clients with a known transport."""
+    packet = build_update_stats(account_id=account_id, team_id=team_id)
+    sent = 0
+    lock = getattr(server, "clients_lock", None)
+    clients = getattr(server, "clients", {})
+    if lock is not None:
+        with lock:
+            targets = list(clients.values())
+    else:
+        targets = list(clients.values())
+
+    for target in targets:
+        try:
+            udp_addr = getattr(target.session, "udp_addr", None)
+            if server.udp_handler and udp_addr:
+                server.udp_handler.send_to(packet, udp_addr)
+                sent += 1
+            elif target.tcp_handler:
+                target.tcp_handler.send(packet)
+                sent += 1
+        except Exception as ex:
+            print(
+                f"[STATS] Broadcast UPDATE_STATS failed for "
+                f"client {getattr(target, 'client_id', '?')}: {ex}"
+            )
+    return sent
+
+
+def _schedule_team_select_spawn(server: "WulframServer", ctx: "ClientContext", team_id: int, reason: str) -> None:
+    """Schedule/queue auto-spawn for legacy team-select flow."""
+    session = ctx.session
+    if not getattr(server, "spawn_on_team_select", False):
+        session.pending_spawn_team_id = 0
+        return
+
+    now = time.monotonic()
+    wants_updates = session.want_updates_received or session.want_updates_handled
+    if wants_updates:
+        session.pending_spawn_team_id = 0
+        session.delayed_spawn_team = team_id
+        session.delayed_spawn_time = now + server.spawn_delay_seconds
+        print(
+            f"[SPAWN] Client {ctx.client_id}: Scheduled delayed spawn in "
+            f"{server.spawn_delay_seconds:.1f}s for team {team_id} ({reason})"
+        )
+        return
+
+    session.pending_spawn_team_id = team_id
+    print(
+        f"[SPAWN] Client {ctx.client_id}: Deferred spawn for team {team_id} "
+        f"until WANT_UPDATES ({reason})"
+    )
 
 
 def handle_bps(server: "WulframServer", ctx: "ClientContext", packet: bytes):
@@ -167,12 +213,22 @@ def handle_bps(server: "WulframServer", ctx: "ClientContext", packet: bytes):
         print(f"[GAME] Client {ctx.client_id}: BPS request: rate={rate_index}")
         tcp.send(build_bps_response(rate_index, approved=True))
 
-        # Send WORLD_STATS after BPS if not yet sent
-        if (FEATURES.send_world_stats_on_login and not session.world_stats_sent
-                and session.phase == Phase.TEAM_SELECT):
-            time.sleep(0.2)
+        if session.phase != Phase.TEAM_SELECT:
+            return
+
+        # Safe ordering: prime quantizers/config on BPS, then WORLD_STATS.
+        if FEATURES.send_behavior_packet and not session.behavior_sent:
+            tcp.send(build_behavior_packet())
+            session.behavior_sent = True
+
+        if FEATURES.send_translation_packet and not session.translation_sent:
+            tcp.send(build_translation_packet())
+            session.translation_sent = True
+
+        if FEATURES.send_world_stats_on_login and not session.world_stats_sent:
+            time.sleep(0.15)
             print(f"[GAME] Client {ctx.client_id}: Sending WORLD_STATS after BPS request")
-            tcp.send(build_world_stats())
+            tcp.send(server.build_world_stats_packet())
             session.world_stats_sent = True
 
 
@@ -207,32 +263,70 @@ def handle_want_updates(server: "WulframServer", ctx: "ClientContext", packet: b
     # Send welcome chat
     tcp.send(build_chat_message("System: Welcome to Wulfram!"))
 
+    # Send initial VIEW_UPDATE snapshot (wulf-forge does this on WANT_UPDATES)
+    if getattr(server, "view_update_enabled", False):
+        tick = get_ticks()
+        include_local = (
+            getattr(server, "view_update_local_stats", False)
+            and session.translation_ack_received
+        )
+        tcp.send(build_view_update_multi(
+            tick,
+            include_local_state=include_local,
+            weapon_id=0,
+            health=1.0,
+            fuel=1.0,
+            entities=[],
+        ))
+
     # Send empty update array
     if FEATURES.send_update_array_empty:
         tcp.send(build_update_array_empty())
 
     # Send spawn points
     if FEATURES.send_spawn_points:
-        spawn_points = [
-            {'oid': 5001, 'team': 1, 'x': 50.0, 'y': 10.0, 'z': 50.0},
-            {'oid': 5002, 'team': 1, 'x': 60.0, 'y': 10.0, 'z': 50.0},
-            {'oid': 5003, 'team': 2, 'x': 150.0, 'y': 10.0, 'z': 150.0},
-            {'oid': 5004, 'team': 2, 'x': 160.0, 'y': 10.0, 'z': 150.0},
-        ]
+        spawn_points = server.get_spawn_points()
         if hasattr(server, "_to_client_pos"):
             for sp in spawn_points:
                 x, y, z = server._to_client_pos((sp["x"], sp["y"], sp["z"]))
                 sp["x"], sp["y"], sp["z"] = x, y, z
         print(f"[GAME] Client {ctx.client_id}: Sending {len(spawn_points)} spawn points")
-        tcp.send(build_update_array_spawn_points(0, spawn_points))
+        tick = get_ticks()
+        if getattr(server, "view_update_enabled", False):
+            include_local = (
+                getattr(server, "view_update_local_stats", False)
+                and session.translation_ack_received
+            )
+            tcp.send(build_view_update_spawn_points(
+                tick,
+                spawn_points,
+                include_local_state=include_local,
+                weapon_id=0,
+                health=1.0,
+                fuel=1.0,
+            ))
+        else:
+            tcp.send(build_update_array_spawn_points(tick, spawn_points))
 
-    # Spawn if team was selected
+    # Optional legacy path: spawn directly from team-select state.
     if session.pending_spawn_team_id:
-        server._auto_join_team(ctx, session.pending_spawn_team_id)
+        if getattr(server, "spawn_on_team_select", False):
+            team = session.pending_spawn_team_id
+            session.pending_spawn_team_id = 0
+            session.delayed_spawn_time = now + server.spawn_delay_seconds
+            session.delayed_spawn_team = team
+            print(
+                f"[GAME] Client {ctx.client_id}: Scheduled spawn in "
+                f"{server.spawn_delay_seconds:.1f}s for team {team} (team select)"
+            )
+            session.want_updates_handled = True
+            session.want_updates_handled_time = now
+            return
+        print(
+            f"[GAME] Client {ctx.client_id}: pending team-select spawn ignored "
+            "(spawn_on_team_select=0)"
+        )
         session.pending_spawn_team_id = 0
-        session.want_updates_handled = True
-        session.want_updates_handled_time = now
-        return
 
     session.want_updates_handled = True
     session.want_updates_handled_time = now
@@ -240,9 +334,12 @@ def handle_want_updates(server: "WulframServer", ctx: "ClientContext", packet: b
     # Auto-join team
     if FEATURES.auto_join_team:
         team = session.team_id or session.pending_spawn_team_id or 1
-        session.delayed_spawn_time = now + 3.0
+        session.delayed_spawn_time = now + server.spawn_delay_seconds
         session.delayed_spawn_team = team
-        print(f"[GAME] Client {ctx.client_id}: Scheduled auto-spawn in 3 seconds for team {team}")
+        print(
+            f"[GAME] Client {ctx.client_id}: Scheduled auto-spawn in "
+            f"{server.spawn_delay_seconds:.1f}s for team {team}"
+        )
     else:
         print(f"[GAME] Client {ctx.client_id}: Auto-spawn disabled")
 
@@ -262,18 +359,28 @@ def handle_reincarnate_tcp(server: "WulframServer", ctx: "ClientContext", packet
 
     print(f"[GAME] Client {ctx.client_id}: Spawn request for team {team_id}")
 
-    session.pending_spawn_team_id = team_id
     session.team_id = team_id
+    _schedule_team_select_spawn(server, ctx, team_id, reason="tcp_reincarnate")
 
-    # Send UPDATE_STATS
-    tcp.send(build_update_stats(
+    # Send UPDATE_STATS (broadcast so team changes stay consistent across clients)
+    sent = _broadcast_update_stats(
+        server,
         account_id=session.player_id or ctx.entity_id,
-        team_id=team_id
-    ))
+        team_id=team_id,
+    )
+    if sent <= 0:
+        tcp.send(build_update_stats(
+            account_id=session.player_id or ctx.entity_id,
+            team_id=team_id
+        ))
+
+    # Mirror wulf-forge: acknowledge team switch/spawn intent with REINCARNATE code 0x11.
+    if getattr(server, "team_switch_send_reincarnate", True):
+        tcp.send(build_reincarnate(0x11, ""))
 
     # Send WORLD_STATS if not sent
     if not session.world_stats_sent:
-        tcp.send(build_world_stats())
+        tcp.send(server.build_world_stats_packet())
         session.world_stats_sent = True
 
 
@@ -354,8 +461,13 @@ def handle_udp_chat(server: "WulframServer", ctx: Optional["ClientContext"], dat
 
     if cmd.lower() == "spawn":
         net_id = ctx.session.player_id or ctx.entity_id
-        team_id = ctx.session.team_id or 2
-        server._spawn_wf_style(ctx, team_id=team_id, net_id=net_id)
+        team_id = ctx.session.team_id or 1
+        # Align with wulf-forge /s spawn behavior: fixed debug spawn, no map-spawn lookup.
+        if server.up_axis == "z":
+            spawn_pos = (100.0, 100.0, server.spawn_height)
+        else:
+            spawn_pos = (100.0, server.spawn_height, 100.0)
+        server._spawn_wf_style(ctx, team_id=team_id, net_id=net_id, pos=spawn_pos)
 
     elif cmd.lower() in ("fire", "pulse", "pew"):
         # Test command: spawn a pulse shell projectile
@@ -426,42 +538,51 @@ def handle_team_switch(server: "WulframServer", ctx: "ClientContext", team_id: i
 
     print(f"[UDP] Client {ctx.client_id}: Team switch to team {team_id}")
     session.team_id = team_id
-    session.pending_spawn_team_id = team_id
+    _schedule_team_select_spawn(server, ctx, team_id, reason="udp_team_switch")
 
-    if server.udp_handler and addr:
-        # UPDATE_STATS
+    sent = _broadcast_update_stats(
+        server,
+        account_id=session.player_id or ctx.entity_id,
+        team_id=team_id,
+    )
+    if sent <= 0 and server.udp_handler and addr:
         update_stats_pkt = build_update_stats(
             account_id=session.player_id or ctx.entity_id,
             team_id=team_id
         )
         server.udp_handler.send_to(update_stats_pkt, addr)
 
-        # REINCARNATE code=0x11
-        reincarnate_pkt = b'\x25\x11\x00' + struct.pack("B", team_id) + b'\x00'
-        server.udp_handler.send_to(reincarnate_pkt, addr)
-        print(f"[UDP] Sent REINCARNATE code=0x11 for team {team_id}")
+    # Wulf-forge sends REINCARNATE(code=17) after team switch.
+    if getattr(server, "team_switch_send_reincarnate", True) and ctx.tcp_handler:
+        ctx.tcp_handler.send(build_reincarnate(0x11, ""))
+        print(f"[UDP] Team {team_id} switch acked with REINCARNATE 0x11")
 
-    print(f"[UDP] Team {team_id} selected - use /s spawn to spawn")
+    if getattr(server, "spawn_on_team_select", False):
+        print(
+            f"[UDP] Team {team_id} selected - spawn_on_team_select=1 "
+            "(legacy auto-spawn path)"
+        )
+    else:
+        print(
+            f"[UDP] Team {team_id} selected - waiting for explicit spawn-point packet"
+        )
 
 
 def handle_spawn_at_point(server: "WulframServer", ctx: "ClientContext", spawn_point_id: int, vehicle_type: int, addr: tuple):
     """Handle spawn at a specific spawn point."""
     print(f"[SPAWN] Client {ctx.client_id}: Spawn at point {spawn_point_id} vehicle={vehicle_type}")
+    spawn_points = server.get_spawn_points()
+    selected = None
+    for sp in spawn_points:
+        if sp.get("oid") == spawn_point_id:
+            selected = sp
+            break
 
-    spawn_positions = {
-        5001: (50.0, 10.0, 50.0),
-        5002: (60.0, 10.0, 50.0),
-        5003: (150.0, 10.0, 150.0),
-        5004: (160.0, 10.0, 150.0),
-    }
-
-    pos = spawn_positions.get(spawn_point_id, (100.0, 10.0, 100.0))
-
-    if spawn_point_id in (5001, 5002):
-        team_id = 1
-    elif spawn_point_id in (5003, 5004):
-        team_id = 2
+    if selected:
+        pos = (selected["x"], selected["y"], selected["z"])
+        team_id = selected.get("team", ctx.session.team_id or 2)
     else:
+        pos = (100.0, 10.0, 100.0)
         team_id = ctx.session.team_id or 2
 
     server._spawn_wf_style(ctx, team_id=team_id, pos=pos)

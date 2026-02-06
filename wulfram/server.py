@@ -66,8 +66,14 @@ class WulframServer:
         self.clients: Dict[int, ClientContext] = {}
         self.clients_lock = threading.Lock()
         self.next_client_id = 1
-        # Match wulf-forge: start entity IDs at 1.
-        self.next_entity_id = 1
+        # Match wulf-forge default player/entity ID space (config.toml uses 1337).
+        # Very low IDs can collide with implicit client/map assumptions.
+        try:
+            self.next_entity_id = int(os.environ.get("WULFRAM_START_ENTITY_ID", "1337"))
+        except ValueError:
+            self.next_entity_id = 1337
+        if self.next_entity_id <= 0:
+            self.next_entity_id = 1337
 
         # UDP address to client mapping for packet routing
         self.udp_addr_to_client: Dict[tuple, ClientContext] = {}
@@ -78,21 +84,28 @@ class WulframServer:
             self.up_axis = "z"
         spawn_height_env = os.environ.get("WULFRAM_SPAWN_HEIGHT")
         try:
-            # Wulf-forge defaults to z=100 for spawns.
-            self.spawn_height = float(spawn_height_env) if spawn_height_env is not None else 100.0
+            # Default to ground-height spawn to avoid immediate fall-damage overlays.
+            self.spawn_height = float(spawn_height_env) if spawn_height_env is not None else 5.0
         except ValueError:
-            self.spawn_height = 100.0
+            self.spawn_height = 5.0
         try:
             self.spawn_delay_seconds = float(os.environ.get("WULFRAM_SPAWN_DELAY", "6.0"))
         except ValueError:
             self.spawn_delay_seconds = 6.0
+        # Team-select should not implicitly spawn by default; wait for explicit spawn-point selection.
+        self.spawn_on_team_select = os.environ.get("WULFRAM_SPAWN_ON_TEAM_SELECT", "0") == "1"
+        self.team_switch_send_reincarnate = os.environ.get("WULFRAM_TEAM_SWITCH_REINCARNATE", "1") == "1"
         try:
             self.spawn_force_after = float(os.environ.get("WULFRAM_SPAWN_FORCE_AFTER", "12.0"))
         except ValueError:
             self.spawn_force_after = 12.0
-        # If enabled, pin ground level to the spawn height (useful for fixed-altitude tests).
-        # Default OFF so gravity can settle to configured ground_level.
-        self.spawn_sets_ground_level = os.environ.get("WULFRAM_SPAWN_SET_GROUND", "0") == "1"
+        try:
+            # Avoid false "crash" diagnosis when scripted input arrives slightly late.
+            self.inactivity_timeout = float(os.environ.get("WULFRAM_INACTIVITY_TIMEOUT", "30.0"))
+        except ValueError:
+            self.inactivity_timeout = 30.0
+        # Keep spawns pinned to ground unless explicitly disabled.
+        self.spawn_sets_ground_level = os.environ.get("WULFRAM_SPAWN_SET_GROUND", "1") == "1"
         # Spawn packet toggles (useful for crash isolation).
         # Spawn sequence toggles (default to Wulf-Forge minimal behavior).
         self.spawn_send_udp_tank = os.environ.get("WULFRAM_SPAWN_UDP_TANK", "1") == "1"
@@ -116,6 +129,18 @@ class WulframServer:
         spawn_points_env = os.environ.get("WULFRAM_SEND_SPAWN_POINTS")
         if spawn_points_env is not None:
             FEATURES.send_spawn_points = spawn_points_env.strip().lower() not in ("0", "false", "off", "no")
+        behavior_env = os.environ.get("WULFRAM_SEND_BEHAVIOR")
+        if behavior_env is not None:
+            FEATURES.send_behavior_packet = behavior_env.strip().lower() not in ("0", "false", "off", "no")
+        translation_env = os.environ.get("WULFRAM_SEND_TRANSLATION")
+        if translation_env is not None:
+            FEATURES.send_translation_packet = translation_env.strip().lower() not in ("0", "false", "off", "no")
+        world_stats_env = os.environ.get("WULFRAM_SEND_WORLD_STATS_ON_LOGIN")
+        if world_stats_env is not None:
+            FEATURES.send_world_stats_on_login = world_stats_env.strip().lower() not in ("0", "false", "off", "no")
+        tick_loop_env = os.environ.get("WULFRAM_TICK_LOOP_ENABLED")
+        if tick_loop_env is not None:
+            FEATURES.tick_loop_enabled = tick_loop_env.strip().lower() not in ("0", "false", "off", "no")
         auto_join_env = os.environ.get("WULFRAM_AUTO_JOIN_TEAM")
         if auto_join_env is not None:
             FEATURES.auto_join_team = auto_join_env.strip().lower() not in ("0", "false", "off", "no")
@@ -139,7 +164,8 @@ class WulframServer:
         self.send_updates_udp = os.environ.get("WULFRAM_UPDATE_UDP", "1") == "1"
         # Local player update mask (align with wulf-forge minimal updates by default).
         # Modes: pos, pos_vel, pos_rot, pos_vel_rot
-        self.local_update_mode = os.environ.get("WULFRAM_LOCAL_UPDATE_MODE", "pos").strip().lower()
+        # Default to full local transform updates to avoid client-side state divergence.
+        self.local_update_mode = os.environ.get("WULFRAM_LOCAL_UPDATE_MODE", "pos_vel_rot").strip().lower()
         # Remote update shape to avoid malformed packets destabilizing HUD state in multi-client.
         # Modes: pos, pos_rot, pos_vel_rot, heartbeat, off (default: pos).
         self.remote_update_mode = os.environ.get("WULFRAM_REMOTE_UPDATE_MODE", "pos").strip().lower()
@@ -170,12 +196,12 @@ class WulframServer:
             self.viewpoint_timeout = float(os.environ.get("WULFRAM_VIEWPOINT_TIMEOUT", "1.0"))
         except ValueError:
             self.viewpoint_timeout = 1.0
-        # VIEW_UPDATE (0x0F) snapshot on WANT_UPDATES (wulf-forge behavior).
-        self.view_update_enabled = os.environ.get("WULFRAM_VIEW_UPDATE", "1") == "1"
+        # VIEW_UPDATE is optional and has been less stable than UPDATE_ARRAY.
+        self.view_update_enabled = os.environ.get("WULFRAM_VIEW_UPDATE", "0") == "1"
         # Periodic VIEW_UPDATE loop (separate from initial snapshot). Default OFF for stability.
         self.view_update_loop = os.environ.get("WULFRAM_VIEW_UPDATE_LOOP", "0") == "1"
-        # Wulf-forge uses minimal local stats in view updates (health/energy only).
-        self.view_update_local_stats = os.environ.get("WULFRAM_VIEW_UPDATE_LOCAL_STATS", "1") == "1"
+        # Keep local-stats out of VIEW_UPDATE unless explicitly requested.
+        self.view_update_local_stats = os.environ.get("WULFRAM_VIEW_UPDATE_LOCAL_STATS", "0") == "1"
         # Wulf-forge marks HEALTH dirty on spawn; include entity vitals by default.
         # This uses update-mask bits 5/7 (health/energy per wulf-forge).
         # Entity vitals (mask bits 5/7) should be sent only when dirty; default off.
@@ -311,8 +337,8 @@ class WulframServer:
                     f"{rows}x{cols} (size={size_x:.1f}x{size_y:.1f})"
                 )
         self.map_spawn_points = self._parse_spawn_points_env(os.environ.get("WULFRAM_SPAWN_POINTS", ""))
-        # Use map-provided spawn points by default (align with wulf-forge map spawns).
-        self.use_map_spawn_points = os.environ.get("WULFRAM_USE_MAP_SPAWN", "1") == "1"
+        default_use_map_spawn = "1" if self.map_name.lower() == "crossroads" else "0"
+        self.use_map_spawn_points = os.environ.get("WULFRAM_USE_MAP_SPAWN", default_use_map_spawn) == "1"
         gravity_env = os.environ.get("WULFRAM_GRAVITY")
         try:
             self.gravity = float(gravity_env) if gravity_env is not None else -50.0
@@ -345,6 +371,7 @@ class WulframServer:
         # Local-player state in UPDATE_ARRAY must match client expectations exactly.
         # Wulf-forge mode sends minimal local stats (weapon_id + health/energy).
         # Modes: off, wf, auto, force
+        # Default to wulf-forge style local-state vitals to keep HUD health stable.
         update_local_state_raw = os.environ.get("WULFRAM_UPDATE_LOCAL_STATE", "wf").strip().lower()
         if update_local_state_raw in ("1", "true", "on", "yes", "force"):
             self.update_local_state_mode = "force"
@@ -359,7 +386,7 @@ class WulframServer:
         self.update_local_state = self.update_local_state_mode != "off"
         update_packet_raw = os.environ.get("WULFRAM_UPDATE_PACKET", "").strip().lower()
         if not update_packet_raw:
-            update_packet_raw = "view" if self.update_local_state_mode == "wf" else "update"
+            update_packet_raw = "update"
         if update_packet_raw not in ("update", "view"):
             update_packet_raw = "update"
         self.update_packet_type = update_packet_raw
@@ -374,9 +401,12 @@ class WulframServer:
             f"allow_large_grid={int(self.map_allow_large_grid)} "
             f"spawn_height={self.spawn_height:.1f} ground_level={self.ground_level:.1f} "
             f"spawn_set_ground={int(self.spawn_sets_ground_level)} "
+            f"spawn_on_team_select={int(self.spawn_on_team_select)} "
+            f"team_switch_reincarnate={int(self.team_switch_send_reincarnate)} "
             f"gravity={self.gravity:.1f} tick_hz={self.tick_rate_hz:.1f} "
             f"update_on_change={int(self.update_on_change)} heartbeat={self.update_heartbeat_interval:.2f}s "
-            f"map_spawns={int(self.use_map_spawn_points)} update_packet={self.update_packet_type}"
+            f"map_spawns={int(self.use_map_spawn_points)} update_packet={self.update_packet_type} "
+            f"inactivity_timeout={self.inactivity_timeout:.1f}s"
         )
 
         # PLAYER_INFO triggers local-state sync on the client; default OFF to avoid
@@ -450,11 +480,11 @@ class WulframServer:
             self.update_local_state_mode = "off"
             self.update_local_state = False
 
-        # Periodically refresh TankPacket vitals to keep health stable.
-        # If local-state is disabled or minimal, default to heartbeat ON unless explicitly overridden.
+        # TankPacket vitals heartbeat: wulf-forge NEVER sends repeated 0x18 packets.
+        # Each 0x18 triggers Entity_create_from_network or LocalPlayer_initialize,
+        # which can destabilize the client. Default OFF to match wulf-forge.
         if tank_vitals_heartbeat_env is None:
-            # Default: keep HUD stable even if local-state desyncs (WF mode can be fragile).
-            self.tank_vitals_heartbeat = self.update_local_state_mode in ("off", "wf")
+            self.tank_vitals_heartbeat = False
         else:
             self.tank_vitals_heartbeat = tank_vitals_heartbeat_env == "1"
 
@@ -632,6 +662,22 @@ class WulframServer:
             return (pos[0], pos[1], pos[2] + self.pos_offset)
         return (pos[0], pos[1] + self.pos_offset, pos[2])
 
+    def _extract_update_mask(self, payload: bytes) -> Optional[int]:
+        """Decode local entity update_mask from UPDATE_ARRAY payload for diagnostics."""
+        if not payload or len(payload) < 8 or payload[0] != 0x0E:
+            return None
+        try:
+            br = BitReader(payload[5:])
+            _has_local_state = br.read_bits(1)
+            entity_count = br.read_bits(8)
+            if entity_count < 1:
+                return None
+            _entity_id = br.read_bits(32)
+            _is_manned = br.read_bits(1)
+            return br.read_bits(10)
+        except Exception:
+            return None
+
     def _get_health_value(self) -> float:
         """Return health multiplier for outgoing packets (0..1)."""
         value = self.debug_health_value
@@ -678,7 +724,7 @@ class WulframServer:
         """Return a snapshot list of in-game clients (thread-safe)."""
         return [c for c in self._snapshot_clients() if c.session and c.session.in_game]
 
-    def _send_packet_to_client(self, ctx: ClientContext, payload: bytes, *, prefer_tcp: bool = True) -> None:
+    def _send_packet_to_client(self, ctx: ClientContext, payload: bytes, *, prefer_tcp: bool = True) -> bool:
         """Send payload to a client, preferring TCP and falling back to UDP."""
         sent = False
         if prefer_tcp and ctx.tcp_handler:
@@ -688,23 +734,28 @@ class WulframServer:
             except Exception as tcp_err:
                 print(f"[MULTI] Client {ctx.client_id}: TCP send failed ({tcp_err})")
         if not sent and self.udp_handler and ctx.session.udp_addr:
-            self.udp_handler.send_to(payload, ctx.session.udp_addr)
+            try:
+                self.udp_handler.send_to(payload, ctx.session.udp_addr)
+                sent = True
+            except Exception as udp_err:
+                print(f"[MULTI] Client {ctx.client_id}: UDP send failed ({udp_err})")
+        return sent
 
     def _send_roster_entry(self, target_ctx: ClientContext, player_ctx: ClientContext) -> None:
         """Send ADD_TO_ROSTER for player_ctx to target_ctx (once)."""
-        if not target_ctx.tcp_handler:
-            return
         player_id = player_ctx.session.player_id or player_ctx.entity_id
         if player_id in target_ctx.known_roster_ids:
             return
         name = player_ctx.session.username or f"Player{player_ctx.client_id}"
         team = player_ctx.session.team_id or 1
-        target_ctx.tcp_handler.send(build_add_to_roster(
+        payload = build_add_to_roster(
             player_id=player_id,
             entity_id=player_id,
             name=name,
             team=team,
-        ))
+        )
+        if not self._send_packet_to_client(target_ctx, payload, prefer_tcp=True):
+            return
         target_ctx.known_roster_ids.add(player_id)
         print(f"[MULTI] Sent roster {name} (id={player_id}) -> client {target_ctx.client_id}")
 
@@ -727,7 +778,8 @@ class WulframServer:
             include_health=False,
             is_manned=False,
         )
-        self._send_packet_to_client(target_ctx, packet, prefer_tcp=True)
+        if not self._send_packet_to_client(target_ctx, packet, prefer_tcp=True):
+            return
         target_ctx.known_entity_ids.add(entity_id)
         print(f"[MULTI] Sent entity create id={entity_id} -> client {target_ctx.client_id}")
 
@@ -1335,7 +1387,11 @@ class WulframServer:
 
         # Reset position tracking to spawn location (prefer map-provided coords).
         if pos is None:
-            if self.up_axis == "z":
+            map_spawn = self._pick_spawn_point(team_id)
+            if map_spawn:
+                spawn_pos = (map_spawn["x"], map_spawn["y"], map_spawn["z"])
+                print(f"[SPAWN] Auto-selected map spawn oid={map_spawn['oid']} team={team_id} pos={spawn_pos}")
+            elif self.up_axis == "z":
                 spawn_pos = (100.0, 100.0, self.spawn_height)
             else:
                 spawn_pos = (100.0, self.spawn_height, 100.0)
@@ -1445,6 +1501,10 @@ class WulframServer:
                 # Fallback to TCP if no UDP address
                 ctx.tcp_handler.send(tank_packet)
                 print(f"[SPAWN] Sent TCP TankPacket (no UDP addr)")
+        else:
+            # Explicit TCP fallback for spawn-isolation runs.
+            ctx.tcp_handler.send(tank_packet)
+            print("[SPAWN] Sent TCP TankPacket (WULFRAM_SPAWN_UDP_TANK=0)")
 
         # Comm messages are TCP-only in wulf-forge; avoid sending 0x1F over UDP.
         if announce and ctx.tcp_handler:
@@ -1606,10 +1666,14 @@ class WulframServer:
         print(f"[SPAWN] Minimal WF: client={ctx.client_id} net_id={net_id} team={team_id}")
         ctx.entity_type = 0
 
-        if self.up_axis == "z":
+        map_spawn = self._pick_spawn_point(team_id)
+        if map_spawn:
+            spawn_pos = (map_spawn["x"], map_spawn["y"], map_spawn["z"])
+            print(f"[SPAWN] Minimal mode map spawn oid={map_spawn['oid']} team={team_id} pos={spawn_pos}")
+        elif self.up_axis == "z":
             spawn_pos = (100.0, 100.0, self.spawn_height)
         else:
-            spawn_pos = (100.0, 5.0, 100.0)
+            spawn_pos = (100.0, self.spawn_height, 100.0)
         if self.spawn_sets_ground_level:
             if self.up_axis == "z":
                 ctx.ground_level_override = spawn_pos[2]
@@ -1993,7 +2057,7 @@ class WulframServer:
         # Track last activity for dead connection detection
         # UDP packets count as activity since client sends TRANSLATION_ACK continuously
         last_activity = time.monotonic()
-        INACTIVITY_TIMEOUT = 10.0  # Disconnect if no TCP/UDP activity for 10 seconds
+        inactivity_timeout = self.inactivity_timeout
 
         while ctx.running and ctx.session.phase in [Phase.TEAM_SELECT, Phase.SPAWNING, Phase.IN_GAME]:
             # Check for delayed spawn
@@ -2023,8 +2087,8 @@ class WulframServer:
                 if ctx.session.last_udp_activity:
                     last_activity = max(last_activity, ctx.session.last_udp_activity)
 
-                if time.monotonic() - last_activity > INACTIVITY_TIMEOUT:
-                    print(f"[GAME] Client {ctx.client_id} inactive for {INACTIVITY_TIMEOUT}s - disconnecting")
+                if time.monotonic() - last_activity > inactivity_timeout:
+                    print(f"[GAME] Client {ctx.client_id} inactive for {inactivity_timeout:.1f}s - disconnecting")
                     break
 
                 # Also try getpeername as backup check
@@ -2060,7 +2124,12 @@ class WulframServer:
                 # Tank resend request (client didn't accept PLAYER_INFO)
                 print("[GAME] TANK_RESEND_REQUEST received - resending TankPacket")
                 entity_id = ctx.session.entity_id or ctx.entity_id
-                tank_pos = (100.0, 15.0, self.spawn_height) if self.up_axis == "z" else (100.0, 15.0, 100.0)
+                if ctx.player_pos and len(ctx.player_pos) == 3:
+                    tank_pos = ctx.player_pos
+                elif self.up_axis == "z":
+                    tank_pos = (100.0, 15.0, self.spawn_height)
+                else:
+                    tank_pos = (100.0, self.spawn_height, 15.0)
                 send_pos = self._to_client_pos(tank_pos)
                 send_rot = (
                     ctx.player_pose.get("roll", 0.0),
@@ -2116,10 +2185,12 @@ class WulframServer:
         """Send TankPacket (0x18) to spawn the player's tank."""
         if entity_id is None:
             entity_id = ctx.entity_id
-        if self.up_axis == "z":
+        if ctx.player_pos and len(ctx.player_pos) == 3:
+            spawn_pos = ctx.player_pos
+        elif self.up_axis == "z":
             spawn_pos = (100.0, 100.0, self.spawn_height)
         else:
-            spawn_pos = (100.0, 5.0, 100.0)
+            spawn_pos = (100.0, self.spawn_height, 100.0)
         send_pos = self._to_client_pos(spawn_pos)
         send_rot = (
             ctx.player_pose.get("roll", 0.0),
@@ -3241,6 +3312,15 @@ class WulframServer:
                     include_lpos = True
                     include_lvel = self.local_update_mode in ("pos_vel", "pos_vel_rot")
                     include_lrot = self.local_update_mode in ("pos_rot", "pos_vel_rot")
+                    if not getattr(ctx, "_update_mode_logged", False):
+                        print(
+                            "[UPDATE-MODE] "
+                            f"mode={self.local_update_mode!r} "
+                            f"include_pos={int(include_lpos)} "
+                            f"include_vel={int(include_lvel)} "
+                            f"include_rot={int(include_lrot)}"
+                        )
+                        ctx._update_mode_logged = True
                     if self.combine_update_arrays and self.send_player_updates:
                         entities = [
                             {
@@ -3632,7 +3712,15 @@ class WulframServer:
                             health_hex = payload[5:8].hex()
                     else:
                         health_hex = "??"
-                    print(f"[TICK-HEALTH] t={ctx.session.tick} type={pkt_type} udp={udp_addr} health_bytes={health_hex}")
+                    update_mask = self._extract_update_mask(payload) if payload else None
+                    if update_mask is None:
+                        mask_note = "?"
+                    else:
+                        mask_note = f"0x{update_mask:03x}"
+                    print(
+                        f"[TICK-HEALTH] t={ctx.session.tick} type={pkt_type} "
+                        f"udp={udp_addr} mask={mask_note} health_bytes={health_hex}"
+                    )
 
                 sleep_dt = 1.0 / self.tick_rate_hz if self.tick_rate_hz > 0 else 0.1
                 time.sleep(sleep_dt)

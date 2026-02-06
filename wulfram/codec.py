@@ -76,7 +76,7 @@ class BitReader:
 # Fixed-point 16.16 format utilities
 def pack_fixed16(value: float) -> bytes:
     """Pack a float as Fixed16.16 (big-endian)."""
-    fixed = int(value * 65536.0)
+    fixed = int(round(value * 65536.0))
     # Clamp to signed 32-bit range
     fixed = max(-2147483648, min(2147483647, fixed))
     return struct.pack(">i", fixed)
