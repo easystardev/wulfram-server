@@ -472,7 +472,27 @@ class WulframServer:
             local_state_safe = self.local_state_turret_bits > 0 and (
                 self.local_state_secondary_override not in ("0", "false", "False")
             )
-        if self.update_local_state_mode not in ("off", "wf") and not self.allow_unsafe_local_state and not local_state_safe:
+        wf_payload_safe = True
+        if not self.wf_local_state_turrets and self.local_state_weapon_type in (
+            *LOCAL_STATE_PRIMARY_TURRET_TYPES,
+            *LOCAL_STATE_SECONDARY_TURRET_TYPES,
+        ):
+            wf_payload_safe = False
+        if (
+            self.update_local_state_mode == "wf"
+            and not self.allow_unsafe_local_state
+            and not wf_payload_safe
+        ):
+            # "wf" mode sends minimal local-state by design. For Tank (weapon_type=0),
+            # the client expects at least primary turret bits in local-state payload.
+            # Sending minimal payload without those bits can desync HUD vitals.
+            print(
+                "[LOCAL-STATE] Disabling wf local-state: required turret bits missing "
+                "(set WULFRAM_WF_LOCAL_TURRETS=1 or WULFRAM_ALLOW_UNSAFE_LOCAL_STATE=1)."
+            )
+            self.update_local_state_mode = "off"
+            self.update_local_state = False
+        elif self.update_local_state_mode not in ("off", "wf") and not self.allow_unsafe_local_state and not local_state_safe:
             print(
                 "[LOCAL-STATE] Unsafe local-state config; disabling local-state. "
                 "Set WULFRAM_ALLOW_UNSAFE_LOCAL_STATE=1 to override."
