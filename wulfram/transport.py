@@ -154,6 +154,12 @@ class UDPHandler:
 
         except socket.timeout:
             return None, None
+        except OSError as e:
+            # WinError 10054 is expected when a UDP peer disappears; treat as no-data.
+            if getattr(e, "winerror", None) == 10054:
+                return None, None
+            print(f"[UDP RECV] Error: {e}")
+            return None, None
         except Exception as e:
             print(f"[UDP RECV] Error: {e}")
             return None, None

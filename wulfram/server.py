@@ -92,18 +92,28 @@ class WulframServer:
             self.spawn_delay_seconds = float(os.environ.get("WULFRAM_SPAWN_DELAY", "6.0"))
         except ValueError:
             self.spawn_delay_seconds = 6.0
-        # Team-select should not implicitly spawn by default; wait for explicit spawn-point selection.
+        # Default to server-side team-select spawn for stability; explicit spawn-point
+        # selection is still available by setting WULFRAM_SPAWN_ON_TEAM_SELECT=0.
         self.spawn_on_team_select = os.environ.get("WULFRAM_SPAWN_ON_TEAM_SELECT", "1") == "1"
         self.team_switch_send_reincarnate = os.environ.get("WULFRAM_TEAM_SWITCH_REINCARNATE", "1") == "1"
+        # Allow explicit spawn-point packets to recover clients stuck on entry-map
+        # after auto-spawn already marked the session IN_GAME.
+        self.spawn_allow_point_override = os.environ.get("WULFRAM_SPAWN_POINT_OVERRIDE", "1") == "1"
+        try:
+            self.spawn_point_override_min_interval = float(
+                os.environ.get("WULFRAM_SPAWN_POINT_OVERRIDE_MIN_INTERVAL", "0.0")
+            )
+        except ValueError:
+            self.spawn_point_override_min_interval = 0.0
         try:
             self.spawn_force_after = float(os.environ.get("WULFRAM_SPAWN_FORCE_AFTER", "12.0"))
         except ValueError:
             self.spawn_force_after = 12.0
         try:
             # Avoid false "crash" diagnosis when scripted input arrives slightly late.
-            self.inactivity_timeout = float(os.environ.get("WULFRAM_INACTIVITY_TIMEOUT", "30.0"))
+            self.inactivity_timeout = float(os.environ.get("WULFRAM_INACTIVITY_TIMEOUT", "120.0"))
         except ValueError:
-            self.inactivity_timeout = 30.0
+            self.inactivity_timeout = 120.0
         # Keep spawns pinned to ground unless explicitly disabled.
         self.spawn_sets_ground_level = os.environ.get("WULFRAM_SPAWN_SET_GROUND", "1") == "1"
         # Spawn packet toggles (useful for crash isolation).
@@ -111,8 +121,8 @@ class WulframServer:
         self.spawn_send_udp_tank = os.environ.get("WULFRAM_SPAWN_UDP_TANK", "1") == "1"
         spawn_player_info_env = os.environ.get("WULFRAM_SPAWN_PLAYER_INFO")
         if spawn_player_info_env is None:
-            # Default to sending PLAYER_INFO (safe when local-state is off).
-            self.spawn_send_player_info = True
+            # Wulf-forge does NOT send PLAYER_INFO during spawn.
+            self.spawn_send_player_info = False
         else:
             self.spawn_send_player_info = spawn_player_info_env == "1"
         # Wulf-forge spawns with TankPacket only (no UPDATE_ARRAY create).
@@ -120,15 +130,16 @@ class WulframServer:
         # Wulf-forge spawns local tanks via TankPacket; UPDATE_ARRAY create is optional.
         self.spawn_send_update_array = os.environ.get("WULFRAM_SPAWN_UPDATE_ARRAY", "0") == "1"
         self.spawn_send_game_clock = os.environ.get("WULFRAM_SPAWN_GAME_CLOCK", "0") == "1"
+        # Wulf-forge does NOT send REINCARNATE(0x11) during spawn.
         self.spawn_send_reincarnate = os.environ.get("WULFRAM_SPAWN_REINCARNATE", "0") == "1"
         self.spawn_send_birth_notice = os.environ.get("WULFRAM_SPAWN_BIRTH_NOTICE", "0") == "1"
         self.spawn_send_player_packet = os.environ.get("WULFRAM_SPAWN_PLAYER_PACKET", "0") == "1"
         self.spawn_player_spectator = os.environ.get("WULFRAM_SPAWN_PLAYER_SPECTATOR", "0") == "1"
         self.player_info_properties_mode = os.environ.get("WULFRAM_PLAYER_INFO_PROPERTIES", "team").strip().lower()
-        # Optional env toggle for spawn points (repair pads).
-        spawn_points_env = os.environ.get("WULFRAM_SEND_SPAWN_POINTS")
-        if spawn_points_env is not None:
-            FEATURES.send_spawn_points = spawn_points_env.strip().lower() not in ("0", "false", "off", "no")
+        # Spawn points are required for reliable entry-map progression.
+        # Keep ON by default; allow explicit opt-out for protocol experiments.
+        spawn_points_env = os.environ.get("WULFRAM_SEND_SPAWN_POINTS", "1")
+        FEATURES.send_spawn_points = spawn_points_env.strip().lower() not in ("0", "false", "off", "no")
         behavior_env = os.environ.get("WULFRAM_SEND_BEHAVIOR")
         if behavior_env is not None:
             FEATURES.send_behavior_packet = behavior_env.strip().lower() not in ("0", "false", "off", "no")
@@ -176,7 +187,9 @@ class WulframServer:
         # Local stats in projectile packets: owner-only local-state helps keep HUD vitals
         # stable while projectile UPDATE_ARRAY traffic is active. Remote peers still receive
         # include_local_state=0 packets.
-        self.projectile_local_stats = os.environ.get("WULFRAM_PROJECTILE_LOCAL_STATS", "1") == "1"
+        # Keep local-state out of projectile packets by default. Local-state bits are
+        # weapon-profile-dependent and easy to desync, which causes red-overlay flicker.
+        self.projectile_local_stats = os.environ.get("WULFRAM_PROJECTILE_LOCAL_STATS", "0") == "1"
         self.debug_projectiles = (
             os.environ.get("WULFRAM_DEBUG_PROJECTILES", "0") == "1"
             or os.environ.get("WULFRAM_DEBUG_AIM", "0") == "1"
@@ -249,7 +262,9 @@ class WulframServer:
         if self.weapon_id < 0 or self.weapon_id > 31:
             print(f"[WEAPON] Invalid weapon_id={self.weapon_id}, defaulting to 0")
             self.weapon_id = 0
-        self.projectile_aim_source = os.environ.get("WULFRAM_PROJECTILE_AIM_SOURCE", "auto").lower()
+        # Default to body-aligned firing for stability. Slot/viewpoint aim remains
+        # available via env toggles for targeted experiments.
+        self.projectile_aim_source = os.environ.get("WULFRAM_PROJECTILE_AIM_SOURCE", "body").lower()
         self.projectiles_enabled = os.environ.get("WULFRAM_PROJECTILES_ENABLED", "1") == "1"
         # Projectile update mode:
         # 0=no updates after spawn, 1=5Hz, 2=15Hz (default), 3=30Hz
@@ -367,6 +382,14 @@ class WulframServer:
             self.ground_level = float(ground_level_env) if ground_level_env is not None else 5.0
         except ValueError:
             self.ground_level = 5.0
+        world_bound_env = os.environ.get("WULFRAM_WORLD_BOUND")
+        try:
+            # Clamp world X/Y to the protocol position domain by default (VEC_POS max=8192).
+            self.world_bound = abs(float(world_bound_env)) if world_bound_env is not None else 8192.0
+        except ValueError:
+            self.world_bound = 8192.0
+        if self.world_bound < 256.0:
+            self.world_bound = 256.0
         try:
             # Wulf-forge update loop runs at ~10 Hz; default to 10 for stability.
             self.tick_rate_hz = float(os.environ.get("WULFRAM_TICK_RATE_HZ", "10.0"))
@@ -420,8 +443,10 @@ class WulframServer:
             f"map={self.map_name} grid={self.map_grid_rows}x{self.map_grid_cols} scale={self.map_scale} "
             f"allow_large_grid={int(self.map_allow_large_grid)} "
             f"spawn_height={self.spawn_height:.1f} ground_level={self.ground_level:.1f} "
+            f"world_bound={self.world_bound:.1f} "
             f"spawn_set_ground={int(self.spawn_sets_ground_level)} "
             f"spawn_on_team_select={int(self.spawn_on_team_select)} "
+            f"spawn_point_override={int(self.spawn_allow_point_override)} "
             f"team_switch_reincarnate={int(self.team_switch_send_reincarnate)} "
             f"gravity={self.gravity:.1f} tick_hz={self.tick_rate_hz:.1f} "
             f"update_on_change={int(self.update_on_change)} heartbeat={self.update_heartbeat_interval:.2f}s "
@@ -439,7 +464,7 @@ class WulframServer:
         else:
             self.player_info_local_state_mode = "auto"
         self.player_info_local_state = self.player_info_local_state_mode != "off"
-        # Optionally clear spectator flag after spawn by sending PLAYER(spectator=0).
+        # Wulf-forge does NOT send PLAYER(spectator=0) during spawn.
         self.spawn_send_player_active = os.environ.get("WULFRAM_SPAWN_PLAYER_ACTIVE", "0") == "1"
         # Local-state weapon type (entity type index). Default is 0 (tank).
         # Override if needed for testing or to probe local-state bit expectations.
@@ -545,15 +570,17 @@ class WulframServer:
         # Tick selection: default to server tick for stability across multiple clients.
         self.use_client_ticks = os.environ.get("WULFRAM_USE_CLIENT_TICKS", "0") == "1"
         print(f"[CONFIG] use_client_ticks={int(self.use_client_ticks)}")
+        # Aim/movement configuration (shared across clients)
+        # Slot-integrated aim is sensitive to noisy axis samples; keep opt-in.
+        self.use_slot_aim = os.environ.get("WULFRAM_USE_SLOT_AIM", "0") == "1"
         print(
             "[CONFIG] projectiles_enabled="
             f"{int(self.projectiles_enabled)} projectile_update_mode={self.projectile_update_mode} "
             f"projectile_local_stats={int(self.projectile_local_stats)} "
-            f"projectile_spawn_snap={int(self.projectile_spawn_snap)}"
+            f"projectile_spawn_snap={int(self.projectile_spawn_snap)} "
+            f"projectile_aim_source={self.projectile_aim_source} "
+            f"use_slot_aim={int(self.use_slot_aim)}"
         )
-
-        # Aim/movement configuration (shared across clients)
-        self.use_slot_aim = os.environ.get("WULFRAM_USE_SLOT_AIM", "0") == "1"
         try:
             self.aim_turn_adjust = float(os.environ.get("WULFRAM_AIM_TURN_ADJUST", "4.5"))
         except ValueError:
@@ -1238,6 +1265,8 @@ class WulframServer:
         # Update ctx if we found it, or try to find it from addr
         if ctx is None:
             ctx = self.udp_addr_to_client.get(addr)
+        if ctx is None:
+            ctx = self._recover_udp_client(addr)
 
         # For some packet types (HELLO, D_HANDSHAKE), we may not have ctx yet
         # These packets help identify/register the client
@@ -1359,9 +1388,71 @@ class WulframServer:
         else:
             print(f"[UDP] Packet 0x{pkt_type:02X} from {addr} (len={len(data)})")
 
-        # Update last activity time if we have ctx
+        # Track last UDP activity for mapped clients regardless of packet type.
         if ctx:
             ctx.session.last_udp_activity = time.monotonic()
+
+    def _recover_udp_client(self, addr: tuple) -> Optional[ClientContext]:
+        """
+        Recover a missing UDP->client mapping when the client reconnects/rebinds.
+        Prefer the most advanced/active client on that host.
+        """
+        existing = self.udp_addr_to_client.get(addr)
+        if existing:
+            return existing
+
+        ip = addr[0] if addr else None
+        if not ip:
+            return None
+
+        candidates: list[ClientContext] = []
+        with self.clients_lock:
+            for c in self.clients.values():
+                if not c or not c.running or not c.session:
+                    continue
+                if not c.client_addr or c.client_addr[0] != ip:
+                    continue
+                if c.session.phase != Phase.DISCONNECTED:
+                    candidates.append(c)
+
+        if not candidates:
+            return None
+
+        phase_rank = {
+            Phase.DISCONNECTED: 0,
+            Phase.HANDSHAKE: 1,
+            Phase.LOGIN: 2,
+            Phase.TEAM_SELECT: 3,
+            Phase.SPAWNING: 4,
+            Phase.IN_GAME: 5,
+        }
+
+        def _score(c: ClientContext):
+            s = c.session
+            return (
+                phase_rank.get(s.phase, 0),
+                1 if s.login_complete else 0,
+                1 if (s.want_updates_received or s.want_updates_handled) else 0,
+                1 if s.translation_ack_received else 0,
+                1 if s.udp_verified else 0,
+                c.client_id,
+            )
+
+        ctx = max(candidates, key=_score)
+        if len(candidates) > 1:
+            cand_ids = ",".join(str(c.client_id) for c in candidates)
+            print(
+                f"[UDP] Recover addr {addr}: multiple candidates [{cand_ids}], "
+                f"selected client {ctx.client_id}"
+            )
+
+        old_addr = ctx.session.udp_addr
+        if old_addr and old_addr != addr and self.udp_addr_to_client.get(old_addr) is ctx:
+            del self.udp_addr_to_client[old_addr]
+        ctx.session.udp_addr = addr
+        self.udp_addr_to_client[addr] = ctx
+        print(f"[UDP] Re-associated addr {addr} -> client {ctx.client_id}")
+        return ctx
 
     def _handle_udp_d_handshake(self, ctx: Optional[ClientContext], data: bytes, addr: tuple):
         """Handle UDP D_HANDSHAKE (0x03) and respond with stream definitions."""
@@ -1537,11 +1628,22 @@ class WulframServer:
             ctx.tcp_handler.send(tank_packet)
             print("[SPAWN] Sent TCP TankPacket (WULFRAM_SPAWN_UDP_TANK=0)")
 
-        # Comm messages are TCP-only in wulf-forge; avoid sending 0x1F over UDP.
-        if announce and ctx.tcp_handler:
+        # Wulf-forge sends a spawn COMM_MESSAGE (0x1F) over UDP.
+        # The legacy client accepts it on UDP reliably; fall back to TCP if needed.
+        if announce:
             comm_pkt = build_chat_message("Spawning in...", source_id=net_id)
-            ctx.tcp_handler.send(comm_pkt)
-            print(f"[SPAWN] Sent TCP CommMessage for spawn")
+            if self.udp_handler and ctx.session.udp_addr:
+                try:
+                    self.udp_handler.send_to(comm_pkt, ctx.session.udp_addr)
+                    print(f"[SPAWN] Sent UDP CommMessage for spawn to {ctx.session.udp_addr}")
+                except Exception as ex:
+                    print(f"[SPAWN] Failed to send UDP CommMessage for spawn: {ex}")
+                    if ctx.tcp_handler:
+                        ctx.tcp_handler.send(comm_pkt)
+                        print(f"[SPAWN] Sent TCP CommMessage for spawn (fallback)")
+            elif ctx.tcp_handler:
+                ctx.tcp_handler.send(comm_pkt)
+                print(f"[SPAWN] Sent TCP CommMessage for spawn (no UDP addr)")
 
         # NOTE: We rely on TankPacket (UDP) to create the entity.
         # UPDATE_ARRAY_CREATE_TANK causes crash when sent AFTER TankPacket.
@@ -1663,7 +1765,18 @@ class WulframServer:
         if self.spawn_send_game_clock:
             ctx.tcp_handler.send(build_game_clock())
         if self.spawn_send_reincarnate:
-            ctx.tcp_handler.send(build_reincarnate(0x11, "Spawn success"))
+            rein = build_reincarnate(0x11, "")
+            sent_rein = False
+            if self.udp_handler and ctx.session.udp_addr:
+                try:
+                    self.udp_handler.send_to(rein, ctx.session.udp_addr)
+                    sent_rein = True
+                    print(f"[SPAWN] Sent UDP REINCARNATE(0x11) to {ctx.session.udp_addr}")
+                except Exception as ex:
+                    print(f"[SPAWN] Failed to send UDP REINCARNATE(0x11): {ex}")
+            if not sent_rein:
+                ctx.tcp_handler.send(rein)
+                print("[SPAWN] Sent TCP REINCARNATE(0x11) (fallback)")
         if self.spawn_send_birth_notice:
             ctx.tcp_handler.send(build_birth_notice(net_id))
         if self.spawn_send_game_clock or self.spawn_send_reincarnate or self.spawn_send_birth_notice:
@@ -1675,9 +1788,17 @@ class WulframServer:
             )
 
         # Enter game mode and start tick loop for UPDATE_ARRAY
+        was_in_game = ctx.session.in_game or ctx.session.phase == Phase.IN_GAME
         ctx.session.entity_id = net_id
+        ctx.session.last_spawn_time = time.monotonic()
         ctx.session.in_game = True
-        ctx.session.transition_to(Phase.IN_GAME)
+        if not was_in_game:
+            ctx.session.transition_to(Phase.IN_GAME)
+        else:
+            print(f"[SPAWN] Client {ctx.client_id}: refreshed active spawn while already IN_GAME")
+        if self.spawn_send_player_active:
+            ctx.tcp_handler.send(build_player(net_id, spectator=False))
+            print("[SPAWN] Sent PLAYER spectator=0 (post-spawn reassert)")
 
         # Sync roster/entity visibility with other in-game clients.
         self._sync_clients_on_spawn(ctx)
@@ -1997,18 +2118,21 @@ class WulframServer:
             import traceback
             traceback.print_exc()
         finally:
+            # Preserve UDP addr before session reset so we can clean mapping safely.
+            udp_addr = ctx.session.udp_addr
             ctx.running = False
             ctx.session.in_game = False
-            ctx.session.reset()
 
             # Remove from client tracking
             with self.clients_lock:
                 if ctx.client_id in self.clients:
                     del self.clients[ctx.client_id]
 
-            # Remove UDP address mapping
-            if ctx.session.udp_addr and ctx.session.udp_addr in self.udp_addr_to_client:
-                del self.udp_addr_to_client[ctx.session.udp_addr]
+            # Remove UDP address mapping only if it still points to this context.
+            if udp_addr and self.udp_addr_to_client.get(udp_addr) is ctx:
+                del self.udp_addr_to_client[udp_addr]
+
+            ctx.session.reset()
 
             sock.close()
             print(f"[SERVER] Client {ctx.client_id} disconnected")
@@ -2380,6 +2504,9 @@ class WulframServer:
                 ctx.session.input_ready = True
                 ctx.session.input_ready_time = time.monotonic()
                 print(f"[GAME] Client {ctx.client_id}: input ready (ACTION_DUMP)")
+            # Refresh heading from the newest turn input before firing so
+            # projectile yaw is not one tick behind during rapid rotation.
+            self._update_player_heading(ctx)
             self._update_player_aim(ctx)
             # Update weapon system with current pose
             ctx.weapon_system.player_id = ctx.session.player_id or ctx.entity_id
@@ -2397,6 +2524,9 @@ class WulframServer:
                 aim_pitch = ctx.player_aim_pitch
                 aim_yaw = ctx.player_aim_yaw
                 aim_override = "viewpoint"
+            elif self.projectile_aim_source == "auto":
+                # Keep dynamic source from _get_aim_rotation().
+                aim_override = aim_src
             ctx.weapon_system.player_rot = (
                 ctx.player_pose.get("roll", 0.0),
                 aim_pitch,
@@ -2438,6 +2568,9 @@ class WulframServer:
                 ctx.session.input_ready = True
                 ctx.session.input_ready_time = time.monotonic()
                 print(f"[GAME] Client {ctx.client_id}: input ready (ACTION_UPDATE)")
+            # ACTION_UPDATE carries turn deltas too; apply them immediately so
+            # fire packets use current body heading instead of stale yaw.
+            self._update_player_heading(ctx)
             self._update_player_aim(ctx)
             # Yaw is tracked via VIEWPOINT_INFO when available; otherwise input-based fallback is used.
             # Position is simulated in the tick loop from behavior slots.
@@ -2458,6 +2591,9 @@ class WulframServer:
                 aim_pitch = ctx.player_aim_pitch
                 aim_yaw = ctx.player_aim_yaw
                 aim_override = "viewpoint"
+            elif self.projectile_aim_source == "auto":
+                # Keep dynamic source from _get_aim_rotation().
+                aim_override = aim_src
             ctx.weapon_system.player_rot = (
                 ctx.player_pose.get("roll", 0.0),
                 aim_pitch,
@@ -2840,13 +2976,13 @@ class WulframServer:
 
         # Clamp to reasonable world bounds
         if self.up_axis == "z":
-            new_x = max(-4000.0, min(4000.0, new_x))
-            new_y = max(-4000.0, min(4000.0, new_y))
+            new_x = max(-self.world_bound, min(self.world_bound, new_x))
+            new_y = max(-self.world_bound, min(self.world_bound, new_y))
             # Clamp to ground level
             new_z = max(ground_level, new_z)
         else:
-            new_x = max(-4000.0, min(4000.0, new_x))
-            new_z = max(-4000.0, min(4000.0, new_z))
+            new_x = max(-self.world_bound, min(self.world_bound, new_x))
+            new_z = max(-self.world_bound, min(self.world_bound, new_z))
             # Clamp to ground level
             new_y = max(ground_level, new_y)
 

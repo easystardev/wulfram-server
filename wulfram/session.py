@@ -50,6 +50,7 @@ class Session:
     tick: int = 0
     in_game: bool = False
     pending_spawn_team_id: int = 0
+    last_spawn_time: float = 0.0
 
     # Packet sequencing
     behavior_sent: bool = False
@@ -92,6 +93,7 @@ class Session:
         self.tick = 0
         self.in_game = False
         self.pending_spawn_team_id = 0
+        self.last_spawn_time = 0.0
         self.behavior_sent = False
         self.translation_sent = False
         self.roster_sent = False

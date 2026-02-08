@@ -177,6 +177,31 @@ def _broadcast_update_stats(server: "WulframServer", account_id: int, team_id: i
     return sent
 
 
+def _safe_tcp_send(ctx: "ClientContext", payload: bytes, label: str = "") -> bool:
+    """
+    Best-effort TCP send for paths that may run from UDP/tick threads.
+    Returns False when the client socket is gone instead of raising.
+    """
+    tcp = getattr(ctx, "tcp_handler", None)
+    if not tcp:
+        return False
+    sock = getattr(tcp, "sock", None)
+    try:
+        if sock is None or sock.fileno() < 0:
+            print(f"[TCP-SEND] Skip {label or 'packet'}: socket unavailable for client {ctx.client_id}")
+            return False
+    except Exception:
+        print(f"[TCP-SEND] Skip {label or 'packet'}: socket state check failed for client {ctx.client_id}")
+        return False
+
+    try:
+        tcp.send(payload)
+        return True
+    except Exception as ex:
+        print(f"[TCP-SEND] Failed {label or 'packet'} for client {ctx.client_id}: {ex}")
+        return False
+
+
 def _schedule_team_select_spawn(server: "WulframServer", ctx: "ClientContext", team_id: int, reason: str) -> None:
     """Schedule/queue auto-spawn for legacy team-select flow."""
     session = ctx.session
@@ -500,14 +525,63 @@ def handle_udp_reincarnate(server: "WulframServer", ctx: Optional["ClientContext
     subtype = payload[0]
 
     if subtype == 0x00:
-        # Type 0: Spawn at spawn point
-        if len(payload) >= 9:
-            spawn_point_id = struct.unpack(">I", payload[1:5])[0]
-            vehicle_type = struct.unpack(">I", payload[5:9])[0]
-            print(f"[UDP] REINCARNATE (spawn) seq={seq_num} spawn_point={spawn_point_id} vehicle={vehicle_type}")
+        # Type 0: explicit spawn request. Different clients/builds can append
+        # extra fields, so decode conservatively and resolve the spawn point
+        # from any known spawn oid in the payload words.
+        words = []
+        for off in range(1, len(payload), 4):
+            if off + 4 > len(payload):
+                break
+            words.append(struct.unpack(">I", payload[off:off + 4])[0])
+
+        spawn_points = server.get_spawn_points()
+        spawn_ids = {int(sp.get("oid", 0)) for sp in spawn_points}
+        spawn_point_id = 0
+        vehicle_type = 0
+        team_hint = ctx.session.team_id or 1
+
+        if words:
+            if len(words) >= 2:
+                first, second = words[0], words[1]
+                if first in spawn_ids:
+                    spawn_point_id = first
+                    vehicle_type = second
+                elif second in spawn_ids:
+                    # Some variants place unit/vehicle id first and spawn oid second.
+                    spawn_point_id = second
+                    vehicle_type = first
+                if first in (1, 2):
+                    team_hint = first
+            if not spawn_point_id:
+                for w in words:
+                    if w in spawn_ids:
+                        spawn_point_id = w
+                        break
+            if not spawn_point_id and len(words) > 1 and words[1] in (1, 2):
+                team_hint = words[1]
+            if not spawn_point_id and len(words) >= 2:
+                vehicle_type = words[1]
+
+        if not spawn_point_id and spawn_points:
+            # Last-resort fallback: pick a spawn point for the current/hinted team.
+            picked = next((sp for sp in spawn_points if sp.get("team") == team_hint), spawn_points[0])
+            spawn_point_id = int(picked.get("oid", 0))
+            print(
+                f"[UDP] REINCARNATE (spawn) seq={seq_num} words={words} "
+                f"fallback_spawn_point={spawn_point_id} team_hint={team_hint}"
+            )
+
+        if spawn_point_id:
+            print(
+                f"[UDP] REINCARNATE (spawn) seq={seq_num} "
+                f"spawn_point={spawn_point_id} vehicle={vehicle_type} words={words}"
+            )
             handle_spawn_at_point(server, ctx, spawn_point_id, vehicle_type, addr)
         else:
-            print(f"[UDP] REINCARNATE (spawn) seq={seq_num} - incomplete payload")
+            print(
+                f"[UDP] REINCARNATE (spawn) seq={seq_num} "
+                f"unable_to_resolve_spawn words={words} payload_hex={payload.hex()}"
+            )
 
     elif subtype == 0x01:
         # Type 1: Team switch
@@ -552,10 +626,22 @@ def handle_team_switch(server: "WulframServer", ctx: "ClientContext", team_id: i
         )
         server.udp_handler.send_to(update_stats_pkt, addr)
 
-    # Wulf-forge sends REINCARNATE(code=17) after team switch.
-    if getattr(server, "team_switch_send_reincarnate", True) and ctx.tcp_handler:
-        ctx.tcp_handler.send(build_reincarnate(0x11, ""))
-        print(f"[UDP] Team {team_id} switch acked with REINCARNATE 0x11")
+    # Wulf-forge-style ACK: REINCARNATE(code=17) should be seen on UDP for
+    # reliable entry-map -> world transition. Fall back to TCP only when UDP
+    # address is not yet known.
+    if getattr(server, "team_switch_send_reincarnate", True):
+        rein = build_reincarnate(0x11, "")
+        sent_rein = False
+        if server.udp_handler and addr:
+            try:
+                server.udp_handler.send_to(rein, addr)
+                sent_rein = True
+                print(f"[UDP] Team {team_id} switch acked with REINCARNATE 0x11 (UDP)")
+            except Exception as ex:
+                print(f"[UDP] Failed to send team-switch REINCARNATE over UDP: {ex}")
+        if not sent_rein and ctx.tcp_handler:
+            if _safe_tcp_send(ctx, rein, label="team_switch_reincarnate_ack"):
+                print(f"[TCP] Team {team_id} switch acked with REINCARNATE 0x11 (fallback)")
 
     if getattr(server, "spawn_on_team_select", False):
         print(
@@ -563,6 +649,21 @@ def handle_team_switch(server: "WulframServer", ctx: "ClientContext", team_id: i
             "(legacy auto-spawn path)"
         )
     else:
+        # Explicit spawn-point flow: if the client never sends subtype-0 REINCARNATE,
+        # schedule a bounded fallback spawn to avoid getting stuck in entry-map UI.
+        force_after = float(getattr(server, "spawn_force_after", 0.0) or 0.0)
+        if force_after > 0.0:
+            now = time.monotonic()
+            base = session.want_updates_time if session.want_updates_time > 0.0 else now
+            session.delayed_spawn_team = team_id
+            session.delayed_spawn_time = max(base + force_after, now + 0.5)
+            session.spawn_wait_logged = False
+            wait_s = max(0.0, session.delayed_spawn_time - now)
+            anchor = "WANT_UPDATES" if session.want_updates_time > 0.0 else "team-switch"
+            print(
+                f"[UDP] Team {team_id} explicit-spawn fallback scheduled in "
+                f"{wait_s:.1f}s (anchor={anchor})"
+            )
         print(
             f"[UDP] Team {team_id} selected - waiting for explicit spawn-point packet"
         )
@@ -570,6 +671,62 @@ def handle_team_switch(server: "WulframServer", ctx: "ClientContext", team_id: i
 
 def handle_spawn_at_point(server: "WulframServer", ctx: "ClientContext", spawn_point_id: int, vehicle_type: int, addr: tuple):
     """Handle spawn at a specific spawn point."""
+    session = ctx.session
+    now = time.monotonic()
+    in_game = session.in_game or session.phase == Phase.IN_GAME
+    spawn_override = False
+
+    # Some clients can remain on entry-map UI after auto-spawn and then send an
+    # explicit spawn-point click. Allow a guarded override for that case.
+    if in_game:
+        if not getattr(server, "spawn_allow_point_override", False):
+            print(
+                f"[SPAWN] Client {ctx.client_id}: Ignoring duplicate spawn request "
+                f"while IN_GAME (point={spawn_point_id} vehicle={vehicle_type})"
+            )
+            _safe_tcp_send(ctx, build_reincarnate(0x11, "Already spawned"), label="spawn_duplicate_reincarnate")
+            _safe_tcp_send(
+                ctx,
+                build_player(session.player_id or ctx.entity_id, spectator=False),
+                label="spawn_duplicate_player_active",
+            )
+            return
+
+        try:
+            min_interval = float(getattr(server, "spawn_point_override_min_interval", 0.0))
+        except (TypeError, ValueError):
+            min_interval = 0.0
+        elapsed = now - float(session.last_spawn_time or 0.0)
+        if min_interval > 0.0 and elapsed < min_interval:
+            print(
+                f"[SPAWN] Client {ctx.client_id}: Ignoring IN_GAME spawn override "
+                f"(elapsed={elapsed:.2f}s < min={min_interval:.2f}s) "
+                f"point={spawn_point_id} vehicle={vehicle_type}"
+            )
+            return
+
+        spawn_override = True
+        print(
+            f"[SPAWN] Client {ctx.client_id}: Applying IN_GAME spawn-point override "
+            f"(point={spawn_point_id} vehicle={vehicle_type}, elapsed={elapsed:.2f}s)"
+        )
+
+    # If a spawn is already being processed, ignore retries to avoid re-entry races.
+    if session.phase == Phase.SPAWNING and not spawn_override:
+        print(
+            f"[SPAWN] Client {ctx.client_id}: Ignoring duplicate spawn request "
+            f"while SPAWNING (point={spawn_point_id} vehicle={vehicle_type})"
+        )
+        return
+
+    # Explicit spawn-point packet won; cancel any delayed fallback spawn from team-switch.
+    session.pending_spawn_team_id = 0
+    session.delayed_spawn_team = 0
+    session.delayed_spawn_time = 0.0
+    session.spawn_wait_logged = False
+
+    if not spawn_override:
+        session.transition_to(Phase.SPAWNING)
     print(f"[SPAWN] Client {ctx.client_id}: Spawn at point {spawn_point_id} vehicle={vehicle_type}")
     spawn_points = server.get_spawn_points()
     selected = None
