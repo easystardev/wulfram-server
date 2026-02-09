@@ -610,6 +610,10 @@ class WulframServer:
         except ValueError:
             self.turn_deadzone = 0.05
         try:
+            self.turn_sign = float(os.environ.get("WULFRAM_TURN_SIGN", "1.0"))
+        except ValueError:
+            self.turn_sign = 1.0
+        try:
             self.aim_hold_time = float(os.environ.get("WULFRAM_AIM_HOLD", "0.4"))
         except ValueError:
             self.aim_hold_time = 0.4
@@ -2605,7 +2609,8 @@ class WulframServer:
                 new_projectiles = ctx.weapon_system.update()
                 if new_projectiles:
                     yaw_deg = math.degrees(ctx.player_yaw)
-                    print(f"[WEAPON-FIRE] Firing {len(new_projectiles)} proj at yaw={yaw_deg:.1f} pos={ctx.player_pos}")
+                    turn_val = ctx.weapon_system.behavior_slots[BehaviorSlot.TURNING]
+                    print(f"[WEAPON-FIRE] Firing {len(new_projectiles)} proj at yaw={yaw_deg:.1f} heading={math.degrees(ctx.player_heading):.1f} turn_slot={turn_val:.3f} pos={ctx.player_pos}")
                 for proj in new_projectiles:
                     self._spawn_moving_projectile(ctx, proj, addr)
 
@@ -2672,7 +2677,8 @@ class WulframServer:
                 new_projectiles = ctx.weapon_system.update()
                 if new_projectiles:
                     yaw_deg = math.degrees(ctx.player_yaw)
-                    print(f"[WEAPON-FIRE] Firing {len(new_projectiles)} proj at yaw={yaw_deg:.1f} pos={ctx.player_pos}")
+                    turn_val = ctx.weapon_system.behavior_slots[BehaviorSlot.TURNING]
+                    print(f"[WEAPON-FIRE] Firing {len(new_projectiles)} proj at yaw={yaw_deg:.1f} heading={math.degrees(ctx.player_heading):.1f} turn_slot={turn_val:.3f} pos={ctx.player_pos}")
                 for proj in new_projectiles:
                     self._spawn_moving_projectile(ctx, proj, addr)
 
@@ -2888,7 +2894,7 @@ class WulframServer:
         dt = min(dt, 0.1)  # Clamp to avoid huge jumps
 
         # Apply turn rate to movement heading (not aim yaw)
-        ctx.player_heading += turn_input * turn_adjust * dt
+        ctx.player_heading += self.turn_sign * turn_input * turn_adjust * dt
 
         # Keep heading in -pi to pi range
         while ctx.player_heading > math.pi:
@@ -2899,6 +2905,10 @@ class WulframServer:
         # Body yaw always follows movement heading.
         ctx.player_yaw = ctx.player_heading
         ctx.player_pose["yaw"] = ctx.player_heading
+
+        # Yaw tracking log (~3/sec when turning)
+        if hasattr(ctx.session, 'tick') and ctx.session.tick % 10 == 0 and abs(turn_input) > 0.01:
+            print(f"[YAW-TRACK] turn_input={turn_input:.3f} sign={self.turn_sign:.0f} dt={dt:.4f} delta={self.turn_sign * turn_input * turn_adjust * dt:.4f} heading={math.degrees(ctx.player_heading):.1f}deg")
 
     def _update_player_aim(self, ctx: ClientContext):
         """Update aim yaw/pitch from viewpoint or slot inputs (if enabled)."""
@@ -3408,7 +3418,7 @@ class WulframServer:
         _write_local_player_state(
             bw,
             include=True,
-            weapon_id=0,
+            weapon_id=self._get_local_state_weapon_type(ctx),
             health=1.0,
             fuel=1.0,
             include_ammo_turrets=False,
