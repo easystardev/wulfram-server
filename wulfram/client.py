@@ -55,6 +55,7 @@ class ClientContext:
     player_vel: tuple = (0.0, 0.0, 0.0)
     player_yaw: float = 0.0
     player_heading: float = 0.0
+    player_angular_vel: float = 0.0
     player_energy: float = 100.0
 
     # Aim tracking

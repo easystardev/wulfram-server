@@ -659,7 +659,8 @@ def build_update_array_heartbeat(tick: int, entity_id: int, include_health: bool
                                  secondary_turret_angle: float = 0.0,
                                  turret_max: float = 6.3,
                                  turret_range: float = 12.6,
-                                 is_view_update: bool = False) -> bytes:
+                                 is_view_update: bool = False,
+                                 rot: tuple = None) -> bytes:
     """Build UPDATE_ARRAY/VIEW_UPDATE with entity heartbeat and optional health data.
 
     When include_health=True, sends local player state with full health/energy.
@@ -707,8 +708,15 @@ def build_update_array_heartbeat(tick: int, entity_id: int, include_health: bool
     bw.write_bits(8, 1)              # 1 entity
     bw.write_bits(32, entity_id)     # net_id (OID)
     bw.write_bits(1, 1)              # is_manned = True
-    bw.write_bits(10, 0)             # mask = 0 (no data fields)
+    mask = 0
+    if rot is not None:
+        mask |= (1 << 3)             # bit 3 = ROT
+    bw.write_bits(10, mask)
     bw.write_bits(16, 0)             # bank_selector = 0
+    if rot is not None:
+        bw.write_bits(4, 15)         # rotation header (max precision)
+        for v in rot:
+            bw.write_bits(16, _compress_value(v, VEC_ROT_MAX, VEC_ROT_RANGE, total_bits=16))
     return header + bw.get_bytes()
 
 

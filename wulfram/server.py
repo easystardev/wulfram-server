@@ -610,9 +610,25 @@ class WulframServer:
         except ValueError:
             self.turn_deadzone = 0.05
         try:
-            self.turn_sign = float(os.environ.get("WULFRAM_TURN_SIGN", "1.0"))
+            self.turn_sign = float(os.environ.get("WULFRAM_TURN_SIGN", "-1.0"))
         except ValueError:
-            self.turn_sign = 1.0
+            self.turn_sign = -1.0
+        # Damped rotation physics: max angular velocity in rad/s.
+        # BEHAVIOR Section 4 has turn_rate=0.05 and mass=33000 for Tank.
+        # The client's actual turn rate depends on its full physics model.
+        # Default 1.5 rad/s (~86 deg/s) is a starting point for calibration.
+        # Use WULFRAM_TURN_DAMPING to tune empirically.
+        try:
+            self.turn_damping = float(os.environ.get("WULFRAM_TURN_DAMPING", "1.5"))
+        except ValueError:
+            self.turn_damping = 1.5
+        try:
+            self.turn_friction = float(os.environ.get("WULFRAM_TURN_FRICTION", "0.8"))
+        except ValueError:
+            self.turn_friction = 0.8
+        # Send server rotation in heartbeat UPDATE_ARRAY to override client physics.
+        # Default OFF - enabling may freeze client movement (needs investigation).
+        self.heartbeat_include_rot = os.environ.get("WULFRAM_HEARTBEAT_ROT", "0") == "1"
         try:
             self.aim_hold_time = float(os.environ.get("WULFRAM_AIM_HOLD", "0.4"))
         except ValueError:
@@ -1543,6 +1559,7 @@ class WulframServer:
         ctx.player_pose["pos"] = spawn_pos
         ctx.player_yaw = 0.0
         ctx.player_heading = 0.0
+        ctx.player_angular_vel = 0.0
         ctx.last_action_dump_time = time.monotonic()  # Reset timer for position tracking
         if self.spawn_sets_ground_level:
             if self.up_axis == "z":
@@ -2867,7 +2884,13 @@ class WulframServer:
                 )
 
     def _update_player_heading(self, ctx: ClientContext):
-        """Track player movement heading from TURNING input (slot 1)."""
+        """Track player movement heading from TURNING input (slot 1).
+
+        Uses turn_rate from BEHAVIOR Section 4 as the effective maximum
+        angular velocity (rad/s).  The angular velocity smoothly approaches
+        the target (input * turn_rate) at a rate controlled by turn_friction
+        to mimic the client's damped drivetrain physics.
+        """
         import math
 
         def _normalize_axis(val: float) -> float:
@@ -2884,8 +2907,11 @@ class WulframServer:
         if abs(turn_input) < self.turn_deadzone:
             turn_input = 0.0
 
-        # Turn physics from BEHAVIOR packet (approximate)
-        turn_adjust = self.turn_adjust
+        # Turn physics from BEHAVIOR packet:
+        #   turn_damping (turn_rate, Section 4) = max angular velocity in rad/s
+        #   turn_friction (ground_friction, Section 4) = lerp speed for ang vel
+        turn_max_rate = self.turn_damping   # 0.05 rad/s ≈ 2.86 deg/s
+        smooth_rate = self.turn_friction    # 0.8 (how fast ang vel reaches target)
 
         # Use actual time delta for turn integration (clamped).
         now = time.monotonic()
@@ -2893,8 +2919,15 @@ class WulframServer:
         ctx.last_heading_update = now
         dt = min(dt, 0.1)  # Clamp to avoid huge jumps
 
-        # Apply turn rate to movement heading (not aim yaw)
-        ctx.player_heading += self.turn_sign * turn_input * turn_adjust * dt
+        # Target angular velocity from input (capped by turn_max_rate)
+        target_vel = self.turn_sign * turn_input * turn_max_rate
+
+        # Smoothly approach target angular velocity (exponential lerp)
+        lerp_factor = 1.0 - math.exp(-smooth_rate * dt * 30.0)
+        ctx.player_angular_vel += (target_vel - ctx.player_angular_vel) * lerp_factor
+
+        # Integrate heading from angular velocity
+        ctx.player_heading += ctx.player_angular_vel * dt
 
         # Keep heading in -pi to pi range
         while ctx.player_heading > math.pi:
@@ -2908,7 +2941,7 @@ class WulframServer:
 
         # Yaw tracking log (~3/sec when turning)
         if hasattr(ctx.session, 'tick') and ctx.session.tick % 10 == 0 and abs(turn_input) > 0.01:
-            print(f"[YAW-TRACK] turn_input={turn_input:.3f} sign={self.turn_sign:.0f} dt={dt:.4f} delta={self.turn_sign * turn_input * turn_adjust * dt:.4f} heading={math.degrees(ctx.player_heading):.1f}deg")
+            print(f"[YAW-TRACK] input={turn_input:.3f} target_vel={target_vel:.4f} ang_vel={ctx.player_angular_vel:.4f} heading={math.degrees(ctx.player_heading):.1f}deg")
 
     def _update_player_aim(self, ctx: ClientContext):
         """Update aim yaw/pitch from viewpoint or slot inputs (if enabled)."""
@@ -3859,6 +3892,13 @@ class WulframServer:
                         self.update_local_state_mode,
                     )
                     use_view = self.heartbeat_view_update
+                    hb_rot = None
+                    if self.heartbeat_include_rot:
+                        hb_rot = (
+                            ctx.player_pose.get("roll", 0.0),
+                            0.0,
+                            ctx.player_yaw,
+                        )
                     payload = build_update_array_heartbeat(
                         tick,
                         ctx.session.entity_id,
@@ -3875,6 +3915,7 @@ class WulframServer:
                         turret_max=self.local_state_turret_max,
                         turret_range=self.local_state_turret_range,
                         is_view_update=use_view,
+                        rot=hb_rot,
                     )
                     pkt_label = "VIEW_UPDATE_BEAT" if use_view else "UPDATE_ARRAY_BEAT"
                     if include_local_state:
