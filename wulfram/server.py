@@ -125,10 +125,12 @@ class WulframServer:
             self.spawn_send_player_info = False
         else:
             self.spawn_send_player_info = spawn_player_info_env == "1"
-        # Wulf-forge spawns with TankPacket only (no UPDATE_ARRAY create).
-        # Wulf-forge sends UPDATE_ARRAY entity creation alongside TankPacket.
-        # Wulf-forge spawns local tanks via TankPacket; UPDATE_ARRAY create is optional.
-        self.spawn_send_update_array = os.environ.get("WULFRAM_SPAWN_UPDATE_ARRAY", "0") == "1"
+        # Pre-create entity via UPDATE_ARRAY before TankPacket so OIDTable has the
+        # correct OID when PLAYER_INFO processes it.  Without this,
+        # Entity_create_from_network in PLAYER_INFO stores a garbage OID (unaff_EBX)
+        # → OIDTable_lookup fails on retransmit → LocalPlayer_initialize never fires
+        # → g_local_player_entity stays 0 → sync_local_player skips all health writes.
+        self.spawn_send_update_array = os.environ.get("WULFRAM_SPAWN_UPDATE_ARRAY", "1") == "1"
         self.spawn_send_game_clock = os.environ.get("WULFRAM_SPAWN_GAME_CLOCK", "0") == "1"
         # Wulf-forge does NOT send REINCARNATE(0x11) during spawn.
         self.spawn_send_reincarnate = os.environ.get("WULFRAM_SPAWN_REINCARNATE", "0") == "1"
@@ -184,12 +186,12 @@ class WulframServer:
         self.remote_update_is_manned = os.environ.get("WULFRAM_REMOTE_IS_MANNED", "0") == "1"
         # Combine local + remote updates into a single UPDATE_ARRAY per tick.
         self.combine_update_arrays = os.environ.get("WULFRAM_COMBINE_UPDATE_ARRAYS", "0") == "1"
-        # Local stats in projectile packets: owner-only local-state helps keep HUD vitals
-        # stable while projectile UPDATE_ARRAY traffic is active. Remote peers still receive
-        # include_local_state=0 packets.
-        # Keep local-state out of projectile packets by default. Local-state bits are
-        # weapon-profile-dependent and easy to desync, which causes red-overlay flicker.
-        self.projectile_local_stats = os.environ.get("WULFRAM_PROJECTILE_LOCAL_STATS", "0") == "1"
+        # Local stats in projectile packets: owner-only local-state keeps HUD vitals
+        # stable while projectile UPDATE_ARRAY traffic is active. Remote peers still
+        # receive include_local_state=0 packets.
+        # Safe with weapon_id=2 (AssaultPlatform): no turret bits, no ammo bits,
+        # so local-state is exactly 26 bits (1+5+10+10) matching the heartbeat.
+        self.projectile_local_stats = os.environ.get("WULFRAM_PROJECTILE_LOCAL_STATS", "1") == "1"
         self.debug_projectiles = (
             os.environ.get("WULFRAM_DEBUG_PROJECTILES", "0") == "1"
             or os.environ.get("WULFRAM_DEBUG_AIM", "0") == "1"
@@ -274,18 +276,17 @@ class WulframServer:
             self.projectile_update_mode = 2
         if self.projectile_update_mode < 0 or self.projectile_update_mode > 3:
             self.projectile_update_mode = 2
-        # TankPacket vitals are optional once UPDATE_ARRAY local-state is correct.
-        # In practice, stale shell env with WULFRAM_TANK_VITALS=0 regresses into
-        # red-overlay flicker. Keep a fail-safe ON unless explicitly allowed.
-        tank_vitals_raw = os.environ.get("WULFRAM_TANK_VITALS", "1").strip().lower()
+        # TankPacket vitals OFF: flag=0 means the client skips the entire
+        # local_state read (weapon, health, fuel, ammo, turret).  This ensures
+        # unit_type/net_id/team/pos are parsed correctly so the entity is
+        # created and the entry map dismisses.
+        # Health is instead delivered by the heartbeat UPDATE_ARRAY which
+        # includes entity_count=1, calling Network_record_update_stats (sets
+        # EAX for tick guard) then sync_local_player (applies health from ESI).
+        # The BEHAVIOR packet clears weapon_def[0]+0x170 (turret flag), so the
+        # heartbeat local_state has no turret bit misalignment.
+        tank_vitals_raw = os.environ.get("WULFRAM_TANK_VITALS", "0").strip().lower()
         self.tank_vitals = tank_vitals_raw in ("1", "true", "on", "yes")
-        self.allow_tank_vitals_off = os.environ.get("WULFRAM_ALLOW_TANK_VITALS_OFF", "0") == "1"
-        if not self.tank_vitals and not self.allow_tank_vitals_off:
-            print(
-                "[VITALS] WULFRAM_TANK_VITALS=0 detected; forcing vitals ON for stability. "
-                "Set WULFRAM_ALLOW_TANK_VITALS_OFF=1 to keep vitals disabled."
-            )
-            self.tank_vitals = True
         # Map configuration (WORLD_STATS + spawn points).
         # Default to Wulf-Forge's startup map ("crossroads").
         self.map_name = os.environ.get("WULFRAM_MAP_NAME", "crossroads")
@@ -433,6 +434,10 @@ class WulframServer:
         if update_packet_raw not in ("update", "view"):
             update_packet_raw = "update"
         self.update_packet_type = update_packet_raw
+        # Use VIEW_UPDATE (0x0F) for heartbeat instead of UPDATE_ARRAY (0x0E).
+        # wulf-forge sends health primarily via 0x0F packets; the client may only
+        # update HUD health from VIEW_UPDATE format.
+        self.heartbeat_view_update = os.environ.get("WULFRAM_HEARTBEAT_VIEW_UPDATE", "0") == "1"
 
         print(
             "[CONFIG] spawn_udp_tank="
@@ -451,6 +456,7 @@ class WulframServer:
             f"gravity={self.gravity:.1f} tick_hz={self.tick_rate_hz:.1f} "
             f"update_on_change={int(self.update_on_change)} heartbeat={self.update_heartbeat_interval:.2f}s "
             f"map_spawns={int(self.use_map_spawn_points)} update_packet={self.update_packet_type} "
+            f"heartbeat_view={int(self.heartbeat_view_update)} "
             f"inactivity_timeout={self.inactivity_timeout:.1f}s"
         )
 
@@ -466,13 +472,19 @@ class WulframServer:
         self.player_info_local_state = self.player_info_local_state_mode != "off"
         # Wulf-forge does NOT send PLAYER(spectator=0) during spawn.
         self.spawn_send_player_active = os.environ.get("WULFRAM_SPAWN_PLAYER_ACTIVE", "0") == "1"
-        # Local-state weapon type (entity type index). Default is 0 (tank).
-        # Override if needed for testing or to probe local-state bit expectations.
+        # Local-state weapon type (entity type index). Default is 2 (AssaultPlatform).
+        # Tank (0) sets weapon_def+0x170=1 → client reads 16 turret bits we don't send → desync.
+        # Scout (1) sets weapon_def+0x68=1 → similar secondary turret desync.
+        # AssaultPlatform (2) sets neither → no turret bits expected → clean alignment.
         try:
-            self.local_state_weapon_type = int(os.environ.get("WULFRAM_LOCAL_STATE_WEAPON_TYPE", "0"))
+            self.local_state_weapon_type = int(os.environ.get("WULFRAM_LOCAL_STATE_WEAPON_TYPE", "2"))
         except ValueError:
-            self.local_state_weapon_type = 0
-        # In WF local-state mode, optionally include turret angles (experimental).
+            self.local_state_weapon_type = 2
+        # In WF local-state mode, include turret angles to match client's
+        # read_local_player_state expectations.  Tank (weapon_type=0) requires
+        # primary turret (weapon_def+0x170=1).  Omitting these bits causes a
+        # bitstream desync: the client reads 16 turret bits from the entity
+        # section, garbling entity_count and preventing health application.
         self.wf_local_state_turrets = os.environ.get("WULFRAM_WF_LOCAL_TURRETS", "0") == "1"
         # Local-state ammo bitmask parameters (active slot flags). Defaults match our BEHAVIOR config (no active flags).
         try:
@@ -1555,8 +1567,34 @@ class WulframServer:
         # It does NOT send UPDATE_STATS or REINCARNATE before TankPacket!
         # Those are only sent in response to team switch requests.
 
-        # Send TankPacket (vitals only if TRANSLATION has been applied).
-        include_spawn_vitals = self.tank_vitals and ctx.session.translation_ack_received
+        # Ensure TRANSLATION has been applied before sending TankPacket with vitals.
+        if not ctx.session.translation_ack_received:
+            wait_until = time.monotonic() + 2.0
+            while not ctx.session.translation_ack_received and time.monotonic() < wait_until:
+                time.sleep(0.05)
+            if not ctx.session.translation_ack_received:
+                print("[SPAWN] WARNING: TRANSLATION_ACK not received before TankPacket")
+
+        # vitals=1 on the FIRST TankPacket — this writes health=1.0 into
+        # the ESI buffer during PLAYER_INFO's read_local_player_state.  The
+        # subsequent sync_local_player (the ONLY call that passes the tick
+        # guard, because Mode3_init_descriptor → operator_new returns a heap
+        # pointer that gets stored in g_last_input_apply_tick, permanently
+        # blocking all future heartbeat sync_local_player calls) then writes
+        # ESI[0]=1.0 to the HUD health meter.
+        #
+        # NOTE: previous test showed vitals=1 caused "entry map persistence"
+        # but that was WITHOUT UPDATE_ARRAY pre-creation.  With pre-creation,
+        # PLAYER_INFO takes the "entity found" code path (LocalPlayer_initialize
+        # in the else branch) instead of Entity_create_from_network.
+        include_spawn_vitals = True
+        # Set last_spawn_time BEFORE sending TankPacket so the 2-second
+        # jump suppression window covers the entire retransmit period.
+        # Without this, a jump ACTION_UPDATE arriving during retransmit
+        # sleep bypasses suppression and sends a velocity UPDATE_ARRAY
+        # that sets prev_health positive before a retransmit re-creates
+        # the entity with health=0 → permanent DeathScreen.
+        ctx.session.last_spawn_time = time.monotonic()
         if not self.spawn_send_udp_tank:
             print("[SPAWN] Skipping UDP TankPacket (WULFRAM_SPAWN_UDP_TANK=0)")
         else:
@@ -1567,6 +1605,9 @@ class WulframServer:
             0.0,
             ctx.player_yaw,
         )
+        # Use local_state weapon type (default 2=AssaultPlatform) so the client's
+        # read_local_player_state won't expect turret bits we don't send.
+        ls_weapon = self._get_local_state_weapon_type(ctx)
         # Optional: create the entity via UPDATE_ARRAY before PLAYER_INFO.
         if self.spawn_send_update_array:
             health_val = self._get_health_value()
@@ -1583,6 +1624,7 @@ class WulframServer:
                 health=health_val,
                 fuel=fuel_val,
                 is_manned=True,
+                weapon_id=ls_weapon,
             )
             if self.udp_handler and ctx.session.udp_addr:
                 self.udp_handler.send_to(ua_packet, ctx.session.udp_addr)
@@ -1590,6 +1632,13 @@ class WulframServer:
             else:
                 ctx.tcp_handler.send(ua_packet)
                 print("[SPAWN] Sent UPDATE_ARRAY_CREATE_TANK via TCP")
+            # Delay so client processes entity creation before PLAYER_INFO.
+            # The TankPacket's OIDTable_lookup must find the entity created
+            # by UPDATE_ARRAY; if the TankPacket arrives first, it takes the
+            # Entity_create_from_network path which does NOT call
+            # LocalPlayer_initialize → entry map stays.  200ms gives ~6
+            # frames at 30fps for the client to process the UPDATE_ARRAY.
+            time.sleep(0.20)
         spawn_tick = self._get_network_tick(ctx)
         tank_packet = build_udp_tank_packet_wf(
             net_id=net_id,
@@ -1599,7 +1648,7 @@ class WulframServer:
             rot=send_rot,
             tick=spawn_tick,
             include_vitals=include_spawn_vitals,
-            weapon_id=self.weapon_id,
+            weapon_id=ls_weapon,
             health=1.0,
             energy=1.0,
         )
@@ -1609,27 +1658,13 @@ class WulframServer:
             include_vitals=include_spawn_vitals,
             health=1.0,
             energy=1.0,
-            weapon_id=self.weapon_id,
+            weapon_id=ls_weapon,
             note=f"team={team_id} net_id={net_id}",
         )
         # HEX DUMP for comparison with wulf-forge
         print(f"[TANK-HEX] len={len(tank_packet)} hex={tank_packet.hex().upper()}")
-        # Send over UDP (matching wulf-forge behavior)
-        if self.spawn_send_udp_tank:
-            if self.udp_handler and ctx.session.udp_addr:
-                self.udp_handler.send_to(tank_packet, ctx.session.udp_addr)
-                print(f"[SPAWN] Sent UDP TankPacket to {ctx.session.udp_addr}")
-            else:
-                # Fallback to TCP if no UDP address
-                ctx.tcp_handler.send(tank_packet)
-                print(f"[SPAWN] Sent TCP TankPacket (no UDP addr)")
-        else:
-            # Explicit TCP fallback for spawn-isolation runs.
-            ctx.tcp_handler.send(tank_packet)
-            print("[SPAWN] Sent TCP TankPacket (WULFRAM_SPAWN_UDP_TANK=0)")
 
-        # Wulf-forge sends a spawn COMM_MESSAGE (0x1F) over UDP.
-        # The legacy client accepts it on UDP reliably; fall back to TCP if needed.
+        # Wulf-forge order: CommMessage FIRST, then TankPacket.
         if announce:
             comm_pkt = build_chat_message("Spawning in...", source_id=net_id)
             if self.udp_handler and ctx.session.udp_addr:
@@ -1645,46 +1680,75 @@ class WulframServer:
                 ctx.tcp_handler.send(comm_pkt)
                 print(f"[SPAWN] Sent TCP CommMessage for spawn (no UDP addr)")
 
+        # Send TankPacket over UDP (matching wulf-forge behavior)
+        if self.spawn_send_udp_tank:
+            if self.udp_handler and ctx.session.udp_addr:
+                self.udp_handler.send_to(tank_packet, ctx.session.udp_addr)
+                print(f"[SPAWN] Sent UDP TankPacket to {ctx.session.udp_addr}")
+                # Resend TankPacket for reliability (UDP can drop packets)
+                # Each retransmit triggers Entity_create_from_network (new
+                # entity, 0xD0=0).  This is safe as long as no velocity
+                # UPDATE_ARRAY sets prev_health positive during the
+                # retransmit window.  The jump-suppression timer (set
+                # before TankPacket send) prevents that race.
+                spawn_retransmits = int(os.environ.get("WULFRAM_SPAWN_RETRANSMIT", "0"))
+                if spawn_retransmits > 0:
+                    # Retransmits DISABLED by default (0).  Each retransmit
+                    # calls LocalPlayer_initialize again; if it arrives during
+                    # the spawn transition it re-shows the entry map overlay
+                    # (race condition: run 20260209_000347 vs _000127).
+                    # Wulf-forge sends only one TankPacket, no retransmits.
+                    # The pre-creation UPDATE_ARRAY handles entity existence
+                    # and the first TankPacket is reliably received on
+                    # localhost.  Keep env var for optional override.
+                    for i in range(spawn_retransmits):
+                        time.sleep(0.05)
+                        retransmit_tick = self._get_network_tick(ctx)
+                        retransmit_packet = build_udp_tank_packet_wf(
+                            net_id=net_id,
+                            unit_type=unit_type,
+                            team_id=team_id,
+                            pos=send_pos,
+                            rot=send_rot,
+                            tick=retransmit_tick,
+                            include_vitals=True,
+                            weapon_id=ls_weapon,
+                            health=1.0,
+                            energy=1.0,
+                        )
+                        self.udp_handler.send_to(retransmit_packet, ctx.session.udp_addr)
+                    print(f"[SPAWN] Retransmitted TankPacket {spawn_retransmits}x (vitals=1)")
+                # Immediate UPDATE_ARRAY heartbeat with health=1.0.
+                # The pre-creation UPDATE_ARRAY set up the OID table entry,
+                # and the TankPacket's PLAYER_INFO path found it via
+                # OIDTable_lookup → called LocalPlayer_initialize →
+                # g_local_player_entity is now set.  This heartbeat populates
+                # ESI with health=1.0 so sync_local_player writes it to the
+                # HUD health meter, clearing the red overlay.
+                time.sleep(0.05)
+                hb_tick = self._get_network_tick(ctx)
+                hb_packet = build_update_array_heartbeat(
+                    tick=hb_tick,
+                    entity_id=net_id,
+                    include_health=True,
+                    weapon_id=ls_weapon,
+                    health=1.0,
+                    fuel=1.0,
+                )
+                self.udp_handler.send_to(hb_packet, ctx.session.udp_addr)
+                print(f"[SPAWN] Sent immediate heartbeat UPDATE_ARRAY (health=1.0)")
+            else:
+                # Fallback to TCP if no UDP address
+                ctx.tcp_handler.send(tank_packet)
+                print(f"[SPAWN] Sent TCP TankPacket (no UDP addr)")
+        else:
+            # Explicit TCP fallback for spawn-isolation runs.
+            ctx.tcp_handler.send(tank_packet)
+            print("[SPAWN] Sent TCP TankPacket (WULFRAM_SPAWN_UDP_TANK=0)")
+
         # NOTE: We rely on TankPacket (UDP) to create the entity.
         # UPDATE_ARRAY_CREATE_TANK causes crash when sent AFTER TankPacket.
         # For now, skip UPDATE_ARRAY and try PLAYER_INFO alone.
-
-        # Ensure TRANSLATION has been applied before sending any local-state data.
-        if not ctx.session.translation_ack_received:
-            wait_until = time.monotonic() + 2.0
-            while not ctx.session.translation_ack_received and time.monotonic() < wait_until:
-                time.sleep(0.05)
-            if not ctx.session.translation_ack_received:
-                print("[SPAWN] WARNING: TRANSLATION_ACK not received before PLAYER_INFO")
-        # If we spawned without vitals, send a vitals refresh once TRANSLATION is ready.
-        if self.spawn_send_udp_tank and self.tank_vitals and not include_spawn_vitals and ctx.session.translation_ack_received:
-            vitals_packet = build_udp_tank_packet_wf(
-                net_id=net_id,
-                unit_type=unit_type,
-                team_id=team_id,
-                pos=send_pos,
-                rot=send_rot,
-                tick=self._get_network_tick(ctx),
-                include_vitals=True,
-                weapon_id=self.weapon_id,
-                health=1.0,
-                energy=1.0,
-            )
-            self._log_vitals(
-                ctx,
-                "TANK_UDP_REFRESH",
-                include_vitals=True,
-                health=1.0,
-                energy=1.0,
-                weapon_id=self.weapon_id,
-                note=f"team={team_id} net_id={net_id}",
-            )
-            if self.udp_handler and ctx.session.udp_addr:
-                self.udp_handler.send_to(vitals_packet, ctx.session.udp_addr)
-                print(f"[SPAWN] Sent UDP TankPacket vitals refresh to {ctx.session.udp_addr}")
-            else:
-                ctx.tcp_handler.send(vitals_packet)
-                print("[SPAWN] Sent TCP TankPacket vitals refresh (no UDP addr)")
 
         # PLAYER_INFO tells the client "this is your controllable entity"
         # Without this, client won't send VIEWPOINT_INFO (0x35)
@@ -2751,6 +2815,24 @@ class WulframServer:
             chat_packet = build_chat_message(pos_msg, source_id=ctx.session.player_id or ctx.entity_id)
             ctx.tcp_handler.send(chat_packet)
         print(f"[WEAPON] {pos_msg}")
+
+        # Belt-and-suspenders: send an immediate heartbeat UPDATE_ARRAY to the
+        # firing player so their HUD health stays at 1.0 even if the projectile
+        # local_state bits are somehow missed or arrive out of order.
+        if self.udp_handler and ctx.session.udp_addr:
+            hb_tick = self._get_network_tick(ctx)
+            hb_weapon = self._get_local_state_weapon_type(ctx)
+            hb_packet = build_update_array_heartbeat(
+                tick=hb_tick,
+                entity_id=ctx.session.entity_id,
+                include_health=True,
+                weapon_id=hb_weapon,
+                health=1.0,
+                fuel=1.0,
+            )
+            self.udp_handler.send_to(hb_packet, ctx.session.udp_addr)
+            print(f"[PROJ-HEARTBEAT] Sent post-fire heartbeat UPDATE_ARRAY (health=1.0)")
+
         if self.debug_projectiles and proj.debug_context:
             hp_shape = proj.debug_context.get("hardpoint_shape")
             hp_raw = proj.debug_context.get("hardpoint_raw")
@@ -3228,6 +3310,11 @@ class WulframServer:
         Process jump jet input from behavior slot 5.
         Called after decoding ACTION_DUMP or ACTION_UPDATE.
         """
+        # Suppress jump jets for the first 2 seconds after spawn to avoid
+        # interfering with the client's spawn state machine.
+        if hasattr(ctx.session, 'last_spawn_time') and (time.monotonic() - ctx.session.last_spawn_time) < 2.0:
+            return
+
         # Get slot 5 value (upward thrust / Q/Z key)
         slot5_value = ctx.weapon_system.behavior_slots[BehaviorSlot.UPWARD_THRUST]
 
@@ -3304,7 +3391,7 @@ class WulframServer:
 
     def _build_velocity_update_packet(self, ctx: ClientContext) -> bytes:
         """Build UPDATE_ARRAY packet with current velocity."""
-        from .packets import _compress_value
+        from .packets import _compress_value, _write_local_player_state
         from .codec import BitWriter
 
         tick = self._get_network_tick(ctx)
@@ -3312,8 +3399,20 @@ class WulframServer:
 
         bw = BitWriter()
 
-        # CRITICAL: Must have local stats flag first!
-        bw.write_bits(1, 0)  # No local stats
+        # CRITICAL: Always include local_state with health=1.0.
+        # The client calls sync_local_player after processing EVERY
+        # UPDATE_ARRAY.  It reads health from a static buffer filled
+        # by read_local_player_state.  If we send flag=0 (no stats),
+        # the buffer retains stale/zero data, and sync_local_player
+        # zeroes entity health → triggers permanent DeathScreen.
+        _write_local_player_state(
+            bw,
+            include=True,
+            weapon_id=0,
+            health=1.0,
+            fuel=1.0,
+            include_ammo_turrets=False,
+        )
 
         # Header: 1 entity
         bw.write_bits(8, 1)
@@ -3441,8 +3540,12 @@ class WulframServer:
                     print(f"[TICK-DEBUG] Client {ctx.client_id}: network_tick={tick} client_tick={ctx.last_client_tick} offset={ctx.tick_offset}")
                 health_val = self._get_health_value()
                 fuel_val = 1.0
-                # Full position updates (server authoritative)
-                send_full_update = True
+                # Full position updates (server authoritative).
+                # Default OFF: wulf-forge does NOT send the local player's position
+                # in UPDATE_ARRAY. Sending position overrides the client's own physics
+                # and causes underground clipping + red health overlay on hilly terrain
+                # (server ground_level is flat, terrain is not).
+                send_full_update = os.environ.get("WULFRAM_SEND_FULL_UPDATES", "0") == "1"
                 # Default to current position for tracking even if we skip UPDATE_ARRAY.
                 send_pos = self._to_client_pos(ctx.player_pos)
                 payload: Optional[bytes] = None
@@ -3734,15 +3837,18 @@ class WulframServer:
                     if self.update_local_state_mode == "wf":
                         ammo_bits = 0
                         ammo_mask = 0
-                        pt_bits = 0
-                        st_bits = 0
-                        weapon_type = 0
+                        if not self.wf_local_state_turrets:
+                            pt_bits = 0
+                            st_bits = 0
+                        # Keep weapon_type from _get_local_state_weapon_type (default 2=AssaultPlatform).
+                        # Previously hardcoded to 0 (Tank) which caused 16-bit turret desync.
                     include_local_state = self._should_send_local_state(
                         ctx,
                         pt_bits,
                         st_bits,
                         self.update_local_state_mode,
                     )
+                    use_view = self.heartbeat_view_update
                     payload = build_update_array_heartbeat(
                         tick,
                         ctx.session.entity_id,
@@ -3758,11 +3864,13 @@ class WulframServer:
                         secondary_turret_angle=st_angle,
                         turret_max=self.local_state_turret_max,
                         turret_range=self.local_state_turret_range,
+                        is_view_update=use_view,
                     )
+                    pkt_label = "VIEW_UPDATE_BEAT" if use_view else "UPDATE_ARRAY_BEAT"
                     if include_local_state:
                         self._log_vitals(
                             ctx,
-                        "UPDATE_ARRAY_BEAT",
+                        pkt_label,
                         include_vitals=True,
                         health=health_val,
                         energy=fuel_val,
@@ -3772,7 +3880,7 @@ class WulframServer:
                     elif self.debug_vitals and ctx.session.tick % 300 == 0:
                         self._log_vitals(
                             ctx,
-                        "UPDATE_ARRAY_BEAT",
+                        pkt_label,
                         include_vitals=False,
                         health=health_val,
                         energy=fuel_val,
@@ -3871,7 +3979,7 @@ class WulframServer:
                     aim_recent = (time.monotonic() - ctx.player_aim_time) < self.viewpoint_timeout
                     if not aim_recent:
                         print(f"[VIEWPOINT-INPUT] yaw={yaw_deg:.1f}")
-                    pkt_type = "FULL" if send_full_update else "BEAT"
+                    pkt_type = "FULL" if send_full_update else ("VIEW_BEAT" if self.heartbeat_view_update else "BEAT")
                     udp_addr = ctx.session.udp_addr if ctx.session.udp_addr else "NO_ADDR"
                     # Verify health encoding in payload
                     if payload and len(payload) > 7:

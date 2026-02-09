@@ -658,17 +658,25 @@ def build_update_array_heartbeat(tick: int, entity_id: int, include_health: bool
                                  secondary_turret_bits: int = 0,
                                  secondary_turret_angle: float = 0.0,
                                  turret_max: float = 6.3,
-                                 turret_range: float = 12.6) -> bytes:
-    """Build UPDATE_ARRAY with entity heartbeat and optional health data.
+                                 turret_range: float = 12.6,
+                                 is_view_update: bool = False) -> bytes:
+    """Build UPDATE_ARRAY/VIEW_UPDATE with entity heartbeat and optional health data.
 
     When include_health=True, sends local player state with full health/energy.
+    When is_view_update=True, uses 0x0F (VIEW_UPDATE) format with timestamp+tick
+    header, matching wulf-forge's primary health delivery mechanism.
 
     - Entity: net_id(32) + is_manned(1) + mask(10) + bank_selector(16)
-
-    NO ammo, NO turret angles - those were causing crashes!
     """
-    # Tick is read as byte-aligned u32 by client, NOT from bitstream
-    tick_bytes = struct.pack(">I", tick)
+    if is_view_update:
+        # VIEW_UPDATE (0x0F): timestamp(4) + tick(4) + bitstream
+        # wulf-forge uses this format for health updates in its main loop
+        timestamp = get_ticks()
+        header = b'\x0F' + struct.pack(">I", timestamp) + struct.pack(">I", tick)
+    else:
+        # UPDATE_ARRAY (0x0E): tick(4) + bitstream
+        header = b'\x0E' + struct.pack(">I", tick)
+
     bw = BitWriter()
 
     _write_local_player_state(
@@ -688,13 +696,20 @@ def build_update_array_heartbeat(tick: int, entity_id: int, include_health: bool
         include_ammo_turrets=include_health,
     )
 
-    # Include 1 entity (the player) - client may ignore health when entity_count=0
-    bw.write_bits(8, 1)           # 1 entity
-    bw.write_bits(32, entity_id)  # OID
-    bw.write_bits(1, 1)           # is_manned = True (local player)
-    bw.write_bits(10, 0)          # Update mask = 0 (no updates, just heartbeat)
-    bw.write_bits(16, 0)          # Bank selector = 0
-    return b'\x0E' + tick_bytes + bw.get_bytes()
+    # entity_count = 1 with the local player entity (mask=0, no data fields).
+    # This is critical because entity_count > 0 causes
+    # Network_record_update_stats(packet_tick) to be called, whose return
+    # value flows to sync_local_player's EAX (tick guard parameter).
+    # With entity_count=0, EAX = return of Network_update_latency_stats()
+    # (a small value), which fails the tick guard when g_last_input_apply_tick
+    # was set by client input processing to the current game tick (~27000+).
+    # With entity_count=1, EAX = packet tick → guard passes.
+    bw.write_bits(8, 1)              # 1 entity
+    bw.write_bits(32, entity_id)     # net_id (OID)
+    bw.write_bits(1, 1)              # is_manned = True
+    bw.write_bits(10, 0)             # mask = 0 (no data fields)
+    bw.write_bits(16, 0)             # bank_selector = 0
+    return header + bw.get_bytes()
 
 
 def _compress_value(val: float, max_val: float, range_val: float, total_bits: int = 16) -> int:
@@ -1148,7 +1163,8 @@ def build_update_array_create_tank(tick: int, entity_id: int, entity_type: int, 
                                     include_entity_vitals: bool = False,
                                     health: float = 1.0,
                                     fuel: float = 1.0,
-                                    is_manned: bool = True) -> bytes:
+                                    is_manned: bool = True,
+                                    weapon_id: int = 2) -> bytes:
     """
     Build UPDATE_ARRAY that creates a tank entity with position inline.
 
@@ -1168,7 +1184,7 @@ def build_update_array_create_tank(tick: int, entity_id: int, entity_type: int, 
     bw = BitWriter()
 
     # Header (bitstream starts here)
-    _write_local_player_state(bw, include_health, include_ammo_turrets=False)
+    _write_local_player_state(bw, include_health, weapon_id=weapon_id, health=health, fuel=fuel, include_ammo_turrets=False)
     bw.write_bits(8, 1)            # 1 entity
 
     # Entity header (matches wulf-forge update_array.py EntitySerializer.serialize)
