@@ -54,8 +54,10 @@ class WulframServer:
     The UDP handler is shared across all clients.
     """
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 2627):
-        self.host = host
+    def __init__(self, host: str = None, port: int = 2627):
+        self.host = host or os.environ.get("WULFRAM_BIND_ADDR", "0.0.0.0")
+        # Address to advertise to clients for UDP (e.g. when binding 0.0.0.0)
+        self.public_addr = os.environ.get("WULFRAM_PUBLIC_ADDR", self.host)
         self.port = port
         self.logger = PacketLogger()
         self.udp_handler: Optional[UDPHandler] = None
@@ -1010,6 +1012,7 @@ class WulframServer:
 
         # Start control server for packet injection
         self.control_server.server = self
+        self.control_server.udp_handler = self.udp_handler
         self.control_server.start()
 
         print(f"[SERVER] Listening on {self.host}:{self.port} (multi-client enabled)")
@@ -2186,6 +2189,10 @@ class WulframServer:
         with self.clients_lock:
             self.clients[ctx.client_id] = ctx
 
+        # Wire control server to this client's handlers
+        self.control_server.tcp_handler = ctx.tcp_handler
+        self.control_server.session = ctx.session
+
         print(f"[SERVER] Client {ctx.client_id} assigned entity_id={ctx.entity_id}")
 
         try:
@@ -2226,8 +2233,13 @@ class WulframServer:
         """Perform initial handshake."""
         time.sleep(0.5)  # Let client initialize
 
-        # Send UDP config
-        ctx.tcp_handler.send(build_hello_udp_config(self.host, self.port))
+        # Send UDP config - use public_addr, or resolve from client's TCP connection
+        udp_addr = self.public_addr
+        if udp_addr == "0.0.0.0":
+            # Use the local address the client actually connected to
+            udp_addr = ctx.tcp_handler.sock.getsockname()[0]
+        print(f"[HANDSHAKE] Client {ctx.client_id} UDP config: {udp_addr}:{self.port}")
+        ctx.tcp_handler.send(build_hello_udp_config(udp_addr, self.port))
 
         # Wait for UDP verification
         timeout = time.monotonic() + 5.0

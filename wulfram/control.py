@@ -11,6 +11,7 @@ Commands:
   packets                - List available packet types
   phase <name>           - Force session phase transition
   flag <name> <0|1>      - Set feature flag
+  turn [param] [value]   - Show/set turning parameters live
   help                   - Show commands
   quit                   - Disconnect
 """
@@ -194,6 +195,10 @@ class ControlServer:
             return self._cmd_send_health(args)
         elif cmd == 'spawn_points':
             return self._cmd_spawn_points(args)
+        elif cmd == 'turn':
+            return self._cmd_turn(args)
+        elif cmd == 'behavior' or cmd == 'beh':
+            return self._cmd_behavior(args)
         elif cmd == 'quit' or cmd == 'exit':
             return "Goodbye!"
         else:
@@ -215,6 +220,7 @@ class ControlServer:
   shell [x y z] [yaw] [pitch] [speed] [duration] - Spawn shell with full control + updates
   spread [count] [x y z] [speed] - Fire spread of shells in 360° pattern
   reset_pos / rp - Reset player position to spawn
+  turn [param] [value]   - Show/set turning params (sign, damping, friction, deadzone, adjust)
   help                   - Show this help
   quit                   - Disconnect
 
@@ -337,6 +343,150 @@ Examples:
 
         setattr(FEATURES, name, value)
         return f"Set {name} = {value}"
+
+    def _cmd_turn(self, args: list) -> str:
+        """
+        Show or set turning parameters at runtime.
+        Usage:
+          turn                     - Show all turning params
+          turn <param> <value>     - Set a turning param
+          turn sign -1             - Set turn_sign to -1
+          turn damping 2.0         - Set turn_damping to 2.0
+          turn friction 0.5        - Set turn_friction to 0.5
+          turn deadzone 0.1        - Set turn_deadzone to 0.1
+          turn adjust 4.5          - Set turn_adjust to 4.5
+        """
+        if not self.server:
+            return "Error: No server reference"
+
+        if not args:
+            # Show all turning params
+            import math
+            lines = [
+                "Turning parameters:",
+                f"  sign     = {self.server.turn_sign}",
+                f"  damping  = {self.server.turn_damping}  (max angular vel rad/s = {math.degrees(self.server.turn_damping):.1f} deg/s)",
+                f"  friction = {self.server.turn_friction}  (lerp rate toward target)",
+                f"  deadzone = {self.server.turn_deadzone}",
+                f"  adjust   = {self.server.turn_adjust}  (input multiplier)",
+                "",
+                "Usage: turn <param> <value>",
+                "Params: sign, damping, friction, deadzone, adjust",
+            ]
+            return '\n'.join(lines)
+
+        if len(args) < 2:
+            return "Usage: turn <param> <value> (params: sign, damping, friction, deadzone, adjust)"
+
+        param = args[0].lower()
+        try:
+            value = float(args[1])
+        except ValueError:
+            return f"Invalid value: {args[1]}"
+
+        param_map = {
+            'sign': 'turn_sign',
+            'damping': 'turn_damping',
+            'friction': 'turn_friction',
+            'deadzone': 'turn_deadzone',
+            'adjust': 'turn_adjust',
+        }
+
+        attr = param_map.get(param)
+        if not attr:
+            return f"Unknown turn param: {param}. Valid: {', '.join(param_map.keys())}"
+
+        old_value = getattr(self.server, attr)
+        setattr(self.server, attr, value)
+        print(f"[CONTROL] turn {param}: {old_value} -> {value}")
+        return f"Set {param} = {value} (was {old_value})"
+
+    def _cmd_behavior(self, args: list) -> str:
+        """
+        Show or modify BEHAVIOR packet parameters and re-send to client.
+        Usage:
+          behavior                          - Show current BEHAVIOR params
+          behavior <param> <value>          - Set param and re-send packet
+          behavior send                     - Re-send packet with current values
+          behavior turn_rate 0.15           - Set Section 4 turn_rate
+          behavior turn_adjust 6.0          - Set Section 6 turn_adjust
+          behavior ground_friction 0.5      - Set Section 4 ground_friction
+          behavior mass 15000               - Set Section 4 mass
+          behavior gravity 150.0            - Set Section 1 gravity_force
+          behavior speed 30.0               - Set Section 4 speed
+          behavior move_adjust 100.0        - Set Section 6 move_adjust
+          behavior max_velocity 100.0       - Set Section 6 max_velocity
+        """
+        if not self.tcp_handler:
+            return "Error: No game client connected"
+
+        from . import packets as pkt
+
+        # Current values from module globals
+        param_map = {
+            'turn_rate': ('BEHAVIOR_TURN_RATE', 'Section 4: vehicle turn rate (rad/s)'),
+            'ground_friction': ('BEHAVIOR_GROUND_FRICTION', 'Section 4: ground friction'),
+            'suspension_dampening': ('BEHAVIOR_SUSPENSION_DAMPENING', 'Section 4: suspension dampening'),
+            'max_altitude': ('BEHAVIOR_MAX_ALTITUDE', 'Section 6: max altitude'),
+            'gravity_pct': ('BEHAVIOR_GRAVITY_PCT', 'Section 6: gravity percent'),
+        }
+
+        if not args:
+            lines = [
+                "BEHAVIOR packet parameters:",
+                f"  -- Section 1 (Header) --",
+                f"  gravity_force    = 100.0  (hardcoded)",
+                f"  -- Section 4 (Vehicle Physics, x2 vehicles) --",
+                f"  speed            = 20.0  (hardcoded)",
+                f"  accel            = 4.0  (hardcoded)",
+                f"  engine_torque    = 700  (hardcoded)",
+                f"  suspension_stiff = 550  (hardcoded)",
+                f"  ground_friction  = {pkt.BEHAVIOR_GROUND_FRICTION}",
+                f"  turn_rate        = {pkt.BEHAVIOR_TURN_RATE}",
+                f"  susp_dampening   = {pkt.BEHAVIOR_SUSPENSION_DAMPENING}",
+                f"  mass             = 33000  (hardcoded)",
+                f"  -- Section 6 (Active Vehicle, Tank) --",
+                f"  turn_adjust      = 4.5  (hardcoded)",
+                f"  move_adjust      = 85.0  (hardcoded)",
+                f"  strafe_adjust    = 69.7  (hardcoded)",
+                f"  max_velocity     = 80.0  (hardcoded)",
+                f"  max_altitude     = {pkt.BEHAVIOR_MAX_ALTITUDE}",
+                f"  gravity_pct      = {pkt.BEHAVIOR_GRAVITY_PCT}",
+                "",
+                "Usage: behavior <param> <value>  (re-sends packet)",
+                "       behavior send              (re-send with current values)",
+                "Params: turn_rate, ground_friction, suspension_dampening, max_altitude, gravity_pct",
+            ]
+            return '\n'.join(lines)
+
+        if args[0].lower() == 'send':
+            # Just re-send with current values
+            data = pkt.build_behavior_packet()
+            self.tcp_handler.send(data)
+            return f"Re-sent BEHAVIOR packet ({len(data)} bytes)"
+
+        if len(args) < 2:
+            return "Usage: behavior <param> <value> or behavior send"
+
+        param = args[0].lower()
+        try:
+            value = float(args[1])
+        except ValueError:
+            return f"Invalid value: {args[1]}"
+
+        if param not in param_map:
+            return f"Unknown param: {param}. Valid: {', '.join(param_map.keys())}"
+
+        global_name, desc = param_map[param]
+        old_value = getattr(pkt, global_name)
+        setattr(pkt, global_name, value)
+
+        # Rebuild and send
+        data = pkt.build_behavior_packet()
+        self.tcp_handler.send(data)
+
+        print(f"[CONTROL] behavior {param}: {old_value} -> {value}, re-sent ({len(data)} bytes)")
+        return f"Set {param} = {value} (was {old_value}), re-sent BEHAVIOR ({len(data)} bytes)\n{desc}"
 
     def _cmd_spawn_full(self, args: list) -> str:
         """
