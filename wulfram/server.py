@@ -394,10 +394,11 @@ class WulframServer:
         if self.world_bound < 256.0:
             self.world_bound = 256.0
         try:
-            # Wulf-forge update loop runs at ~10 Hz; default to 10 for stability.
-            self.tick_rate_hz = float(os.environ.get("WULFRAM_TICK_RATE_HZ", "10.0"))
+            # Higher tick rate improves heading integration accuracy.
+            # 30 Hz reduces heading drift from ~14 deg to ~5 deg over 2s turns.
+            self.tick_rate_hz = float(os.environ.get("WULFRAM_TICK_RATE_HZ", "30.0"))
         except ValueError:
-            self.tick_rate_hz = 10.0
+            self.tick_rate_hz = 30.0
         # Keep steady full-rate updates by default; sparse/on-change updates have
         # shown intermittent HUD red-overlay regressions during active gameplay.
         self.update_on_change = os.environ.get("WULFRAM_UPDATE_ON_CHANGE", "0") == "1"
