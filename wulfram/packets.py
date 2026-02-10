@@ -697,26 +697,27 @@ def build_update_array_heartbeat(tick: int, entity_id: int, include_health: bool
         include_ammo_turrets=include_health,
     )
 
-    # entity_count = 1 with the local player entity (mask=0, no data fields).
-    # This is critical because entity_count > 0 causes
+    # entity_count = 1 is critical: entity_count > 0 causes
     # Network_record_update_stats(packet_tick) to be called, whose return
     # value flows to sync_local_player's EAX (tick guard parameter).
     # With entity_count=0, EAX = return of Network_update_latency_stats()
     # (a small value), which fails the tick guard when g_last_input_apply_tick
     # was set by client input processing to the current game tick (~27000+).
     # With entity_count=1, EAX = packet tick → guard passes.
+    #
+    # IMPORTANT: Use a dummy entity_id (not the player's) so OIDTable_lookup
+    # returns NULL and entity processing goes to g_null_entity_stub.
+    # This avoids two problems with using the real entity_id:
+    #   - mask=0 (no rotation): Replication.c:1163 zeros entity rotation/velocity
+    #   - mask with rotation: overrides client rotation to server heading (diverges)
+    # With a dummy ID, the null stub absorbs all writes harmlessly while the
+    # tick guard still passes (entity_count > 0).
+    DUMMY_ENTITY_ID = 0xFFFFFFFE
     bw.write_bits(8, 1)              # 1 entity
-    bw.write_bits(32, entity_id)     # net_id (OID)
+    bw.write_bits(32, DUMMY_ENTITY_ID)  # dummy net_id (not in OIDTable)
     bw.write_bits(1, 1)              # is_manned = True
-    mask = 0
-    if rot is not None:
-        mask |= (1 << 3)             # bit 3 = ROT
-    bw.write_bits(10, mask)
+    bw.write_bits(10, 0)             # mask=0, no data fields
     bw.write_bits(16, 0)             # bank_selector = 0
-    if rot is not None:
-        bw.write_bits(4, 15)         # rotation header (max precision)
-        for v in rot:
-            bw.write_bits(16, _compress_value(v, VEC_ROT_MAX, VEC_ROT_RANGE, total_bits=16))
     return header + bw.get_bytes()
 
 

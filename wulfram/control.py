@@ -173,7 +173,7 @@ class ControlServer:
             return self._cmd_spawn_full(args)
         elif cmd == 'spawn_udp' or cmd == 'spawn_wf':
             return self._cmd_spawn_udp(args)
-        elif cmd == 'projectile' or cmd == 'fire':
+        elif cmd == 'projectile':
             return self._cmd_projectile(args)
         elif cmd == 'pulse' or cmd == 'fire_pulse':
             return self._cmd_fire_pulse(args)
@@ -199,6 +199,10 @@ class ControlServer:
             return self._cmd_turn(args)
         elif cmd == 'barrel':
             return self._cmd_barrel(args)
+        elif cmd == 'heading' or cmd == 'hdg':
+            return self._cmd_heading(args)
+        elif cmd == 'fire':
+            return self._cmd_fire(args)
         elif cmd == 'behavior' or cmd == 'beh':
             return self._cmd_behavior(args)
         elif cmd == 'quit' or cmd == 'exit':
@@ -224,6 +228,8 @@ class ControlServer:
   reset_pos / rp - Reset player position to spawn
   turn [param] [value]   - Show/set turning params (sign, damping, friction, deadzone, adjust)
   barrel [param] [value] - Show/set barrel offsets (forward, right, up)
+  heading [param] [value]- Show/set heading & aim params (offset, aim_offset, source, reset)
+  fire [count|at <deg>]  - Force-fire projectile at current/specified heading
   help                   - Show this help
   quit                   - Disconnect
 
@@ -487,6 +493,185 @@ Examples:
             old_value = value
         print(f"[CONTROL] barrel {param}: {old_value} -> {value} ({updated} clients)")
         return f"Set {param} = {value} (was {old_value}, updated {updated} clients)"
+
+    def _cmd_heading(self, args: list) -> str:
+        """
+        Show or set heading/aim parameters for projectile alignment.
+        Usage:
+          heading                          - Show all heading params + live comparison
+          heading offset <deg>             - Set heading_offset_deg on all weapon systems
+          heading aim_offset <deg>         - Set aim_yaw_offset_deg on all weapon systems
+          heading source <body|viewpoint|auto> - Set projectile_aim_source
+          heading reset                    - Reset server heading to 0 for all clients
+        """
+        import math
+
+        if not self.server:
+            return "Error: No server reference"
+
+        # Get first weapon system for display
+        ws = None
+        ctx_ref = None
+        with self.server.clients_lock:
+            for ctx in self.server.clients.values():
+                if hasattr(ctx, 'weapon_system'):
+                    ws = ctx.weapon_system
+                    ctx_ref = ctx
+                    break
+
+        if not args:
+            lines = ["Heading/aim parameters:"]
+            lines.append(f"  aim_source       = {self.server.projectile_aim_source}")
+            if ws:
+                lines.append(f"  heading_offset   = {math.degrees(ws.heading_offset):.1f}deg")
+                lines.append(f"  aim_yaw_offset   = {math.degrees(ws.aim_yaw_offset):.1f}deg")
+            else:
+                lines.append(f"  heading_offset   = (no client)")
+                lines.append(f"  aim_yaw_offset   = (no client)")
+            if ctx_ref:
+                srv_hdg = math.degrees(ctx_ref.player_heading)
+                vp_yaw = math.degrees(ctx_ref.player_aim_yaw)
+                vp_age = time.monotonic() - ctx_ref.player_aim_time
+                delta = vp_yaw - srv_hdg
+                while delta > 180.0:
+                    delta -= 360.0
+                while delta < -180.0:
+                    delta += 360.0
+                lines.append(f"")
+                lines.append(f"  Live comparison:")
+                lines.append(f"    server_heading = {srv_hdg:.1f}deg")
+                lines.append(f"    viewpoint_yaw  = {vp_yaw:.1f}deg (age={vp_age:.1f}s)")
+                lines.append(f"    delta          = {delta:.1f}deg")
+                lines.append(f"    vp_source      = {ctx_ref.player_aim_source}")
+                lines.append(f"    vp_count       = {ctx_ref.viewpoint_count}")
+            lines.append("")
+            lines.append("Usage: heading <param> <value>")
+            lines.append("Params: offset, aim_offset, source, reset")
+            return '\n'.join(lines)
+
+        param = args[0].lower()
+
+        if param == 'reset':
+            count = 0
+            with self.server.clients_lock:
+                for ctx in self.server.clients.values():
+                    ctx.player_heading = 0.0
+                    ctx.player_yaw = 0.0
+                    ctx.player_pose["yaw"] = 0.0
+                    count += 1
+            return f"Reset heading to 0 for {count} client(s)"
+
+        if param == 'source':
+            if len(args) < 2:
+                return f"Current source: {self.server.projectile_aim_source}. Usage: heading source <body|viewpoint|auto>"
+            new_src = args[1].lower()
+            if new_src not in ('body', 'viewpoint', 'auto'):
+                return f"Invalid source: {new_src}. Valid: body, viewpoint, auto"
+            old = self.server.projectile_aim_source
+            self.server.projectile_aim_source = new_src
+            print(f"[CONTROL] heading source: {old} -> {new_src}")
+            return f"Set aim source = {new_src} (was {old})"
+
+        if len(args) < 2:
+            return "Usage: heading <param> <value>"
+
+        try:
+            value = float(args[1])
+        except ValueError:
+            return f"Invalid value: {args[1]}"
+
+        if param == 'offset':
+            updated = 0
+            old_val = None
+            with self.server.clients_lock:
+                for ctx in self.server.clients.values():
+                    if hasattr(ctx, 'weapon_system'):
+                        if old_val is None:
+                            old_val = math.degrees(ctx.weapon_system.heading_offset)
+                        ctx.weapon_system.heading_offset = math.radians(value)
+                        updated += 1
+            print(f"[CONTROL] heading offset: {old_val} -> {value} ({updated} clients)")
+            return f"Set heading_offset = {value}deg (was {old_val}deg, {updated} clients)"
+
+        if param == 'aim_offset':
+            updated = 0
+            old_val = None
+            with self.server.clients_lock:
+                for ctx in self.server.clients.values():
+                    if hasattr(ctx, 'weapon_system'):
+                        if old_val is None:
+                            old_val = math.degrees(ctx.weapon_system.aim_yaw_offset)
+                        ctx.weapon_system.aim_yaw_offset = math.radians(value)
+                        updated += 1
+            print(f"[CONTROL] heading aim_offset: {old_val} -> {value} ({updated} clients)")
+            return f"Set aim_yaw_offset = {value}deg (was {old_val}deg, {updated} clients)"
+
+        return f"Unknown heading param: {param}. Valid: offset, aim_offset, source, reset"
+
+    def _cmd_fire(self, args: list) -> str:
+        """
+        Force-fire a projectile from the server side using current heading.
+        Usage:
+          fire                     - Fire once using current heading
+          fire <count>             - Fire count times with 100ms delay
+          fire at <yaw_deg>        - Fire at specific heading (degrees)
+        """
+        import math
+
+        if not self.server:
+            return "Error: No server reference"
+
+        # Find first connected client
+        ctx = None
+        addr = None
+        with self.server.clients_lock:
+            for c in self.server.clients.values():
+                if hasattr(c, 'weapon_system') and c.session and c.session.udp_addr:
+                    ctx = c
+                    addr = c.session.udp_addr
+                    break
+
+        if not ctx:
+            return "Error: No connected client with weapon system"
+
+        count = 1
+        override_yaw = None
+
+        if args:
+            if args[0] == 'at' and len(args) >= 2:
+                try:
+                    override_yaw = math.radians(float(args[1]))
+                except ValueError:
+                    return f"Invalid yaw: {args[1]}"
+            else:
+                try:
+                    count = int(args[0])
+                except ValueError:
+                    return f"Invalid count: {args[0]}"
+
+        results = []
+        for i in range(count):
+            # Set weapon system pose from current heading (or override)
+            yaw = override_yaw if override_yaw is not None else ctx.player_heading
+            ctx.weapon_system.player_pos = ctx.player_pos
+            ctx.weapon_system.player_rot = (0.0, 0.0, yaw)
+            ctx.weapon_system.current_weapon = 4  # PULSE_CANNON
+
+            proj = ctx.weapon_system._fire_pulse_cannon()
+            if proj:
+                self.server._spawn_moving_projectile(ctx, proj, addr)
+                ctx.weapon_system.projectiles.append(proj)
+                hdg = math.degrees(yaw)
+                results.append(f"Shot {i+1}: heading={hdg:.1f}deg proj_id={proj.entity_id}")
+                print(f"[CONTROL-FIRE] heading={hdg:.1f} pos={ctx.player_pos}")
+            else:
+                results.append(f"Shot {i+1}: FAILED (cooldown?)")
+
+            if i < count - 1:
+                import time
+                time.sleep(0.1)
+
+        return '\n'.join(results)
 
     def _cmd_behavior(self, args: list) -> str:
         """

@@ -604,9 +604,9 @@ class WulframServer:
         except ValueError:
             self.aim_pitch_adjust = 2.5
         try:
-            self.turn_adjust = float(os.environ.get("WULFRAM_TURN_ADJUST", "4.5"))
+            self.turn_adjust = float(os.environ.get("WULFRAM_TURN_ADJUST", "3.0"))
         except ValueError:
-            self.turn_adjust = 4.5
+            self.turn_adjust = 3.0
         try:
             self.turn_deadzone = float(os.environ.get("WULFRAM_TURN_DEADZONE", "0.05"))
         except ValueError:
@@ -2533,9 +2533,21 @@ class WulframServer:
 
                 # Log ALL viewpoint packets for debugging
                 old_yaw_deg = math.degrees(old_yaw)
+                # Compare server-tracked heading vs client viewpoint
+                heading_deg = math.degrees(ctx.player_heading)
+                delta_deg = yaw_deg - heading_deg
+                # Normalize to -180..180
+                while delta_deg > 180.0:
+                    delta_deg -= 360.0
+                while delta_deg < -180.0:
+                    delta_deg += 360.0
                 print(
                     f"[VIEWPOINT #{ctx.viewpoint_count}] pitch={pitch_deg:.1f} "
                     f"yaw={yaw_deg:.1f} (was {old_yaw_deg:.1f})"
+                )
+                print(
+                    f"[HEADING-COMPARE] server={heading_deg:.1f} client={yaw_deg:.1f} "
+                    f"delta={delta_deg:.1f}deg"
                 )
                 return
             except (IndexError, ValueError, struct.error) as e:
@@ -2638,7 +2650,14 @@ class WulframServer:
                 if new_projectiles:
                     yaw_deg = math.degrees(ctx.player_yaw)
                     turn_val = ctx.weapon_system.behavior_slots[BehaviorSlot.TURNING]
-                    print(f"[WEAPON-FIRE] Firing {len(new_projectiles)} proj at yaw={yaw_deg:.1f} heading={math.degrees(ctx.player_heading):.1f} turn_slot={turn_val:.3f} pos={ctx.player_pos}")
+                    aim_pitch, aim_yaw, aim_src = self._get_aim_rotation(ctx)
+                    vp_yaw = math.degrees(ctx.player_aim_yaw)
+                    print(
+                        f"[WEAPON-FIRE] Firing {len(new_projectiles)} proj "
+                        f"heading={math.degrees(ctx.player_heading):.1f} "
+                        f"aim_yaw={math.degrees(aim_yaw):.1f} vp_yaw={vp_yaw:.1f} "
+                        f"src={aim_src} turn_slot={turn_val:.3f} pos={ctx.player_pos}"
+                    )
                 for proj in new_projectiles:
                     self._spawn_moving_projectile(ctx, proj, addr)
 
@@ -2704,9 +2723,15 @@ class WulframServer:
             if self.projectiles_enabled:
                 new_projectiles = ctx.weapon_system.update()
                 if new_projectiles:
-                    yaw_deg = math.degrees(ctx.player_yaw)
                     turn_val = ctx.weapon_system.behavior_slots[BehaviorSlot.TURNING]
-                    print(f"[WEAPON-FIRE] Firing {len(new_projectiles)} proj at yaw={yaw_deg:.1f} heading={math.degrees(ctx.player_heading):.1f} turn_slot={turn_val:.3f} pos={ctx.player_pos}")
+                    vp_yaw = math.degrees(ctx.player_aim_yaw)
+                    print(
+                        f"[WEAPON-FIRE] Firing {len(new_projectiles)} proj "
+                        f"heading={math.degrees(ctx.player_heading):.1f} "
+                        f"aim_yaw={math.degrees(aim_yaw):.1f} vp_yaw={vp_yaw:.1f} "
+                        f"src={aim_override if aim_override != 'auto' else aim_src} "
+                        f"turn_slot={turn_val:.3f} pos={ctx.player_pos}"
+                    )
                 for proj in new_projectiles:
                     self._spawn_moving_projectile(ctx, proj, addr)
 
