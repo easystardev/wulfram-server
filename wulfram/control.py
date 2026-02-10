@@ -197,6 +197,8 @@ class ControlServer:
             return self._cmd_spawn_points(args)
         elif cmd == 'turn':
             return self._cmd_turn(args)
+        elif cmd == 'barrel':
+            return self._cmd_barrel(args)
         elif cmd == 'behavior' or cmd == 'beh':
             return self._cmd_behavior(args)
         elif cmd == 'quit' or cmd == 'exit':
@@ -221,6 +223,7 @@ class ControlServer:
   spread [count] [x y z] [speed] - Fire spread of shells in 360° pattern
   reset_pos / rp - Reset player position to spawn
   turn [param] [value]   - Show/set turning params (sign, damping, friction, deadzone, adjust)
+  barrel [param] [value] - Show/set barrel offsets (forward, right, up)
   help                   - Show this help
   quit                   - Disconnect
 
@@ -351,10 +354,9 @@ Examples:
           turn                     - Show all turning params
           turn <param> <value>     - Set a turning param
           turn sign -1             - Set turn_sign to -1
-          turn damping 2.0         - Set turn_damping to 2.0
-          turn friction 0.5        - Set turn_friction to 0.5
           turn deadzone 0.1        - Set turn_deadzone to 0.1
-          turn adjust 4.5          - Set turn_adjust to 4.5
+          turn adjust 4.5          - Set turn_adjust (BEHAVIOR Sec 6 multiplier)
+          turn curve 0,0.005,...   - Set piecewise steering curve samples (comma-sep)
         """
         if not self.server:
             return "Error: No server reference"
@@ -362,21 +364,97 @@ Examples:
         if not args:
             # Show all turning params
             import math
+            curve_str = ",".join(f"{s:.3f}" for s in self.server.turn_curve_samples)
             lines = [
-                "Turning parameters:",
+                "Turning parameters (client curve model):",
                 f"  sign     = {self.server.turn_sign}",
-                f"  damping  = {self.server.turn_damping}  (max angular vel rad/s = {math.degrees(self.server.turn_damping):.1f} deg/s)",
-                f"  friction = {self.server.turn_friction}  (lerp rate toward target)",
                 f"  deadzone = {self.server.turn_deadzone}",
-                f"  adjust   = {self.server.turn_adjust}  (input multiplier)",
+                f"  adjust   = {self.server.turn_adjust}  (BEHAVIOR Sec 6 turn multiplier)",
+                f"  curve    = [{curve_str}]  ({len(self.server.turn_curve_samples)} samples)",
                 "",
                 "Usage: turn <param> <value>",
-                "Params: sign, damping, friction, deadzone, adjust",
+                "Params: sign, deadzone, adjust, curve",
             ]
             return '\n'.join(lines)
 
         if len(args) < 2:
-            return "Usage: turn <param> <value> (params: sign, damping, friction, deadzone, adjust)"
+            return "Usage: turn <param> <value> (params: sign, deadzone, adjust, curve)"
+
+        param = args[0].lower()
+
+        if param == 'curve':
+            # Curve takes comma-separated floats
+            try:
+                samples = [float(s) for s in args[1].split(",")]
+            except ValueError:
+                return f"Invalid curve values: {args[1]}. Use comma-separated floats."
+            if len(samples) < 2:
+                return "Curve needs at least 2 samples."
+            old_str = ",".join(f"{s:.3f}" for s in self.server.turn_curve_samples)
+            self.server.turn_curve_samples = samples
+            new_str = ",".join(f"{s:.3f}" for s in samples)
+            print(f"[CONTROL] turn curve: [{old_str}] -> [{new_str}]")
+            return f"Set curve = [{new_str}] ({len(samples)} samples)"
+
+        try:
+            value = float(args[1])
+        except ValueError:
+            return f"Invalid value: {args[1]}"
+
+        param_map = {
+            'sign': 'turn_sign',
+            'deadzone': 'turn_deadzone',
+            'adjust': 'turn_adjust',
+        }
+
+        attr = param_map.get(param)
+        if not attr:
+            return f"Unknown turn param: {param}. Valid: {', '.join(list(param_map.keys()) + ['curve'])}"
+
+        old_value = getattr(self.server, attr)
+        setattr(self.server, attr, value)
+        print(f"[CONTROL] turn {param}: {old_value} -> {value}")
+        return f"Set {param} = {value} (was {old_value})"
+
+    def _cmd_barrel(self, args: list) -> str:
+        """
+        Show or set barrel/turret offset parameters for projectile spawning.
+        Usage:
+          barrel                   - Show all barrel params
+          barrel <param> <value>   - Set a barrel param
+          barrel forward 2.0       - Set forward offset (spawn_offset)
+          barrel right 0.5         - Set lateral (right) offset
+          barrel up 0.3            - Set vertical (up) offset
+        """
+        if not self.server:
+            return "Error: No server reference"
+
+        # Collect current values from first connected client's weapon system, or defaults
+        ws = None
+        with self.server.clients_lock:
+            for ctx in self.server.clients.values():
+                if hasattr(ctx, 'weapon_system'):
+                    ws = ctx.weapon_system
+                    break
+
+        cur_forward = ws.projectile_spawn_offset if ws else 2.0
+        cur_right = ws.projectile_barrel_right if ws else 0.0
+        cur_up = ws.projectile_barrel_up if ws else 0.2
+
+        if not args:
+            lines = [
+                "Barrel offset parameters:",
+                f"  forward = {cur_forward}  (spawn offset along aim direction)",
+                f"  right   = {cur_right}  (lateral offset, rotates with heading)",
+                f"  up      = {cur_up}  (vertical offset)",
+                "",
+                "Usage: barrel <param> <value>",
+                "Params: forward, right, up",
+            ]
+            return '\n'.join(lines)
+
+        if len(args) < 2:
+            return "Usage: barrel <param> <value> (params: forward, right, up)"
 
         param = args[0].lower()
         try:
@@ -385,21 +463,30 @@ Examples:
             return f"Invalid value: {args[1]}"
 
         param_map = {
-            'sign': 'turn_sign',
-            'damping': 'turn_damping',
-            'friction': 'turn_friction',
-            'deadzone': 'turn_deadzone',
-            'adjust': 'turn_adjust',
+            'forward': 'projectile_spawn_offset',
+            'right': 'projectile_barrel_right',
+            'up': 'projectile_barrel_up',
         }
 
         attr = param_map.get(param)
         if not attr:
-            return f"Unknown turn param: {param}. Valid: {', '.join(param_map.keys())}"
+            return f"Unknown barrel param: {param}. Valid: {', '.join(param_map.keys())}"
 
-        old_value = getattr(self.server, attr)
-        setattr(self.server, attr, value)
-        print(f"[CONTROL] turn {param}: {old_value} -> {value}")
-        return f"Set {param} = {value} (was {old_value})"
+        # Update all connected clients' weapon systems
+        updated = 0
+        old_value = None
+        with self.server.clients_lock:
+            for ctx in self.server.clients.values():
+                if hasattr(ctx, 'weapon_system'):
+                    if old_value is None:
+                        old_value = getattr(ctx.weapon_system, attr)
+                    setattr(ctx.weapon_system, attr, value)
+                    updated += 1
+
+        if old_value is None:
+            old_value = value
+        print(f"[CONTROL] barrel {param}: {old_value} -> {value} ({updated} clients)")
+        return f"Set {param} = {value} (was {old_value}, updated {updated} clients)"
 
     def _cmd_behavior(self, args: list) -> str:
         """

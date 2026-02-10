@@ -402,9 +402,9 @@ class WulframServer:
         # shown intermittent HUD red-overlay regressions during active gameplay.
         self.update_on_change = os.environ.get("WULFRAM_UPDATE_ON_CHANGE", "0") == "1"
         try:
-            self.update_heartbeat_interval = float(os.environ.get("WULFRAM_UPDATE_HEARTBEAT", "1.0"))
+            self.update_heartbeat_interval = float(os.environ.get("WULFRAM_UPDATE_HEARTBEAT", "3.0"))
         except ValueError:
-            self.update_heartbeat_interval = 1.0
+            self.update_heartbeat_interval = 3.0
         try:
             self.update_epsilon = float(os.environ.get("WULFRAM_UPDATE_EPSILON", "0.001"))
         except ValueError:
@@ -615,22 +615,21 @@ class WulframServer:
             self.turn_sign = float(os.environ.get("WULFRAM_TURN_SIGN", "-1.0"))
         except ValueError:
             self.turn_sign = -1.0
-        # Damped rotation physics: max angular velocity in rad/s.
-        # BEHAVIOR Section 4 has turn_rate=0.05 and mass=33000 for Tank.
-        # The client's actual turn rate depends on its full physics model.
-        # Default 1.5 rad/s (~86 deg/s) is a starting point for calibration.
-        # Use WULFRAM_TURN_DAMPING to tune empirically.
+        # Steering curve: piecewise-linear dead-zone curve from client
+        # (azurefishy-src Vehicles.c:1030 Piecewise_interpolate).
+        # 10 samples over domain 0.0-1.0, looked up with abs(input).
+        # Default samples match the client's default curve.
+        default_curve = "0.0,0.005,0.01,0.15,0.25,0.4,0.55,0.7,0.85,1.0"
+        curve_str = os.environ.get("WULFRAM_TURN_CURVE", default_curve)
         try:
-            self.turn_damping = float(os.environ.get("WULFRAM_TURN_DAMPING", "1.5"))
+            self.turn_curve_samples = [float(s) for s in curve_str.split(",")]
         except ValueError:
-            self.turn_damping = 1.5
-        try:
-            self.turn_friction = float(os.environ.get("WULFRAM_TURN_FRICTION", "0.8"))
-        except ValueError:
-            self.turn_friction = 0.8
-        # Send server rotation in heartbeat UPDATE_ARRAY to override client physics.
-        # Default OFF - enabling may freeze client movement (needs investigation).
-        self.heartbeat_include_rot = os.environ.get("WULFRAM_HEARTBEAT_ROT", "0") == "1"
+            self.turn_curve_samples = [float(s) for s in default_curve.split(",")]
+        if len(self.turn_curve_samples) < 2:
+            self.turn_curve_samples = [float(s) for s in default_curve.split(",")]
+        # Send server rotation in heartbeat UPDATE_ARRAY to prevent client angular velocity zeroing.
+        # Default ON - entity entries with mask=0 (no rotation) cause client to zero angular velocity.
+        self.heartbeat_include_rot = os.environ.get("WULFRAM_HEARTBEAT_ROT", "1") == "1"
         try:
             self.aim_hold_time = float(os.environ.get("WULFRAM_AIM_HOLD", "0.4"))
         except ValueError:
@@ -2895,19 +2894,38 @@ class WulframServer:
                     f"muzzle_push={muzzle_push}"
                 )
 
+    @staticmethod
+    def _piecewise_interpolate(samples: list, t: float) -> float:
+        """Piecewise-linear interpolation matching the client's steering curve.
+
+        ``samples`` contains N evenly-spaced output values over the domain
+        [0.0, 1.0].  ``t`` should be in [0, 1].  Returns the interpolated
+        output value (0.0-1.0).
+        """
+        n = len(samples)
+        if n < 2:
+            return t
+        t = max(0.0, min(1.0, t))
+        # Map t into the sample index space.
+        idx_f = t * (n - 1)
+        idx_lo = int(idx_f)
+        if idx_lo >= n - 1:
+            return samples[-1]
+        frac = idx_f - idx_lo
+        return samples[idx_lo] + (samples[idx_lo + 1] - samples[idx_lo]) * frac
+
     def _update_player_heading(self, ctx: ClientContext):
         """Track player movement heading from TURNING input (slot 1).
 
-        Uses turn_rate from BEHAVIOR Section 4 as the effective maximum
-        angular velocity (rad/s).  The angular velocity smoothly approaches
-        the target (input * turn_rate) at a rate controlled by turn_friction
-        to mimic the client's damped drivetrain physics.
+        Matches the client's steering formula from Vehicles.c:1030:
+          steer = turn_rate * curve_response * yaw_input
+        where curve_response = Piecewise_interpolate(abs(input)) is a
+        non-linear dead-zone curve, and turn_adjust (from BEHAVIOR Section 6,
+        default 4.5) scales the result.
         """
         import math
 
         def _normalize_axis(val: float) -> float:
-            # Inputs decoded from ACTION_* packets appear to already be in -1..1.
-            # Only scale down if we ever see large quantized values (e.g., +/-1000).
             if val > 1.5 or val < -1.5:
                 scale = getattr(ctx.weapon_system, "control_max", 1000.0) or 1000.0
                 return max(-1.0, min(1.0, val / scale))
@@ -2919,27 +2937,21 @@ class WulframServer:
         if abs(turn_input) < self.turn_deadzone:
             turn_input = 0.0
 
-        # Turn physics from BEHAVIOR packet:
-        #   turn_damping (turn_rate, Section 4) = max angular velocity in rad/s
-        #   turn_friction (ground_friction, Section 4) = lerp speed for ang vel
-        turn_max_rate = self.turn_damping   # 0.05 rad/s ≈ 2.86 deg/s
-        smooth_rate = self.turn_friction    # 0.8 (how fast ang vel reaches target)
-
         # Use actual time delta for turn integration (clamped).
         now = time.monotonic()
         dt = now - ctx.last_heading_update
         ctx.last_heading_update = now
-        dt = min(dt, 0.1)  # Clamp to avoid huge jumps
+        dt = min(dt, 0.5)  # Clamp to avoid huge jumps
 
-        # Target angular velocity from input (capped by turn_max_rate)
-        target_vel = self.turn_sign * turn_input * turn_max_rate
+        # Client steering model:
+        #   curve_response = Piecewise_interpolate(abs(input))
+        #   heading_delta  = turn_sign * sign(input) * curve_response * turn_adjust * dt
+        abs_input = abs(turn_input)
+        curve_response = self._piecewise_interpolate(self.turn_curve_samples, abs_input)
+        sign = 1.0 if turn_input >= 0.0 else -1.0
+        heading_delta = self.turn_sign * sign * curve_response * self.turn_adjust * dt
 
-        # Smoothly approach target angular velocity (exponential lerp)
-        lerp_factor = 1.0 - math.exp(-smooth_rate * dt * 30.0)
-        ctx.player_angular_vel += (target_vel - ctx.player_angular_vel) * lerp_factor
-
-        # Integrate heading from angular velocity
-        ctx.player_heading += ctx.player_angular_vel * dt
+        ctx.player_heading += heading_delta
 
         # Keep heading in -pi to pi range
         while ctx.player_heading > math.pi:
@@ -2953,7 +2965,7 @@ class WulframServer:
 
         # Yaw tracking log (~3/sec when turning)
         if hasattr(ctx.session, 'tick') and ctx.session.tick % 10 == 0 and abs(turn_input) > 0.01:
-            print(f"[YAW-TRACK] input={turn_input:.3f} target_vel={target_vel:.4f} ang_vel={ctx.player_angular_vel:.4f} heading={math.degrees(ctx.player_heading):.1f}deg")
+            print(f"[YAW-TRACK] input={turn_input:.3f} curve={curve_response:.3f} delta={math.degrees(heading_delta):.2f}deg/tick heading={math.degrees(ctx.player_heading):.1f}deg")
 
     def _update_player_aim(self, ctx: ClientContext):
         """Update aim yaw/pitch from viewpoint or slot inputs (if enabled)."""
@@ -3614,6 +3626,11 @@ class WulframServer:
                     heartbeat_due = self.update_heartbeat_interval > 0 and (now - ctx.last_update_send) >= self.update_heartbeat_interval
                     if not (pos_changed or vel_changed or yaw_changed or heartbeat_due):
                         send_update = False
+                else:
+                    # Throttle heartbeat to configured interval instead of every tick
+                    if self.update_heartbeat_interval > 0:
+                        if (now - ctx.last_update_send) < self.update_heartbeat_interval:
+                            send_update = False
 
                 if self.send_player_updates and send_full_update and send_update:
                     # Send UPDATE_ARRAY with position/velocity

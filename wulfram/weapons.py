@@ -163,6 +163,14 @@ class WeaponSystem:
             self.aim_pitch_offset = 0.0
         self.aim_yaw_invert = os.environ.get("WULFRAM_AIM_YAW_INVERT", "0") == "1"
         self.aim_pitch_invert = os.environ.get("WULFRAM_AIM_PITCH_INVERT", "0") == "1"
+        # Constant heading offset (radians) applied to yaw before projectile direction
+        # calculation. Compensates for any reference frame mismatch between the
+        # server's tracked heading (starts at 0.0) and the client's actual facing.
+        # Tune empirically: fire at spawn, observe direction, adjust offset.
+        try:
+            self.heading_offset = math.radians(float(os.environ.get("WULFRAM_HEADING_OFFSET_DEG", "0.0")))
+        except ValueError:
+            self.heading_offset = 0.0
 
         # Projectile spawn tuning via hardpoints (shape data).
         # Hardpoint data is useful for tuning but not yet stable across maps/models.
@@ -173,6 +181,14 @@ class WeaponSystem:
             self.projectile_spawn_offset = float(os.environ.get("WULFRAM_PROJECTILE_SPAWN_OFFSET", "2.0"))
         except ValueError:
             self.projectile_spawn_offset = 2.0
+        try:
+            self.projectile_barrel_right = float(os.environ.get("WULFRAM_PROJECTILE_BARREL_RIGHT", "0.0"))
+        except ValueError:
+            self.projectile_barrel_right = 0.0
+        try:
+            self.projectile_barrel_up = float(os.environ.get("WULFRAM_PROJECTILE_BARREL_UP", "0.2"))
+        except ValueError:
+            self.projectile_barrel_up = 0.2
         try:
             self.shape_coord_scale = float(os.environ.get("WULFRAM_SHAPE_COORD_SCALE", "4096.0"))
         except ValueError:
@@ -516,23 +532,24 @@ class WeaponSystem:
         if not self.use_pitch:
             pitch = 0.0
 
-        # Apply aim tuning (invert + offset)
+        # Apply aim tuning (invert + offset + heading reference frame offset)
         if self.aim_yaw_invert:
             yaw = -yaw
         if self.aim_pitch_invert:
             pitch = -pitch
-        yaw += self.aim_yaw_offset
+        yaw += self.aim_yaw_offset + self.heading_offset
         pitch += self.aim_pitch_offset
 
         if self.up_axis == "z":
             # Z-up: X/Y horizontal, Z vertical
+            # Client rotation matrix M[6] = -sin(euler_Y) for forward Z component
             fwd_x = math.cos(pitch) * math.cos(yaw)
             fwd_y = math.cos(pitch) * math.sin(yaw)
-            fwd_z = math.sin(pitch)
+            fwd_z = -math.sin(pitch)
         else:
             # Y-up: X/Z horizontal, Y vertical (default)
             fwd_x = math.cos(pitch) * math.cos(yaw)
-            fwd_y = math.sin(pitch)
+            fwd_y = -math.sin(pitch)
             fwd_z = math.cos(pitch) * math.sin(yaw)
 
         vel_x = self.pulse_shell_speed * fwd_x
@@ -593,6 +610,22 @@ class WeaponSystem:
                 spawn_x += spawn_offset * fwd_x
                 spawn_y += spawn_offset * fwd_y
                 spawn_z += spawn_offset * fwd_z
+            # Barrel right/up offsets rotate with heading
+            barrel_right = self.projectile_barrel_right
+            barrel_up = self.projectile_barrel_up
+            if barrel_right != 0.0 or barrel_up != 0.0:
+                cy = math.cos(yaw)
+                sy = math.sin(yaw)
+                if self.up_axis == "z":
+                    # Z-up: right is perpendicular to forward in XY plane, up is Z
+                    spawn_x += barrel_right * (-sy)
+                    spawn_y += barrel_right * cy
+                    spawn_z += barrel_up
+                else:
+                    # Y-up: right is perpendicular to forward in XZ plane, up is Y
+                    spawn_x += barrel_right * (-sy)
+                    spawn_y += barrel_up
+                    spawn_z += barrel_right * cy
 
         if self.projectile_muzzle_push:
             spawn_x += self.projectile_muzzle_push * fwd_x
@@ -610,11 +643,14 @@ class WeaponSystem:
             "up_axis": self.up_axis,
             "aim_yaw_offset_deg": math.degrees(self.aim_yaw_offset),
             "aim_pitch_offset_deg": math.degrees(self.aim_pitch_offset),
+            "heading_offset_deg": math.degrees(self.heading_offset),
             "aim_yaw_invert": self.aim_yaw_invert,
             "aim_pitch_invert": self.aim_pitch_invert,
             "forward": (fwd_x, fwd_y, fwd_z),
             "spawn_mode": spawn_mode,
             "spawn_offset": spawn_offset,
+            "barrel_right": self.projectile_barrel_right,
+            "barrel_up": self.projectile_barrel_up,
             "spawn_pos": (spawn_x, spawn_y, spawn_z),
             "vel": (vel_x, vel_y, vel_z),
             "speed": self.pulse_shell_speed,
