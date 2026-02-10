@@ -605,9 +605,9 @@ class WulframServer:
         except ValueError:
             self.aim_pitch_adjust = 2.5
         try:
-            self.turn_adjust = float(os.environ.get("WULFRAM_TURN_ADJUST", "3.0"))
+            self.turn_adjust = float(os.environ.get("WULFRAM_TURN_ADJUST", "3.2"))
         except ValueError:
-            self.turn_adjust = 3.0
+            self.turn_adjust = 3.2
         try:
             self.turn_deadzone = float(os.environ.get("WULFRAM_TURN_DEADZONE", "0.05"))
         except ValueError:
