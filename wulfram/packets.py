@@ -330,6 +330,26 @@ def build_birth_notice(entity_id: int, owner_entity_id: Optional[int] = None) ->
     return b'\x1E' + struct.pack(">I", entity_id) + struct.pack(">I", owner_entity_id)
 
 
+def build_delete_object(tick: int, entity_ids: list, with_effects: bool = False) -> bytes:
+    """Build DELETE_OBJECT packet (0x15).
+
+    Decompiler ref: PacketHandler_DELETE_OBJECT in Handlers.c
+    Format:
+      - u32 tick
+      - u8 entity_count
+      - For each entity:
+        - u32 entity OID
+        - u8 has_effects (1 = play explosion sound/FX, 0 = silent)
+    """
+    payload = struct.pack(">I", tick)
+    payload += struct.pack("B", len(entity_ids))
+    effects_byte = 1 if with_effects else 0
+    for eid in entity_ids:
+        payload += struct.pack(">I", eid)
+        payload += struct.pack("B", effects_byte)
+    return b'\x15' + payload
+
+
 def build_game_clock(time_ms: int = 0, running: bool = True, round_time_ms: int = 30000) -> bytes:
     """Build GAME_CLOCK packet (0x2F).
 
@@ -1240,6 +1260,53 @@ def build_update_array_create_tank(tick: int, entity_id: int, entity_type: int, 
     if include_entity_vitals:
         bw.write_bits(10, _encode_health_bits(health, total_bits=10))
         bw.write_bits(10, _encode_health_bits(fuel, total_bits=10, max_val=ENERGY_MAX, range_val=ENERGY_RANGE))
+
+    return b'\x0E' + tick_bytes + bw.get_bytes()
+
+
+def build_update_array_teleport(tick: int, entity_id: int,
+                                pos: Tuple[float, float, float],
+                                rot: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+                                include_health: bool = True,
+                                weapon_id: int = 2,
+                                health: float = 1.0,
+                                fuel: float = 1.0) -> bytes:
+    """Build UPDATE_ARRAY that teleports an existing entity to a new position.
+
+    Uses the REAL entity ID with position+rotation mask bits to override
+    the client's entity position in-place.  No entity deletion needed,
+    so no entry-map / team-select issues.
+
+    Entity_apply_network_transform will copy the position and rotation
+    directly into the entity, overriding client-side physics for one frame.
+    """
+    tick_bytes = struct.pack(">I", tick)
+    bw = BitWriter()
+
+    # Local player state (health/energy) - prevents red overlay
+    _write_local_player_state(bw, include_health, weapon_id=weapon_id,
+                              health=health, fuel=fuel,
+                              include_ammo_turrets=False)
+
+    bw.write_bits(8, 1)              # 1 entity
+    bw.write_bits(32, entity_id)     # REAL entity net_id
+    bw.write_bits(1, 1)              # is_manned = True
+
+    # Presence mask: bit 1 (position) + bit 3 (rotation) = 0b0000001010 = 10
+    bw.write_bits(10, 0b0000001010)
+    bw.write_bits(16, 0)             # bank_selector = 0
+
+    # Position vectors: header(4) + x(16) + y(16) + z(16)
+    bw.write_bits(4, 15)             # priority = 15
+    for coord in pos:
+        _, quantized = _compress_position(coord)
+        bw.write_bits(16, quantized)
+
+    # Rotation vectors: header(4) + x(16) + y(16) + z(16)
+    bw.write_bits(4, 15)             # priority = 15
+    for val in rot:
+        _, quantized = _compress_rotation(val)
+        bw.write_bits(16, quantized)
 
     return b'\x0E' + tick_bytes + bw.get_bytes()
 

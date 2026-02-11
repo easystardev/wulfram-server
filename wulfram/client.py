@@ -62,7 +62,7 @@ class ClientContext:
     angular_vel_yaw: float = 0.0
     player_energy: float = 100.0
 
-    # Spring-damper physics for heading (matches client's spring-based system)
+    # Direct-impulse physics for heading (matches client's damped torque system)
     vehicle_physics: Optional[VehiclePhysics] = None
 
     # Aim tracking
@@ -115,6 +115,8 @@ class ClientContext:
     last_update_send: float = field(default_factory=time.monotonic)
     # Periodic correction (real entity pos+rot to correct drift)
     last_correction_send: float = 0.0
+    # Pending respawn position (set by respawn command, consumed by auto_join_team)
+    pending_respawn_pos: Optional[tuple] = None
     last_sent_pos: tuple = field(default_factory=lambda: (0.0, 0.0, 0.0))
     last_sent_vel: tuple = field(default_factory=lambda: (0.0, 0.0, 0.0))
     last_sent_yaw: float = 0.0

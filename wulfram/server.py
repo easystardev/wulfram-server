@@ -636,6 +636,14 @@ class WulframServer:
         except ValueError:
             self.aim_hold_time = 0.4
 
+        # Angular velocity damping coefficient.
+        # From Physics_substep_integrate: ang_vel += (torque - ang_vel * damp_coeff) * dt
+        # Steady state: ang_vel = torque / damp_coeff = turn_adjust / damp_coeff
+        try:
+            self.damp_coeff = float(os.environ.get("WULFRAM_DAMP_COEFF", "1.0"))
+        except ValueError:
+            self.damp_coeff = 1.0
+
         # Periodic correction: send real entity pos+rot to correct client drift.
         # 0 = disabled, >0 = interval in seconds between corrections.
         try:
@@ -648,7 +656,8 @@ class WulframServer:
 
         print(
             f"[CONFIG-HEADING] turn_adjust={self.turn_adjust} turn_sign={self.turn_sign} "
-            f"deadzone={self.turn_deadzone} tick_rate={self.tick_rate_hz}Hz "
+            f"deadzone={self.turn_deadzone} damp_coeff={self.damp_coeff} "
+            f"tick_rate={self.tick_rate_hz}Hz "
             f"correction_interval={self.correction_interval}s"
         )
 
@@ -981,6 +990,7 @@ class WulframServer:
             player_pos=init_pos,
         )
         ctx.entity_type = 0
+        ctx.vehicle_physics.damp_coeff = self.damp_coeff
 
         # Update pose dict
         ctx.player_pose["pos"] = init_pos
@@ -1555,6 +1565,7 @@ class WulframServer:
             entity_id=entity_id,
         )
         ctx.tcp_handler = None  # No TCP for ghost clients
+        ctx.vehicle_physics.damp_coeff = self.damp_coeff
 
         # Set up weapon/jump systems.
         ctx.weapon_system = WeaponSystem()
@@ -2587,11 +2598,17 @@ class WulframServer:
     def _auto_join_team(self, ctx: ClientContext, team_id: int):
         """Auto-spawn after WANT_UPDATES using Wulf-Forge-style UDP TANK."""
         print(f"[GAME] Client {ctx.client_id}: Auto-spawn (WF) on team {team_id}")
-        spawn = self._pick_spawn_point(team_id)
+        # Check for pending respawn position (set by respawn command)
         pos = None
-        if spawn:
-            pos = (spawn["x"], spawn["y"], spawn["z"])
-            print(f"[SPAWN] Using spawn point oid={spawn['oid']} team={team_id} pos={pos}")
+        if getattr(ctx, 'pending_respawn_pos', None):
+            pos = ctx.pending_respawn_pos
+            ctx.pending_respawn_pos = None
+            print(f"[SPAWN] Using pending respawn pos={pos}")
+        else:
+            spawn = self._pick_spawn_point(team_id)
+            if spawn:
+                pos = (spawn["x"], spawn["y"], spawn["z"])
+                print(f"[SPAWN] Using spawn point oid={spawn['oid']} team={team_id} pos={pos}")
         self._spawn_wf_style(ctx, team_id=team_id, net_id=ctx.session.player_id or ctx.entity_id, pos=pos)
 
     def _handle_reincarnate(self, ctx: ClientContext, packet: bytes):
@@ -3104,11 +3121,15 @@ class WulframServer:
         frac = idx_f - idx_lo
         return samples[idx_lo] + (samples[idx_lo + 1] - samples[idx_lo]) * frac
 
-    def _compute_steering_response(self, ctx: ClientContext) -> float:
-        """Compute angular velocity from TURNING input (matches client Vehicles.c:1030).
+    def _get_raw_turn_input(self, ctx: ClientContext) -> float:
+        """Get normalized turning input [-1, 1] with deadzone and sign applied.
 
-        Returns the steering response in rad/s (clamped to [-1, 1] then scaled).
-        Packets update inputs; the tick loop calls this and integrates heading.
+        Returns the raw turning input for direct-impulse yaw physics.
+        The client uses raw input directly for yaw (Vehicles.c:1193),
+        NOT the piecewise curve (which only feeds the spring system for
+        pitch/roll terrain following).
+
+        The torque is computed externally: torque = raw_input * turn_adjust.
         """
         def _normalize_axis(val: float) -> float:
             if val > 1.5 or val < -1.5:
@@ -3121,12 +3142,10 @@ class WulframServer:
         if abs(turn_input) < self.turn_deadzone:
             turn_input = 0.0
 
-        abs_input = abs(turn_input)
-        curve_response = self._piecewise_interpolate(self.turn_curve_samples, abs_input)
-        sign = 1.0 if turn_input >= 0.0 else -1.0
-
-        # Steering response = angular velocity target (rad/s)
-        return self.turn_sign * sign * curve_response * self.turn_adjust
+        # Apply turn_sign to match client negation:
+        # Client: controller[0x74] = -button_normalized(1)
+        # Our turn_sign = -1.0 achieves the same inversion.
+        return self.turn_sign * turn_input
 
     def _update_player_aim(self, ctx: ClientContext):
         """Update aim yaw/pitch from viewpoint or slot inputs (if enabled)."""
@@ -3724,18 +3743,16 @@ class WulframServer:
                 # Once translation is ready, make sure this client sees others and vice versa.
                 self._ensure_multiplayer_visibility(ctx)
 
-                # Compute steering response from current inputs (piecewise curve output).
-                # _compute_steering_response returns turn_sign * sign * curve * turn_adjust.
-                # The client clamps this to [-1, 1] and sets it as softbody[0x23] (spring target).
-                steering_response = self._compute_steering_response(ctx)
+                # Direct-impulse yaw physics (matches client Vehicles.c:1193).
+                # Client uses raw turning input directly for yaw — no piecewise curve.
+                # torque = lateral_mobility * turn_adjust * raw_input (per frame)
+                # ang_vel += (torque - ang_vel * damp_coeff) * dt
+                raw_input = self._get_raw_turn_input(ctx)
+                torque = raw_input * self.turn_adjust  # lateral_mobility=1.0 for now
 
-                # Two-stage spring-damper heading integration.
-                # Stage 1: Spring target = clamp(steering_response, -1, 1)
-                # Stage 2: Spring displacement → torque → angular velocity → heading
                 physics = ctx.vehicle_physics
-                physics.spring.target = max(-1.0, min(1.0, steering_response))
                 dt = 1.0 / self.tick_rate_hz
-                physics.step(dt)
+                physics.step(torque, dt)
 
                 ctx.player_heading = physics.heading
                 ctx.angular_vel_yaw = physics.angular_velocity
@@ -3744,8 +3761,7 @@ class WulframServer:
 
                 if ctx.session.tick % 10 == 0 and abs(ctx.angular_vel_yaw) > 0.01:
                     print(
-                        f"[YAW-TRACK] spring_target={physics.spring.target:.3f} "
-                        f"spring_disp={physics.spring.value:.3f} "
+                        f"[YAW-TRACK] input={raw_input:.3f} torque={torque:.3f} "
                         f"ang_vel={ctx.angular_vel_yaw:.4f} "
                         f"heading={math.degrees(ctx.player_heading):.1f}deg"
                     )

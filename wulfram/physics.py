@@ -1,113 +1,78 @@
 """
-Spring-damper physics model for vehicle heading.
+Direct-impulse physics model for vehicle heading.
 
-The Wulfram2 client uses a two-stage spring-based physics system for tank rotation:
+The Wulfram2 client uses a direct torque-impulse system for tank yaw rotation,
+NOT springs. The spring system only handles suspension and pitch/roll terrain
+following — it explicitly ZEROES yaw torque output (Physics.c:2584).
 
-  Stage 1: Spring internal displacement
-    Input → Piecewise curve → Spring TARGET (softbody[0x23], clamped [-1,1])
-    Spring dynamics: F = -k*(displacement - target) - c*velocity
-    → displacement oscillates toward target
+Per-frame cycle:
+  1. Torque accumulator zeroed (entity[0x48-0x50] cleared after previous frame)
+  2. Yaw torque = lateral_mobility * turn_adjust * raw_input  (Vehicles.c:1193)
+     - raw_input = -button_normalized(1), clamped [-1,1]  (no piecewise curve!)
+  3. Physics substep (Physics.c:4502-4562, damped mode):
+     a. heading += angular_velocity * dt  (explicit Euler, heading first)
+     b. angular_velocity += (torque - angular_velocity * damp_coeff) * dt
+  4. Torque accumulator zeroed for next frame (Physics.c:6169-6174)
 
-  Stage 2: Displacement → torque → angular velocity → heading
-    torque = displacement * torque_scale
-    angular_velocity += torque           (impulse, not force*dt)
-    angular_velocity *= (1 - dampening)  (per-frame rotation dampening)
-    heading += angular_velocity * dt
+At steady state: angular_velocity = torque / damp_coeff
 
 Client references:
-  - Vehicles.c:1015-1040 (GUESS2_Tank_apply_steering_response) — sets softbody[0x23]
-  - Vehicles.c:1225 (rotation dampening = turn_rate * 1.4137167 ≈ 0.0707)
-  - Physics.c:1934-1947 (SpringParam_init_uniform, stiffness=40)
-  - Physics.c:2473-2586 (GUESS4_Spring_simulate_step)
-  - Physics.c:2594-2618 (GUESS4_Spring_apply_forces_to_entity) — adds torque to ang_vel
+  - Vehicles.c:1193: entity[0x50] += lateral_mobility * turn_adjust * raw_input
+  - Vehicles.c:1229: dampening = turn_rate * 1.4137167 (stored but not the damp_coeff)
+  - Physics.c:4502-4562: Physics_substep_integrate (substep with damped mode)
+  - Physics.c:4414-4494: Matrix3_integrate_angular (orientation + ang_vel update)
+  - Physics.c:6169-6174: entity[0x48-0x50] zeroed after physics step
+  - Physics.c:2582-2584: Spring system zeroes yaw torque output
 """
 
 import math
 
 
-class SpringDamper1D:
-    """Second-order spring-damper for spring internal displacement.
-
-    Models the spring's own position/velocity, separate from entity heading.
-    Target is set from steering response (clamped [-1,1]).
-    Output (value) is the spring displacement, converted to torque externally.
-    """
-
-    def __init__(self, stiffness: float = 40.0, damping: float = 4.0):
-        self.k = stiffness       # Spring stiffness
-        self.c = damping          # Spring damping
-        self.value = 0.0          # Spring displacement (internal state, NOT heading)
-        self.velocity = 0.0       # Spring velocity (internal)
-        self.target = 0.0         # Target displacement (from steering, [-1,1])
-
-    def step(self, dt: float):
-        """Integrate one timestep using semi-implicit Euler."""
-        error = self.value - self.target
-        acceleration = -self.k * error - self.c * self.velocity
-        self.velocity += acceleration * dt
-        self.value += self.velocity * dt
-
-
 class VehiclePhysics:
-    """Per-vehicle two-stage spring-damper physics.
+    """Per-vehicle direct-impulse physics for heading.
 
-    Stage 1: Spring internal displacement tracks steering target
-    Stage 2: Spring displacement → torque → angular velocity → heading
+    Matches the client's actual yaw physics pipeline:
+      torque = lateral_mobility * turn_adjust * raw_input  (per frame)
+      heading += angular_velocity * dt  (explicit Euler)
+      angular_velocity += (torque - angular_velocity * damp_coeff) * dt
 
-    Matches the client's actual physics pipeline from Vehicles.c / Physics.c.
-    All parameters are tunable at runtime via control commands.
+    Parameters are tunable at runtime via control commands.
     """
 
-    def __init__(
-        self,
-        spring_stiffness: float = 40.0,
-        spring_damping: float = 4.0,
-        torque_scale: float = 0.342,
-        rotation_dampening: float = 0.0707,
-    ):
-        # Stage 1: Spring internal state
-        self.spring = SpringDamper1D(stiffness=spring_stiffness, damping=spring_damping)
-
-        # Stage 2: Entity rotational state
+    def __init__(self, damp_coeff: float = 1.0):
         self._heading = 0.0
         self._angular_velocity = 0.0
 
-        # Torque scale: converts spring displacement to angular velocity impulse.
-        # Derived from lever arm in Spring_apply_forces_to_entity.
-        # Calibrated so that steady-state turn rate ≈ turn_adjust (4.5 rad/s).
-        # Formula: torque_scale = desired_vel * dampening / (1 - dampening)
-        #        = 4.5 * 0.0707 / 0.9293 ≈ 0.342
-        self.torque_scale = torque_scale
+        # Damping coefficient for angular velocity.
+        # From Physics_substep_integrate damped mode: entity->0xbc->+4->+0x7c
+        # At steady state: ang_vel_ss = torque / damp_coeff
+        # With torque=4.5 and damp_coeff=1.0: ang_vel_ss = 4.5 rad/s (258 deg/s)
+        self.damp_coeff = damp_coeff
 
-        # Per-frame rotation dampening (Vehicles.c:1225: turn_rate * 1.4137167)
-        self.rotation_dampening = rotation_dampening
-
-    def step(self, dt: float):
+    def step(self, torque: float, dt: float):
         """Advance physics by dt seconds.
 
-        1. Step spring (displacement tracks target)
-        2. Apply spring displacement as torque impulse to angular velocity
-        3. Apply rotation dampening
-        4. Integrate heading
+        torque: pre-computed yaw torque = lateral_mobility * turn_adjust * raw_input.
+                This mimics entity[0x50] which is zeroed each frame and refilled.
+        dt: timestep in seconds (1/tick_rate, typically 1/30).
+
+        Integration order matches client (explicit Euler):
+          Matrix3_integrate_angular rotates orientation by ang_vel*dt FIRST,
+          then updates ang_vel by (torque - ang_vel * damp_coeff) * dt.
         """
-        # Stage 1: Spring dynamics
-        self.spring.step(dt)
-
-        # Stage 2: Displacement → torque → angular velocity → heading
-        # Client does: entity[ang_vel] += torque (impulse, not force*dt)
-        self._angular_velocity += self.spring.value * self.torque_scale
-
-        # Per-frame dampening (client: ang_vel *= (1 - dampening))
-        self._angular_velocity *= (1.0 - self.rotation_dampening)
-
-        # Integrate heading
+        # 1. Integrate heading with CURRENT angular velocity (before update)
         self._heading += self._angular_velocity * dt
 
+        # 2. Update angular velocity with damping
+        # Physics_substep_integrate: effective = torque - ang_vel * damp_coeff
+        # Matrix3_integrate_angular: ang_vel += effective * dt
+        self._angular_velocity += (torque - self._angular_velocity * self.damp_coeff) * dt
+
         # Wrap to [-pi, pi]
-        while self._heading > math.pi:
-            self._heading -= 2 * math.pi
-        while self._heading < -math.pi:
-            self._heading += 2 * math.pi
+        if self._heading > math.pi:
+            self._heading -= 2 * math.pi * ((self._heading + math.pi) // (2 * math.pi))
+        elif self._heading < -math.pi:
+            self._heading += 2 * math.pi * ((-self._heading + math.pi) // (2 * math.pi))
 
     @property
     def heading(self) -> float:
@@ -127,8 +92,5 @@ class VehiclePhysics:
 
     def reset(self):
         """Reset all state to zero."""
-        self.spring.value = 0.0
-        self.spring.velocity = 0.0
-        self.spring.target = 0.0
         self._heading = 0.0
         self._angular_velocity = 0.0

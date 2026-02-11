@@ -12,7 +12,7 @@ Commands:
   phase <name>           - Force session phase transition
   flag <name> <0|1>      - Set feature flag
   turn [param] [value]   - Show/set turning parameters live
-  spring [param] [value] - Show/set spring-damper physics params
+  physics [param] [value] - Show/set yaw physics params (damp, reset)
   help                   - Show commands
   quit                   - Disconnect
 """
@@ -35,6 +35,8 @@ from .packets import (
     build_behavior_packet, build_translation_packet,
     build_login_status, build_bps_response, build_game_clock,
     build_udp_tank_packet_wf,
+    build_delete_object,
+    build_update_array_teleport,
 )
 
 
@@ -76,6 +78,27 @@ class ControlServer:
             'BPS_RESPONSE': self._build_bps_response,
             'GAME_CLOCK': self._build_game_clock,
         }
+
+    def _get_active_client(self):
+        """Find the first connected client from the game server's client list.
+
+        Returns (ctx, addr) or (None, None). This works even when
+        self.session/self.tcp_handler are stale (e.g. after server restart).
+        """
+        if not self.server:
+            return None, None
+        with self.server.clients_lock:
+            for c in self.server.clients.values():
+                if c.session and c.session.udp_addr:
+                    return c, c.session.udp_addr
+        return None, None
+
+    def _sync_to_active_client(self):
+        """Update self.session/tcp_handler to match the active game client."""
+        ctx, _ = self._get_active_client()
+        if ctx:
+            self.session = ctx.session
+            self.tcp_handler = ctx.tcp_handler
 
     def start(self):
         """Start the control server in a background thread."""
@@ -208,8 +231,12 @@ class ControlServer:
             return self._cmd_correction(args)
         elif cmd == 'behavior' or cmd == 'beh':
             return self._cmd_behavior(args)
-        elif cmd == 'spring':
-            return self._cmd_spring(args)
+        elif cmd == 'physics' or cmd == 'phys':
+            return self._cmd_physics(args)
+        elif cmd == 'respawn' or cmd == 'rs':
+            return self._cmd_respawn(args)
+        elif cmd == 'reload':
+            return self._cmd_reload(args)
         elif cmd == 'quit' or cmd == 'exit':
             return "Goodbye!"
         else:
@@ -236,7 +263,8 @@ class ControlServer:
   heading [param] [value]- Show/set heading & aim params (offset, aim_offset, source, reset)
   fire [count|at <deg>]  - Force-fire projectile at current/specified heading
   correction [secs|on|off|now] - Drift correction (pos+rot sync to client)
-  spring [param] [value] - Spring-damper physics (stiffness, damping, reset)
+  physics [param] [value] - Yaw physics params (damp, reset)
+  respawn / rs           - Re-send TankPacket to reset client entity position + heading
   help                   - Show this help
   quit                   - Disconnect
 
@@ -252,6 +280,9 @@ Examples:
   spawn_full 2 1337 0 0 100 50 100 150 0 ws=1 want=2000 interp=1 strict=1  # suppress WANT_UPDATES payload"""
 
     def _cmd_state(self) -> str:
+        # Auto-sync to active client if our reference is stale
+        if not self.session or self.session.phase.name == "DISCONNECTED":
+            self._sync_to_active_client()
         if not self.session:
             return "No active session"
         s = self.session
@@ -746,17 +777,14 @@ Examples:
             except ValueError:
                 return f"Invalid value: {subcmd}. Use a number, 'on', 'off', or 'now'."
 
-    def _cmd_spring(self, args: list) -> str:
+    def _cmd_physics(self, args: list) -> str:
         """
-        Show or modify spring-damper physics parameters.
-        Two-stage model: spring displacement → torque → angular velocity → heading.
+        Show or modify yaw physics parameters.
+        Direct-impulse model: torque → damped angular velocity → heading.
         Usage:
-          spring                    - Show current spring params
-          spring stiffness <val>    - Set spring stiffness (default 40.0)
-          spring damping <val>      - Set spring damping (default 4.0)
-          spring torque <val>       - Set torque scale (default 0.342)
-          spring rot_damp <val>     - Set rotation dampening (default 0.0707)
-          spring reset              - Reset all spring state
+          physics                   - Show current physics params
+          physics damp <val>        - Set damping coefficient (default 1.0)
+          physics reset             - Reset heading and angular velocity
         """
         import math
 
@@ -767,25 +795,21 @@ Examples:
                 break
 
         if not args:
-            lines = ["Spring-damper physics (two-stage model):"]
+            lines = ["Yaw physics (direct-impulse model):"]
+            lines.append(f"  turn_adjust     = {self.server.turn_adjust}")
+            lines.append(f"  turn_sign       = {self.server.turn_sign}")
             if ctx_ref and ctx_ref.vehicle_physics:
                 p = ctx_ref.vehicle_physics
-                lines.append(f"  -- Stage 1: Spring internal --")
-                lines.append(f"  stiffness       = {p.spring.k:.2f}")
-                lines.append(f"  damping         = {p.spring.c:.4f}")
-                lines.append(f"  displacement    = {p.spring.value:.4f}")
-                lines.append(f"  spring_vel      = {p.spring.velocity:.4f}")
-                lines.append(f"  target          = {p.spring.target:.4f}")
-                lines.append(f"  -- Stage 2: Entity rotation --")
-                lines.append(f"  torque_scale    = {p.torque_scale:.4f}")
-                lines.append(f"  rot_dampening   = {p.rotation_dampening:.4f}")
+                lines.append(f"  damp_coeff      = {p.damp_coeff:.4f}")
                 lines.append(f"  angular_vel     = {p.angular_velocity:.4f} rad/s")
                 lines.append(f"  heading         = {math.degrees(p.heading):.1f}deg")
+                ss = self.server.turn_adjust / p.damp_coeff if p.damp_coeff > 0 else float('inf')
+                lines.append(f"  steady_state    = {ss:.2f} rad/s ({math.degrees(ss):.0f}deg/s)")
             else:
                 lines.append("  (no client connected)")
             lines.append("")
-            lines.append("Usage: spring <param> [value]")
-            lines.append("Params: stiffness, damping, torque, rot_damp, reset")
+            lines.append("Usage: physics <param> [value]")
+            lines.append("Params: damp, reset")
             return '\n'.join(lines)
 
         param = args[0].lower()
@@ -801,69 +825,31 @@ Examples:
                         ctx.player_pose["yaw"] = 0.0
                         ctx.angular_vel_yaw = 0.0
                         count += 1
-            return f"Reset spring + heading for {count} client(s)"
+            return f"Reset heading + angular velocity for {count} client(s)"
 
         if len(args) < 2:
-            return "Usage: spring <param> <value>"
+            return "Usage: physics <param> <value>"
 
         try:
             value = float(args[1])
         except ValueError:
             return f"Invalid value: {args[1]}"
 
-        if param == 'stiffness' or param == 'k':
+        if param == 'damp' or param == 'damp_coeff' or param == 'dc':
             count = 0
             old_val = None
             with self.server.clients_lock:
                 for ctx in self.server.clients.values():
                     if ctx.vehicle_physics:
                         if old_val is None:
-                            old_val = ctx.vehicle_physics.spring.k
-                        ctx.vehicle_physics.spring.k = value
+                            old_val = ctx.vehicle_physics.damp_coeff
+                        ctx.vehicle_physics.damp_coeff = value
                         count += 1
-            print(f"[CONTROL] spring stiffness: {old_val} -> {value} ({count} clients)")
-            return f"Set stiffness = {value} (was {old_val}, {count} clients)"
+            self.server.damp_coeff = value
+            print(f"[CONTROL] damp_coeff: {old_val} -> {value} ({count} clients)")
+            return f"Set damp_coeff = {value} (was {old_val}, {count} clients)"
 
-        if param == 'damping' or param == 'c':
-            count = 0
-            old_val = None
-            with self.server.clients_lock:
-                for ctx in self.server.clients.values():
-                    if ctx.vehicle_physics:
-                        if old_val is None:
-                            old_val = ctx.vehicle_physics.spring.c
-                        ctx.vehicle_physics.spring.c = value
-                        count += 1
-            print(f"[CONTROL] spring damping: {old_val} -> {value} ({count} clients)")
-            return f"Set damping = {value} (was {old_val}, {count} clients)"
-
-        if param == 'torque' or param == 'ts':
-            count = 0
-            old_val = None
-            with self.server.clients_lock:
-                for ctx in self.server.clients.values():
-                    if ctx.vehicle_physics:
-                        if old_val is None:
-                            old_val = ctx.vehicle_physics.torque_scale
-                        ctx.vehicle_physics.torque_scale = value
-                        count += 1
-            print(f"[CONTROL] spring torque_scale: {old_val} -> {value} ({count} clients)")
-            return f"Set torque_scale = {value} (was {old_val}, {count} clients)"
-
-        if param == 'rot_damp' or param == 'rd':
-            count = 0
-            old_val = None
-            with self.server.clients_lock:
-                for ctx in self.server.clients.values():
-                    if ctx.vehicle_physics:
-                        if old_val is None:
-                            old_val = ctx.vehicle_physics.rotation_dampening
-                        ctx.vehicle_physics.rotation_dampening = value
-                        count += 1
-            print(f"[CONTROL] spring rot_dampening: {old_val} -> {value} ({count} clients)")
-            return f"Set rot_dampening = {value} (was {old_val}, {count} clients)"
-
-        return f"Unknown spring param: {param}. Valid: stiffness, damping, torque, rot_damp, reset"
+        return f"Unknown physics param: {param}. Valid: damp, reset"
 
     def _cmd_behavior(self, args: list) -> str:
         """
@@ -951,6 +937,122 @@ Examples:
 
         print(f"[CONTROL] behavior {param}: {old_value} -> {value}, re-sent ({len(data)} bytes)")
         return f"Set {param} = {value} (was {old_value}), re-sent BEHAVIOR ({len(data)} bytes)\n{desc}"
+
+    def _cmd_reload(self, args: list) -> str:
+        """Hot-reload control.py and packets.py without restarting server.
+
+        Swaps this instance's class to the reloaded ControlServer, so all
+        _cmd_* methods pick up new code immediately.  Instance state
+        (server, session, tcp_handler, etc.) is preserved.
+        """
+        import importlib
+
+        try:
+            from . import packets as packets_mod
+            from . import control as control_mod
+
+            # Preserve tick counter base across reload
+            old_server_start = packets_mod._SERVER_START
+
+            # Reload packets first (control depends on it)
+            importlib.reload(packets_mod)
+            packets_mod._SERVER_START = old_server_start
+
+            # Reload control module
+            importlib.reload(control_mod)
+
+            # Swap class — instance state preserved, new methods active
+            self.__class__ = control_mod.ControlServer
+
+            print("[RELOAD] Reloaded control + packets modules")
+            return "Reloaded control + packets modules"
+        except Exception as e:
+            print(f"[RELOAD] ERROR: {e}")
+            return f"Reload failed: {e}"
+
+    def _cmd_respawn(self, args: list) -> str:
+        """
+        Respawn by DELETE + server-triggered delayed spawn.
+
+        1) DELETE entity (client goes to team select)
+        2) Set delayed_spawn on session (game loop auto-fires _auto_join_team)
+        3) _auto_join_team picks up pending_respawn_pos and spawns there
+
+        No client interaction needed - the game loop handles the re-spawn
+        the same way it handles the initial auto-join.
+
+        Usage:
+          respawn              - Respawn at map spawn point
+          respawn <x> <y> <z>  - Respawn at specific position
+        """
+        if not self.server:
+            return "Error: No server reference"
+
+        ctx, addr = self._get_active_client()
+        if not ctx:
+            return "Error: No connected client"
+
+        # Default to map spawn position
+        map_spawn = self.server._pick_spawn_point(ctx.session.team_id if ctx.session else 1)
+        if map_spawn:
+            x, y, z = map_spawn["x"], map_spawn["y"], map_spawn["z"]
+        elif self.server.up_axis == "z":
+            x, y, z = 100.0, 100.0, self.server.spawn_height
+        else:
+            x, y, z = 100.0, self.server.spawn_height, 100.0
+
+        try:
+            if len(args) >= 3:
+                x, y, z = float(args[0]), float(args[1]), float(args[2])
+        except ValueError as e:
+            return f"respawn arg parse error: {e}"
+
+        entity_id = ctx.entity_id or 1337
+        team_id = ctx.session.team_id if ctx.session else 1
+
+        # 1) Set pending respawn position (consumed by _auto_join_team)
+        ctx.pending_respawn_pos = (x, y, z)
+
+        # 2) Reset server-side state
+        ctx.player_pos = (x, y, z)
+        ctx.player_vel = (0.0, 0.0, 0.0)
+        ctx.player_heading = 0.0
+        ctx.player_yaw = 0.0
+        ctx.angular_vel_yaw = 0.0
+        ctx.player_pose["pos"] = (x, y, z)
+        ctx.player_pose["vel"] = (0.0, 0.0, 0.0)
+        ctx.player_pose["yaw"] = 0.0
+        if ctx.vehicle_physics:
+            ctx.vehicle_physics.heading = 0.0
+            ctx.vehicle_physics._angular_velocity = 0.0
+        ctx.last_correction_send = time.monotonic()
+
+        # 3) DELETE entity from OIDTable
+        print(f"[RESPAWN] DELETE entity {entity_id}, pending pos=({x:.1f},{y:.1f},{z:.1f})")
+        delete_pkt = build_delete_object(
+            tick=self.server._get_network_tick(ctx),
+            entity_ids=[entity_id],
+            with_effects=False,
+        )
+        if ctx.tcp_handler:
+            ctx.tcp_handler.send(delete_pkt)
+
+        # 4) Reset session phase (tick loop stops)
+        ctx.session.phase = Phase.TEAM_SELECT
+        ctx.session.in_game = False
+
+        # 5) Wait for client to process DELETE and fully tear down local player.
+        #    300ms/1s too short - spawn arrives before construction timeout finishes.
+        #    Need ~5s so client completes teardown before new spawn packets arrive.
+        time.sleep(5.0)
+
+        # 6) Spawn directly - no REINCARNATE (avoids spawn point selection).
+        print(f"[RESPAWN] Spawning at ({x:.1f},{y:.1f},{z:.1f})")
+        self.server._spawn_wf_style(ctx, team_id=team_id,
+                                     net_id=entity_id, pos=(x, y, z))
+
+        self._sync_to_active_client()
+        return f"Respawned at ({x:.1f},{y:.1f},{z:.1f})"
 
     def _cmd_spawn_full(self, args: list) -> str:
         """
