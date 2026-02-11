@@ -605,9 +605,9 @@ class WulframServer:
         except ValueError:
             self.aim_pitch_adjust = 2.5
         try:
-            self.turn_adjust = float(os.environ.get("WULFRAM_TURN_ADJUST", "3.2"))
+            self.turn_adjust = float(os.environ.get("WULFRAM_TURN_ADJUST", "4.5"))
         except ValueError:
-            self.turn_adjust = 3.2
+            self.turn_adjust = 4.5
         try:
             self.turn_deadzone = float(os.environ.get("WULFRAM_TURN_DEADZONE", "0.05"))
         except ValueError:
@@ -636,7 +636,26 @@ class WulframServer:
         except ValueError:
             self.aim_hold_time = 0.4
 
+        # Periodic correction: send real entity pos+rot to correct client drift.
+        # 0 = disabled, >0 = interval in seconds between corrections.
+        try:
+            self.correction_interval = float(os.environ.get("WULFRAM_CORRECTION_INTERVAL", "0"))
+        except ValueError:
+            self.correction_interval = 0.0
+        # Correction mode: full, rot_only, pos_only, dual_entity, view_update
+        # rot_only: only correct heading (position corrections freeze movement)
+        self.correction_mode = os.environ.get("WULFRAM_CORRECTION_MODE", "rot_only")
+
+        print(
+            f"[CONFIG-HEADING] turn_adjust={self.turn_adjust} turn_sign={self.turn_sign} "
+            f"deadzone={self.turn_deadzone} tick_rate={self.tick_rate_hz}Hz "
+            f"correction_interval={self.correction_interval}s"
+        )
+
         self.estimated_speed = 15.0  # Units per second (tunable)
+        # Ghost rejoin: auto-create session from orphan UDP (e.g., VM snapshot restore)
+        self.ghost_rejoin = os.environ.get("WULFRAM_GHOST_REJOIN", "1") == "1"
+        self._ghost_rejoin_attempted: set = set()  # Track addrs we already tried
 
     def _sync_tick_offset(self, ctx: ClientContext, client_tick: int) -> None:
         """Align server ticks to client tick domain for UPDATE_ARRAY gating."""
@@ -1392,6 +1411,8 @@ class WulframServer:
 
         elif pkt_type == 0x09:
             # ACTION_DUMP - full behavior slot dump (includes fire state)
+            if ctx is None:
+                ctx = self._ghost_rejoin(addr)
             print(f"[UDP] ACTION_DUMP received: len={len(data)} data={data[:24].hex()}")
             self._handle_action_dump(ctx, data, addr)
 
@@ -1489,6 +1510,149 @@ class WulframServer:
         print(f"[UDP] Re-associated addr {addr} -> client {ctx.client_id}")
         return ctx
 
+    def _ghost_rejoin(self, addr: tuple) -> Optional[ClientContext]:
+        """Create a headless client from orphan UDP traffic (VM snapshot restore).
+
+        When ghost_rejoin is enabled and we see game traffic (ACTION_DUMP) from
+        an unknown address, create a ClientContext with no TCP, spawn via UDP,
+        and start the tick loop.  This lets us restore a VM snapshot and have
+        the client seamlessly reconnect without the full login flow.
+        """
+        if not self.ghost_rejoin:
+            return None
+        if addr in self._ghost_rejoin_attempted:
+            return None
+        self._ghost_rejoin_attempted.add(addr)
+
+        print(f"[GHOST] Attempting ghost rejoin for {addr}")
+
+        # Create a minimal session in IN_GAME state.
+        session = Session()
+        session.phase = Phase.IN_GAME
+        session.username = "ghost"
+        session.login_complete = True
+        session.in_game = True
+        session.udp_addr = addr
+        session.udp_verified = True
+        session.translation_ack_received = True  # Skip translation wait
+        session.roster_sent = True  # Skip roster send (needs TCP)
+        session.behavior_sent = True
+        session.translation_sent = True
+        session.want_updates_received = True
+        session.want_updates_handled = True
+
+        client_id = self.next_client_id
+        self.next_client_id += 1
+        entity_id = 1337  # Same as normal to match client's cached OID
+        session.player_id = entity_id
+        session.entity_id = entity_id
+        session.team_id = 1  # Red team
+
+        ctx = ClientContext(
+            client_id=client_id,
+            client_addr=(addr[0], 0),
+            session=session,
+            entity_id=entity_id,
+        )
+        ctx.tcp_handler = None  # No TCP for ghost clients
+
+        # Set up weapon/jump systems.
+        ctx.weapon_system = WeaponSystem()
+        ctx.weapon_system.next_entity_id = max(ctx.weapon_system.next_entity_id, 20000 + (client_id * 1000))
+        ctx.weapon_system.on_chain_gun_fire = lambda pos, rot, team, name=None: self._on_chain_gun_fire(ctx, pos, rot, team, name)
+        ctx.weapon_system.on_projectile_spawn = lambda proj: self._on_projectile_spawn(ctx, proj)
+        ctx.jump_jet_system = JumpJetSystem()
+        ctx.jump_jet_system.on_jump = lambda pid, imp, vel: self._on_jump_jet_triggered(ctx, pid, imp, vel)
+
+        # Register.
+        with self.clients_lock:
+            self.clients[client_id] = ctx
+        self.udp_addr_to_client[addr] = ctx
+
+        # Pick spawn point (same logic as normal spawn).
+        spawn_pos = None
+        if self.map_spawn_points:
+            team_spawns = [sp for sp in self.map_spawn_points if sp.get("team") == session.team_id]
+            if team_spawns:
+                spawn_pos = team_spawns[0]["pos"]
+        if spawn_pos is None:
+            spawn_pos = (100.0, 100.0, self.spawn_height)
+
+        ctx.player_pos = spawn_pos
+        ctx.player_pose["pos"] = spawn_pos
+        ctx.player_yaw = 0.0
+        ctx.player_heading = 0.0
+        ctx.angular_vel_yaw = 0.0
+        ctx.vehicle_physics.reset()
+        if self.spawn_sets_ground_level:
+            ctx.ground_level_override = spawn_pos[2] if self.up_axis == "z" else spawn_pos[1]
+
+        print(f"[GHOST] Created ghost client {client_id} entity={entity_id} pos={spawn_pos}")
+
+        # Send spawn packets via UDP (skip all TCP-dependent parts).
+        if self.udp_handler:
+            send_pos = self._to_client_pos(spawn_pos)
+            ls_weapon = self._get_local_state_weapon_type(ctx)
+            health_val = self._get_health_value()
+
+            # Pre-creation UPDATE_ARRAY.
+            ua_packet = build_update_array_create_tank(
+                tick=self._get_network_tick(ctx),
+                entity_id=entity_id,
+                entity_type=0,
+                team=session.team_id,
+                pos=send_pos,
+                behavior_type=0,
+                include_health=self.update_local_state,
+                include_entity_vitals=self.update_entity_vitals,
+                health=health_val,
+                fuel=1.0,
+                is_manned=True,
+                weapon_id=ls_weapon,
+            )
+            self.udp_handler.send_to(ua_packet, addr)
+            time.sleep(0.20)
+
+            # TankPacket.
+            tank_packet = build_udp_tank_packet_wf(
+                net_id=entity_id,
+                unit_type=0,
+                team_id=session.team_id,
+                pos=send_pos,
+                rot=(0.0, 0.0, 0.0),
+                tick=self._get_network_tick(ctx),
+                include_vitals=True,
+                weapon_id=ls_weapon,
+                health=1.0,
+                energy=1.0,
+            )
+            comm_pkt = build_chat_message("Ghost rejoin", source_id=entity_id)
+            self.udp_handler.send_to(comm_pkt, addr)
+            self.udp_handler.send_to(tank_packet, addr)
+            print(f"[GHOST] Sent spawn packets to {addr}")
+
+            # Heartbeat.
+            time.sleep(0.05)
+            hb_packet = build_update_array_heartbeat(
+                tick=self._get_network_tick(ctx),
+                entity_id=entity_id,
+                include_health=True,
+                weapon_id=ls_weapon,
+                health=1.0,
+                fuel=1.0,
+            )
+            self.udp_handler.send_to(hb_packet, addr)
+
+        # Start tick loop.
+        session.last_spawn_time = time.monotonic()
+        ctx.last_action_dump_time = time.monotonic()
+        if FEATURES.tick_loop_enabled and (ctx.tick_thread is None or not ctx.tick_thread.is_alive()):
+            ctx.tick_thread = threading.Thread(target=self._tick_loop, args=(ctx,), daemon=True)
+            ctx.tick_thread.start()
+            print(f"[GHOST] Started tick loop for ghost client {client_id}")
+
+        return ctx
+
     def _handle_udp_d_handshake(self, ctx: Optional[ClientContext], data: bytes, addr: tuple):
         """Handle UDP D_HANDSHAKE (0x03) and respond with stream definitions."""
         handlers.handle_udp_d_handshake(self, ctx, data, addr)
@@ -1563,6 +1727,7 @@ class WulframServer:
         ctx.player_yaw = 0.0
         ctx.player_heading = 0.0
         ctx.player_angular_vel = 0.0
+        ctx.vehicle_physics.reset()
         ctx.last_action_dump_time = time.monotonic()  # Reset timer for position tracking
         if self.spawn_sets_ground_level:
             if self.up_axis == "z":
@@ -2602,20 +2767,20 @@ class WulframServer:
         if ctx is None:
             return
 
+        client_tick = 0
         if len(data) >= 5:
             try:
-                self._sync_tick_offset(ctx, struct.unpack(">I", data[1:5])[0])
+                client_tick = struct.unpack(">I", data[1:5])[0]
+                self._sync_tick_offset(ctx, client_tick)
             except struct.error:
                 pass
         if ctx.weapon_system.decode_action_dump(data):
             ctx.last_action_dump_time = time.monotonic()
+
             if ctx.session and not ctx.session.input_ready:
                 ctx.session.input_ready = True
                 ctx.session.input_ready_time = time.monotonic()
                 print(f"[GAME] Client {ctx.client_id}: input ready (ACTION_DUMP)")
-            # Refresh heading from the newest turn input before firing so
-            # projectile yaw is not one tick behind during rapid rotation.
-            self._update_player_heading(ctx)
             self._update_player_aim(ctx)
             # Update weapon system with current pose
             ctx.weapon_system.player_id = ctx.session.player_id or ctx.entity_id
@@ -2674,9 +2839,11 @@ class WulframServer:
             return
 
         print(f"[UDP] ACTION_UPDATE received: len={len(data)} data={data.hex()}")
+        client_tick = 0
         if len(data) >= 6:
             try:
-                self._sync_tick_offset(ctx, struct.unpack(">I", data[2:6])[0])
+                client_tick = struct.unpack(">I", data[2:6])[0]
+                self._sync_tick_offset(ctx, client_tick)
             except struct.error:
                 pass
         if ctx.weapon_system.decode_action_update(data):
@@ -2685,9 +2852,6 @@ class WulframServer:
                 ctx.session.input_ready = True
                 ctx.session.input_ready_time = time.monotonic()
                 print(f"[GAME] Client {ctx.client_id}: input ready (ACTION_UPDATE)")
-            # ACTION_UPDATE carries turn deltas too; apply them immediately so
-            # fire packets use current body heading instead of stale yaw.
-            self._update_player_heading(ctx)
             self._update_player_aim(ctx)
             # Yaw is tracked via VIEWPOINT_INFO when available; otherwise input-based fallback is used.
             # Position is simulated in the tick loop from behavior slots.
@@ -2940,58 +3104,29 @@ class WulframServer:
         frac = idx_f - idx_lo
         return samples[idx_lo] + (samples[idx_lo + 1] - samples[idx_lo]) * frac
 
-    def _update_player_heading(self, ctx: ClientContext):
-        """Track player movement heading from TURNING input (slot 1).
+    def _compute_steering_response(self, ctx: ClientContext) -> float:
+        """Compute angular velocity from TURNING input (matches client Vehicles.c:1030).
 
-        Matches the client's steering formula from Vehicles.c:1030:
-          steer = turn_rate * curve_response * yaw_input
-        where curve_response = Piecewise_interpolate(abs(input)) is a
-        non-linear dead-zone curve, and turn_adjust (from BEHAVIOR Section 6,
-        default 4.5) scales the result.
+        Returns the steering response in rad/s (clamped to [-1, 1] then scaled).
+        Packets update inputs; the tick loop calls this and integrates heading.
         """
-        import math
-
         def _normalize_axis(val: float) -> float:
             if val > 1.5 or val < -1.5:
                 scale = getattr(ctx.weapon_system, "control_max", 1000.0) or 1000.0
                 return max(-1.0, min(1.0, val / scale))
             return max(-1.0, min(1.0, val))
 
-        # Slot 1 is TURNING (mouse/left-right) per empirical input mapping.
         turn_val = ctx.weapon_system.behavior_slots[BehaviorSlot.TURNING]
         turn_input = _normalize_axis(turn_val)
         if abs(turn_input) < self.turn_deadzone:
             turn_input = 0.0
 
-        # Use actual time delta for turn integration (clamped).
-        now = time.monotonic()
-        dt = now - ctx.last_heading_update
-        ctx.last_heading_update = now
-        dt = min(dt, 0.5)  # Clamp to avoid huge jumps
-
-        # Client steering model:
-        #   curve_response = Piecewise_interpolate(abs(input))
-        #   heading_delta  = turn_sign * sign(input) * curve_response * turn_adjust * dt
         abs_input = abs(turn_input)
         curve_response = self._piecewise_interpolate(self.turn_curve_samples, abs_input)
         sign = 1.0 if turn_input >= 0.0 else -1.0
-        heading_delta = self.turn_sign * sign * curve_response * self.turn_adjust * dt
 
-        ctx.player_heading += heading_delta
-
-        # Keep heading in -pi to pi range
-        while ctx.player_heading > math.pi:
-            ctx.player_heading -= 2 * math.pi
-        while ctx.player_heading < -math.pi:
-            ctx.player_heading += 2 * math.pi
-
-        # Body yaw always follows movement heading.
-        ctx.player_yaw = ctx.player_heading
-        ctx.player_pose["yaw"] = ctx.player_heading
-
-        # Yaw tracking log (~3/sec when turning)
-        if hasattr(ctx.session, 'tick') and ctx.session.tick % 10 == 0 and abs(turn_input) > 0.01:
-            print(f"[YAW-TRACK] input={turn_input:.3f} curve={curve_response:.3f} delta={math.degrees(heading_delta):.2f}deg/tick heading={math.degrees(ctx.player_heading):.1f}deg")
+        # Steering response = angular velocity target (rad/s)
+        return self.turn_sign * sign * curve_response * self.turn_adjust
 
     def _update_player_aim(self, ctx: ClientContext):
         """Update aim yaw/pitch from viewpoint or slot inputs (if enabled)."""
@@ -3537,6 +3672,8 @@ class WulframServer:
         print(f"[TICK] Starting tick loop for client {ctx.client_id}")
         tcp_failed = False
         tick_start_time = time.monotonic()
+        # Delay first correction to avoid interfering with spawn transition
+        ctx.last_correction_send = tick_start_time
         logged_wait_translation = False
         logged_wait_client_tick = False
         grace_period_logged = False
@@ -3587,8 +3724,32 @@ class WulframServer:
                 # Once translation is ready, make sure this client sees others and vice versa.
                 self._ensure_multiplayer_visibility(ctx)
 
-                # Update simulated heading/position from inputs
-                self._update_player_heading(ctx)
+                # Compute steering response from current inputs (piecewise curve output).
+                # _compute_steering_response returns turn_sign * sign * curve * turn_adjust.
+                # The client clamps this to [-1, 1] and sets it as softbody[0x23] (spring target).
+                steering_response = self._compute_steering_response(ctx)
+
+                # Two-stage spring-damper heading integration.
+                # Stage 1: Spring target = clamp(steering_response, -1, 1)
+                # Stage 2: Spring displacement → torque → angular velocity → heading
+                physics = ctx.vehicle_physics
+                physics.spring.target = max(-1.0, min(1.0, steering_response))
+                dt = 1.0 / self.tick_rate_hz
+                physics.step(dt)
+
+                ctx.player_heading = physics.heading
+                ctx.angular_vel_yaw = physics.angular_velocity
+                ctx.player_yaw = ctx.player_heading
+                ctx.player_pose["yaw"] = ctx.player_heading
+
+                if ctx.session.tick % 10 == 0 and abs(ctx.angular_vel_yaw) > 0.01:
+                    print(
+                        f"[YAW-TRACK] spring_target={physics.spring.target:.3f} "
+                        f"spring_disp={physics.spring.value:.3f} "
+                        f"ang_vel={ctx.angular_vel_yaw:.4f} "
+                        f"heading={math.degrees(ctx.player_heading):.1f}deg"
+                    )
+
                 self._update_player_aim(ctx)
                 self._update_player_position(ctx)
 
@@ -3928,7 +4089,7 @@ class WulframServer:
                             elif ctx.tcp_handler:
                                 ctx.tcp_handler.send(view_payload, log=False)
                 elif self.send_player_updates and not send_full_update and send_update:
-                    # Heartbeat only (health/energy) - no position to avoid rubber-banding
+                    # Heartbeat path: health/energy delivery + periodic correction.
                     weapon_type = self._get_local_state_weapon_type(ctx)
                     ammo_bits, ammo_mask = self._get_local_state_ammo_bits(ctx)
                     pt_bits, pt_angle, st_bits, st_angle = self._get_local_state_turret_bits(ctx)
@@ -3938,41 +4099,121 @@ class WulframServer:
                         if not self.wf_local_state_turrets:
                             pt_bits = 0
                             st_bits = 0
-                        # Keep weapon_type from _get_local_state_weapon_type (default 2=AssaultPlatform).
-                        # Previously hardcoded to 0 (Tank) which caused 16-bit turret desync.
                     include_local_state = self._should_send_local_state(
                         ctx,
                         pt_bits,
                         st_bits,
                         self.update_local_state_mode,
                     )
-                    use_view = self.heartbeat_view_update
-                    hb_rot = None
-                    if self.heartbeat_include_rot:
-                        hb_rot = (
+
+                    # Check if a drift correction is due (real entity pos+rot).
+                    correction_due = (
+                        self.correction_interval > 0
+                        and (now - ctx.last_correction_send) >= self.correction_interval
+                    )
+
+                    if correction_due:
+                        corr_pos = self._to_client_pos(ctx.player_pos)
+                        corr_rot = (
                             ctx.player_pose.get("roll", 0.0),
                             0.0,
                             ctx.player_yaw,
                         )
-                    payload = build_update_array_heartbeat(
-                        tick,
-                        ctx.session.entity_id,
-                        include_health=include_local_state,
-                        weapon_id=weapon_type,
-                        health=health_val,
-                        fuel=fuel_val,
-                        ammo_count_bits=ammo_bits,
-                        ammo_count=ammo_mask,
-                        primary_turret_bits=pt_bits,
-                        primary_turret_angle=pt_angle,
-                        secondary_turret_bits=st_bits,
-                        secondary_turret_angle=st_angle,
-                        turret_max=self.local_state_turret_max,
-                        turret_range=self.local_state_turret_range,
-                        is_view_update=use_view,
-                        rot=hb_rot,
-                    )
-                    pkt_label = "VIEW_UPDATE_BEAT" if use_view else "UPDATE_ARRAY_BEAT"
+                        cmode = self.correction_mode
+                        inc_pos = cmode in ("full", "pos_only", "dual_entity", "view_update")
+                        inc_vel = cmode in ("full", "pos_only", "dual_entity", "view_update")
+                        inc_rot = cmode in ("full", "rot_only", "dual_entity", "view_update")
+
+                        common_kw = dict(
+                            include_local_state=include_local_state,
+                            weapon_id=weapon_type,
+                            health=health_val,
+                            fuel=fuel_val,
+                            ammo_count_bits=ammo_bits,
+                            ammo_count=ammo_mask,
+                            primary_turret_bits=pt_bits,
+                            primary_turret_angle=pt_angle,
+                            secondary_turret_bits=st_bits,
+                            secondary_turret_angle=st_angle,
+                            turret_max=self.local_state_turret_max,
+                            turret_range=self.local_state_turret_range,
+                        )
+
+                        if cmode == "view_update":
+                            payload = build_view_update_player_update(
+                                tick, ctx.session.entity_id,
+                                pos=corr_pos, vel=ctx.player_vel, rot=corr_rot,
+                                include_pos=inc_pos, include_vel=inc_vel,
+                                include_rot=inc_rot, **common_kw,
+                            )
+                        elif cmode == "dual_entity":
+                            # 2 entities: real entity with correction + dummy.
+                            # Client only triggers state_sync when entity_count==1
+                            # and entity==local_player. With 2 entities it skips that.
+                            ent_real = dict(
+                                entity_id=ctx.session.entity_id,
+                                is_manned=True,
+                                pos=corr_pos, vel=ctx.player_vel, rot=corr_rot,
+                                include_pos=inc_pos, include_vel=inc_vel,
+                                include_rot=inc_rot,
+                            )
+                            ent_dummy = dict(
+                                entity_id=0xFFFFFFFE,
+                                is_manned=True,
+                                pos=(0, 0, 0), vel=(0, 0, 0), rot=(0, 0, 0),
+                                include_pos=False, include_vel=False,
+                                include_rot=False,
+                            )
+                            payload = build_update_array_multi(
+                                tick, entities=[ent_real, ent_dummy],
+                                **common_kw,
+                            )
+                        else:
+                            # full, rot_only, pos_only
+                            payload = build_update_array_player_update(
+                                tick, ctx.session.entity_id,
+                                pos=corr_pos, vel=ctx.player_vel, rot=corr_rot,
+                                include_pos=inc_pos, include_vel=inc_vel,
+                                include_rot=inc_rot, **common_kw,
+                            )
+
+                        ctx.last_correction_send = now
+                        pkt_label = f"CORRECTION({cmode})"
+                        print(
+                            f"[CORRECTION] mode={cmode} client={ctx.client_id} "
+                            f"pos=({corr_pos[0]:.1f},{corr_pos[1]:.1f},{corr_pos[2]:.1f}) "
+                            f"heading={math.degrees(ctx.player_heading):.1f}deg "
+                            f"inc_pos={inc_pos} inc_rot={inc_rot}"
+                        )
+                    else:
+                        # Normal dummy-entity heartbeat (health only, no position override).
+                        use_view = self.heartbeat_view_update
+                        hb_rot = None
+                        if self.heartbeat_include_rot:
+                            hb_rot = (
+                                ctx.player_pose.get("roll", 0.0),
+                                0.0,
+                                ctx.player_yaw,
+                            )
+                        payload = build_update_array_heartbeat(
+                            tick,
+                            ctx.session.entity_id,
+                            include_health=include_local_state,
+                            weapon_id=weapon_type,
+                            health=health_val,
+                            fuel=fuel_val,
+                            ammo_count_bits=ammo_bits,
+                            ammo_count=ammo_mask,
+                            primary_turret_bits=pt_bits,
+                            primary_turret_angle=pt_angle,
+                            secondary_turret_bits=st_bits,
+                            secondary_turret_angle=st_angle,
+                            turret_max=self.local_state_turret_max,
+                            turret_range=self.local_state_turret_range,
+                            is_view_update=use_view,
+                            rot=hb_rot,
+                        )
+                        pkt_label = "VIEW_UPDATE_BEAT" if use_view else "UPDATE_ARRAY_BEAT"
                     if include_local_state:
                         self._log_vitals(
                             ctx,

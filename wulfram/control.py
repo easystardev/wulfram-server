@@ -12,6 +12,7 @@ Commands:
   phase <name>           - Force session phase transition
   flag <name> <0|1>      - Set feature flag
   turn [param] [value]   - Show/set turning parameters live
+  spring [param] [value] - Show/set spring-damper physics params
   help                   - Show commands
   quit                   - Disconnect
 """
@@ -203,8 +204,12 @@ class ControlServer:
             return self._cmd_heading(args)
         elif cmd == 'fire':
             return self._cmd_fire(args)
+        elif cmd == 'correction' or cmd == 'corr':
+            return self._cmd_correction(args)
         elif cmd == 'behavior' or cmd == 'beh':
             return self._cmd_behavior(args)
+        elif cmd == 'spring':
+            return self._cmd_spring(args)
         elif cmd == 'quit' or cmd == 'exit':
             return "Goodbye!"
         else:
@@ -230,6 +235,8 @@ class ControlServer:
   barrel [param] [value] - Show/set barrel offsets (forward, right, up)
   heading [param] [value]- Show/set heading & aim params (offset, aim_offset, source, reset)
   fire [count|at <deg>]  - Force-fire projectile at current/specified heading
+  correction [secs|on|off|now] - Drift correction (pos+rot sync to client)
+  spring [param] [value] - Spring-damper physics (stiffness, damping, reset)
   help                   - Show this help
   quit                   - Disconnect
 
@@ -558,6 +565,7 @@ Examples:
                     ctx.player_heading = 0.0
                     ctx.player_yaw = 0.0
                     ctx.player_pose["yaw"] = 0.0
+                    ctx.vehicle_physics.reset()
                     count += 1
             return f"Reset heading to 0 for {count} client(s)"
 
@@ -672,6 +680,190 @@ Examples:
                 time.sleep(0.1)
 
         return '\n'.join(results)
+
+    def _cmd_correction(self, args: list) -> str:
+        """Show or set drift correction parameters at runtime.
+
+        Usage:
+          correction                - Show correction settings
+          correction on             - Enable correction (5s default)
+          correction off            - Disable correction
+          correction <seconds>      - Set interval (0=off)
+          correction now            - Force immediate correction
+          correction mode <name>    - Set mode: full, rot_only, pos_only, dual_entity, view_update
+        """
+        if not self.server:
+            return "Error: No server reference"
+
+        if not args:
+            interval = self.server.correction_interval
+            status = "ON" if interval > 0 else "OFF"
+            mode = self.server.correction_mode
+            lines = [
+                f"Drift correction: {status}  mode={mode}",
+                f"  interval = {interval:.1f}s (0=disabled)",
+            ]
+            # Show per-client last correction time
+            for ctx in self.server._snapshot_in_game_clients():
+                age = time.monotonic() - ctx.last_correction_send if ctx.last_correction_send > 0 else -1
+                lines.append(f"  client {ctx.client_id}: last_correction={age:.1f}s ago" if age >= 0 else f"  client {ctx.client_id}: no corrections sent yet")
+            lines.append("")
+            lines.append("Usage: correction <seconds|on|off|now|mode <name>>")
+            lines.append("Modes: full, rot_only, pos_only, dual_entity, view_update")
+            return '\n'.join(lines)
+
+        subcmd = args[0].lower()
+        if subcmd == 'on':
+            if self.server.correction_interval <= 0:
+                self.server.correction_interval = 5.0
+            return f"Correction ON (interval={self.server.correction_interval:.1f}s)"
+        elif subcmd == 'off':
+            self.server.correction_interval = 0.0
+            return "Correction OFF"
+        elif subcmd == 'now':
+            # Force immediate correction on next tick for all clients
+            for ctx in self.server._snapshot_in_game_clients():
+                ctx.last_correction_send = 0.0
+            return f"Forced correction on next tick (mode={self.server.correction_mode})"
+        elif subcmd == 'mode':
+            valid_modes = ("full", "rot_only", "pos_only", "dual_entity", "view_update")
+            if len(args) < 2:
+                return f"Current mode: {self.server.correction_mode}\nModes: {', '.join(valid_modes)}"
+            new_mode = args[1].lower()
+            if new_mode not in valid_modes:
+                return f"Invalid mode: {new_mode}\nModes: {', '.join(valid_modes)}"
+            old = self.server.correction_mode
+            self.server.correction_mode = new_mode
+            print(f"[CONTROL] correction mode: {old} -> {new_mode}")
+            return f"Correction mode: {old} -> {new_mode}"
+        else:
+            try:
+                val = float(subcmd)
+                old = self.server.correction_interval
+                self.server.correction_interval = val
+                print(f"[CONTROL] correction interval: {old:.1f} -> {val:.1f}")
+                return f"Set correction interval = {val:.1f}s" + (" (OFF)" if val <= 0 else "")
+            except ValueError:
+                return f"Invalid value: {subcmd}. Use a number, 'on', 'off', or 'now'."
+
+    def _cmd_spring(self, args: list) -> str:
+        """
+        Show or modify spring-damper physics parameters.
+        Two-stage model: spring displacement → torque → angular velocity → heading.
+        Usage:
+          spring                    - Show current spring params
+          spring stiffness <val>    - Set spring stiffness (default 40.0)
+          spring damping <val>      - Set spring damping (default 4.0)
+          spring torque <val>       - Set torque scale (default 0.342)
+          spring rot_damp <val>     - Set rotation dampening (default 0.0707)
+          spring reset              - Reset all spring state
+        """
+        import math
+
+        ctx_ref = None
+        with self.server.clients_lock:
+            for ctx in self.server.clients.values():
+                ctx_ref = ctx
+                break
+
+        if not args:
+            lines = ["Spring-damper physics (two-stage model):"]
+            if ctx_ref and ctx_ref.vehicle_physics:
+                p = ctx_ref.vehicle_physics
+                lines.append(f"  -- Stage 1: Spring internal --")
+                lines.append(f"  stiffness       = {p.spring.k:.2f}")
+                lines.append(f"  damping         = {p.spring.c:.4f}")
+                lines.append(f"  displacement    = {p.spring.value:.4f}")
+                lines.append(f"  spring_vel      = {p.spring.velocity:.4f}")
+                lines.append(f"  target          = {p.spring.target:.4f}")
+                lines.append(f"  -- Stage 2: Entity rotation --")
+                lines.append(f"  torque_scale    = {p.torque_scale:.4f}")
+                lines.append(f"  rot_dampening   = {p.rotation_dampening:.4f}")
+                lines.append(f"  angular_vel     = {p.angular_velocity:.4f} rad/s")
+                lines.append(f"  heading         = {math.degrees(p.heading):.1f}deg")
+            else:
+                lines.append("  (no client connected)")
+            lines.append("")
+            lines.append("Usage: spring <param> [value]")
+            lines.append("Params: stiffness, damping, torque, rot_damp, reset")
+            return '\n'.join(lines)
+
+        param = args[0].lower()
+
+        if param == 'reset':
+            count = 0
+            with self.server.clients_lock:
+                for ctx in self.server.clients.values():
+                    if ctx.vehicle_physics:
+                        ctx.vehicle_physics.reset()
+                        ctx.player_heading = 0.0
+                        ctx.player_yaw = 0.0
+                        ctx.player_pose["yaw"] = 0.0
+                        ctx.angular_vel_yaw = 0.0
+                        count += 1
+            return f"Reset spring + heading for {count} client(s)"
+
+        if len(args) < 2:
+            return "Usage: spring <param> <value>"
+
+        try:
+            value = float(args[1])
+        except ValueError:
+            return f"Invalid value: {args[1]}"
+
+        if param == 'stiffness' or param == 'k':
+            count = 0
+            old_val = None
+            with self.server.clients_lock:
+                for ctx in self.server.clients.values():
+                    if ctx.vehicle_physics:
+                        if old_val is None:
+                            old_val = ctx.vehicle_physics.spring.k
+                        ctx.vehicle_physics.spring.k = value
+                        count += 1
+            print(f"[CONTROL] spring stiffness: {old_val} -> {value} ({count} clients)")
+            return f"Set stiffness = {value} (was {old_val}, {count} clients)"
+
+        if param == 'damping' or param == 'c':
+            count = 0
+            old_val = None
+            with self.server.clients_lock:
+                for ctx in self.server.clients.values():
+                    if ctx.vehicle_physics:
+                        if old_val is None:
+                            old_val = ctx.vehicle_physics.spring.c
+                        ctx.vehicle_physics.spring.c = value
+                        count += 1
+            print(f"[CONTROL] spring damping: {old_val} -> {value} ({count} clients)")
+            return f"Set damping = {value} (was {old_val}, {count} clients)"
+
+        if param == 'torque' or param == 'ts':
+            count = 0
+            old_val = None
+            with self.server.clients_lock:
+                for ctx in self.server.clients.values():
+                    if ctx.vehicle_physics:
+                        if old_val is None:
+                            old_val = ctx.vehicle_physics.torque_scale
+                        ctx.vehicle_physics.torque_scale = value
+                        count += 1
+            print(f"[CONTROL] spring torque_scale: {old_val} -> {value} ({count} clients)")
+            return f"Set torque_scale = {value} (was {old_val}, {count} clients)"
+
+        if param == 'rot_damp' or param == 'rd':
+            count = 0
+            old_val = None
+            with self.server.clients_lock:
+                for ctx in self.server.clients.values():
+                    if ctx.vehicle_physics:
+                        if old_val is None:
+                            old_val = ctx.vehicle_physics.rotation_dampening
+                        ctx.vehicle_physics.rotation_dampening = value
+                        count += 1
+            print(f"[CONTROL] spring rot_dampening: {old_val} -> {value} ({count} clients)")
+            return f"Set rot_dampening = {value} (was {old_val}, {count} clients)"
+
+        return f"Unknown spring param: {param}. Valid: stiffness, damping, torque, rot_damp, reset"
 
     def _cmd_behavior(self, args: list) -> str:
         """

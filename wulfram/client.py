@@ -13,6 +13,8 @@ import threading
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional, Any
 
+from .physics import VehiclePhysics
+
 if TYPE_CHECKING:
     from .session import Session
     from .transport import TCPHandler
@@ -56,7 +58,12 @@ class ClientContext:
     player_yaw: float = 0.0
     player_heading: float = 0.0
     player_angular_vel: float = 0.0
+    # Angular velocity from steering response, integrated in tick loop (rad/s)
+    angular_vel_yaw: float = 0.0
     player_energy: float = 100.0
+
+    # Spring-damper physics for heading (matches client's spring-based system)
+    vehicle_physics: Optional[VehiclePhysics] = None
 
     # Aim tracking
     player_aim_yaw: float = 0.0
@@ -76,7 +83,9 @@ class ClientContext:
     # Input tracking
     last_action_dump_time: float = field(default_factory=time.monotonic)
     last_client_tick: int = 0
+    last_heading_client_tick: int = 0  # Client tick at last heading update
     tick_offset: Optional[int] = None
+
     last_sent_tick: int = 0
     tick_lock: threading.Lock = field(default_factory=threading.Lock)
     last_sent_player_state: Optional[dict] = None
@@ -104,6 +113,8 @@ class ClientContext:
     last_view_update_send: float = field(default_factory=time.monotonic)
     # Update throttling (server-authoritative snapshots)
     last_update_send: float = field(default_factory=time.monotonic)
+    # Periodic correction (real entity pos+rot to correct drift)
+    last_correction_send: float = 0.0
     last_sent_pos: tuple = field(default_factory=lambda: (0.0, 0.0, 0.0))
     last_sent_vel: tuple = field(default_factory=lambda: (0.0, 0.0, 0.0))
     last_sent_yaw: float = 0.0
@@ -121,6 +132,8 @@ class ClientContext:
         self.last_sent_pos = self.player_pos
         self.last_sent_vel = self.player_vel
         self.last_sent_yaw = self.player_yaw
+        if self.vehicle_physics is None:
+            self.vehicle_physics = VehiclePhysics()
 
     def reset(self):
         """Reset client state for reconnection."""
