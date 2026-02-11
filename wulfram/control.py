@@ -235,6 +235,8 @@ class ControlServer:
             return self._cmd_physics(args)
         elif cmd == 'respawn' or cmd == 'rs':
             return self._cmd_respawn(args)
+        elif cmd == 'shells':
+            return self._cmd_shells(args)
         elif cmd == 'reload':
             return self._cmd_reload(args)
         elif cmd == 'quit' or cmd == 'exit':
@@ -654,6 +656,8 @@ Examples:
           fire                     - Fire once using current heading
           fire <count>             - Fire count times with 100ms delay
           fire at <yaw_deg>        - Fire at specific heading (degrees)
+          fire speed <val>         - Set projectile speed (default 75)
+          fire slow <count>        - Fire slow (speed=5) burst for minimap tracing
         """
         import math
 
@@ -675,6 +679,7 @@ Examples:
 
         count = 1
         override_yaw = None
+        speed_override = None
 
         if args:
             if args[0] == 'at' and len(args) >= 2:
@@ -682,6 +687,15 @@ Examples:
                     override_yaw = math.radians(float(args[1]))
                 except ValueError:
                     return f"Invalid yaw: {args[1]}"
+            elif args[0] == 'speed' and len(args) >= 2:
+                try:
+                    ctx.weapon_system.pulse_shell_speed = float(args[1])
+                except ValueError:
+                    return f"Invalid speed: {args[1]}"
+                return f"Set pulse_shell_speed = {ctx.weapon_system.pulse_shell_speed}"
+            elif args[0] == 'slow':
+                speed_override = 40.0
+                count = int(args[1]) if len(args) >= 2 else 15
             else:
                 try:
                     count = int(args[0])
@@ -689,6 +703,10 @@ Examples:
                     return f"Invalid count: {args[0]}"
 
         results = []
+        old_speed = ctx.weapon_system.pulse_shell_speed
+        if speed_override is not None:
+            ctx.weapon_system.pulse_shell_speed = speed_override
+
         for i in range(count):
             # Set weapon system pose from current heading (or override)
             yaw = override_yaw if override_yaw is not None else ctx.player_heading
@@ -696,19 +714,26 @@ Examples:
             ctx.weapon_system.player_rot = (0.0, 0.0, yaw)
             ctx.weapon_system.current_weapon = 4  # PULSE_CANNON
 
+            # Reset cooldown so rapid-fire works
+            ctx.weapon_system.last_fire_time = 0
             proj = ctx.weapon_system._fire_pulse_cannon()
             if proj:
                 self.server._spawn_moving_projectile(ctx, proj, addr)
                 ctx.weapon_system.projectiles.append(proj)
                 hdg = math.degrees(yaw)
-                results.append(f"Shot {i+1}: heading={hdg:.1f}deg proj_id={proj.entity_id}")
-                print(f"[CONTROL-FIRE] heading={hdg:.1f} pos={ctx.player_pos}")
+                spd = ctx.weapon_system.pulse_shell_speed
+                results.append(f"Shot {i+1}: heading={hdg:.1f}deg speed={spd:.0f} proj_id={proj.entity_id}")
+                if i == 0 or i == count - 1:
+                    print(f"[CONTROL-FIRE] heading={hdg:.1f} speed={spd} pos={ctx.player_pos}")
             else:
-                results.append(f"Shot {i+1}: FAILED (cooldown?)")
+                results.append(f"Shot {i+1}: FAILED")
 
             if i < count - 1:
                 import time
-                time.sleep(0.1)
+                time.sleep(0.05)
+
+        if speed_override is not None:
+            ctx.weapon_system.pulse_shell_speed = old_speed
 
         return '\n'.join(results)
 

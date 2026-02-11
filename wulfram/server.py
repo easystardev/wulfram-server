@@ -605,9 +605,9 @@ class WulframServer:
         except ValueError:
             self.aim_pitch_adjust = 2.5
         try:
-            self.turn_adjust = float(os.environ.get("WULFRAM_TURN_ADJUST", "4.5"))
+            self.turn_adjust = float(os.environ.get("WULFRAM_TURN_ADJUST", "3.5"))
         except ValueError:
-            self.turn_adjust = 4.5
+            self.turn_adjust = 3.5
         try:
             self.turn_deadzone = float(os.environ.get("WULFRAM_TURN_DEADZONE", "0.05"))
         except ValueError:
@@ -640,9 +640,9 @@ class WulframServer:
         # From Physics_substep_integrate: ang_vel += (torque - ang_vel * damp_coeff) * dt
         # Steady state: ang_vel = torque / damp_coeff = turn_adjust / damp_coeff
         try:
-            self.damp_coeff = float(os.environ.get("WULFRAM_DAMP_COEFF", "1.0"))
+            self.damp_coeff = float(os.environ.get("WULFRAM_DAMP_COEFF", "1.5"))
         except ValueError:
-            self.damp_coeff = 1.0
+            self.damp_coeff = 1.5
 
         # Periodic correction: send real entity pos+rot to correct client drift.
         # 0 = disabled, >0 = interval in seconds between corrections.
