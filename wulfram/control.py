@@ -93,6 +93,16 @@ class ControlServer:
                     return c, c.session.udp_addr
         return None, None
 
+    def _get_client_by_id(self, client_id: int):
+        """Find a specific client by client_id. Returns (ctx, addr) or (None, None)."""
+        if not self.server:
+            return None, None
+        with self.server.clients_lock:
+            for c in self.server.clients.values():
+                if c.client_id == client_id and c.session and c.session.udp_addr:
+                    return c, c.session.udp_addr
+        return None, None
+
     def _sync_to_active_client(self):
         """Update self.session/tcp_handler to match the active game client."""
         ctx, _ = self._get_active_client()
@@ -239,6 +249,8 @@ class ControlServer:
             return self._cmd_shells(args)
         elif cmd == 'reload':
             return self._cmd_reload(args)
+        elif cmd == 'players' or cmd == 'pl':
+            return self._cmd_players(args)
         elif cmd == 'quit' or cmd == 'exit':
             return "Goodbye!"
         else:
@@ -267,6 +279,7 @@ class ControlServer:
   correction [secs|on|off|now] - Drift correction (pos+rot sync to client)
   physics [param] [value] - Yaw physics params (damp, reset)
   respawn / rs           - Re-send TankPacket to reset client entity position + heading
+  players / pl [json]    - Show all connected players' positions and headings
   help                   - Show this help
   quit                   - Disconnect
 
@@ -994,6 +1007,54 @@ Examples:
         except Exception as e:
             print(f"[RELOAD] ERROR: {e}")
             return f"Reload failed: {e}"
+
+    def _cmd_players(self, args: list) -> str:
+        """Show all connected players' positions and headings.
+
+        Usage:
+          players       - List all in-game clients with server-tracked position/heading
+          players json  - Output as JSON for tooling
+        """
+        import math
+        import json as _json
+
+        if not self.server:
+            return "Error: No server reference"
+
+        json_mode = args and args[0].lower() == "json"
+        clients = []
+        with self.server.clients_lock:
+            for ctx in self.server.clients.values():
+                if not ctx or not ctx.running:
+                    continue
+                phase = ctx.session.phase.name if ctx.session else "NONE"
+                entry = {
+                    "client_id": ctx.client_id,
+                    "entity_id": ctx.session.entity_id if ctx.session else None,
+                    "phase": phase,
+                    "pos": list(ctx.player_pos),
+                    "vel": list(ctx.player_vel),
+                    "heading_deg": round(math.degrees(ctx.player_heading), 1),
+                    "aim_yaw_deg": round(math.degrees(ctx.player_aim_yaw), 1),
+                    "aim_pitch_deg": round(math.degrees(ctx.player_aim_pitch), 1),
+                }
+                clients.append(entry)
+
+        if not clients:
+            return "No connected clients"
+
+        if json_mode:
+            return _json.dumps(clients, indent=2)
+
+        lines = []
+        for c in clients:
+            x, y, z = c["pos"]
+            lines.append(
+                f"Client {c['client_id']} (entity {c['entity_id']}) [{c['phase']}]: "
+                f"pos=({x:.1f}, {y:.1f}, {z:.1f}) "
+                f"heading={c['heading_deg']}° aim={c['aim_yaw_deg']}°"
+            )
+        return "\n".join(lines)
 
     def _cmd_respawn(self, args: list) -> str:
         """

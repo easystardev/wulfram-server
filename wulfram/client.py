@@ -115,6 +115,8 @@ class ClientContext:
     last_update_send: float = field(default_factory=time.monotonic)
     # Periodic correction (real entity pos+rot to correct drift)
     last_correction_send: float = 0.0
+    # Remote player update throttle
+    last_remote_update_send: float = 0.0
     # Pending respawn position (set by respawn command, consumed by auto_join_team)
     pending_respawn_pos: Optional[tuple] = None
     last_sent_pos: tuple = field(default_factory=lambda: (0.0, 0.0, 0.0))

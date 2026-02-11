@@ -184,6 +184,12 @@ class WulframServer:
         # Remote update shape to avoid malformed packets destabilizing HUD state in multi-client.
         # Modes: pos, pos_rot, pos_vel_rot, heartbeat, off (default: pos).
         self.remote_update_mode = os.environ.get("WULFRAM_REMOTE_UPDATE_MODE", "pos").strip().lower()
+        # Throttle remote player updates: interval in seconds (0 = every tick).
+        # Default 0.1s = 10Hz, reduces packet flood vs 30Hz tick rate.
+        try:
+            self.remote_update_interval = float(os.environ.get("WULFRAM_REMOTE_UPDATE_INTERVAL", "0.1"))
+        except ValueError:
+            self.remote_update_interval = 0.1
         # For remote player updates, set is_manned bit (likely required for player vehicles).
         self.remote_update_is_manned = os.environ.get("WULFRAM_REMOTE_IS_MANNED", "0") == "1"
         # Combine local + remote updates into a single UPDATE_ARRAY per tick.
@@ -571,7 +577,7 @@ class WulframServer:
             f"ammo_from_behavior={int(self.local_state_ammo_from_behavior)} "
             f"vitals_heartbeat={int(self.tank_vitals_heartbeat)} wf_local_turrets={int(self.wf_local_state_turrets)} "
             f"local_update_mode={self.local_update_mode} "
-            f"remote_update_mode={self.remote_update_mode} "
+            f"remote_update_mode={self.remote_update_mode} remote_interval={self.remote_update_interval:.2f}s "
             f"combine_updates={int(self.combine_update_arrays)}"
         )
         print(
@@ -940,27 +946,28 @@ class WulframServer:
         include_rot = mode in ("pos_rot", "pos_vel_rot", "full", "all")
         health_val = self._get_health_value()
         fuel_val = 1.0
-        weapon_type = self._get_local_state_weapon_type(ctx)
-        ammo_bits, ammo_mask = self._get_local_state_ammo_bits(ctx)
-        pt_bits, pt_angle, st_bits, st_angle = self._get_local_state_turret_bits(ctx)
-        if self.update_local_state_mode == "wf":
-            ammo_bits = 0
-            ammo_mask = 0
-            if not self.wf_local_state_turrets:
-                pt_bits = 0
-                st_bits = 0
-        include_local_state = self._should_send_local_state(
-            ctx,
-            pt_bits,
-            st_bits,
-            self.update_local_state_mode,
-        )
         for other in self._snapshot_in_game_clients():
             if other is ctx:
                 continue
             entity_id = other.session.entity_id or other.entity_id
             if entity_id not in ctx.known_entity_ids:
                 continue
+            # Extract weapon/ammo/turret data from the REMOTE player, not the viewer.
+            weapon_type = self._get_local_state_weapon_type(other)
+            ammo_bits, ammo_mask = self._get_local_state_ammo_bits(other)
+            pt_bits, pt_angle, st_bits, st_angle = self._get_local_state_turret_bits(other)
+            if self.update_local_state_mode == "wf":
+                ammo_bits = 0
+                ammo_mask = 0
+                if not self.wf_local_state_turrets:
+                    pt_bits = 0
+                    st_bits = 0
+            include_local_state = self._should_send_local_state(
+                other,
+                pt_bits,
+                st_bits,
+                self.update_local_state_mode,
+            )
             send_pos = self._to_client_pos(other.player_pos)
             payload = build_update_array_player_update(
                 tick,
@@ -969,7 +976,7 @@ class WulframServer:
                 vel=other.player_vel,
                 rot=(
                     other.player_pose.get("roll", 0.0),
-                    0.0,
+                    other.player_pose.get("pitch", 0.0),
                     other.player_yaw,
                 ),
                 include_pos=include_pos,
@@ -4346,7 +4353,12 @@ class WulframServer:
                             )
 
                 # Send other players' transforms to this client (multiplayer visibility).
-                if self.send_player_updates and not self.combine_update_arrays:
+                remote_due = (
+                    self.remote_update_interval <= 0
+                    or (now - ctx.last_remote_update_send) >= self.remote_update_interval
+                )
+                if self.send_player_updates and not self.combine_update_arrays and remote_due:
+                    ctx.last_remote_update_send = now
                     self._send_remote_player_updates(
                         ctx,
                         tick,
