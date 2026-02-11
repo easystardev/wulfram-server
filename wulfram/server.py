@@ -1506,8 +1506,16 @@ class WulframServer:
                     continue
                 if not c.client_addr or c.client_addr[0] != ip:
                     continue
-                if c.session.phase != Phase.DISCONNECTED:
-                    candidates.append(c)
+                if c.session.phase == Phase.DISCONNECTED:
+                    continue
+                # Skip clients that already have a verified UDP address on a
+                # different port -- recovering them would steal the mapping and
+                # break the other client's UDP routing (localhost two-client bug).
+                if (c.session.udp_verified and c.session.udp_addr
+                        and c.session.udp_addr != addr
+                        and c.session.udp_addr in self.udp_addr_to_client):
+                    continue
+                candidates.append(c)
 
         if not candidates:
             return None
