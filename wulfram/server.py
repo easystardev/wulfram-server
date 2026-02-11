@@ -938,6 +938,23 @@ class WulframServer:
         include_pos = mode not in ("heartbeat", "mask0")
         include_vel = mode in ("pos_vel", "pos_vel_rot", "full", "all")
         include_rot = mode in ("pos_rot", "pos_vel_rot", "full", "all")
+        health_val = self._get_health_value()
+        fuel_val = 1.0
+        weapon_type = self._get_local_state_weapon_type(ctx)
+        ammo_bits, ammo_mask = self._get_local_state_ammo_bits(ctx)
+        pt_bits, pt_angle, st_bits, st_angle = self._get_local_state_turret_bits(ctx)
+        if self.update_local_state_mode == "wf":
+            ammo_bits = 0
+            ammo_mask = 0
+            if not self.wf_local_state_turrets:
+                pt_bits = 0
+                st_bits = 0
+        include_local_state = self._should_send_local_state(
+            ctx,
+            pt_bits,
+            st_bits,
+            self.update_local_state_mode,
+        )
         for other in self._snapshot_in_game_clients():
             if other is ctx:
                 continue
@@ -958,9 +975,20 @@ class WulframServer:
                 include_pos=include_pos,
                 include_vel=include_vel,
                 include_rot=include_rot,
-                include_local_state=False,
+                include_local_state=include_local_state,
                 include_entity_vitals=False,
                 is_manned=self.remote_update_is_manned,
+                weapon_id=weapon_type,
+                health=health_val,
+                fuel=fuel_val,
+                ammo_count_bits=ammo_bits,
+                ammo_count=ammo_mask,
+                primary_turret_bits=pt_bits,
+                primary_turret_angle=pt_angle,
+                secondary_turret_bits=st_bits,
+                secondary_turret_angle=st_angle,
+                turret_max=self.local_state_turret_max,
+                turret_range=self.local_state_turret_range,
             )
             self._send_packet_to_client(ctx, payload, prefer_tcp=prefer_tcp)
 
