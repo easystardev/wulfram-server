@@ -3097,32 +3097,24 @@ class WulframServer:
 
     def _send_projectile_spawn(self, ctx: ClientContext, proj, addr: tuple):
         """Send packet to spawn a projectile entity."""
-        # Build UPDATE_ARRAY packet to create the projectile entity
-        tick = self._get_network_tick(ctx)
-        # Local-state weapon field is an entity-type index, not selected weapon slot.
-        local_state_weapon = self._get_local_state_weapon_type(ctx)
-        packet_local = build_projectile_spawn_packet(
-            proj,
-            tick,
-            include_local_state=self.projectile_local_stats,
-            weapon_id=local_state_weapon,
-            health=self._get_health_value(ctx),
-            fuel=1.0,
-            entity_config=self.projectile_config,
-            is_static=self.projectile_spawn_snap,
-        )
-        # Always include local_state in remote projectile spawn packets.
-        # An UPDATE_ARRAY without local_state can cause the client to
-        # interpret health as 0, triggering the red damage overlay.
-        packet_remote = packet_local
-
-        # Send via UDP
+        # Build per-client packets so each viewer gets their OWN health
+        # in local_state (not the shooter's health).
         sent_count = 0
         if self.udp_handler:
             for target in self._snapshot_in_game_clients():
                 if not target.session.udp_addr or not target.session.translation_ack_received:
                     continue
-                packet = packet_local if target is ctx else packet_remote
+                tick = self._get_network_tick(target)
+                packet = build_projectile_spawn_packet(
+                    proj,
+                    tick,
+                    include_local_state=self.projectile_local_stats,
+                    weapon_id=self._get_local_state_weapon_type(target),
+                    health=self._get_health_value(target),
+                    fuel=1.0,
+                    entity_config=self.projectile_config,
+                    is_static=self.projectile_spawn_snap,
+                )
                 self.udp_handler.send_to(packet, target.session.udp_addr)
                 sent_count += 1
         if sent_count:
@@ -3133,7 +3125,7 @@ class WulframServer:
                 f"config={self.projectile_config} spawn_snap={int(self.projectile_spawn_snap)}"
             )
             if os.environ.get("WULFRAM_DEBUG_PROJECTILE_HEX", "0") == "1":
-                print(f"[PROJ-HEX] id={proj.entity_id} len={len(packet_local)} hex={packet_local.hex()}")
+                print(f"[PROJ-HEX] id={proj.entity_id} (per-client packets, no single hex to show)")
 
         # Send chat message with projectile position for debugging (TCP only).
         pos_msg = f"FIRE! pos=({proj.pos[0]:.1f},{proj.pos[1]:.1f},{proj.pos[2]:.1f}) vel=({proj.vel[0]:.1f},{proj.vel[1]:.1f},{proj.vel[2]:.1f})"
@@ -3495,25 +3487,22 @@ class WulframServer:
                     break  # Stop update loop
 
                 # Send position update (dt=0 since we already advanced pos above)
-                tick = self._get_network_tick(ctx)
-                update_pkt_local = build_projectile_update_packet(
-                    proj,
-                    tick,
-                    0.0,  # Position already advanced above
-                    include_local_state=self.projectile_local_stats,
-                    weapon_id=self._get_local_state_weapon_type(ctx),
-                    health=self._get_health_value(ctx),
-                    fuel=1.0,
-                )
-                # Always include local_state in remote update packets to prevent
-                # the client from zeroing health on UPDATE_ARRAY without local_state.
-                update_pkt_remote = update_pkt_local
-
+                # Build per-client packets so each viewer gets their OWN health
+                # in local_state (not the shooter's health).
                 if self.udp_handler:
                     for target in self._snapshot_in_game_clients():
                         if not target.session.udp_addr or not target.session.translation_ack_received:
                             continue
-                        pkt = update_pkt_local if target is ctx else update_pkt_remote
+                        tick = self._get_network_tick(target)
+                        pkt = build_projectile_update_packet(
+                            proj,
+                            tick,
+                            0.0,  # Position already advanced above
+                            include_local_state=self.projectile_local_stats,
+                            weapon_id=self._get_local_state_weapon_type(target),
+                            health=self._get_health_value(target),
+                            fuel=1.0,
+                        )
                         self.udp_handler.send_to(pkt, target.session.udp_addr)
 
                 if i % 15 == 0:  # Log every 0.5 sec at 30Hz
