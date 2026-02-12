@@ -251,6 +251,12 @@ class ControlServer:
             return self._cmd_reload(args)
         elif cmd == 'players' or cmd == 'pl':
             return self._cmd_players(args)
+        elif cmd == 'input' or cmd == 'inp':
+            return self._cmd_input(args)
+        elif cmd == 'move' or cmd == 'mv':
+            return self._cmd_move(args)
+        elif cmd == 'teleport' or cmd == 'tp':
+            return self._cmd_teleport(args)
         elif cmd == 'quit' or cmd == 'exit':
             return "Goodbye!"
         else:
@@ -615,6 +621,32 @@ Examples:
                     count += 1
             return f"Reset heading to 0 for {count} client(s)"
 
+        if param == 'set':
+            # heading set <deg> [c<id>] — force server heading to specific value
+            if len(args) < 2:
+                return "Usage: heading set <deg> [c<id>]"
+            try:
+                deg = float(args[1])
+            except ValueError:
+                return f"Invalid angle: {args[1]}"
+            rad = math.radians(deg)
+            target_id = None
+            if len(args) >= 3 and args[2].lower().startswith("c") and args[2][1:].isdigit():
+                target_id = int(args[2][1:])
+            updated = []
+            with self.server.clients_lock:
+                for ctx in self.server.clients.values():
+                    if target_id is not None and ctx.client_id != target_id:
+                        continue
+                    ctx.player_heading = rad
+                    ctx.player_yaw = rad
+                    ctx.player_pose["yaw"] = rad
+                    if ctx.vehicle_physics:
+                        ctx.vehicle_physics.heading = rad
+                        ctx.vehicle_physics._angular_velocity = 0.0
+                    updated.append(ctx.client_id)
+            return f"Set heading to {deg}° for client(s) {updated}"
+
         if param == 'source':
             if len(args) < 2:
                 return f"Current source: {self.server.projectile_aim_source}. Usage: heading source <body|viewpoint|auto>"
@@ -977,13 +1009,19 @@ Examples:
         return f"Set {param} = {value} (was {old_value}), re-sent BEHAVIOR ({len(data)} bytes)\n{desc}"
 
     def _cmd_reload(self, args: list) -> str:
-        """Hot-reload control.py and packets.py without restarting server.
+        """Hot-reload server modules without restarting.
 
-        Swaps this instance's class to the reloaded ControlServer, so all
-        _cmd_* methods pick up new code immediately.  Instance state
-        (server, session, tcp_handler, etc.) is preserved.
+        Reloads all .py modules and swaps classes on live instances.
+        All instance state (sockets, threads, clients, physics) is preserved.
+
+        Usage:
+          reload        - Reload all modules (server, control, packets, physics, etc.)
+          reload quick  - Reload only control + packets (faster, for command changes)
         """
         import importlib
+        import traceback
+
+        quick = args and args[0].lower() in ('quick', 'q')
 
         try:
             from . import packets as packets_mod
@@ -992,20 +1030,70 @@ Examples:
             # Preserve tick counter base across reload
             old_server_start = packets_mod._SERVER_START
 
-            # Reload packets first (control depends on it)
-            importlib.reload(packets_mod)
-            packets_mod._SERVER_START = old_server_start
+            reloaded = []
 
-            # Reload control module
-            importlib.reload(control_mod)
+            if not quick:
+                # Full reload: all modules in dependency order
+                from . import codec as codec_mod
+                from . import session as session_mod
+                from . import client as client_mod
+                from . import physics as physics_mod
+                from . import weapons as weapons_mod
+                from . import transport as transport_mod
+                from . import handlers as handlers_mod
+                from . import jump_jets as jump_jets_mod
+                from . import server as server_mod
 
-            # Swap class — instance state preserved, new methods active
-            self.__class__ = control_mod.ControlServer
+                # Reload leaf modules first, then dependents
+                for mod, name in [
+                    (codec_mod, "codec"),
+                    (session_mod, "session"),
+                    (physics_mod, "physics"),
+                    (jump_jets_mod, "jump_jets"),
+                    (weapons_mod, "weapons"),
+                    (client_mod, "client"),
+                    (transport_mod, "transport"),
+                    (packets_mod, "packets"),
+                    (handlers_mod, "handlers"),
+                    (control_mod, "control"),
+                    (server_mod, "server"),
+                ]:
+                    importlib.reload(mod)
+                    reloaded.append(name)
 
-            print("[RELOAD] Reloaded control + packets modules")
-            return "Reloaded control + packets modules"
+                # Restore preserved state
+                packets_mod._SERVER_START = old_server_start
+
+                # Swap WulframServer class on live instance
+                if self.server:
+                    self.server.__class__ = server_mod.WulframServer
+
+                    # Swap VehiclePhysics class on all client contexts
+                    with self.server.clients_lock:
+                        for ctx in self.server.clients.values():
+                            if hasattr(ctx, 'vehicle_physics') and ctx.vehicle_physics:
+                                ctx.vehicle_physics.__class__ = physics_mod.VehiclePhysics
+
+                # Swap ControlServer class on this instance
+                self.__class__ = control_mod.ControlServer
+
+            else:
+                # Quick reload: just control + packets
+                importlib.reload(packets_mod)
+                packets_mod._SERVER_START = old_server_start
+                reloaded.append("packets")
+
+                importlib.reload(control_mod)
+                reloaded.append("control")
+
+                self.__class__ = control_mod.ControlServer
+
+            msg = f"Reloaded: {', '.join(reloaded)}"
+            print(f"[RELOAD] {msg}")
+            return msg
         except Exception as e:
-            print(f"[RELOAD] ERROR: {e}")
+            tb = traceback.format_exc()
+            print(f"[RELOAD] ERROR: {e}\n{tb}")
             return f"Reload failed: {e}"
 
     def _cmd_players(self, args: list) -> str:
@@ -1049,12 +1137,203 @@ Examples:
         lines = []
         for c in clients:
             x, y, z = c["pos"]
+            vx, vy, vz = c["vel"]
+            speed = (vx**2 + vy**2 + vz**2) ** 0.5
+            vel_str = f" vel=({vx:.1f}, {vy:.1f}, {vz:.1f}) speed={speed:.1f}" if speed > 0.1 else ""
             lines.append(
                 f"Client {c['client_id']} (entity {c['entity_id']}) [{c['phase']}]: "
                 f"pos=({x:.1f}, {y:.1f}, {z:.1f}) "
-                f"heading={c['heading_deg']}° aim={c['aim_yaw_deg']}°"
+                f"heading={c['heading_deg']}° aim={c['aim_yaw_deg']}°{vel_str}"
             )
         return "\n".join(lines)
+
+    def _cmd_input(self, args: list) -> str:
+        """Show raw input slot values for all connected clients."""
+        if not self.server:
+            return "Error: No server reference"
+        try:
+            import math as _math
+            from .weapons import BehaviorSlot
+            lines = []
+            with self.server.clients_lock:
+                for ctx in self.server.clients.values():
+                    if not ctx or not ctx.running:
+                        continue
+                    ws = ctx.weapon_system
+                    turn = ws.behavior_slots[BehaviorSlot.TURNING]
+                    fwd = ws.behavior_slots[BehaviorSlot.MOVING_FORWARD]
+                    side = ws.behavior_slots[BehaviorSlot.MOVING_SIDEWAYS]
+                    fire = ws.behavior_slots[BehaviorSlot.FIRE]
+                    thrust = ws.behavior_slots[BehaviorSlot.UPWARD_THRUST]
+                    s6 = ws.behavior_slots[BehaviorSlot.SLOT6]
+                    s7 = ws.behavior_slots[BehaviorSlot.SLOT7]
+                    raw_input = self.server._get_raw_turn_input(ctx)
+                    physics = ctx.vehicle_physics
+                    ang_vel = physics.angular_velocity if physics else 0.0
+                    lines.append(
+                        f"C{ctx.client_id}: turn={turn:.4f} fwd={fwd:.4f} side={side:.4f} "
+                        f"fire={fire:.0f} thrust={thrust:.4f} s6={s6:.4f} s7={s7:.4f} | "
+                        f"raw={raw_input:.4f} av={ang_vel:.4f} hdg={_math.degrees(ctx.player_heading):.1f}"
+                    )
+            return "\n".join(lines) if lines else "No connected clients"
+        except Exception as e:
+            return f"Error: {e}"
+
+    def _cmd_move(self, args: list) -> str:
+        """Inject movement input for a client.
+
+        Usage:
+          move forward [secs] [c<id>]   - Drive forward (default 3s)
+          move back [secs] [c<id>]      - Drive backward
+          move left [secs] [c<id>]      - Strafe left
+          move right [secs] [c<id>]     - Strafe right
+          move stop [c<id>]             - Zero all movement inputs
+        """
+        if not self.server:
+            return "Error: No server reference"
+        from .weapons import BehaviorSlot
+        import threading
+
+        direction = args[0].lower() if args else "forward"
+        duration = 3.0
+        client_filter = None
+
+        for a in args[1:]:
+            if a.lower().startswith("c") and a[1:].isdigit():
+                client_filter = int(a[1:])
+            else:
+                try:
+                    duration = float(a)
+                except ValueError:
+                    pass
+
+        targets = []
+        with self.server.clients_lock:
+            for ctx in self.server.clients.values():
+                if not ctx or not ctx.running:
+                    continue
+                if client_filter is not None and ctx.client_id != client_filter:
+                    continue
+                targets.append(ctx)
+
+        if not targets:
+            return "No matching clients"
+
+        fwd_val = 0.0
+        strafe_val = 0.0
+        if direction in ("forward", "fwd", "f"):
+            fwd_val = 0.549  # Matches quantized full-key forward input (ACTION_UPDATE slot 2)
+        elif direction in ("back", "backward", "b"):
+            fwd_val = -0.549
+        elif direction in ("left", "l"):
+            strafe_val = -0.549
+        elif direction in ("right", "r"):
+            strafe_val = 0.549
+        elif direction == "stop":
+            for ctx in targets:
+                ctx.injected_input = None
+            return f"Stopped movement for {len(targets)} client(s)"
+
+        def _do_move():
+            for ctx in targets:
+                ctx.injected_input = (fwd_val, strafe_val)
+            time.sleep(duration)
+            for ctx in targets:
+                ctx.injected_input = None
+            print(f"[MOVE] {direction} complete ({duration:.1f}s)")
+
+        t = threading.Thread(target=_do_move, daemon=True)
+        t.start()
+        return f"Moving {direction} for {duration:.1f}s ({len(targets)} client(s))"
+
+    def _do_respawn(self, ctx, pos: tuple = None, offset_x: float = 0.0) -> str:
+        """Core respawn logic for a single client. Returns status string."""
+        map_spawn = self.server._pick_spawn_point(ctx.session.team_id if ctx.session else 1)
+        if pos:
+            x, y, z = pos
+        elif map_spawn:
+            x, y, z = map_spawn["x"], map_spawn["y"], map_spawn["z"]
+        elif self.server.up_axis == "z":
+            x, y, z = 100.0, 100.0, self.server.spawn_height
+        else:
+            x, y, z = 100.0, self.server.spawn_height, 100.0
+        x += offset_x
+
+        entity_id = ctx.entity_id or 1337
+        team_id = ctx.session.team_id if ctx.session else 1
+        ctx.pending_respawn_pos = (x, y, z)
+        ctx.player_pos = (x, y, z)
+        ctx.player_vel = (0.0, 0.0, 0.0)
+        ctx.player_heading = 0.0
+        ctx.player_yaw = 0.0
+        ctx.angular_vel_yaw = 0.0
+        ctx.player_pose["pos"] = (x, y, z)
+        ctx.player_pose["vel"] = (0.0, 0.0, 0.0)
+        ctx.player_pose["yaw"] = 0.0
+        if ctx.vehicle_physics:
+            ctx.vehicle_physics.heading = 0.0
+            ctx.vehicle_physics._angular_velocity = 0.0
+        ctx.last_correction_send = time.monotonic()
+
+        print(f"[RESPAWN] DELETE entity {entity_id}, pending pos=({x:.1f},{y:.1f},{z:.1f})")
+        delete_pkt = build_delete_object(
+            tick=self.server._get_network_tick(ctx),
+            entity_ids=[entity_id],
+            with_effects=False,
+        )
+        if ctx.tcp_handler:
+            ctx.tcp_handler.send(delete_pkt)
+        ctx.session.phase = Phase.TEAM_SELECT
+        ctx.session.in_game = False
+        time.sleep(5.0)
+        print(f"[RESPAWN] Spawning client {ctx.client_id} at ({x:.1f},{y:.1f},{z:.1f})")
+        self.server._spawn_wf_style(ctx, team_id=team_id, net_id=entity_id, pos=(x, y, z))
+        return f"({x:.1f},{y:.1f},{z:.1f})"
+
+    def _cmd_teleport(self, args: list) -> str:
+        """Teleport: offset server position and force correction to test if client moves.
+
+        Usage:
+          teleport <dx> <dy> [dz]  - Offset position by (dx,dy,dz) and send correction
+          teleport <x> <y> <z> abs - Set absolute position and send correction
+        """
+        if not self.server:
+            return "Error: No server reference"
+
+        clients = self.server._snapshot_in_game_clients()
+        if not clients:
+            return "No in-game clients"
+        ctx = clients[0]
+
+        if not args:
+            return "Usage: teleport <dx> <dy> [dz] | teleport <x> <y> <z> abs"
+
+        try:
+            absolute = len(args) > 3 and args[-1].lower() == 'abs'
+            x = float(args[0])
+            y = float(args[1]) if len(args) > 1 else 0.0
+            z = float(args[2]) if len(args) > 2 and args[2].lower() != 'abs' else 0.0
+
+            old_pos = ctx.player_pos
+            if absolute:
+                ctx.player_pos = (x, y, z)
+            else:
+                ctx.player_pos = (old_pos[0] + x, old_pos[1] + y, old_pos[2] + z)
+
+            # Zero velocity so server doesn't keep moving from old trajectory
+            ctx.player_vel = (0.0, 0.0, 0.0)
+
+            # Force immediate correction
+            ctx.last_correction_send = 0.0
+
+            new_pos = ctx.player_pos
+            print(f"[TELEPORT] ({old_pos[0]:.1f},{old_pos[1]:.1f},{old_pos[2]:.1f}) -> "
+                  f"({new_pos[0]:.1f},{new_pos[1]:.1f},{new_pos[2]:.1f})")
+            return (f"Teleported: ({old_pos[0]:.1f},{old_pos[1]:.1f},{old_pos[2]:.1f}) -> "
+                    f"({new_pos[0]:.1f},{new_pos[1]:.1f},{new_pos[2]:.1f})\n"
+                    f"Correction will fire on next tick")
+        except (ValueError, IndexError) as e:
+            return f"Error: {e}"
 
     def _cmd_respawn(self, args: list) -> str:
         """
@@ -1070,11 +1349,36 @@ Examples:
         Usage:
           respawn              - Respawn at map spawn point
           respawn <x> <y> <z>  - Respawn at specific position
+          respawn c<id>        - Respawn specific client (e.g. c4)
+          respawn c<id> <x> <y> <z> - Respawn specific client at position
+          respawn all          - Respawn all clients at staggered positions
         """
         if not self.server:
             return "Error: No server reference"
 
-        ctx, addr = self._get_active_client()
+        # Handle "respawn all" — respawn every in-game client at staggered positions
+        if args and args[0].lower() == "all":
+            results = []
+            offset = 0.0
+            with self.server.clients_lock:
+                clients = [c for c in self.server.clients.values()
+                           if c and c.running and c.session and c.session.in_game]
+            for c in clients:
+                result = self._do_respawn(c, offset_x=offset)
+                results.append(f"Client {c.client_id}: {result}")
+                offset += 80.0  # Stagger 80 units apart
+            return "\n".join(results) if results else "No in-game clients"
+
+        # Check for c<id> prefix to target specific client
+        ctx = None
+        if args and args[0].lower().startswith("c") and args[0][1:].isdigit():
+            target_id = int(args[0][1:])
+            ctx, addr = self._get_client_by_id(target_id)
+            if not ctx:
+                return f"Error: No client with id {target_id}"
+            args = args[1:]  # consume the c<id> arg
+        else:
+            ctx, addr = self._get_active_client()
         if not ctx:
             return "Error: No connected client"
 
@@ -1093,52 +1397,9 @@ Examples:
         except ValueError as e:
             return f"respawn arg parse error: {e}"
 
-        entity_id = ctx.entity_id or 1337
-        team_id = ctx.session.team_id if ctx.session else 1
-
-        # 1) Set pending respawn position (consumed by _auto_join_team)
-        ctx.pending_respawn_pos = (x, y, z)
-
-        # 2) Reset server-side state
-        ctx.player_pos = (x, y, z)
-        ctx.player_vel = (0.0, 0.0, 0.0)
-        ctx.player_heading = 0.0
-        ctx.player_yaw = 0.0
-        ctx.angular_vel_yaw = 0.0
-        ctx.player_pose["pos"] = (x, y, z)
-        ctx.player_pose["vel"] = (0.0, 0.0, 0.0)
-        ctx.player_pose["yaw"] = 0.0
-        if ctx.vehicle_physics:
-            ctx.vehicle_physics.heading = 0.0
-            ctx.vehicle_physics._angular_velocity = 0.0
-        ctx.last_correction_send = time.monotonic()
-
-        # 3) DELETE entity from OIDTable
-        print(f"[RESPAWN] DELETE entity {entity_id}, pending pos=({x:.1f},{y:.1f},{z:.1f})")
-        delete_pkt = build_delete_object(
-            tick=self.server._get_network_tick(ctx),
-            entity_ids=[entity_id],
-            with_effects=False,
-        )
-        if ctx.tcp_handler:
-            ctx.tcp_handler.send(delete_pkt)
-
-        # 4) Reset session phase (tick loop stops)
-        ctx.session.phase = Phase.TEAM_SELECT
-        ctx.session.in_game = False
-
-        # 5) Wait for client to process DELETE and fully tear down local player.
-        #    300ms/1s too short - spawn arrives before construction timeout finishes.
-        #    Need ~5s so client completes teardown before new spawn packets arrive.
-        time.sleep(5.0)
-
-        # 6) Spawn directly - no REINCARNATE (avoids spawn point selection).
-        print(f"[RESPAWN] Spawning at ({x:.1f},{y:.1f},{z:.1f})")
-        self.server._spawn_wf_style(ctx, team_id=team_id,
-                                     net_id=entity_id, pos=(x, y, z))
-
+        result = self._do_respawn(ctx, pos=(x, y, z))
         self._sync_to_active_client()
-        return f"Respawned at ({x:.1f},{y:.1f},{z:.1f})"
+        return f"Respawned client {ctx.client_id} at {result}"
 
     def _cmd_spawn_full(self, args: list) -> str:
         """

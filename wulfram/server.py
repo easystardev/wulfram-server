@@ -156,6 +156,9 @@ class WulframServer:
         tick_loop_env = os.environ.get("WULFRAM_TICK_LOOP_ENABLED")
         if tick_loop_env is not None:
             FEATURES.tick_loop_enabled = tick_loop_env.strip().lower() not in ("0", "false", "off", "no")
+        auto_login_env = os.environ.get("WULFRAM_AUTO_LOGIN")
+        if auto_login_env is not None:
+            FEATURES.auto_login = auto_login_env.strip().lower() not in ("0", "false", "off", "no")
         auto_join_env = os.environ.get("WULFRAM_AUTO_JOIN_TEAM")
         if auto_join_env is not None:
             FEATURES.auto_join_team = auto_join_env.strip().lower() not in ("0", "false", "off", "no")
@@ -182,14 +185,14 @@ class WulframServer:
         # Default to full local transform updates to avoid client-side state divergence.
         self.local_update_mode = os.environ.get("WULFRAM_LOCAL_UPDATE_MODE", "pos_vel_rot").strip().lower()
         # Remote update shape to avoid malformed packets destabilizing HUD state in multi-client.
-        # Modes: pos, pos_rot, pos_vel_rot, heartbeat, off (default: pos).
-        self.remote_update_mode = os.environ.get("WULFRAM_REMOTE_UPDATE_MODE", "pos").strip().lower()
+        # Modes: pos, pos_rot, pos_vel_rot, heartbeat, off (default: pos_rot).
+        self.remote_update_mode = os.environ.get("WULFRAM_REMOTE_UPDATE_MODE", "pos_rot").strip().lower()
         # Throttle remote player updates: interval in seconds (0 = every tick).
-        # Default 0.1s = 10Hz, reduces packet flood vs 30Hz tick rate.
+        # 30Hz tick rate = every tick; lower values reduce packet flood.
         try:
-            self.remote_update_interval = float(os.environ.get("WULFRAM_REMOTE_UPDATE_INTERVAL", "0.1"))
+            self.remote_update_interval = float(os.environ.get("WULFRAM_REMOTE_UPDATE_INTERVAL", "0"))
         except ValueError:
-            self.remote_update_interval = 0.1
+            self.remote_update_interval = 0
         # For remote player updates, set is_manned bit (likely required for player vehicles).
         self.remote_update_is_manned = os.environ.get("WULFRAM_REMOTE_IS_MANNED", "0") == "1"
         # Combine local + remote updates into a single UPDATE_ARRAY per tick.
@@ -611,9 +614,9 @@ class WulframServer:
         except ValueError:
             self.aim_pitch_adjust = 2.5
         try:
-            self.turn_adjust = float(os.environ.get("WULFRAM_TURN_ADJUST", "3.5"))
+            self.turn_adjust = float(os.environ.get("WULFRAM_TURN_ADJUST", "4.5"))
         except ValueError:
-            self.turn_adjust = 3.5
+            self.turn_adjust = 4.5
         try:
             self.turn_deadzone = float(os.environ.get("WULFRAM_TURN_DEADZONE", "0.05"))
         except ValueError:
@@ -646,23 +649,51 @@ class WulframServer:
         # From Physics_substep_integrate: ang_vel += (torque - ang_vel * damp_coeff) * dt
         # Steady state: ang_vel = torque / damp_coeff = turn_adjust / damp_coeff
         try:
-            self.damp_coeff = float(os.environ.get("WULFRAM_DAMP_COEFF", "1.5"))
+            self.damp_coeff = float(os.environ.get("WULFRAM_DAMP_COEFF", "1.95"))
         except ValueError:
-            self.damp_coeff = 1.5
+            self.damp_coeff = 1.95
+
+        # Linear velocity damping coefficients.
+        # From RigidBody_integrate_position (Physics.c:5120-5134, damped mode):
+        #   effective_acc = impulse - vel * linear_damp
+        #   pos += vel * dt + 0.5 * effective_acc * dt²
+        #   vel += effective_acc * dt
+        # Entity velocity at 0x18 is PERSISTENT (not zeroed each frame).
+        # Impulse at 0x24 IS zeroed each frame (from vehicle controller).
+        #
+        # Client uses TWO different damp values (from Tank_read_throttle_input
+        # and Tank_compute_mobility_factors in Vehicles.c):
+        #   DRIVING (throttle != 0): damp = ground_friction * terrain_scale + world_damp
+        #     On flat ground: 0.8 * 1.0 + 0.0 = 0.8
+        #   COASTING (throttle == 0): damp = 2.0 (hardcoded at Vehicles.c:932, 0x40000000)
+        try:
+            self.linear_damp_driving = float(os.environ.get("WULFRAM_LINEAR_DAMP_DRIVING", "0.8"))
+        except ValueError:
+            self.linear_damp_driving = 0.8
+        try:
+            self.linear_damp_coasting = float(os.environ.get("WULFRAM_LINEAR_DAMP_COASTING", "2.0"))
+        except ValueError:
+            self.linear_damp_coasting = 2.0
 
         # Periodic correction: send real entity pos+rot to correct client drift.
-        # 0 = disabled, >0 = interval in seconds between corrections.
+        # 0 = disabled (default), >0 = interval in seconds between corrections.
+        # WARNING: Corrections send UPDATE_ARRAY with player's own entity ID.
+        # Single-entity UPDATE_ARRAY for local player triggers client state_sync,
+        # switching entity to network-controlled mode and freezing local physics.
+        # Use dual_entity mode to avoid this (sends 2 entities, skips state_sync).
         try:
             self.correction_interval = float(os.environ.get("WULFRAM_CORRECTION_INTERVAL", "0"))
         except ValueError:
-            self.correction_interval = 0.0
+            self.correction_interval = 0
         # Correction mode: full, rot_only, pos_only, dual_entity, view_update
-        # rot_only: only correct heading (position corrections freeze movement)
-        self.correction_mode = os.environ.get("WULFRAM_CORRECTION_MODE", "rot_only")
+        # dual_entity: sends 2 entities so client skips state_sync (no freeze)
+        # rot_only/pos_only/full: single-entity, triggers state_sync freeze
+        self.correction_mode = os.environ.get("WULFRAM_CORRECTION_MODE", "dual_entity")
 
         print(
             f"[CONFIG-HEADING] turn_adjust={self.turn_adjust} turn_sign={self.turn_sign} "
             f"deadzone={self.turn_deadzone} damp_coeff={self.damp_coeff} "
+            f"linear_damp=driving:{self.linear_damp_driving}/coast:{self.linear_damp_coasting} "
             f"tick_rate={self.tick_rate_hz}Hz "
             f"correction_interval={self.correction_interval}s"
         )
@@ -2481,6 +2512,16 @@ class WulframServer:
         # Request username
         ctx.tcp_handler.send(build_login_status(5))  # Code 5 = request handle
 
+        if FEATURES.auto_login:
+            # Skip waiting for client handle input - auto-advance to team select
+            time.sleep(0.3)  # Let client process the status 5
+            ctx.session.username = f"Player{ctx.client_id}"
+            ctx.session.login_complete = True
+            ctx.session.transition_to(Phase.TEAM_SELECT)
+            handlers.send_initial_game_data(self, ctx)
+            print(f"[LOGIN] Client {ctx.client_id}: Auto-login as {ctx.session.username}")
+            return
+
         # Wait for packets
         while ctx.session.phase == Phase.LOGIN:
             packet = ctx.tcp_handler.recv()
@@ -3061,18 +3102,10 @@ class WulframServer:
             entity_config=self.projectile_config,
             is_static=self.projectile_spawn_snap,
         )
+        # Always include local_state in remote projectile spawn packets.
+        # An UPDATE_ARRAY without local_state can cause the client to
+        # interpret health as 0, triggering the red damage overlay.
         packet_remote = packet_local
-        if self.projectile_local_stats:
-            packet_remote = build_projectile_spawn_packet(
-                proj,
-                tick,
-                include_local_state=False,
-                weapon_id=local_state_weapon,
-                health=1.0,
-                fuel=1.0,
-                entity_config=self.projectile_config,
-                is_static=self.projectile_spawn_snap,
-            )
 
         # Send via UDP
         sent_count = 0
@@ -3246,43 +3279,55 @@ class WulframServer:
 
     def _update_player_position(self, ctx: ClientContext):
         """
-        Simulate player position based on movement input (slot 2 forward, slot 3 strafe).
-        Uses actual time delta for accurate physics simulation.
+        Simulate player position using damped persistent velocity model.
+
+        Matches client's RigidBody_integrate_position (Physics.c:5101-5136):
+          1. Vehicle controller computes per-frame impulse (zeroed each frame)
+          2. effective_acc = impulse - vel * linear_damp  (damped mode, flag 0xc0+3)
+          3. pos += vel * dt + 0.5 * effective_acc * dt²  (Verlet integration)
+          4. vel += effective_acc * dt  (velocity persists across frames)
+
+        Entity layout:
+          entity[0x0c] = position (persistent)
+          entity[0x18] = velocity (persistent, damped)
+          entity[0x24] = impulse accumulator (zeroed after physics step)
+
+        Steady state: vel = impulse / linear_damp
+
+        Dual-damp model (from Tank_read_throttle_input / Tank_compute_mobility_factors):
+          DRIVING (throttle != 0): linear_damp = ground_friction (0.8 on flat ground)
+          COASTING (throttle == 0): linear_damp = 2.0 (hardcoded, Vehicles.c:932)
         """
         import math
 
         def _normalize_axis(val: float) -> float:
-            # Inputs decoded from ACTION_* packets appear to already be in -1..1.
-            # Only scale down if we ever see large quantized values (e.g., +/-1000).
             if val > 1.5 or val < -1.5:
                 scale = getattr(ctx.weapon_system, "control_max", 1000.0) or 1000.0
                 return max(-1.0, min(1.0, val / scale))
             return max(-1.0, min(1.0, val))
 
-        # Calculate actual time delta
-        now = time.monotonic()
-        dt = now - ctx.last_position_update
-        ctx.last_position_update = now
+        dt = 1.0 / self.tick_rate_hz
 
-        # Clamp dt to reasonable range (avoid huge jumps)
-        dt = min(dt, 0.1)  # Max 100ms
+        # Read movement input (slot 2 = forward, slot 3 = strafe)
+        if ctx.injected_input is not None:
+            throttle_input, strafe_input = ctx.injected_input
+        else:
+            throttle_val = ctx.weapon_system.behavior_slots[BehaviorSlot.MOVING_FORWARD]
+            strafe_val = ctx.weapon_system.behavior_slots[BehaviorSlot.MOVING_SIDEWAYS]
+            throttle_input = _normalize_axis(throttle_val)
+            strafe_input = _normalize_axis(strafe_val)
 
-        # Slot 2 = moving_forward, slot 3 = moving_sideways (strafe)
-        throttle_val = ctx.weapon_system.behavior_slots[BehaviorSlot.MOVING_FORWARD]
-        strafe_val = ctx.weapon_system.behavior_slots[BehaviorSlot.MOVING_SIDEWAYS]
-        throttle_input = _normalize_axis(throttle_val)
-        strafe_input = _normalize_axis(strafe_val)
-
-        # Deadzone
         if abs(throttle_input) < 0.05:
             throttle_input = 0.0
         if abs(strafe_input) < 0.05:
             strafe_input = 0.0
 
-        # Tank physics from BEHAVIOR packet (approximate values)
-        move_adjust = 85.0   # Forward/back speed scaling
-        strafe_adjust = 69.7  # Lateral speed scaling
-        max_velocity = 80.0  # Speed cap
+        move_adjust = 85.0
+        strafe_adjust = 69.7
+        # Dual-damp: client uses 0.8 when driving, 2.0 when coasting
+        # (from Tank_read_throttle_input and Tank_compute_mobility_factors in Vehicles.c)
+        has_input = abs(throttle_input) > 0.0 or abs(strafe_input) > 0.0
+        linear_damp = self.linear_damp_driving if has_input else self.linear_damp_coasting
 
         yaw = ctx.player_heading
         cos_yaw = math.cos(yaw)
@@ -3297,70 +3342,72 @@ class WulframServer:
             right = (-sin_yaw, 0.0, cos_yaw)
             vertical_idx = 1
 
-        fwd_speed = throttle_input * move_adjust
-        strafe_speed = strafe_input * strafe_adjust
+        # Per-frame impulse (like entity[0x24], zeroed each frame by controller)
+        fwd_impulse = throttle_input * move_adjust
+        strafe_impulse = strafe_input * strafe_adjust
 
-        vx = forward[0] * fwd_speed + right[0] * strafe_speed
-        vy = forward[1] * fwd_speed + right[1] * strafe_speed
-        vz = forward[2] * fwd_speed + right[2] * strafe_speed
+        impulse_x = forward[0] * fwd_impulse + right[0] * strafe_impulse
+        impulse_y = forward[1] * fwd_impulse + right[1] * strafe_impulse
+        impulse_z = forward[2] * fwd_impulse + right[2] * strafe_impulse
 
-        # Preserve vertical velocity component (jump jets) and apply gravity
-        gravity = self.gravity  # Downward acceleration (units/s^2)
+        # Add gravity to vertical impulse (matches GUESS3_Transform_accelerate_z)
+        gravity = self.gravity
         ground_level = self.ground_level
         if ctx.ground_level_override is not None:
             ground_level = ctx.ground_level_override
 
         if vertical_idx == 2:
-            # Z is up
-            current_z = ctx.player_pos[2]
-            current_vz = ctx.player_vel[2]
-
-            # Apply gravity to vertical velocity
-            new_vz = current_vz + gravity * dt
-
-            # Ground collision - stop falling if at ground level
-            if current_z <= ground_level and new_vz < 0:
-                new_vz = 0.0
-
-            vz = new_vz
+            impulse_z += gravity  # gravity is negative
+            if ctx.player_pos[2] <= ground_level and ctx.player_vel[2] + gravity * dt < 0:
+                impulse_z = 0.0
         else:
-            # Y is up
-            current_y = ctx.player_pos[1]
-            current_vy = ctx.player_vel[1]
+            impulse_y += gravity
+            if ctx.player_pos[1] <= ground_level and ctx.player_vel[1] + gravity * dt < 0:
+                impulse_y = 0.0
 
-            new_vy = current_vy + gravity * dt
-            if current_y <= ground_level and new_vy < 0:
-                new_vy = 0.0
+        # Current persistent velocity (entity[0x18])
+        vel_x, vel_y, vel_z = ctx.player_vel
 
-            vy = new_vy
+        # Damped effective acceleration: acc = impulse - vel * linear_damp
+        # (from RigidBody_integrate_position, damped mode at Physics.c:5126-5129)
+        acc_x = impulse_x - vel_x * linear_damp
+        acc_y = impulse_y - vel_y * linear_damp
+        acc_z = impulse_z - vel_z * linear_damp
 
-        speed = math.sqrt(vx * vx + vy * vy + vz * vz)
-        if speed > max_velocity and speed > 0.0:
-            scale = max_velocity / speed
-            vx *= scale
-            vy *= scale
-            vz *= scale
+        # Ground collision: zero vertical acc+vel when on ground and pushing down
+        if vertical_idx == 2:
+            if ctx.player_pos[2] <= ground_level and (vel_z + acc_z * dt) < 0:
+                acc_z = -vel_z / dt if dt > 0 else 0.0  # bring vel to zero
+        else:
+            if ctx.player_pos[1] <= ground_level and (vel_y + acc_y * dt) < 0:
+                acc_y = -vel_y / dt if dt > 0 else 0.0
 
+        # Verlet integration: pos += vel * dt + 0.5 * acc * dt²
+        # (from Vec3_integrate_motion, Physics.c:4396-4410)
         x, y, z = ctx.player_pos
-        new_x = x + vx * dt
-        new_y = y + vy * dt
-        new_z = z + vz * dt
+        half_dt2 = 0.5 * dt * dt
+        new_x = x + vel_x * dt + acc_x * half_dt2
+        new_y = y + vel_y * dt + acc_y * half_dt2
+        new_z = z + vel_z * dt + acc_z * half_dt2
 
-        # Clamp to reasonable world bounds
+        # Velocity update: vel += acc * dt
+        new_vel_x = vel_x + acc_x * dt
+        new_vel_y = vel_y + acc_y * dt
+        new_vel_z = vel_z + acc_z * dt
+
+        # Clamp to world bounds
         if self.up_axis == "z":
             new_x = max(-self.world_bound, min(self.world_bound, new_x))
             new_y = max(-self.world_bound, min(self.world_bound, new_y))
-            # Clamp to ground level
             new_z = max(ground_level, new_z)
         else:
             new_x = max(-self.world_bound, min(self.world_bound, new_x))
             new_z = max(-self.world_bound, min(self.world_bound, new_z))
-            # Clamp to ground level
             new_y = max(ground_level, new_y)
 
         old_pos = ctx.player_pos
         ctx.player_pos = (new_x, new_y, new_z)
-        ctx.player_vel = (vx, vy, vz)
+        ctx.player_vel = (new_vel_x, new_vel_y, new_vel_z)
         ctx.player_pose["pos"] = ctx.player_pos
         ctx.player_pose["vel"] = ctx.player_vel
 
@@ -3430,17 +3477,9 @@ class WulframServer:
                     health=1.0,
                     fuel=1.0,
                 )
+                # Always include local_state in remote update packets to prevent
+                # the client from zeroing health on UPDATE_ARRAY without local_state.
                 update_pkt_remote = update_pkt_local
-                if self.projectile_local_stats:
-                    update_pkt_remote = build_projectile_update_packet(
-                        proj,
-                        tick,
-                        dt,
-                        include_local_state=False,
-                        weapon_id=self._get_local_state_weapon_type(ctx),
-                        health=1.0,
-                        fuel=1.0,
-                    )
 
                 if self.udp_handler:
                     for target in self._snapshot_in_game_clients():
@@ -3786,6 +3825,16 @@ class WulframServer:
                 # Once translation is ready, make sure this client sees others and vice versa.
                 self._ensure_multiplayer_visibility(ctx)
 
+                # Integration order must match client (RigidBody_step in Physics.c:5144):
+                #   1. Vehicle controller computes velocity impulse using CURRENT heading
+                #   2. Physics_substep_integrate: rotation update (heading += ang_vel * dt)
+                #   3. RigidBody_integrate_position: pos += impulse * dt
+                # The impulse was computed from heading[N-1] BEFORE rotation updated.
+                # So we must compute position BEFORE updating heading.
+
+                self._update_player_position(ctx)
+                self._update_player_aim(ctx)
+
                 # Direct-impulse yaw physics (matches client Vehicles.c:1193).
                 # Client uses raw turning input directly for yaw — no piecewise curve.
                 # torque = lateral_mobility * turn_adjust * raw_input (per frame)
@@ -3802,15 +3851,12 @@ class WulframServer:
                 ctx.player_yaw = ctx.player_heading
                 ctx.player_pose["yaw"] = ctx.player_heading
 
-                if ctx.session.tick % 10 == 0 and abs(ctx.angular_vel_yaw) > 0.01:
+                if abs(ctx.angular_vel_yaw) > 0.01:
                     print(
                         f"[YAW-TRACK] input={raw_input:.3f} torque={torque:.3f} "
                         f"ang_vel={ctx.angular_vel_yaw:.4f} "
                         f"heading={math.degrees(ctx.player_heading):.1f}deg"
                     )
-
-                self._update_player_aim(ctx)
-                self._update_player_position(ctx)
 
                 # Desync detection: track position changes and input
                 now = time.monotonic()
@@ -3865,6 +3911,11 @@ class WulframServer:
                 send_payload = False
 
                 send_update = True
+                # Precompute correction_due so it can bypass heartbeat throttle.
+                correction_due = (
+                    self.correction_interval > 0
+                    and (now - ctx.last_correction_send) >= self.correction_interval
+                )
                 if self.update_on_change:
                     pos_changed = any(abs(a - b) > self.update_epsilon for a, b in zip(send_pos, ctx.last_sent_pos))
                     vel_changed = any(abs(a - b) > self.update_epsilon for a, b in zip(ctx.player_vel, ctx.last_sent_vel))
@@ -4147,7 +4198,7 @@ class WulframServer:
                                 self.udp_handler.send_to(view_payload, ctx.session.udp_addr)
                             elif ctx.tcp_handler:
                                 ctx.tcp_handler.send(view_payload, log=False)
-                elif self.send_player_updates and not send_full_update and send_update:
+                elif self.send_player_updates and not send_full_update and (send_update or correction_due):
                     # Heartbeat path: health/energy delivery + periodic correction.
                     weapon_type = self._get_local_state_weapon_type(ctx)
                     ammo_bits, ammo_mask = self._get_local_state_ammo_bits(ctx)
@@ -4165,12 +4216,8 @@ class WulframServer:
                         self.update_local_state_mode,
                     )
 
-                    # Check if a drift correction is due (real entity pos+rot).
-                    correction_due = (
-                        self.correction_interval > 0
-                        and (now - ctx.last_correction_send) >= self.correction_interval
-                    )
-
+                    # correction_due was precomputed above (before heartbeat throttle gate)
+                    # so corrections can bypass the heartbeat interval when needed.
                     if correction_due:
                         corr_pos = self._to_client_pos(ctx.player_pos)
                         corr_rot = (

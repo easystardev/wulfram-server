@@ -48,6 +48,9 @@ class VehiclePhysics:
         # At steady state: ang_vel_ss = torque / damp_coeff
         # With torque=4.5 and damp_coeff=1.0: ang_vel_ss = 4.5 rad/s (258 deg/s)
         self.damp_coeff = damp_coeff
+        # Minimum angular velocity threshold — zero out when coasting below this
+        # Client likely has a similar cutoff to prevent infinite drift from exponential decay
+        self.ang_vel_cutoff = 0.01  # ~0.6 deg/s
 
     def step(self, torque: float, dt: float):
         """Advance physics by dt seconds.
@@ -67,6 +70,11 @@ class VehiclePhysics:
         # Physics_substep_integrate: effective = torque - ang_vel * damp_coeff
         # Matrix3_integrate_angular: ang_vel += effective * dt
         self._angular_velocity += (torque - self._angular_velocity * self.damp_coeff) * dt
+
+        # 3. Zero angular velocity when below threshold (client does this to stop drift)
+        # Without this, exponential decay never reaches zero and heading drifts forever
+        if abs(torque) < 0.001 and abs(self._angular_velocity) < self.ang_vel_cutoff:
+            self._angular_velocity = 0.0
 
         # Wrap to [-pi, pi]
         if self._heading > math.pi:

@@ -167,6 +167,7 @@ class Features:
     send_world_stats_on_login: bool = True
     # Default off: auto-spawn can trigger before world collision data is ready and crash the client.
     # Spawn should come from explicit REINCARNATE flow (team switch + spawn point selection).
+    auto_login: bool = False
     auto_join_team: bool = False
     tick_loop_enabled: bool = True  # ENABLED - sends health/energy heartbeat
     send_update_array_empty: bool = False  # DISABLED - heartbeat is preferred

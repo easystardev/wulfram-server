@@ -119,6 +119,8 @@ class ClientContext:
     last_remote_update_send: float = 0.0
     # Pending respawn position (set by respawn command, consumed by auto_join_team)
     pending_respawn_pos: Optional[tuple] = None
+    # Server-injected movement input override (fwd, strafe) - persists until cleared
+    injected_input: Optional[tuple] = None
     last_sent_pos: tuple = field(default_factory=lambda: (0.0, 0.0, 0.0))
     last_sent_vel: tuple = field(default_factory=lambda: (0.0, 0.0, 0.0))
     last_sent_yaw: float = 0.0
