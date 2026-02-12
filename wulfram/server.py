@@ -36,6 +36,7 @@ from .packets import (
     build_update_array_create_tank, build_update_array_player_update,
     build_update_array_multi, build_view_update_multi, build_view_update_player_update,
     get_behavior_weapon_capability_counts, build_world_stats,
+    build_delete_object,
     _encode_health_bits, _compress_value, VEC_VEL_MAX, VEC_VEL_RANGE,
 )
 from . import handlers
@@ -836,13 +837,20 @@ class WulframServer:
         except Exception:
             return None
 
-    def _get_health_value(self) -> float:
-        """Return health multiplier for outgoing packets (0..1)."""
+    def _get_health_value(self, ctx: ClientContext = None) -> float:
+        """Return health multiplier for outgoing packets (0..1).
+
+        When ctx is provided, incorporates the client's actual health
+        (from combat damage) into the returned value.
+        """
         value = self.debug_health_value
         if self.debug_health_pattern:
             period = self.debug_health_period if self.debug_health_period > 0 else 1.0
             phase = int(time.monotonic() / period) % 2
             value = self.debug_health_low if phase else self.debug_health_value
+        # Apply per-client health (combat damage)
+        if ctx is not None:
+            value = value * ctx.player_health
         if value < 0.0:
             return 0.0
         if value > 1.0:
@@ -976,7 +984,6 @@ class WulframServer:
         include_pos = mode not in ("heartbeat", "mask0")
         include_vel = mode in ("pos_vel", "pos_vel_rot", "full", "all")
         include_rot = mode in ("pos_rot", "pos_vel_rot", "full", "all")
-        health_val = self._get_health_value()
         fuel_val = 1.0
         for other in self._snapshot_in_game_clients():
             if other is ctx:
@@ -984,6 +991,7 @@ class WulframServer:
             entity_id = other.session.entity_id or other.entity_id
             if entity_id not in ctx.known_entity_ids:
                 continue
+            health_val = self._get_health_value(other)
             # Extract weapon/ammo/turret data from the REMOTE player, not the viewer.
             weapon_type = self._get_local_state_weapon_type(other)
             ammo_bits, ammo_mask = self._get_local_state_ammo_bits(other)
@@ -1679,7 +1687,7 @@ class WulframServer:
         if self.udp_handler:
             send_pos = self._to_client_pos(spawn_pos)
             ls_weapon = self._get_local_state_weapon_type(ctx)
-            health_val = self._get_health_value()
+            health_val = self._get_health_value(ctx)
 
             # Pre-creation UPDATE_ARRAY.
             ua_packet = build_update_array_create_tank(
@@ -1885,7 +1893,7 @@ class WulframServer:
         ls_weapon = self._get_local_state_weapon_type(ctx)
         # Optional: create the entity via UPDATE_ARRAY before PLAYER_INFO.
         if self.spawn_send_update_array:
-            health_val = self._get_health_value()
+            health_val = self._get_health_value(ctx)
             fuel_val = 1.0
             ua_packet = build_update_array_create_tank(
                 tick=self._get_network_tick(ctx),
@@ -3098,7 +3106,7 @@ class WulframServer:
             tick,
             include_local_state=self.projectile_local_stats,
             weapon_id=local_state_weapon,
-            health=1.0,
+            health=self._get_health_value(ctx),
             fuel=1.0,
             entity_config=self.projectile_config,
             is_static=self.projectile_spawn_snap,
@@ -3135,21 +3143,22 @@ class WulframServer:
         print(f"[WEAPON] {pos_msg}")
 
         # Belt-and-suspenders: send an immediate heartbeat UPDATE_ARRAY to the
-        # firing player so their HUD health stays at 1.0 even if the projectile
+        # firing player so their HUD health stays current even if the projectile
         # local_state bits are somehow missed or arrive out of order.
         if self.udp_handler and ctx.session.udp_addr:
             hb_tick = self._get_network_tick(ctx)
             hb_weapon = self._get_local_state_weapon_type(ctx)
+            hb_health = self._get_health_value(ctx)
             hb_packet = build_update_array_heartbeat(
                 tick=hb_tick,
                 entity_id=ctx.session.entity_id,
                 include_health=True,
                 weapon_id=hb_weapon,
-                health=1.0,
+                health=hb_health,
                 fuel=1.0,
             )
             self.udp_handler.send_to(hb_packet, ctx.session.udp_addr)
-            print(f"[PROJ-HEARTBEAT] Sent post-fire heartbeat UPDATE_ARRAY (health=1.0)")
+            print(f"[PROJ-HEARTBEAT] Sent post-fire heartbeat UPDATE_ARRAY (health={hb_health:.2f})")
 
         if self.debug_projectiles and proj.debug_context:
             hp_shape = proj.debug_context.get("hardpoint_shape")
@@ -3467,15 +3476,33 @@ class WulframServer:
                     if proj not in ctx.active_projectiles:
                         break
 
-                # Send position update
+                # Update projectile position for hit detection
+                # (build_projectile_update_packet also updates proj.pos,
+                #  but we need the position current before hit check)
+                proj.pos = (
+                    proj.pos[0] + proj.vel[0] * dt,
+                    proj.pos[1] + proj.vel[1] * dt,
+                    proj.pos[2] + proj.vel[2] * dt,
+                )
+
+                # Check collision with enemy players
+                hit_target = self._check_projectile_hit(proj, ctx)
+                if hit_target:
+                    self._apply_damage(hit_target, proj, ctx)
+                    with ctx.projectile_lock:
+                        if proj in ctx.active_projectiles:
+                            ctx.active_projectiles.remove(proj)
+                    break  # Stop update loop
+
+                # Send position update (dt=0 since we already advanced pos above)
                 tick = self._get_network_tick(ctx)
                 update_pkt_local = build_projectile_update_packet(
                     proj,
                     tick,
-                    dt,
+                    0.0,  # Position already advanced above
                     include_local_state=self.projectile_local_stats,
                     weapon_id=self._get_local_state_weapon_type(ctx),
-                    health=1.0,
+                    health=self._get_health_value(ctx),
                     fuel=1.0,
                 )
                 # Always include local_state in remote update packets to prevent
@@ -3504,6 +3531,99 @@ class WulframServer:
 
         thread = threading.Thread(target=update_loop, daemon=True)
         thread.start()
+
+    def _check_projectile_hit(self, proj, owner_ctx: ClientContext) -> Optional[ClientContext]:
+        """Check if a projectile hit any enemy player (sphere collision).
+
+        Compares projectile position against all in-game players except the owner.
+        Both are in client/world coordinates (proj.pos is already converted).
+        Returns the hit ClientContext or None.
+        """
+        hit_radius = 15.0  # Tank is roughly this size
+        hit_radius_sq = hit_radius * hit_radius
+        for target in self._snapshot_in_game_clients():
+            if target is owner_ctx:
+                continue
+            # Compare in client space (proj.pos already converted)
+            target_pos = self._to_client_pos(target.player_pos)
+            dx = proj.pos[0] - target_pos[0]
+            dy = proj.pos[1] - target_pos[1]
+            dz = proj.pos[2] - target_pos[2]
+            dist_sq = dx * dx + dy * dy + dz * dz
+            if dist_sq <= hit_radius_sq:
+                return target
+        return None
+
+    def _apply_damage(self, target: ClientContext, proj, attacker: ClientContext) -> None:
+        """Apply damage from a projectile hit and broadcast effects.
+
+        1. Reduce target health
+        2. Send health update to target
+        3. Send DELETE_OBJECT for projectile (with explosion FX)
+        4. If dead, send DELETE_OBJECT for target entity
+        """
+        damage = 0.2  # Pulse shell = 20% per hit (5 hits to kill)
+        old_health = target.player_health
+        target.player_health = max(0.0, old_health - damage)
+        new_health = target.player_health
+
+        attacker_name = attacker.session.username or f"Player{attacker.client_id}"
+        target_name = target.session.username or f"Player{target.client_id}"
+        print(
+            f"[COMBAT] {attacker_name} (c{attacker.client_id}) hit {target_name} (c{target.client_id}) "
+            f"for {damage*100:.0f}% damage (health: {old_health*100:.0f}%→{new_health*100:.0f}%)"
+        )
+
+        # Send health update to the damaged player via heartbeat UPDATE_ARRAY
+        if self.udp_handler and target.session.udp_addr:
+            tick = self._get_network_tick(target)
+            weapon_type = self._get_local_state_weapon_type(target)
+            health_pkt = build_update_array_heartbeat(
+                tick=tick,
+                entity_id=target.session.entity_id,
+                include_health=True,
+                weapon_id=weapon_type,
+                health=self._get_health_value(target),
+                fuel=1.0,
+            )
+            self.udp_handler.send_to(health_pkt, target.session.udp_addr)
+
+        # DELETE projectile with explosion FX for all clients
+        tick = self._get_network_tick(attacker)
+        delete_proj_pkt = build_delete_object(
+            tick=tick,
+            entity_ids=[proj.entity_id],
+            with_effects=True,
+        )
+        for client in self._snapshot_in_game_clients():
+            self._send_packet_to_client(client, delete_proj_pkt, prefer_tcp=True)
+
+        # Chat notification
+        hit_msg = f"HIT! {target_name} ({new_health*100:.0f}% health)"
+        chat_pkt = build_chat_message(hit_msg, source_id=attacker.session.player_id or attacker.entity_id)
+        for client in self._snapshot_in_game_clients():
+            if client.tcp_handler:
+                client.tcp_handler.send(chat_pkt)
+
+        # If target is dead, delete their entity with explosion
+        if target.player_health <= 0.0:
+            print(f"[COMBAT] {target_name} (c{target.client_id}) DESTROYED by {attacker_name} (c{attacker.client_id})")
+            kill_msg = f"KILL! {attacker_name} destroyed {target_name}!"
+            kill_chat = build_chat_message(kill_msg, source_id=attacker.session.player_id or attacker.entity_id)
+            for client in self._snapshot_in_game_clients():
+                if client.tcp_handler:
+                    client.tcp_handler.send(kill_chat)
+
+            # Small delay to let explosion render before entity removal
+            time.sleep(0.5)
+            target_entity_id = target.session.entity_id or target.entity_id
+            delete_target_pkt = build_delete_object(
+                tick=self._get_network_tick(target),
+                entity_ids=[target_entity_id],
+                with_effects=True,
+            )
+            for client in self._snapshot_in_game_clients():
+                self._send_packet_to_client(client, delete_target_pkt, prefer_tcp=True)
 
     def _get_aim_rotation(self, ctx: ClientContext) -> tuple:
         """Return (pitch, yaw, source) for aiming/projectiles."""
@@ -3898,7 +4018,7 @@ class WulframServer:
                 # Debug: log tick value periodically
                 if ctx.session.tick % 300 == 0:
                     print(f"[TICK-DEBUG] Client {ctx.client_id}: network_tick={tick} client_tick={ctx.last_client_tick} offset={ctx.tick_offset}")
-                health_val = self._get_health_value()
+                health_val = self._get_health_value(ctx)
                 fuel_val = 1.0
                 # Full position updates (server authoritative).
                 # Default OFF: wulf-forge does NOT send the local player's position

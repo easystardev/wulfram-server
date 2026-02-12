@@ -255,6 +255,8 @@ class ControlServer:
             return self._cmd_input(args)
         elif cmd == 'move' or cmd == 'mv':
             return self._cmd_move(args)
+        elif cmd == 'damage' or cmd == 'dmg':
+            return self._cmd_damage(args)
         elif cmd == 'teleport' or cmd == 'tp':
             return self._cmd_teleport(args)
         elif cmd == 'quit' or cmd == 'exit':
@@ -285,6 +287,9 @@ class ControlServer:
   correction [secs|on|off|now] - Drift correction (pos+rot sync to client)
   physics [param] [value] - Yaw physics params (damp, reset)
   respawn / rs           - Re-send TankPacket to reset client entity position + heading
+  damage <amt> [c<id>]   - Apply damage (0.2=20%, or 20=20%)
+  health [c<id>]         - Show player health
+  health set <val> [c<id>] - Set health directly (0.0-1.0)
   players / pl [json]    - Show all connected players' positions and headings
   help                   - Show this help
   quit                   - Disconnect
@@ -1246,6 +1251,83 @@ Examples:
         t.start()
         return f"Moving {direction} for {duration:.1f}s ({len(targets)} client(s))"
 
+    def _cmd_damage(self, args: list) -> str:
+        """Apply damage to a player for testing.
+
+        Usage:
+          damage <amount> [c<id>]  - Apply damage (0.0-1.0 normalized, e.g. 0.2 = 20%)
+          damage 20 [c<id>]        - Also accepts percentage (>1 treated as percent)
+        """
+        if not self.server:
+            return "Error: No server reference"
+
+        if not args:
+            return "Usage: damage <amount> [c<id>]"
+
+        try:
+            amount = float(args[0])
+        except ValueError:
+            return f"Invalid damage amount: {args[0]}"
+
+        # Treat values > 1 as percentages
+        if amount > 1.0:
+            amount = amount / 100.0
+
+        amount = max(0.0, min(1.0, amount))
+
+        ctx = None
+        if len(args) >= 2 and args[1].lower().startswith("c") and args[1][1:].isdigit():
+            ctx, _ = self._get_client_by_id(int(args[1][1:]))
+            if not ctx:
+                return f"Error: No client with id {args[1][1:]}"
+        else:
+            ctx, _ = self._get_active_client()
+        if not ctx:
+            return "Error: No connected client"
+
+        old_health = ctx.player_health
+        ctx.player_health = max(0.0, old_health - amount)
+        new_health = ctx.player_health
+
+        # Send health update
+        from .packets import build_update_array_heartbeat
+        if self.server.udp_handler and ctx.session and ctx.session.udp_addr:
+            tick = self.server._get_network_tick(ctx)
+            weapon_type = self.server._get_local_state_weapon_type(ctx)
+            packet = build_update_array_heartbeat(
+                tick=tick,
+                entity_id=ctx.session.entity_id or ctx.entity_id,
+                include_health=True,
+                weapon_id=weapon_type,
+                health=self.server._get_health_value(ctx),
+                fuel=1.0,
+            )
+            self.server.udp_handler.send_to(packet, ctx.session.udp_addr)
+
+        print(
+            f"[DAMAGE] Client {ctx.client_id}: "
+            f"{old_health*100:.0f}% → {new_health*100:.0f}% (dmg={amount*100:.0f}%)"
+        )
+
+        # If dead, delete entity
+        if ctx.player_health <= 0.0:
+            entity_id = ctx.session.entity_id or ctx.entity_id
+            delete_pkt = build_delete_object(
+                tick=self.server._get_network_tick(ctx),
+                entity_ids=[entity_id],
+                with_effects=True,
+            )
+            for client in self.server._snapshot_in_game_clients():
+                self.server._send_packet_to_client(client, delete_pkt, prefer_tcp=True)
+            return (
+                f"Client {ctx.client_id}: {old_health*100:.0f}% → DEAD "
+                f"(entity {entity_id} deleted with explosion)"
+            )
+
+        return (
+            f"Client {ctx.client_id}: {old_health*100:.0f}% → {new_health*100:.0f}%"
+        )
+
     def _do_respawn(self, ctx, pos: tuple = None, offset_x: float = 0.0) -> str:
         """Core respawn logic for a single client. Returns status string."""
         map_spawn = self.server._pick_spawn_point(ctx.session.team_id if ctx.session else 1)
@@ -1267,6 +1349,7 @@ Examples:
         ctx.player_heading = 0.0
         ctx.player_yaw = 0.0
         ctx.angular_vel_yaw = 0.0
+        ctx.player_health = 1.0  # Reset health on respawn
         ctx.player_pose["pos"] = (x, y, z)
         ctx.player_pose["vel"] = (0.0, 0.0, 0.0)
         ctx.player_pose["yaw"] = 0.0
@@ -1281,8 +1364,18 @@ Examples:
             entity_ids=[entity_id],
             with_effects=False,
         )
+        # Send DELETE to the respawning client
         if ctx.tcp_handler:
             ctx.tcp_handler.send(delete_pkt)
+        # Also send DELETE to all other clients and remove from their known set
+        # so the entity gets re-created after respawn
+        for other in self.server._snapshot_in_game_clients():
+            if other is ctx:
+                continue
+            other.known_entity_ids.discard(entity_id)
+            if other.tcp_handler:
+                other.tcp_handler.send(delete_pkt)
+                print(f"[RESPAWN] Sent DELETE entity {entity_id} to client {other.client_id}")
         ctx.session.phase = Phase.TEAM_SELECT
         ctx.session.in_game = False
         time.sleep(5.0)
@@ -2234,37 +2327,79 @@ Examples:
 
     def _cmd_send_health(self, args: list) -> str:
         """
-        Send a health update packet to test vitals display.
-        Usage: health [value 0.0-1.0]
-        Default: 1.0 (100% health)
+        Show or set player health.
+        Usage:
+          health                 - Show all players' health
+          health [c<id>]         - Show specific player's health
+          health set <val> [c<id>] - Set health to val (0.0-1.0) and send update
         """
-        if not self.udp_handler or not self.session:
-            return "Error: No UDP handler/session available"
-
-        if not self.session.udp_addr:
-            return "Error: No UDP client address"
+        if not self.server:
+            return "Error: No server reference"
 
         from .packets import build_update_array_heartbeat, get_ticks
 
-        health_val = 1.0
-        if args:
+        # Parse args
+        if args and args[0].lower() == "set":
+            # health set <val> [c<id>]
+            if len(args) < 2:
+                return "Usage: health set <0.0-1.0> [c<id>]"
             try:
-                health_val = float(args[0])
+                new_health = float(args[1])
             except ValueError:
-                return "Invalid health value"
+                return f"Invalid health value: {args[1]}"
+            new_health = max(0.0, min(1.0, new_health))
 
-        tick = get_ticks()
-        packet = build_update_array_heartbeat(tick, self.session.entity_id or 1337, include_health=True)
+            ctx = None
+            if len(args) >= 3 and args[2].lower().startswith("c") and args[2][1:].isdigit():
+                ctx, _ = self._get_client_by_id(int(args[2][1:]))
+                if not ctx:
+                    return f"Error: No client with id {args[2][1:]}"
+            else:
+                ctx, _ = self._get_active_client()
+            if not ctx:
+                return "Error: No connected client"
 
-        print(f"[HEALTH] Sending health update: {health_val}")
-        print(f"[HEALTH] Packet ({len(packet)} bytes): {packet.hex()}")
+            old_health = ctx.player_health
+            ctx.player_health = new_health
 
-        # Send via both UDP and TCP
-        self.udp_handler.send_to(packet, self.session.udp_addr)
-        if self.tcp_handler:
-            self.tcp_handler.send(packet)
+            # Send health update packet
+            if self.server.udp_handler and ctx.session and ctx.session.udp_addr:
+                tick = self.server._get_network_tick(ctx)
+                weapon_type = self.server._get_local_state_weapon_type(ctx)
+                packet = build_update_array_heartbeat(
+                    tick=tick,
+                    entity_id=ctx.session.entity_id or ctx.entity_id,
+                    include_health=True,
+                    weapon_id=weapon_type,
+                    health=self.server._get_health_value(ctx),
+                    fuel=1.0,
+                )
+                self.server.udp_handler.send_to(packet, ctx.session.udp_addr)
 
-        return f"Sent health packet ({len(packet)} bytes): {packet.hex()}"
+            return (
+                f"Client {ctx.client_id}: health {old_health*100:.0f}% → {new_health*100:.0f}%"
+            )
+
+        # Show health for specific or all clients
+        client_filter = None
+        for a in args:
+            if a.lower().startswith("c") and a[1:].isdigit():
+                client_filter = int(a[1:])
+
+        lines = []
+        with self.server.clients_lock:
+            for ctx in self.server.clients.values():
+                if not ctx or not ctx.running:
+                    continue
+                if client_filter is not None and ctx.client_id != client_filter:
+                    continue
+                phase = ctx.session.phase.name if ctx.session else "NONE"
+                name = ctx.session.username if ctx.session else f"Player{ctx.client_id}"
+                lines.append(
+                    f"Client {ctx.client_id} ({name}) [{phase}]: "
+                    f"health={ctx.player_health*100:.0f}%"
+                )
+        return "\n".join(lines) if lines else "No matching clients"
 
     def _cmd_spawn_entity(self, args: list) -> str:
         """

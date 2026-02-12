@@ -61,6 +61,7 @@ class ClientContext:
     # Angular velocity from steering response, integrated in tick loop (rad/s)
     angular_vel_yaw: float = 0.0
     player_energy: float = 100.0
+    player_health: float = 1.0  # Normalized 0.0-1.0, used for HUD health display
 
     # Direct-impulse physics for heading (matches client's damped torque system)
     vehicle_physics: Optional[VehiclePhysics] = None
