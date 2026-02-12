@@ -648,10 +648,11 @@ class WulframServer:
         # Angular velocity damping coefficient.
         # From Physics_substep_integrate: ang_vel += (torque - ang_vel * damp_coeff) * dt
         # Steady state: ang_vel = torque / damp_coeff = turn_adjust / damp_coeff
+        # Binary source: DAT_005730cc+0x1C = 2.0 (Tank entity descriptor, BoundsInfo+0x7C)
         try:
-            self.damp_coeff = float(os.environ.get("WULFRAM_DAMP_COEFF", "1.95"))
+            self.damp_coeff = float(os.environ.get("WULFRAM_DAMP_COEFF", "2.0"))
         except ValueError:
-            self.damp_coeff = 1.95
+            self.damp_coeff = 2.0
 
         # Linear velocity damping coefficients.
         # From RigidBody_integrate_position (Physics.c:5120-5134, damped mode):
