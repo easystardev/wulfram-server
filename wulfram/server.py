@@ -56,6 +56,14 @@ class WulframServer:
     """
 
     def __init__(self, host: str = None, port: int = 2627):
+        # Load .env file if present (written by mp_server.ps1 for detached mode)
+        env_file = Path(__file__).parent.parent / ".env"
+        if env_file.exists():
+            for line in env_file.read_text().splitlines():
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, _, val = line.partition("=")
+                    os.environ.setdefault(key.strip(), val.strip())
         self.host = host or os.environ.get("WULFRAM_BIND_ADDR", "0.0.0.0")
         # Address to advertise to clients for UDP (e.g. when binding 0.0.0.0)
         self.public_addr = os.environ.get("WULFRAM_PUBLIC_ADDR", self.host)
@@ -4012,6 +4020,33 @@ class WulframServer:
 
         return b'\x0E' + tick_bytes + bw.get_bytes()
 
+    def _apply_reload_defaults(self):
+        """Re-read env-var config after hot reload, setting only NEW attributes.
+
+        Called by control.py reload after class swap.  Uses setdefault-style
+        logic so existing live state (connections, counters) is never clobbered.
+        """
+        def _default(attr, val):
+            if not hasattr(self, attr):
+                setattr(self, attr, val)
+
+        # Re-read .env file so new vars are visible
+        env_file = Path(__file__).parent.parent / ".env"
+        if env_file.exists():
+            for line in env_file.read_text().splitlines():
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, _, val = line.partition("=")
+                    os.environ[key.strip()] = val.strip()
+
+        # Config values that may be added in new code
+        try:
+            comp = float(os.environ.get("WULFRAM_YAW_INPUT_COMPENSATION", "0.5"))
+        except ValueError:
+            comp = 0.5
+        _default("yaw_input_compensation", comp)
+        print(f"[RELOAD] _apply_reload_defaults done (yaw_comp={self.yaw_input_compensation})")
+
     def _tick_loop(self, ctx: ClientContext):
         """Game tick loop - sends UPDATE_ARRAY periodically."""
         print(f"[TICK] Starting tick loop for client {ctx.client_id}")
@@ -4029,6 +4064,12 @@ class WulframServer:
         last_position_change_time = time.monotonic()
         last_input_time = time.monotonic()
         desync_warned = False
+
+        # Wall-clock tick pacing: Windows time.sleep(0.033) often sleeps ~15-21ms,
+        # causing the tick loop to run at ~47Hz instead of 30Hz.  Use a monotonic
+        # accumulator to guarantee exactly tick_rate_hz ticks per wall-clock second.
+        next_tick_time = time.monotonic()
+        tick_period = 1.0 / self.tick_rate_hz if self.tick_rate_hz > 0 else 0.1
 
         while ctx.running and ctx.session.in_game:
             try:
@@ -4084,10 +4125,24 @@ class WulframServer:
                 # torque = lateral_mobility * turn_adjust * raw_input (per frame)
                 # ang_vel += (torque - ang_vel * damp_coeff) * dt
                 raw_input = self._get_raw_turn_input(ctx)
+                prev_input = getattr(ctx, 'prev_raw_turn_input', 0.0)
                 torque = raw_input * self.turn_adjust  # lateral_mobility=1.0 for now
 
                 physics = ctx.vehicle_physics
                 dt = 1.0 / self.tick_rate_hz
+
+                # Log input transitions (key press/release) for yaw drift analysis
+                input_changed = abs(raw_input - prev_input) > 0.001
+                if input_changed:
+                    transition = "PRESS" if abs(raw_input) > abs(prev_input) else "RELEASE"
+                    print(
+                        f"[YAW-INPUT] {transition} c{ctx.client_id} "
+                        f"input={prev_input:.3f}->{raw_input:.3f} "
+                        f"ang_vel={physics.angular_velocity:.4f} "
+                        f"heading={math.degrees(physics.heading):.2f}deg "
+                        f"t={ctx.session.tick}"
+                    )
+                ctx.prev_raw_turn_input = raw_input
 
                 physics.step(torque, dt)
 
@@ -4702,8 +4757,14 @@ class WulframServer:
                         f"udp={udp_addr} mask={mask_note} health_bytes={health_hex}"
                     )
 
-                sleep_dt = 1.0 / self.tick_rate_hz if self.tick_rate_hz > 0 else 0.1
-                time.sleep(sleep_dt)
+                # Wall-clock pacing: sleep until next tick boundary
+                next_tick_time += tick_period
+                sleep_dt = next_tick_time - time.monotonic()
+                if sleep_dt > 0:
+                    time.sleep(sleep_dt)
+                elif sleep_dt < -tick_period:
+                    # Fallen behind by more than one tick — reset to avoid burst
+                    next_tick_time = time.monotonic()
 
             except Exception as e:
                 print(f"[TICK] Client {ctx.client_id} Error: {e}")

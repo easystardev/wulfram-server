@@ -1079,6 +1079,11 @@ Examples:
                 if self.server:
                     self.server.__class__ = server_mod.WulframServer
 
+                    # Initialize any NEW attributes from updated __init__
+                    # without overwriting existing state (connections, physics, etc.)
+                    if hasattr(self.server, '_apply_reload_defaults'):
+                        self.server._apply_reload_defaults()
+
                     # Swap VehiclePhysics class on all client contexts
                     with self.server.clients_lock:
                         for ctx in self.server.clients.values():
