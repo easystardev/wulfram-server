@@ -173,6 +173,27 @@ class Features:
     send_update_array_empty: bool = False  # DISABLED - heartbeat is preferred
     wulfforge_compat: bool = False  # When True, minimize to wulf-forge behavior
 
+    def __post_init__(self):
+        """Apply env var overrides so hot-reload preserves settings."""
+        import os
+        def _env_bool(key: str) -> Optional[bool]:
+            v = os.environ.get(key)
+            if v is None:
+                return None
+            return v.strip().lower() not in ("0", "false", "off", "no")
+
+        for env_key, attr in [
+            ("WULFRAM_AUTO_LOGIN", "auto_login"),
+            ("WULFRAM_AUTO_JOIN_TEAM", "auto_join_team"),
+            ("WULFRAM_TICK_LOOP_ENABLED", "tick_loop_enabled"),
+            ("WULFRAM_SEND_BEHAVIOR", "send_behavior_packet"),
+            ("WULFRAM_SEND_TRANSLATION", "send_translation_packet"),
+            ("WULFRAM_SEND_WORLD_STATS_ON_LOGIN", "send_world_stats_on_login"),
+        ]:
+            val = _env_bool(env_key)
+            if val is not None:
+                setattr(self, attr, val)
+
     def set_wulfforge_mode(self, enabled: bool = True):
         """
         Set wulf-forge compatibility mode.

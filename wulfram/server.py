@@ -80,6 +80,8 @@ class WulframServer:
 
         # UDP address to client mapping for packet routing
         self.udp_addr_to_client: Dict[tuple, ClientContext] = {}
+        # Session key to client mapping for deterministic UDP binding
+        self.session_key_to_client: Dict[str, ClientContext] = {}
 
         # Coordinate system config (defaults to z-up).
         self.up_axis = os.environ.get("WULFRAM_UP_AXIS", "z").lower()
@@ -1491,14 +1493,21 @@ class WulframServer:
                 text = data[1:].decode('ascii', errors='ignore').strip('\x00')
                 print(f"[UDP] HELLO_ACK from {addr}: '{text}'")
 
-                # If ctx is None, find a client waiting for UDP verification
+                # Try session-key-based match first (deterministic)
+                if ctx is None and text:
+                    matched = self.session_key_to_client.get(text)
+                    if matched:
+                        ctx = matched
+                        print(f"[UDP] HELLO_ACK matched by session key -> client {ctx.client_id}")
+
+                # Fallback: find a client waiting for UDP verification
                 if ctx is None:
                     from .session import Phase
                     with self.clients_lock:
                         for c in self.clients.values():
                             if c.session and c.session.phase == Phase.HANDSHAKE and not c.session.udp_verified:
                                 ctx = c
-                                print(f"[UDP] Matched HELLO_ACK to client {ctx.client_id} in HANDSHAKE state")
+                                print(f"[UDP] Matched HELLO_ACK to client {ctx.client_id} in HANDSHAKE state (heuristic)")
                                 break
 
                 if ctx:
@@ -1509,10 +1518,22 @@ class WulframServer:
                     print(f"[UDP] Registered client {ctx.client_id} with UDP addr {addr}")
 
         elif pkt_type == 0x13:
-            # Session key
-            if len(data) > 5:
-                key = data[5:].decode('ascii', errors='ignore').strip('\x00')
-                print(f"[UDP] Session key from {addr}: '{key}'")
+            # Session key — use to deterministically bind UDP addr → client
+            # Format: 0x13 + subcmd(1) + length(2) + key_bytes
+            if len(data) > 4:
+                key = data[4:].decode('ascii', errors='ignore').strip('\x00')
+                matched = self.session_key_to_client.get(key)
+                if matched:
+                    old_addr = matched.session.udp_addr
+                    if old_addr and old_addr != addr and self.udp_addr_to_client.get(old_addr) is matched:
+                        del self.udp_addr_to_client[old_addr]
+                    matched.session.udp_addr = addr
+                    matched.session.udp_verified = True
+                    self.udp_addr_to_client[addr] = matched
+                    ctx = matched
+                    print(f"[UDP] Session key BOUND client {matched.client_id} to {addr} (key='{key}')")
+                else:
+                    print(f"[UDP] Session key from {addr}: '{key}' (NO MATCH)")
 
         elif pkt_type == 0x33:
             # TRANSLATION_ACK (client -> server, reliable stream packet)
@@ -1883,10 +1904,18 @@ class WulframServer:
             spawn_pos = (spawn_pos[0] + (ctx.client_id - 1) * self.multi_spawn_offset, spawn_pos[1], spawn_pos[2])
         ctx.player_pos = spawn_pos
         ctx.player_pose["pos"] = spawn_pos
-        ctx.player_yaw = 0.0
-        ctx.player_heading = 0.0
+
         ctx.player_angular_vel = 0.0
         ctx.vehicle_physics.reset()
+
+        # Spawn heading — can't set local client heading (physics overwrites it),
+        # but this affects how OTHER clients see your tank at spawn.
+        import math
+        spawn_heading_env = os.environ.get("WULFRAM_SPAWN_HEADING")
+        spawn_yaw = math.radians(float(spawn_heading_env)) if spawn_heading_env else 0.0
+        ctx.player_yaw = spawn_yaw
+        ctx.player_heading = spawn_yaw
+        ctx.vehicle_physics.heading = spawn_yaw
         ctx.last_action_dump_time = time.monotonic()  # Reset timer for position tracking
         if self.spawn_sets_ground_level:
             if self.up_axis == "z":
@@ -2548,6 +2577,11 @@ class WulframServer:
             if udp_addr and self.udp_addr_to_client.get(udp_addr) is ctx:
                 del self.udp_addr_to_client[udp_addr]
 
+            # Remove session key mapping
+            skey = ctx.session.session_key
+            if skey and self.session_key_to_client.get(skey) is ctx:
+                del self.session_key_to_client[skey]
+
             ctx.session.reset()
 
             sock.close()
@@ -2742,6 +2776,8 @@ class WulframServer:
                     note=f"net_id={entity_id}",
                 )
                 ctx.tcp_handler.send(tank_packet)
+            elif pkt_type == PacketType.HELLO:
+                self._handle_hello(ctx, packet)
             else:
                 print(f"[GAME] Unhandled packet 0x{pkt_type:02X}")
 

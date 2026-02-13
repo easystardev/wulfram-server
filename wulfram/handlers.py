@@ -5,6 +5,7 @@ Contains TCP and UDP packet handling logic.
 
 import struct
 import time
+import secrets
 from typing import TYPE_CHECKING, Optional, Tuple
 
 from .session import Phase, FEATURES
@@ -51,9 +52,12 @@ def handle_hello(server: "WulframServer", ctx: "ClientContext", packet: bytes):
         ctx.tcp_handler.send(build_hello_version(version))
 
     elif subcmd == 0x02:
-        # Subcmd 2 = Session key request
-        print(f"[LOGIN] Client {ctx.client_id}: Session key requested")
-        ctx.tcp_handler.send(build_hello_session_key("WulframSessionKey123"))
+        # Subcmd 2 = Session key request — generate unique key per client
+        key = f"WS-{ctx.client_id}-{secrets.token_hex(8)}"
+        ctx.session.session_key = key
+        server.session_key_to_client[key] = ctx
+        print(f"[LOGIN] Client {ctx.client_id}: Session key generated: {key}")
+        ctx.tcp_handler.send(build_hello_session_key(key))
 
 
 def handle_login_request(server: "WulframServer", ctx: "ClientContext", packet: bytes):
@@ -358,18 +362,8 @@ def handle_want_updates(server: "WulframServer", ctx: "ClientContext", packet: b
 
     # Auto-join team (alternate between team 1 and 2 for multiplayer)
     if FEATURES.auto_join_team:
-        if session.team_id:
-            team = session.team_id
-        elif session.pending_spawn_team_id:
-            team = session.pending_spawn_team_id
-        else:
-            # Alternate teams: count existing in-game clients
-            with server.clients_lock:
-                in_game_count = sum(
-                    1 for c in server.clients.values()
-                    if c and c.running and c.session and c.session.in_game
-                )
-            team = 1 + (in_game_count % 2)  # 0 in-game -> team 1, 1 in-game -> team 2
+        # Alternate by client_id: odd=team1, even=team2
+        team = 1 + ((ctx.client_id - 1) % 2)  # client 1 -> team 1, client 2 -> team 2
         session.delayed_spawn_time = now + server.spawn_delay_seconds
         session.delayed_spawn_team = team
         print(
