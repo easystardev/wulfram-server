@@ -124,6 +124,8 @@ class ClientContext:
     injected_input: Optional[tuple] = None
     # Server-injected turn input override - persists until cleared
     injected_turn: Optional[float] = None
+    # Previous tick's raw turn input — for detecting input transitions (key press/release)
+    prev_raw_turn_input: float = 0.0
     last_sent_pos: tuple = field(default_factory=lambda: (0.0, 0.0, 0.0))
     last_sent_vel: tuple = field(default_factory=lambda: (0.0, 0.0, 0.0))
     last_sent_yaw: float = 0.0

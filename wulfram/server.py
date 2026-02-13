@@ -630,6 +630,15 @@ class WulframServer:
             self.turn_sign = float(os.environ.get("WULFRAM_TURN_SIGN", "-1.0"))
         except ValueError:
             self.turn_sign = -1.0
+        # Input transition compensation: when turning input drops to zero,
+        # the server has been applying torque for ~0.5 ticks too long due to
+        # network delay (ACTION_UPDATE arrives after client already stopped).
+        # This factor corrects the over-rotation: heading -= ang_vel * dt * factor
+        # Default 0.5 = assume input changed halfway through the previous tick.
+        try:
+            self.yaw_input_compensation = float(os.environ.get("WULFRAM_YAW_INPUT_COMPENSATION", "0.5"))
+        except ValueError:
+            self.yaw_input_compensation = 0.5
         # Steering curve: piecewise-linear dead-zone curve from client
         # (azurefishy-src Vehicles.c:1030 Piecewise_interpolate).
         # 10 samples over domain 0.0-1.0, looked up with abs(input).
@@ -1900,8 +1909,15 @@ class WulframServer:
                 spawn_pos = (100.0, self.spawn_height, 100.0)
 
         # Offset spawn to avoid overlapping tanks in multi-client tests.
-        if ctx.client_id > 1 and self.multi_spawn_offset:
-            spawn_pos = (spawn_pos[0] + (ctx.client_id - 1) * self.multi_spawn_offset, spawn_pos[1], spawn_pos[2])
+        # Use 0-based index among active clients (not client_id, which grows unboundedly).
+        if self.multi_spawn_offset:
+            with self.clients_lock:
+                active_ids = sorted(c.client_id for c in self.clients.values() if c and c.running)
+            try:
+                idx = active_ids.index(ctx.client_id)
+            except ValueError:
+                idx = 0
+            spawn_pos = (spawn_pos[0] + idx * self.multi_spawn_offset, spawn_pos[1], spawn_pos[2])
         ctx.player_pos = spawn_pos
         ctx.player_pose["pos"] = spawn_pos
 
@@ -2275,8 +2291,15 @@ class WulframServer:
         else:
             ctx.ground_level_override = None
 
-        if ctx.client_id > 1 and self.multi_spawn_offset:
-            spawn_pos = (spawn_pos[0] + (ctx.client_id - 1) * self.multi_spawn_offset, spawn_pos[1], spawn_pos[2])
+        # Use 0-based index among active clients (not client_id, which grows unboundedly).
+        if self.multi_spawn_offset:
+            with self.clients_lock:
+                active_ids = sorted(c.client_id for c in self.clients.values() if c and c.running)
+            try:
+                idx = active_ids.index(ctx.client_id)
+            except ValueError:
+                idx = 0
+            spawn_pos = (spawn_pos[0] + idx * self.multi_spawn_offset, spawn_pos[1], spawn_pos[2])
 
         send_pos = self._to_client_pos(spawn_pos)
         if self.spawn_sets_ground_level:
@@ -4065,6 +4088,7 @@ class WulframServer:
 
                 physics = ctx.vehicle_physics
                 dt = 1.0 / self.tick_rate_hz
+
                 physics.step(torque, dt)
 
                 ctx.player_heading = physics.heading
