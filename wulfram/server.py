@@ -178,6 +178,8 @@ class WulframServer:
         # Goal: Server controls movement, client renders server state
         # NOTE: Tick loop causes client input freeze - disabled for now (see _spawn_wf_style)
         self.send_player_updates = os.environ.get("WULFRAM_SEND_PLAYER_UPDATES", "1") == "1"
+        # Remote player updates (multiplayer position sync) — independent of local heartbeat.
+        self.send_remote_updates = os.environ.get("WULFRAM_SEND_REMOTE_UPDATES", "1") == "1"
         # Wulf-forge sends UPDATE_ARRAY over UDP only.
         self.send_updates_tcp = os.environ.get("WULFRAM_UPDATE_TCP", "0") == "1"
         self.send_updates_udp = os.environ.get("WULFRAM_UPDATE_UDP", "1") == "1"
@@ -925,37 +927,87 @@ class WulframServer:
         target_ctx.known_roster_ids.add(player_id)
         print(f"[MULTI] Sent roster {name} (id={player_id}) -> client {target_ctx.client_id}")
 
-    def _send_entity_create(self, target_ctx: ClientContext, player_ctx: ClientContext) -> None:
-        """Send UPDATE_ARRAY entity creation for player_ctx to target_ctx (once)."""
+    def _send_entity_create(self, target_ctx: ClientContext, player_ctx: ClientContext, *, is_retry: bool = False) -> None:
+        """Announce player_ctx's entity to target_ctx via UPDATE_ARRAY DEFINITION.
+
+        Remote entities are created via UPDATE_ARRAY's fallback path:
+          1. OIDTable_lookup(entity_id) → NOT FOUND
+          2. Entity_create_from_network() creates entity + sets team/config
+          3. Entity_apply_network_transform: entity+0xAC=0 → copies position →
+             Entity_toggle_static_state() → Entity_set_transform() → visible!
+
+        The client's Replication.c has a global tick guard
+        (g_tick_count < g_next_periodic_send_tick) that may block
+        Entity_apply_network_transform for newly connected clients.
+        To work around this, we resend entity creation packets for a
+        retry period after the first attempt, so that one eventually
+        arrives when the guard is open.
+        """
         if not target_ctx.session.translation_ack_received:
             return
         entity_id = player_ctx.session.entity_id or player_ctx.entity_id
+
+        # Track entity creation timing for retry logic.
+        if not hasattr(target_ctx, '_entity_create_times'):
+            target_ctx._entity_create_times = {}  # entity_id → (first_send_time, last_send_time)
+
+        now = time.monotonic()
+        retry_window = float(os.environ.get("WULFRAM_ENTITY_CREATE_RETRY_SECS", "10"))
+        retry_interval = float(os.environ.get("WULFRAM_ENTITY_CREATE_RETRY_INTERVAL", "0.5"))
+
         if entity_id in target_ctx.known_entity_ids:
-            return
-        team = player_ctx.session.team_id or 1
+            # Already sent at least once.  Check if we should retry.
+            times = target_ctx._entity_create_times.get(entity_id)
+            if times is None:
+                return  # No tracking info — legacy, don't retry.
+            first_send, last_send = times
+            if (now - first_send) > retry_window:
+                return  # Retry window expired.
+            if (now - last_send) < retry_interval:
+                return  # Too soon since last retry.
+            is_retry = True
+
         pos = self._to_client_pos(player_ctx.player_pos)
+        team = player_ctx.session.team_id or 1
         tick = self._get_network_tick(target_ctx)
-        packet = build_update_array_create_tank(
+
+        create_pkt = build_update_array_create_tank(
             tick=tick,
             entity_id=entity_id,
             entity_type=player_ctx.entity_type,
             team=team,
             pos=pos,
-            include_health=False,
-            is_manned=False,
+            is_manned=True,
         )
-        if not self._send_packet_to_client(target_ctx, packet, prefer_tcp=True):
+        label = "RETRY" if is_retry else "CREATE"
+        print(f"[MULTI] UPDATE_ARRAY DEFINITION {label} id={entity_id} "
+              f"type={player_ctx.entity_type} team={team} pos={pos} "
+              f"tick={tick} -> client {target_ctx.client_id}")
+        if not is_retry:
+            print(f"[MULTI-HEX] {create_pkt.hex().upper()}")
+        if not self._send_packet_to_client(target_ctx, create_pkt, prefer_tcp=True):
             return
-        target_ctx.known_entity_ids.add(entity_id)
-        print(f"[MULTI] Sent entity create id={entity_id} -> client {target_ctx.client_id}")
+
+        if entity_id not in target_ctx.known_entity_ids:
+            target_ctx.known_entity_ids.add(entity_id)
+            target_ctx._entity_create_times[entity_id] = (now, now)
+            print(f"[MULTI] Sent entity create OK -> client {target_ctx.client_id}")
+        else:
+            first_send = target_ctx._entity_create_times[entity_id][0]
+            target_ctx._entity_create_times[entity_id] = (first_send, now)
+            elapsed = now - first_send
+            print(f"[MULTI] Sent entity create RETRY -> client {target_ctx.client_id} ({elapsed:.1f}s since first)")
 
     def _ensure_multiplayer_visibility(self, ctx: ClientContext) -> None:
         """Ensure ctx sees other players and vice versa once translation is ready."""
         if not ctx.session.translation_ack_received:
             return
-        for other in self._snapshot_in_game_clients():
-            if other is ctx:
-                continue
+        others = [c for c in self._snapshot_in_game_clients() if c is not ctx]
+        if ctx.session.tick % 300 == 0 and others:
+            print(f"[MULTI-DBG] client={ctx.client_id} trans_ack={ctx.session.translation_ack_received} "
+                  f"others={[(o.client_id, o.session.entity_id or o.entity_id, o.session.translation_ack_received) for o in others]} "
+                  f"known={ctx.known_entity_ids}")
+        for other in others:
             # Always try to exchange roster entries (idempotent).
             self._send_roster_entry(ctx, other)
             if other.session.translation_ack_received:
@@ -985,7 +1037,12 @@ class WulframServer:
         include_vel = mode in ("pos_vel", "pos_vel_rot", "full", "all")
         include_rot = mode in ("pos_rot", "pos_vel_rot", "full", "all")
         fuel_val = 1.0
-        for other in self._snapshot_in_game_clients():
+        others = self._snapshot_in_game_clients()
+        if tick % 300 == 0:
+            other_ids = [(c.client_id, c.session.entity_id or c.entity_id) for c in others if c is not ctx]
+            print(f"[REMOTE-DBG] client={ctx.client_id} tick={tick} mode={mode} "
+                  f"others={other_ids} known={ctx.known_entity_ids}")
+        for other in others:
             if other is ctx:
                 continue
             entity_id = other.session.entity_id or other.entity_id
@@ -1024,7 +1081,7 @@ class WulframServer:
                 include_rot=include_rot,
                 include_local_state=include_local_state,
                 include_entity_vitals=False,
-                is_manned=self.remote_update_is_manned,
+                is_manned=True,
                 weapon_id=weapon_type,
                 health=health_val,
                 fuel=fuel_val,
@@ -1037,7 +1094,10 @@ class WulframServer:
                 turret_max=self.local_state_turret_max,
                 turret_range=self.local_state_turret_range,
             )
-            self._send_packet_to_client(ctx, payload, prefer_tcp=prefer_tcp)
+            ok = self._send_packet_to_client(ctx, payload, prefer_tcp=prefer_tcp)
+            if tick % 300 == 0:
+                print(f"[REMOTE-DBG] Sent entity={entity_id} -> client={ctx.client_id} "
+                      f"pos={send_pos} is_manned=True mode={mode} ok={ok}")
 
     def _create_client_context(self, client_addr: tuple) -> ClientContext:
         """Create a new ClientContext with unique IDs and initialized systems."""
@@ -1801,7 +1861,14 @@ class WulframServer:
         ctx.entity_type = unit_type
 
         # Reset position tracking to spawn location (prefer map-provided coords).
-        if pos is None:
+        spawn_override = os.environ.get("WULFRAM_SPAWN_POS")
+        if pos is not None:
+            spawn_pos = pos
+        elif spawn_override:
+            parts = [float(x) for x in spawn_override.split(",")]
+            spawn_pos = (parts[0], parts[1], parts[2] if len(parts) > 2 else self.spawn_height)
+            print(f"[SPAWN] Using spawn point override pos={spawn_pos}")
+        else:
             map_spawn = self._pick_spawn_point(team_id)
             if map_spawn:
                 spawn_pos = (map_spawn["x"], map_spawn["y"], map_spawn["z"])
@@ -1810,8 +1877,6 @@ class WulframServer:
                 spawn_pos = (100.0, 100.0, self.spawn_height)
             else:
                 spawn_pos = (100.0, self.spawn_height, 100.0)
-        else:
-            spawn_pos = pos
 
         # Offset spawn to avoid overlapping tanks in multi-client tests.
         if ctx.client_id > 1 and self.multi_spawn_offset:
@@ -2698,10 +2763,17 @@ class WulframServer:
             ctx.pending_respawn_pos = None
             print(f"[SPAWN] Using pending respawn pos={pos}")
         else:
-            spawn = self._pick_spawn_point(team_id)
-            if spawn:
-                pos = (spawn["x"], spawn["y"], spawn["z"])
-                print(f"[SPAWN] Using spawn point oid={spawn['oid']} team={team_id} pos={pos}")
+            # Check for env var spawn override first
+            spawn_override = os.environ.get("WULFRAM_SPAWN_POS")
+            if spawn_override:
+                parts = [float(x) for x in spawn_override.split(",")]
+                pos = (parts[0], parts[1], parts[2] if len(parts) > 2 else self.spawn_height)
+                print(f"[SPAWN] Using env spawn override pos={pos}")
+            else:
+                spawn = self._pick_spawn_point(team_id)
+                if spawn:
+                    pos = (spawn["x"], spawn["y"], spawn["z"])
+                    print(f"[SPAWN] Using spawn point oid={spawn['oid']} team={team_id} pos={pos}")
         self._spawn_wf_style(ctx, team_id=team_id, net_id=ctx.session.player_id or ctx.entity_id, pos=pos)
 
     def _handle_reincarnate(self, ctx: ClientContext, packet: bytes):
@@ -3209,6 +3281,9 @@ class WulframServer:
 
         The torque is computed externally: torque = raw_input * turn_adjust.
         """
+        if ctx.injected_turn is not None:
+            return self.turn_sign * ctx.injected_turn
+
         def _normalize_axis(val: float) -> float:
             if val > 1.5 or val < -1.5:
                 scale = getattr(ctx.weapon_system, "control_max", 1000.0) or 1000.0
@@ -4514,7 +4589,7 @@ class WulframServer:
                     self.remote_update_interval <= 0
                     or (now - ctx.last_remote_update_send) >= self.remote_update_interval
                 )
-                if self.send_player_updates and not self.combine_update_arrays and remote_due:
+                if self.send_remote_updates and not self.combine_update_arrays and remote_due:
                     ctx.last_remote_update_send = now
                     self._send_remote_player_updates(
                         ctx,

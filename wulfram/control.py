@@ -56,6 +56,7 @@ class ControlServer:
         self.tcp_handler = None  # TCPHandler for sending to game client
         self.udp_handler = None  # UDPHandler for UDP sends
         self.session: Optional[Session] = None
+        self.ctx = None  # ClientContext for entity/roster info
         self.server = None  # Reference to main WulframServer for player_pos access
 
         # Packet builders registry
@@ -107,6 +108,7 @@ class ControlServer:
         """Update self.session/tcp_handler to match the active game client."""
         ctx, _ = self._get_active_client()
         if ctx:
+            self.ctx = ctx
             self.session = ctx.session
             self.tcp_handler = ctx.tcp_handler
 
@@ -259,6 +261,8 @@ class ControlServer:
             return self._cmd_damage(args)
         elif cmd == 'teleport' or cmd == 'tp':
             return self._cmd_teleport(args)
+        elif cmd == 'resend':
+            return self._cmd_resend(args)
         elif cmd == 'quit' or cmd == 'exit':
             return "Goodbye!"
         else:
@@ -327,6 +331,8 @@ Examples:
             f"UDP Verified: {s.udp_verified}",
             f"WANT_UPDATES: {s.want_updates_received} at {_fmt_time(s.want_updates_time)}",
             f"TRANSLATION_ACK: {s.translation_ack_received} at {_fmt_time(s.translation_ack_time)}",
+            f"Known Entities: {sorted(self.ctx.known_entity_ids) if self.ctx else 'N/A'}",
+            f"Known Roster: {sorted(self.ctx.known_roster_ids) if self.ctx else 'N/A'}",
             "",
             "Feature Flags:",
         ]
@@ -1226,6 +1232,7 @@ Examples:
 
         fwd_val = 0.0
         strafe_val = 0.0
+        turn_val = None  # None = no turn override
         if direction in ("forward", "fwd", "f"):
             fwd_val = 0.549  # Matches quantized full-key forward input (ACTION_UPDATE slot 2)
         elif direction in ("back", "backward", "b"):
@@ -1234,17 +1241,26 @@ Examples:
             strafe_val = -0.549
         elif direction in ("right", "r"):
             strafe_val = 0.549
+        elif direction in ("turnleft", "tl"):
+            turn_val = 0.610  # Matches quantized full-key turn input (ACTION_UPDATE slot 4)
+        elif direction in ("turnright", "tr"):
+            turn_val = -0.610
         elif direction == "stop":
             for ctx in targets:
                 ctx.injected_input = None
+                ctx.injected_turn = None
             return f"Stopped movement for {len(targets)} client(s)"
 
         def _do_move():
             for ctx in targets:
-                ctx.injected_input = (fwd_val, strafe_val)
+                if turn_val is not None:
+                    ctx.injected_turn = turn_val
+                else:
+                    ctx.injected_input = (fwd_val, strafe_val)
             time.sleep(duration)
             for ctx in targets:
                 ctx.injected_input = None
+                ctx.injected_turn = None
             print(f"[MOVE] {direction} complete ({duration:.1f}s)")
 
         t = threading.Thread(target=_do_move, daemon=True)
@@ -1328,7 +1344,7 @@ Examples:
             f"Client {ctx.client_id}: {old_health*100:.0f}% → {new_health*100:.0f}%"
         )
 
-    def _do_respawn(self, ctx, pos: tuple = None, offset_x: float = 0.0) -> str:
+    def _do_respawn(self, ctx, pos: tuple = None, offset_x: float = 0.0, team: int = None) -> str:
         """Core respawn logic for a single client. Returns status string."""
         map_spawn = self.server._pick_spawn_point(ctx.session.team_id if ctx.session else 1)
         if pos:
@@ -1342,7 +1358,9 @@ Examples:
         x += offset_x
 
         entity_id = ctx.entity_id or 1337
-        team_id = ctx.session.team_id if ctx.session else 1
+        team_id = team if team is not None else (ctx.session.team_id if ctx.session else 1)
+        if ctx.session:
+            ctx.session.team_id = team_id
         ctx.pending_respawn_pos = (x, y, z)
         ctx.player_pos = (x, y, z)
         ctx.player_vel = (0.0, 0.0, 0.0)
@@ -1428,6 +1446,96 @@ Examples:
         except (ValueError, IndexError) as e:
             return f"Error: {e}"
 
+    def _cmd_resend(self, args: list) -> str:
+        """Force re-send entity creation packets to all clients.
+
+        Clears known_entity_ids and directly sends entity creation packets.
+
+        Usage:
+          resend            - Clear and resend all entities via TCP
+          resend udp        - Send via UDP instead
+          resend c<id>      - Only resend to specific client
+          resend c<id> udp  - Specific client via UDP
+        """
+        if not self.server:
+            return "Error: No server reference"
+
+        clients = self.server._snapshot_in_game_clients()
+        if len(clients) < 2:
+            return f"Need 2+ in-game clients, have {len(clients)}"
+
+        # Parse args
+        target_id = None
+        use_udp = 'udp' in [a.lower() for a in args]
+        for a in args:
+            if a.startswith('c') and a[1:].isdigit():
+                target_id = int(a[1:])
+
+        from .packets import build_update_array_create_tank
+        # Parse optional override entity ID
+        override_eid = None
+        no_health = 'nohealth' in [a.lower() for a in args]
+        for a in args:
+            if a.isdigit() and int(a) > 100:
+                override_eid = int(a)
+        lines = []
+
+        for ctx in clients:
+            if target_id is not None and ctx.client_id != target_id:
+                continue
+
+            for other in clients:
+                if other is ctx:
+                    continue
+                eid = override_eid or (other.session.entity_id or other.entity_id)
+                ctx.known_entity_ids.discard(eid)
+
+                # Build packet
+                pos = self.server._to_client_pos(other.player_pos)
+                team = other.session.team_id or 1
+                tick = self.server._get_network_tick(ctx)
+                pkt = build_update_array_create_tank(
+                    tick=tick, entity_id=eid,
+                    entity_type=other.entity_type, team=team,
+                    pos=pos, is_manned=True,
+                    include_health=not no_health,
+                )
+
+                # Send
+                if use_udp and self.server.udp_handler and ctx.session.udp_addr:
+                    self.server.udp_handler.send_to(pkt, ctx.session.udp_addr)
+                    ctx.known_entity_ids.add(eid)
+                    lines.append(f"Sent entity {eid} (team={team}) -> client {ctx.client_id} via UDP "
+                                 f"tick={tick} pos={pos} len={len(pkt)}")
+                    lines.append(f"  HEX: {pkt.hex().upper()}")
+                elif ctx.tcp_handler:
+                    ctx.tcp_handler.send(pkt, log=True)
+                    ctx.known_entity_ids.add(eid)
+                    lines.append(f"Sent entity {eid} (team={team}) -> client {ctx.client_id} via TCP "
+                                 f"tick={tick} pos={pos} len={len(pkt)}")
+                    lines.append(f"  HEX: {pkt.hex().upper()}")
+                else:
+                    lines.append(f"FAILED: no transport for client {ctx.client_id}")
+
+        # Also send a health-restore heartbeat if nohealth was used previously
+        if no_health or 'fixhealth' in [a.lower() for a in args]:
+            from .packets import build_update_array_heartbeat
+            for ctx in clients:
+                if target_id is not None and ctx.client_id != target_id:
+                    continue
+                eid = ctx.session.entity_id or ctx.entity_id
+                hb_tick = self.server._get_network_tick(ctx)
+                hb = build_update_array_heartbeat(
+                    tick=hb_tick, entity_id=eid,
+                    include_health=True, weapon_id=2,
+                    health=1.0, fuel=1.0,
+                )
+                if self.server.udp_handler and ctx.session.udp_addr:
+                    self.server.udp_handler.send_to(hb, ctx.session.udp_addr)
+                    lines.append(f"Sent health fix heartbeat to client {ctx.client_id}")
+
+        return "\n".join(lines)
+
     def _cmd_respawn(self, args: list) -> str:
         """
         Respawn by DELETE + server-triggered delayed spawn.
@@ -1444,6 +1552,7 @@ Examples:
           respawn <x> <y> <z>  - Respawn at specific position
           respawn c<id>        - Respawn specific client (e.g. c4)
           respawn c<id> <x> <y> <z> - Respawn specific client at position
+          respawn c<id> t<team> <x> <y> <z> - Respawn on specific team (1=red, 2=blue)
           respawn all          - Respawn all clients at staggered positions
         """
         if not self.server:
@@ -1475,8 +1584,14 @@ Examples:
         if not ctx:
             return "Error: No connected client"
 
+        # Check for t<team> prefix
+        team = None
+        if args and args[0].lower().startswith("t") and args[0][1:].isdigit():
+            team = int(args[0][1:])
+            args = args[1:]
+
         # Default to map spawn position
-        map_spawn = self.server._pick_spawn_point(ctx.session.team_id if ctx.session else 1)
+        map_spawn = self.server._pick_spawn_point(team or (ctx.session.team_id if ctx.session else 1))
         if map_spawn:
             x, y, z = map_spawn["x"], map_spawn["y"], map_spawn["z"]
         elif self.server.up_axis == "z":
@@ -1490,9 +1605,10 @@ Examples:
         except ValueError as e:
             return f"respawn arg parse error: {e}"
 
-        result = self._do_respawn(ctx, pos=(x, y, z))
+        result = self._do_respawn(ctx, pos=(x, y, z), team=team)
         self._sync_to_active_client()
-        return f"Respawned client {ctx.client_id} at {result}"
+        team_name = {1: "Red", 2: "Blue"}.get(team, str(team)) if team else "same"
+        return f"Respawned client {ctx.client_id} (team={team_name}) at {result}"
 
     def _cmd_spawn_full(self, args: list) -> str:
         """

@@ -356,9 +356,20 @@ def handle_want_updates(server: "WulframServer", ctx: "ClientContext", packet: b
     session.want_updates_handled = True
     session.want_updates_handled_time = now
 
-    # Auto-join team
+    # Auto-join team (alternate between team 1 and 2 for multiplayer)
     if FEATURES.auto_join_team:
-        team = session.team_id or session.pending_spawn_team_id or 1
+        if session.team_id:
+            team = session.team_id
+        elif session.pending_spawn_team_id:
+            team = session.pending_spawn_team_id
+        else:
+            # Alternate teams: count existing in-game clients
+            with server.clients_lock:
+                in_game_count = sum(
+                    1 for c in server.clients.values()
+                    if c and c.running and c.session and c.session.in_game
+                )
+            team = 1 + (in_game_count % 2)  # 0 in-game -> team 1, 1 in-game -> team 2
         session.delayed_spawn_time = now + server.spawn_delay_seconds
         session.delayed_spawn_team = team
         print(

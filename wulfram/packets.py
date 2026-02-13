@@ -400,6 +400,7 @@ def build_player_info(entity_oid: int, vehicle_type: int, pos: Tuple[float, floa
                       health: float = 1.0,
                       fuel: float = 1.0,
                       properties: int = 0,
+                      frame_id: int | None = None,
                       ammo_count_bits: int = 0,
                       ammo_count: int = 0,
                       primary_turret_bits: int = 0,
@@ -448,8 +449,11 @@ def build_player_info(entity_oid: int, vehicle_type: int, pos: Tuple[float, floa
     # Vehicle type (32 bits) - 0-4 are valid tank types
     bw.write_bits(32, vehicle_type)
 
-    # Frame ID (32 bits)
-    bw.write_bits(32, entity_oid)  # Use OID as frame ID
+    # Frame ID (32 bits) - controls g_current_frame_id in client.
+    # For local player: frame_id == entity_oid → Entity_set_transform calls LocalPlayer_initialize.
+    # For remote entities: frame_id != entity_oid → Entity_set_transform skips LocalPlayer_initialize.
+    actual_frame_id = frame_id if frame_id is not None else entity_oid
+    bw.write_bits(32, actual_frame_id & 0xFFFFFFFF)
 
     # Properties / config byte (8 bits)
     bw.write_bits(8, properties & 0xFF)
@@ -1240,7 +1244,7 @@ def build_update_array_create_tank(tick: int, entity_id: int, entity_type: int, 
     config_val = behavior_type if behavior_type else team
     bw.write_bits(8, config_val & 0xFF)    # team_id / entity_config
     bw.write_bits(8, team & 0xFF)          # team_id (quantizer[3])
-    bw.write_bits(1, 1)                    # is_static = True (force position)
+    bw.write_bits(1, 0)                    # is_static = False (entity starts non-static)
 
     # --- POSITION VECTORS (Bit 1 / POS) ---
     # Each component: 4-bit header + 16 bits of data at max priority.
