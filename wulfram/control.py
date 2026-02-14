@@ -259,6 +259,8 @@ class ControlServer:
             return self._cmd_move(args)
         elif cmd == 'damage' or cmd == 'dmg':
             return self._cmd_damage(args)
+        elif cmd == 'heal':
+            return self._cmd_heal(args)
         elif cmd == 'teleport' or cmd == 'tp':
             return self._cmd_teleport(args)
         elif cmd == 'resend':
@@ -720,18 +722,30 @@ Examples:
         if not self.server:
             return "Error: No server reference"
 
-        # Find first connected client
+        # Check for c<N> client selector in args (can appear anywhere)
+        target_client_id = None
+        filtered_args = []
+        for a in args:
+            if a.startswith('c') and a[1:].isdigit():
+                target_client_id = int(a[1:])
+            else:
+                filtered_args.append(a)
+        args = filtered_args
+
+        # Find target client (or first connected)
         ctx = None
         addr = None
         with self.server.clients_lock:
             for c in self.server.clients.values():
                 if hasattr(c, 'weapon_system') and c.session and c.session.udp_addr:
+                    if target_client_id is not None and c.client_id != target_client_id:
+                        continue
                     ctx = c
                     addr = c.session.udp_addr
                     break
 
         if not ctx:
-            return "Error: No connected client with weapon system"
+            return f"Error: No connected client{f' c{target_client_id}' if target_client_id else ''} with weapon system"
 
         count = 1
         override_yaw = None
@@ -1055,7 +1069,14 @@ Examples:
                 from . import jump_jets as jump_jets_mod
                 from . import server as server_mod
 
-                # Reload leaf modules first, then dependents
+                # Preserve FEATURES global across reload (session.py recreates it)
+                old_features = session_mod.FEATURES
+
+                # Reload leaf modules first, then dependents.
+                # CRITICAL: Restore FEATURES onto session_mod immediately after
+                # reloading session, BEFORE reloading modules that import it
+                # (handlers, control, server). Otherwise those modules bind to
+                # the discarded new Features() instance.
                 for mod, name in [
                     (codec_mod, "codec"),
                     (session_mod, "session"),
@@ -1071,9 +1092,26 @@ Examples:
                 ]:
                     importlib.reload(mod)
                     reloaded.append(name)
+                    # Restore preserved state immediately after their modules reload
+                    if name == "session":
+                        session_mod.FEATURES = old_features
+                    elif name == "packets":
+                        packets_mod._SERVER_START = old_server_start
 
-                # Restore preserved state
-                packets_mod._SERVER_START = old_server_start
+                # Migrate live session Phase values to the new Phase enum.
+                # When session.py is reloaded, the Phase enum class is recreated.
+                # Existing ctx.session.phase holds OLD Phase instances which fail
+                # identity comparison with new Phase members, causing game loops
+                # to exit (the `phase in [Phase.TEAM_SELECT, ...]` check fails).
+                new_Phase = session_mod.Phase
+                if self.server:
+                    with self.server.clients_lock:
+                        for ctx in self.server.clients.values():
+                            if ctx.session and ctx.session.phase:
+                                try:
+                                    ctx.session.phase = new_Phase[ctx.session.phase.name]
+                                except (KeyError, AttributeError):
+                                    pass
 
                 # Swap WulframServer class on live instance
                 if self.server:
@@ -1084,11 +1122,17 @@ Examples:
                     if hasattr(self.server, '_apply_reload_defaults'):
                         self.server._apply_reload_defaults()
 
-                    # Swap VehiclePhysics class on all client contexts
+                    # Swap classes on all live client sub-objects
                     with self.server.clients_lock:
                         for ctx in self.server.clients.values():
                             if hasattr(ctx, 'vehicle_physics') and ctx.vehicle_physics:
                                 ctx.vehicle_physics.__class__ = physics_mod.VehiclePhysics
+                            if hasattr(ctx, 'weapon_system') and ctx.weapon_system:
+                                ctx.weapon_system.__class__ = weapons_mod.WeaponSystem
+                            if hasattr(ctx, 'jump_jet_system') and ctx.jump_jet_system:
+                                ctx.jump_jet_system.__class__ = jump_jets_mod.JumpJetSystem
+                            if ctx.session:
+                                ctx.session.__class__ = session_mod.Session
 
                 # Swap ControlServer class on this instance
                 self.__class__ = control_mod.ControlServer
@@ -1141,6 +1185,7 @@ Examples:
                     "heading_deg": round(math.degrees(ctx.player_heading), 1),
                     "aim_yaw_deg": round(math.degrees(ctx.player_aim_yaw), 1),
                     "aim_pitch_deg": round(math.degrees(ctx.player_aim_pitch), 1),
+                    "health_pct": round(ctx.player_health * 100),
                 }
                 clients.append(entry)
 
@@ -1156,10 +1201,12 @@ Examples:
             vx, vy, vz = c["vel"]
             speed = (vx**2 + vy**2 + vz**2) ** 0.5
             vel_str = f" vel=({vx:.1f}, {vy:.1f}, {vz:.1f}) speed={speed:.1f}" if speed > 0.1 else ""
+            hp = c["health_pct"]
+            hp_str = f" HP={hp}%" if hp < 100 else ""
             lines.append(
                 f"Client {c['client_id']} (entity {c['entity_id']}) [{c['phase']}]: "
                 f"pos=({x:.1f}, {y:.1f}, {z:.1f}) "
-                f"heading={c['heading_deg']}° aim={c['aim_yaw_deg']}°{vel_str}"
+                f"heading={c['heading_deg']}° aim={c['aim_yaw_deg']}°{vel_str}{hp_str}"
             )
         return "\n".join(lines)
 
@@ -1349,31 +1396,84 @@ Examples:
             f"Client {ctx.client_id}: {old_health*100:.0f}% → {new_health*100:.0f}%"
         )
 
-    def _do_respawn(self, ctx, pos: tuple = None, offset_x: float = 0.0, team: int = None) -> str:
-        """Core respawn logic for a single client. Returns status string."""
-        map_spawn = self.server._pick_spawn_point(ctx.session.team_id if ctx.session else 1)
-        if pos:
-            x, y, z = pos
-        elif map_spawn:
-            x, y, z = map_spawn["x"], map_spawn["y"], map_spawn["z"]
-        elif self.server.up_axis == "z":
-            x, y, z = 100.0, 100.0, self.server.spawn_height
-        else:
-            x, y, z = 100.0, self.server.spawn_height, 100.0
-        x += offset_x
+    def _cmd_heal(self, args: list) -> str:
+        """Reset player health to 100% and send health update.
 
+        Usage:
+          heal          - Heal active client
+          heal c<id>    - Heal specific client
+          heal all      - Heal all in-game clients
+        """
+        if not self.server:
+            return "Error: No server reference"
+
+        from .packets import build_update_array_heartbeat
+
+        def _heal_one(ctx) -> str:
+            old = ctx.player_health
+            ctx.player_health = 1.0
+            entity_id = ctx.session.entity_id or ctx.entity_id
+            tick = self.server._get_network_tick(ctx)
+            weapon_type = self.server._get_local_state_weapon_type(ctx)
+            pkt = build_update_array_heartbeat(
+                tick=tick,
+                entity_id=entity_id,
+                include_health=True,
+                weapon_id=weapon_type,
+                health=self.server._get_health_value(ctx),
+                fuel=1.0,
+            )
+            # Send via TCP (reliable) first
+            if ctx.tcp_handler:
+                ctx.tcp_handler.send(pkt)
+            # Also send via UDP 3x for redundancy
+            if self.server.udp_handler and ctx.session and ctx.session.udp_addr:
+                import time as _time
+                for _ in range(3):
+                    self.server.udp_handler.send_to(pkt, ctx.session.udp_addr)
+                    _time.sleep(0.05)
+            return f"c{ctx.client_id}: {old*100:.0f}% -> 100%"
+
+        if args and args[0].lower() == "all":
+            results = []
+            for c in self.server._snapshot_in_game_clients():
+                results.append(_heal_one(c))
+            return "\n".join(results) if results else "No in-game clients"
+
+        if args and args[0].lower().startswith("c") and args[0][1:].isdigit():
+            ctx, _ = self._get_client_by_id(int(args[0][1:]))
+            if not ctx:
+                return f"Error: No client with id {args[0][1:]}"
+        else:
+            ctx, _ = self._get_active_client()
+        if not ctx:
+            return "Error: No connected client"
+
+        return _heal_one(ctx)
+
+    def _do_respawn(self, ctx, pos: tuple = None, offset_x: float = 0.0, team: int = None) -> str:
+        """Core respawn logic for a single client. Returns status string.
+
+        Sends DELETE_OBJECT with explosion effects, waits for client to
+        process deletion, then spawns a fresh entity with full health.
+        If pos is None, _spawn_wf_style picks from WULFRAM_SPAWN_POS / map.
+        """
         entity_id = ctx.entity_id or 1337
         team_id = team if team is not None else (ctx.session.team_id if ctx.session else 1)
         if ctx.session:
             ctx.session.team_id = team_id
-        ctx.pending_respawn_pos = (x, y, z)
-        ctx.player_pos = (x, y, z)
+
+        # Build spawn pos for the status message (actual spawn uses _spawn_wf_style logic)
+        spawn_pos = pos
+        if spawn_pos and offset_x:
+            spawn_pos = (spawn_pos[0] + offset_x, spawn_pos[1], spawn_pos[2])
+
+        # Reset server-side state
+        ctx.player_health = 1.0
         ctx.player_vel = (0.0, 0.0, 0.0)
         ctx.player_heading = 0.0
         ctx.player_yaw = 0.0
         ctx.angular_vel_yaw = 0.0
-        ctx.player_health = 1.0  # Reset health on respawn
-        ctx.player_pose["pos"] = (x, y, z)
         ctx.player_pose["vel"] = (0.0, 0.0, 0.0)
         ctx.player_pose["yaw"] = 0.0
         if ctx.vehicle_physics:
@@ -1381,30 +1481,36 @@ Examples:
             ctx.vehicle_physics._angular_velocity = 0.0
         ctx.last_correction_send = time.monotonic()
 
-        print(f"[RESPAWN] DELETE entity {entity_id}, pending pos=({x:.1f},{y:.1f},{z:.1f})")
+        pos_str = f"({spawn_pos[0]:.1f},{spawn_pos[1]:.1f},{spawn_pos[2]:.1f})" if spawn_pos else "default"
+        print(f"[RESPAWN] DELETE entity {entity_id} with effects, spawn={pos_str}")
         delete_pkt = build_delete_object(
             tick=self.server._get_network_tick(ctx),
             entity_ids=[entity_id],
-            with_effects=False,
+            with_effects=True,
         )
-        # Send DELETE to the respawning client
+        # Send DELETE to all clients
         if ctx.tcp_handler:
             ctx.tcp_handler.send(delete_pkt)
-        # Also send DELETE to all other clients and remove from their known set
-        # so the entity gets re-created after respawn
         for other in self.server._snapshot_in_game_clients():
             if other is ctx:
                 continue
             other.known_entity_ids.discard(entity_id)
             if other.tcp_handler:
                 other.tcp_handler.send(delete_pkt)
-                print(f"[RESPAWN] Sent DELETE entity {entity_id} to client {other.client_id}")
-        ctx.session.phase = Phase.TEAM_SELECT
+
+        # Stop tick loop (entity no longer exists on client)
         ctx.session.in_game = False
-        time.sleep(5.0)
-        print(f"[RESPAWN] Spawning client {ctx.client_id} at ({x:.1f},{y:.1f},{z:.1f})")
-        self.server._spawn_wf_style(ctx, team_id=team_id, net_id=entity_id, pos=(x, y, z))
-        return f"({x:.1f},{y:.1f},{z:.1f})"
+
+        # Store pending respawn pos for _auto_join_team to use
+        if spawn_pos:
+            ctx.pending_respawn_pos = spawn_pos
+
+        # Use game loop's delayed spawn mechanism
+        respawn_delay = 5.0
+        ctx.session.delayed_spawn_team = team_id
+        ctx.session.delayed_spawn_time = time.monotonic() + respawn_delay
+        print(f"[RESPAWN] Scheduled respawn for c{ctx.client_id} in {respawn_delay:.0f}s")
+        return f"spawn={pos_str} -- respawning in {respawn_delay:.0f}s"
 
     def _cmd_teleport(self, args: list) -> str:
         """Teleport: offset server position and force correction to test if client moves.
@@ -1595,22 +1701,15 @@ Examples:
             team = int(args[0][1:])
             args = args[1:]
 
-        # Default to map spawn position
-        map_spawn = self.server._pick_spawn_point(team or (ctx.session.team_id if ctx.session else 1))
-        if map_spawn:
-            x, y, z = map_spawn["x"], map_spawn["y"], map_spawn["z"]
-        elif self.server.up_axis == "z":
-            x, y, z = 100.0, 100.0, self.server.spawn_height
-        else:
-            x, y, z = 100.0, self.server.spawn_height, 100.0
-
+        # Only pass explicit pos if user provided coordinates
+        pos = None
         try:
             if len(args) >= 3:
-                x, y, z = float(args[0]), float(args[1]), float(args[2])
+                pos = (float(args[0]), float(args[1]), float(args[2]))
         except ValueError as e:
             return f"respawn arg parse error: {e}"
 
-        result = self._do_respawn(ctx, pos=(x, y, z), team=team)
+        result = self._do_respawn(ctx, pos=pos, team=team)
         self._sync_to_active_client()
         team_name = {1: "Red", 2: "Blue"}.get(team, str(team)) if team else "same"
         return f"Respawned client {ctx.client_id} (team={team_name}) at {result}"

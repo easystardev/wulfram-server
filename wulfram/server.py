@@ -1067,7 +1067,7 @@ class WulframServer:
             entity_id = other.session.entity_id or other.entity_id
             if entity_id not in ctx.known_entity_ids:
                 continue
-            health_val = self._get_health_value(other)
+            health_val = self._get_health_value(ctx)  # VIEWER's health for local_state HUD
             # Extract weapon/ammo/turret data from the REMOTE player, not the viewer.
             weapon_type = self._get_local_state_weapon_type(other)
             ammo_bits, ammo_mask = self._get_local_state_ammo_bits(other)
@@ -3622,7 +3622,12 @@ class WulframServer:
                 # Check collision with enemy players
                 hit_target = self._check_projectile_hit(proj, ctx)
                 if hit_target:
-                    self._apply_damage(hit_target, proj, ctx)
+                    try:
+                        self._apply_damage(hit_target, proj, ctx)
+                    except Exception as dmg_err:
+                        print(f"[COMBAT-ERROR] _apply_damage failed: {dmg_err}")
+                        import traceback
+                        traceback.print_exc()
                     with ctx.projectile_lock:
                         if proj in ctx.active_projectiles:
                             ctx.active_projectiles.remove(proj)
@@ -3654,7 +3659,12 @@ class WulframServer:
             with ctx.projectile_lock:
                 if proj in ctx.active_projectiles:
                     ctx.active_projectiles.remove(proj)
-            print(f"[PROJ] id={proj.entity_id} expired")
+            # Send DELETE_OBJECT so the client removes the shell entity
+            tick = self._get_network_tick(ctx)
+            delete_pkt = build_delete_object(tick, [proj.entity_id], with_effects=False)
+            for client in self._snapshot_in_game_clients():
+                self._send_packet_to_client(client, delete_pkt, prefer_tcp=True)
+            print(f"[PROJ] id={proj.entity_id} expired — DELETE sent")
 
         # Add to active list and start thread
         with ctx.projectile_lock:
@@ -3681,7 +3691,16 @@ class WulframServer:
             dy = proj.pos[1] - target_pos[1]
             dz = proj.pos[2] - target_pos[2]
             dist_sq = dx * dx + dy * dy + dz * dz
+            dist = math.sqrt(dist_sq)
+            if dist < 100:  # Log when close
+                print(
+                    f"[PROJ-DIST] id={proj.entity_id} -> c{target.client_id} "
+                    f"dist={dist:.1f} (hit<{hit_radius:.0f}) "
+                    f"proj=({proj.pos[0]:.1f},{proj.pos[1]:.1f},{proj.pos[2]:.1f}) "
+                    f"tgt=({target_pos[0]:.1f},{target_pos[1]:.1f},{target_pos[2]:.1f})"
+                )
             if dist_sq <= hit_radius_sq:
+                print(f"[PROJ-HIT] id={proj.entity_id} HIT c{target.client_id} dist={dist:.1f}")
                 return target
         return None
 
@@ -3693,16 +3712,26 @@ class WulframServer:
         3. Send DELETE_OBJECT for projectile (with explosion FX)
         4. If dead, send DELETE_OBJECT for target entity
         """
+        # Guard: ignore hits on already-dead targets (overkill from queued projectiles)
+        if target.player_health <= 0.0:
+            print(f"[COMBAT] Ignoring hit on already-dead c{target.client_id}")
+            # Still delete the projectile
+            tick = self._get_network_tick(attacker)
+            delete_proj_pkt = build_delete_object(tick, [proj.entity_id], with_effects=True)
+            for client in self._snapshot_in_game_clients():
+                self._send_packet_to_client(client, delete_proj_pkt, prefer_tcp=True)
+            return
+
         damage = 0.2  # Pulse shell = 20% per hit (5 hits to kill)
         old_health = target.player_health
-        target.player_health = max(0.0, old_health - damage)
+        target.player_health = round(max(0.0, old_health - damage), 6)
         new_health = target.player_health
 
         attacker_name = attacker.session.username or f"Player{attacker.client_id}"
         target_name = target.session.username or f"Player{target.client_id}"
         print(
             f"[COMBAT] {attacker_name} (c{attacker.client_id}) hit {target_name} (c{target.client_id}) "
-            f"for {damage*100:.0f}% damage (health: {old_health*100:.0f}%→{new_health*100:.0f}%)"
+            f"for {damage*100:.0f}% damage (health: {old_health*100:.0f}% -> {new_health*100:.0f}%)"
         )
 
         # Send health update to the damaged player via heartbeat UPDATE_ARRAY
@@ -3736,7 +3765,27 @@ class WulframServer:
             if client.tcp_handler:
                 client.tcp_handler.send(chat_pkt)
 
-        # If target is dead, delete their entity with explosion
+        # Send health refresh to ALL surviving clients (attacker etc.)
+        # Projectile UPDATE_ARRAY packets include per-viewer health, but once
+        # projectiles are gone the viewer gets no more health data. This
+        # heartbeat ensures the attacker's HUD doesn't revert to zero.
+        for client in self._snapshot_in_game_clients():
+            if client is target:
+                continue  # Already sent above
+            if self.udp_handler and client.session.udp_addr:
+                c_tick = self._get_network_tick(client)
+                c_weapon = self._get_local_state_weapon_type(client)
+                c_pkt = build_update_array_heartbeat(
+                    tick=c_tick,
+                    entity_id=client.session.entity_id,
+                    include_health=True,
+                    weapon_id=c_weapon,
+                    health=self._get_health_value(client),
+                    fuel=1.0,
+                )
+                self.udp_handler.send_to(c_pkt, client.session.udp_addr)
+
+        # If target is dead, delete their entity with explosion and schedule respawn
         if target.player_health <= 0.0:
             print(f"[COMBAT] {target_name} (c{target.client_id}) DESTROYED by {attacker_name} (c{attacker.client_id})")
             kill_msg = f"KILL! {attacker_name} destroyed {target_name}!"
@@ -3745,9 +3794,9 @@ class WulframServer:
                 if client.tcp_handler:
                     client.tcp_handler.send(kill_chat)
 
-            # Small delay to let explosion render before entity removal
-            time.sleep(0.5)
             target_entity_id = target.session.entity_id or target.entity_id
+
+            # DELETE with effects=True triggers explosion visual on client
             delete_target_pkt = build_delete_object(
                 tick=self._get_network_tick(target),
                 entity_ids=[target_entity_id],
@@ -3755,6 +3804,29 @@ class WulframServer:
             )
             for client in self._snapshot_in_game_clients():
                 self._send_packet_to_client(client, delete_target_pkt, prefer_tcp=True)
+
+            # Stop tick loop (entity no longer exists on client)
+            target.session.in_game = False
+
+            # Remove from other clients' known entities so they re-create on respawn
+            for other in self._snapshot_in_game_clients():
+                if other is not target:
+                    other.known_entity_ids.discard(target_entity_id)
+
+            # Reset server-side state for next spawn
+            target.player_health = 1.0
+            target.player_vel = (0.0, 0.0, 0.0)
+            target.angular_vel_yaw = 0.0
+            if target.vehicle_physics:
+                target.vehicle_physics.reset()
+
+            # Use game loop's delayed spawn mechanism (instead of background thread).
+            # The game loop checks delayed_spawn_team every 0.5s and calls
+            # _auto_join_team -> _spawn_wf_style when the time arrives.
+            respawn_delay = 5.0
+            target.session.delayed_spawn_team = target.session.team_id or 1
+            target.session.delayed_spawn_time = time.monotonic() + respawn_delay
+            print(f"[COMBAT] Respawning c{target.client_id} in {respawn_delay:.0f}s via delayed_spawn")
 
     def _get_aim_rotation(self, ctx: ClientContext) -> tuple:
         """Return (pitch, yaw, source) for aiming/projectiles."""
