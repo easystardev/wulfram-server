@@ -2027,12 +2027,17 @@ class WulframServer:
                 is_manned=True,
                 weapon_id=ls_weapon,
             )
+            # Always send pre-creation UPDATE_ARRAY via TCP for reliability.
+            # After DELETE_OBJECT (respawn), the client may stop processing UDP
+            # while on the team-select screen, causing UDP UPDATE_ARRAY to be
+            # lost and the subsequent TankPacket to take the wrong code path
+            # (Entity_create_from_network instead of LocalPlayer_initialize).
+            ctx.tcp_handler.send(ua_packet)
+            print("[SPAWN] Sent UPDATE_ARRAY_CREATE_TANK via TCP (reliable)")
+            # Also send via UDP as backup (client processes whichever arrives first)
             if self.udp_handler and ctx.session.udp_addr:
                 self.udp_handler.send_to(ua_packet, ctx.session.udp_addr)
-                print("[SPAWN] Sent UPDATE_ARRAY_CREATE_TANK via UDP")
-            else:
-                ctx.tcp_handler.send(ua_packet)
-                print("[SPAWN] Sent UPDATE_ARRAY_CREATE_TANK via TCP")
+                print("[SPAWN] Also sent UPDATE_ARRAY_CREATE_TANK via UDP")
             # Delay so client processes entity creation before PLAYER_INFO.
             # The TankPacket's OIDTable_lookup must find the entity created
             # by UPDATE_ARRAY; if the TankPacket arrives first, it takes the
@@ -2086,6 +2091,12 @@ class WulframServer:
             if self.udp_handler and ctx.session.udp_addr:
                 self.udp_handler.send_to(tank_packet, ctx.session.udp_addr)
                 print(f"[SPAWN] Sent UDP TankPacket to {ctx.session.udp_addr}")
+                # Also send via TCP as backup.  After combat kill + entity DELETE,
+                # the client may not process UDP while on team-select overlay.
+                # With pre-creation UPDATE_ARRAY, entity exists in OIDTable so
+                # TCP PLAYER_INFO takes "entity found" path → LocalPlayer_initialize.
+                ctx.tcp_handler.send(tank_packet)
+                print(f"[SPAWN] Also sent TCP TankPacket (backup for respawn)")
                 # Resend TankPacket for reliability (UDP can drop packets)
                 # Each retransmit triggers Entity_create_from_network (new
                 # entity, 0xD0=0).  This is safe as long as no velocity
@@ -3734,8 +3745,7 @@ class WulframServer:
             f"for {damage*100:.0f}% damage (health: {old_health*100:.0f}% -> {new_health*100:.0f}%)"
         )
 
-        # Send health update to the damaged player via heartbeat UPDATE_ARRAY
-        if self.udp_handler and target.session.udp_addr:
+        if target.player_health > 0.0 and self.udp_handler and target.session.udp_addr:
             tick = self._get_network_tick(target)
             weapon_type = self._get_local_state_weapon_type(target)
             health_pkt = build_update_array_heartbeat(
@@ -3748,13 +3758,9 @@ class WulframServer:
             )
             self.udp_handler.send_to(health_pkt, target.session.udp_addr)
 
-        # DELETE projectile with explosion FX for all clients
+        # DELETE projectile with explosion effects
         tick = self._get_network_tick(attacker)
-        delete_proj_pkt = build_delete_object(
-            tick=tick,
-            entity_ids=[proj.entity_id],
-            with_effects=True,
-        )
+        delete_proj_pkt = build_delete_object(tick, [proj.entity_id], with_effects=True)
         for client in self._snapshot_in_game_clients():
             self._send_packet_to_client(client, delete_proj_pkt, prefer_tcp=True)
 
@@ -3796,14 +3802,11 @@ class WulframServer:
 
             target_entity_id = target.session.entity_id or target.entity_id
 
-            # DELETE with effects=True triggers explosion visual on client
-            delete_target_pkt = build_delete_object(
-                tick=self._get_network_tick(target),
-                entity_ids=[target_entity_id],
-                with_effects=True,
-            )
+            # DELETE entity with explosion effects
+            tick_del = self._get_network_tick(target)
+            del_pkt = build_delete_object(tick_del, [target_entity_id], with_effects=True)
             for client in self._snapshot_in_game_clients():
-                self._send_packet_to_client(client, delete_target_pkt, prefer_tcp=True)
+                self._send_packet_to_client(client, del_pkt, prefer_tcp=True)
 
             # Stop tick loop (entity no longer exists on client)
             target.session.in_game = False
@@ -4205,14 +4208,24 @@ class WulframServer:
 
                 # Log input transitions (key press/release) for yaw drift analysis
                 input_changed = abs(raw_input - prev_input) > 0.001
+                now_mono = time.monotonic()
                 if input_changed:
                     transition = "PRESS" if abs(raw_input) > abs(prev_input) else "RELEASE"
+                    # Calculate elapsed wall-clock since last transition
+                    last_transition_time = getattr(ctx, '_yaw_transition_time', now_mono)
+                    last_transition_tick = getattr(ctx, '_yaw_transition_tick', ctx.session.tick)
+                    elapsed_ms = (now_mono - last_transition_time) * 1000
+                    elapsed_ticks = ctx.session.tick - last_transition_tick
+                    effective_hz = elapsed_ticks / max(0.001, now_mono - last_transition_time)
+                    ctx._yaw_transition_time = now_mono
+                    ctx._yaw_transition_tick = ctx.session.tick
                     print(
                         f"[YAW-INPUT] {transition} c{ctx.client_id} "
                         f"input={prev_input:.3f}->{raw_input:.3f} "
                         f"ang_vel={physics.angular_velocity:.4f} "
                         f"heading={math.degrees(physics.heading):.2f}deg "
-                        f"t={ctx.session.tick}"
+                        f"t={ctx.session.tick} "
+                        f"wall={elapsed_ms:.0f}ms ticks={elapsed_ticks} hz={effective_hz:.1f}"
                     )
                 ctx.prev_raw_turn_input = raw_input
 
@@ -4223,12 +4236,9 @@ class WulframServer:
                 ctx.player_yaw = ctx.player_heading
                 ctx.player_pose["yaw"] = ctx.player_heading
 
-                if abs(ctx.angular_vel_yaw) > 0.01:
-                    print(
-                        f"[YAW-TRACK] input={raw_input:.3f} torque={torque:.3f} "
-                        f"ang_vel={ctx.angular_vel_yaw:.4f} "
-                        f"heading={math.degrees(ctx.player_heading):.1f}deg"
-                    )
+                # YAW-TRACK: disabled to avoid per-tick console I/O slowing tick loop
+                # if abs(ctx.angular_vel_yaw) > 0.01:
+                #     print(f"[YAW-TRACK] ...")
 
                 # Desync detection: track position changes and input
                 now = time.monotonic()
