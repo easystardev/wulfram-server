@@ -265,6 +265,8 @@ class ControlServer:
             return self._cmd_teleport(args)
         elif cmd == 'resend':
             return self._cmd_resend(args)
+        elif cmd == 'terrain' or cmd == 'ter':
+            return self._cmd_terrain(args)
         elif cmd == 'quit' or cmd == 'exit':
             return "Goodbye!"
         else:
@@ -1511,6 +1513,45 @@ Examples:
         ctx.session.delayed_spawn_time = time.monotonic() + respawn_delay
         print(f"[RESPAWN] Scheduled respawn for c{ctx.client_id} in {respawn_delay:.0f}s")
         return f"spawn={pos_str} -- respawning in {respawn_delay:.0f}s"
+
+    def _cmd_terrain(self, args: list) -> str:
+        """Show terrain info at player positions or arbitrary coordinates.
+
+        Usage:
+          terrain         - Show terrain height at each player's position
+          terrain x y     - Query terrain height at (x, y)
+        """
+        import math
+        if not self.server:
+            return "Error: No server reference"
+        t = self.server.terrain
+        if t is None:
+            return "No terrain loaded"
+        offset = self.server.terrain_height_offset
+        lines = [f"Terrain: {t.num_x}x{t.num_z} grid, offset={offset}"]
+
+        if args and len(args) >= 2:
+            try:
+                wx, wy = float(args[0]), float(args[1])
+                h = t.get_height(wx, wy)
+                pitch = t.get_pitch_at_heading(wx, wy, 0.0)
+                lines.append(f"  ({wx:.1f}, {wy:.1f}): h={h:.2f}, ground_z={h + offset:.2f}, pitch={math.degrees(pitch):.1f} deg (north)")
+            except Exception as e:
+                lines.append(f"  Error: {e}")
+        else:
+            with self.server.clients_lock:
+                for ctx in self.server.clients.values():
+                    if not ctx or not ctx.running:
+                        continue
+                    x, y, z = ctx.player_pos
+                    h = t.get_height(x, y)
+                    pitch = t.get_pitch_at_heading(x, y, ctx.player_heading)
+                    lines.append(
+                        f"  c{ctx.client_id} pos=({x:.1f},{y:.1f},{z:.2f}) "
+                        f"terrain_h={h:.2f} ground_z={h + offset:.2f} "
+                        f"pitch={math.degrees(pitch):.1f}deg delta_z={z - (h + offset):.2f}"
+                    )
+        return "\n".join(lines)
 
     def _cmd_teleport(self, args: list) -> str:
         """Teleport: offset server position and force correction to test if client moves.

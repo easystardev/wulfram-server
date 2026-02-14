@@ -23,6 +23,7 @@ from .session import Session, Phase, FEATURES
 from .transport import TCPHandler, UDPHandler, PacketLogger, print_packet
 from .codec import BitReader
 from .control import ControlServer
+from .terrain import Terrain
 from .weapons import WeaponSystem, build_projectile_spawn_packet, EntityType, BehaviorSlot
 from .jump_jets import JumpJetSystem
 from .client import ClientContext
@@ -407,6 +408,14 @@ class WulframServer:
             self.ground_level = float(ground_level_env) if ground_level_env is not None else 5.0
         except ValueError:
             self.ground_level = 5.0
+        # Terrain heightmap for dynamic ground level and slope-aware physics.
+        self.terrain: Optional[Terrain] = None
+        self.terrain_pitch_enabled = os.environ.get("WULFRAM_TERRAIN_PITCH", "1") == "1"
+        try:
+            self.terrain_height_offset = float(os.environ.get("WULFRAM_TERRAIN_HEIGHT_OFFSET", "5.0"))
+        except ValueError:
+            self.terrain_height_offset = 5.0
+        self._load_terrain()
         world_bound_env = os.environ.get("WULFRAM_WORLD_BOUND")
         try:
             # Clamp world X/Y to the protocol position domain by default (VEC_POS max=8192).
@@ -1926,6 +1935,15 @@ class WulframServer:
             except ValueError:
                 idx = 0
             spawn_pos = (spawn_pos[0] + idx * self.multi_spawn_offset, spawn_pos[1], spawn_pos[2])
+
+        # Adjust spawn Z to terrain height when terrain is loaded.
+        if self.terrain and self.up_axis == "z":
+            terrain_z = (
+                self.terrain.get_height(spawn_pos[0], spawn_pos[1])
+                + self.terrain_height_offset
+            )
+            spawn_pos = (spawn_pos[0], spawn_pos[1], terrain_z)
+
         ctx.player_pos = spawn_pos
         ctx.player_pose["pos"] = spawn_pos
 
@@ -2419,6 +2437,34 @@ class WulframServer:
                 return None
             points.append({"oid": oid, "team": team, "x": x, "y": y, "z": z})
         return points
+
+    def _load_terrain(self):
+        """Load terrain heightmap from game data or env var path."""
+        terrain_file = os.environ.get("WULFRAM_TERRAIN_FILE")
+        if terrain_file:
+            land_path = Path(terrain_file)
+        else:
+            repo_root = Path(__file__).resolve().parents[2]
+            maps_root = repo_root / "slurpysoft-wulfram" / "data" / "maps"
+            map_name = self.map_name
+            land_path = maps_root / map_name / "land"
+            if not land_path.exists() and maps_root.exists():
+                for entry in maps_root.iterdir():
+                    if entry.is_dir() and entry.name.lower() == map_name.lower():
+                        candidate = entry / "land"
+                        if candidate.exists():
+                            land_path = candidate
+                            break
+        if land_path.exists():
+            try:
+                self.terrain = Terrain(str(land_path))
+                print(f"[TERRAIN] Pitch in impulse: {'ON' if self.terrain_pitch_enabled else 'OFF'}")
+                print(f"[TERRAIN] Height offset: {self.terrain_height_offset}")
+            except Exception as e:
+                print(f"[TERRAIN] Failed to load {land_path}: {e}")
+                self.terrain = None
+        else:
+            print(f"[TERRAIN] No heightmap found (looked for {land_path})")
 
     def _load_map_land_grid(self) -> Optional[tuple]:
         """Read grid size (rows x cols) from the map land file."""
@@ -3489,7 +3535,18 @@ class WulframServer:
         sin_yaw = math.sin(yaw)
 
         if self.up_axis == "z":
-            forward = (cos_yaw, sin_yaw, 0.0)
+            # When terrain is loaded, apply pitch to forward vector so impulse
+            # on slopes has a vertical component (matching client's
+            # TankVehicle_apply_physics which rotates by full 3D orientation).
+            if self.terrain and self.terrain_pitch_enabled:
+                terrain_pitch = self.terrain.get_pitch_at_heading(
+                    ctx.player_pos[0], ctx.player_pos[1], yaw
+                )
+                cos_pitch = math.cos(terrain_pitch)
+                sin_pitch = math.sin(terrain_pitch)
+                forward = (cos_pitch * cos_yaw, cos_pitch * sin_yaw, sin_pitch)
+            else:
+                forward = (cos_yaw, sin_yaw, 0.0)
             right = (-sin_yaw, cos_yaw, 0.0)
             vertical_idx = 2
         else:
@@ -3507,10 +3564,17 @@ class WulframServer:
 
         # Add gravity to vertical impulse (matches GUESS3_Transform_accelerate_z)
         gravity = self.gravity
-        ground_level = self.ground_level
-        if ctx.ground_level_override is not None:
-            ground_level = ctx.ground_level_override
+        if self.terrain and self.up_axis == "z":
+            ground_level = (
+                self.terrain.get_height(ctx.player_pos[0], ctx.player_pos[1])
+                + self.terrain_height_offset
+            )
+        else:
+            ground_level = self.ground_level
+            if ctx.ground_level_override is not None:
+                ground_level = ctx.ground_level_override
 
+        # Gravity and ground collision use terrain-aware ground_level (computed above).
         if vertical_idx == 2:
             impulse_z += gravity  # gravity is negative
             if ctx.player_pos[2] <= ground_level and ctx.player_vel[2] + gravity * dt < 0:
@@ -3554,7 +3618,21 @@ class WulframServer:
         if self.up_axis == "z":
             new_x = max(-self.world_bound, min(self.world_bound, new_x))
             new_y = max(-self.world_bound, min(self.world_bound, new_y))
-            new_z = max(ground_level, new_z)
+            # Clamp Z to terrain height at NEW position (not pre-integration)
+            if self.terrain:
+                terrain_z = (
+                    self.terrain.get_height(new_x, new_y)
+                    + self.terrain_height_offset
+                )
+                if new_z < terrain_z:
+                    new_z = terrain_z
+                    if new_vel_z < 0:
+                        new_vel_z = 0.0
+            else:
+                if new_z < ground_level:
+                    new_z = ground_level
+                    if new_vel_z < 0:
+                        new_vel_z = 0.0
         else:
             new_x = max(-self.world_bound, min(self.world_bound, new_x))
             new_z = max(-self.world_bound, min(self.world_bound, new_z))
