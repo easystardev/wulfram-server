@@ -6,6 +6,7 @@ Tests for handler functions extracted from server.py.
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent / "shared"))
 
 from wulfram.handlers import decode_lp_string
 

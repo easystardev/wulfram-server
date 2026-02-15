@@ -245,6 +245,11 @@ class ControlServer:
             return self._cmd_behavior(args)
         elif cmd == 'physics' or cmd == 'phys':
             return self._cmd_physics(args)
+        elif cmd == 'subtick':
+            if not self.server:
+                return "No server"
+            self.server.subtick_enabled = not self.server.subtick_enabled
+            return f"Sub-tick interpolation: {'ON' if self.server.subtick_enabled else 'OFF'}"
         elif cmd == 'respawn' or cmd == 'rs':
             return self._cmd_respawn(args)
         elif cmd == 'shells':
@@ -267,6 +272,8 @@ class ControlServer:
             return self._cmd_resend(args)
         elif cmd == 'terrain' or cmd == 'ter':
             return self._cmd_terrain(args)
+        elif cmd == 'despawn' or cmd == 'ds':
+            return self._cmd_despawn(args)
         elif cmd == 'quit' or cmd == 'exit':
             return "Goodbye!"
         else:
@@ -295,6 +302,7 @@ class ControlServer:
   correction [secs|on|off|now] - Drift correction (pos+rot sync to client)
   physics [param] [value] - Yaw physics params (damp, reset)
   respawn / rs           - Re-send TankPacket to reset client entity position + heading
+  despawn / ds [c<id>]   - Kill & despawn player (DELETE + reset to TEAM_SELECT)
   damage <amt> [c<id>]   - Apply damage (0.2=20%, or 20=20%)
   health [c<id>]         - Show player health
   health set <val> [c<id>] - Set health directly (0.0-1.0)
@@ -759,6 +767,41 @@ Examples:
                     override_yaw = math.radians(float(args[1]))
                 except ValueError:
                     return f"Invalid yaw: {args[1]}"
+                if len(args) >= 3:
+                    try:
+                        count = int(args[2])
+                    except ValueError:
+                        pass
+            elif args[0] == 'sweep' and len(args) >= 3:
+                # fire sweep <min_deg> <max_deg> [step] - fan of shells
+                try:
+                    sweep_min = float(args[1])
+                    sweep_max = float(args[2])
+                    sweep_step = float(args[3]) if len(args) >= 4 else 5.0
+                except ValueError:
+                    return "Usage: fire sweep <min_deg> <max_deg> [step_deg]"
+                sweep_headings = []
+                h = sweep_min
+                while h <= sweep_max + 0.01:
+                    sweep_headings.append(math.radians(h))
+                    h += sweep_step
+                # Fire 3 shells per heading
+                results = []
+                for yaw in sweep_headings:
+                    for _ in range(3):
+                        ctx.weapon_system.player_pos = ctx.player_pos
+                        ctx.weapon_system.player_rot = (0.0, 0.0, yaw)
+                        ctx.weapon_system.current_weapon = 4
+                        ctx.weapon_system.last_fire_time = 0
+                        proj = ctx.weapon_system._fire_pulse_cannon()
+                        if proj:
+                            self.server._spawn_moving_projectile(ctx, proj, addr)
+                            ctx.weapon_system.projectiles.append(proj)
+                        import time
+                        time.sleep(0.02)
+                hdg_s = f"{sweep_min:.0f}"
+                hdg_e = f"{sweep_max:.0f}"
+                return f"Swept {len(sweep_headings)} headings from {hdg_s} to {hdg_e} deg (step={sweep_step})"
             elif args[0] == 'speed' and len(args) >= 2:
                 try:
                     ctx.weapon_system.pulse_shell_speed = float(args[1])
@@ -993,7 +1036,7 @@ Examples:
                 f"  susp_dampening   = {pkt.BEHAVIOR_SUSPENSION_DAMPENING}",
                 f"  mass             = 33000  (hardcoded)",
                 f"  -- Section 6 (Active Vehicle, Tank) --",
-                f"  turn_adjust      = 4.5  (hardcoded)",
+                f"  turn_adjust      = 4.25  (empirical, binary has 4.5 but effective rate is lower)",
                 f"  move_adjust      = 85.0  (hardcoded)",
                 f"  strafe_adjust    = 69.7  (hardcoded)",
                 f"  max_velocity     = 80.0  (hardcoded)",
@@ -1182,6 +1225,8 @@ Examples:
                     "client_id": ctx.client_id,
                     "entity_id": ctx.session.entity_id if ctx.session else None,
                     "phase": phase,
+                    "username": ctx.session.username if ctx.session else "",
+                    "team_id": ctx.session.team_id if ctx.session else 0,
                     "pos": list(ctx.player_pos),
                     "vel": list(ctx.player_vel),
                     "heading_deg": round(math.degrees(ctx.player_heading), 1),
@@ -1296,9 +1341,15 @@ Examples:
         elif direction in ("right", "r"):
             strafe_val = 0.549
         elif direction in ("turnleft", "tl"):
-            turn_val = 0.610  # Matches quantized full-key turn input (ACTION_UPDATE slot 4)
+            turn_val = 0.641  # Matches actual client full-key turn input (ACTION_UPDATE slot 1)
         elif direction in ("turnright", "tr"):
-            turn_val = -0.610
+            turn_val = -0.641
+        elif direction in ("fwdright", "fr"):
+            fwd_val = 0.549
+            turn_val = -0.641
+        elif direction in ("fwdleft", "fl"):
+            fwd_val = 0.549
+            turn_val = 0.641
         elif direction == "stop":
             for ctx in targets:
                 ctx.injected_input = None
@@ -1307,10 +1358,10 @@ Examples:
 
         def _do_move():
             for ctx in targets:
+                if fwd_val != 0.0 or strafe_val != 0.0:
+                    ctx.injected_input = (fwd_val, strafe_val)
                 if turn_val is not None:
                     ctx.injected_turn = turn_val
-                else:
-                    ctx.injected_input = (fwd_val, strafe_val)
             time.sleep(duration)
             for ctx in targets:
                 ctx.injected_input = None
@@ -1513,6 +1564,79 @@ Examples:
         ctx.session.delayed_spawn_time = time.monotonic() + respawn_delay
         print(f"[RESPAWN] Scheduled respawn for c{ctx.client_id} in {respawn_delay:.0f}s")
         return f"spawn={pos_str} -- respawning in {respawn_delay:.0f}s"
+
+    def _cmd_despawn(self, args: list) -> str:
+        """Kill and despawn a player without re-spawning.
+
+        Sends DELETE_OBJECT to remove the entity from all clients,
+        resets session to TEAM_SELECT, and cancels any pending respawn.
+        Use this to cleanly reset a stuck player.
+
+        Usage:
+          despawn          - Despawn the active client
+          despawn c<id>    - Despawn specific client
+          despawn all      - Despawn all in-game clients
+        """
+        if not self.server:
+            return "Error: No server reference"
+
+        def _despawn_one(ctx) -> str:
+            entity_id = ctx.entity_id or (ctx.session.entity_id if ctx.session else 0)
+            if not entity_id:
+                return f"Client {ctx.client_id}: no entity to despawn"
+
+            # Send DELETE_OBJECT to all clients
+            delete_pkt = build_delete_object(
+                tick=self.server._get_network_tick(ctx),
+                entity_ids=[entity_id],
+                with_effects=True,
+            )
+            if ctx.tcp_handler:
+                ctx.tcp_handler.send(delete_pkt)
+            for other in self.server._snapshot_in_game_clients():
+                if other is ctx:
+                    continue
+                other.known_entity_ids.discard(entity_id)
+                if other.tcp_handler:
+                    other.tcp_handler.send(delete_pkt)
+
+            # Reset session state — no delayed respawn
+            ctx.session.in_game = False
+            ctx.session.phase = Phase.TEAM_SELECT
+            ctx.session.entity_id = 0
+            # Cancel any pending delayed spawn
+            ctx.session.delayed_spawn_time = 0
+            ctx.session.delayed_spawn_team = 0
+            # Reset physics state
+            ctx.player_health = 1.0
+            ctx.player_vel = (0.0, 0.0, 0.0)
+            ctx.player_heading = 0.0
+            ctx.angular_vel_yaw = 0.0
+            if ctx.vehicle_physics:
+                ctx.vehicle_physics.heading = 0.0
+                ctx.vehicle_physics._angular_velocity = 0.0
+
+            print(f"[DESPAWN] Client {ctx.client_id} entity {entity_id} removed, phase→TEAM_SELECT")
+            return f"Client {ctx.client_id}: despawned entity {entity_id}, now TEAM_SELECT"
+
+        # Handle "despawn all"
+        if args and args[0].lower() == "all":
+            results = []
+            for c in self.server._snapshot_in_game_clients():
+                results.append(_despawn_one(c))
+            return "\n".join(results) if results else "No in-game clients"
+
+        # Target specific client or active client
+        if args and args[0].lower().startswith("c") and args[0][1:].isdigit():
+            ctx, _ = self._get_client_by_id(int(args[0][1:]))
+            if not ctx:
+                return f"Error: No client with id {args[0][1:]}"
+        else:
+            ctx, _ = self._get_active_client()
+        if not ctx:
+            return "Error: No connected client"
+
+        return _despawn_one(ctx)
 
     def _cmd_terrain(self, args: list) -> str:
         """Show terrain info at player positions or arbitrary coordinates.

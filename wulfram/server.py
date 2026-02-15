@@ -636,13 +636,15 @@ class WulframServer:
         except ValueError:
             self.aim_pitch_adjust = 2.5
         try:
-            self.turn_adjust = float(os.environ.get("WULFRAM_TURN_ADJUST", "4.5"))
+            self.turn_adjust = float(os.environ.get("WULFRAM_TURN_ADJUST", "4.25"))
         except ValueError:
-            self.turn_adjust = 4.5
+            self.turn_adjust = 4.25
         try:
             self.turn_deadzone = float(os.environ.get("WULFRAM_TURN_DEADZONE", "0.05"))
         except ValueError:
             self.turn_deadzone = 0.05
+        self.subtick_enabled = os.environ.get("WULFRAM_SUBTICK", "1") == "1"
+        self.ticksync_enabled = os.environ.get("WULFRAM_TICKSYNC", "1") == "1"
         try:
             self.turn_sign = float(os.environ.get("WULFRAM_TURN_SIGN", "-1.0"))
         except ValueError:
@@ -1949,6 +1951,9 @@ class WulframServer:
 
         ctx.player_angular_vel = 0.0
         ctx.vehicle_physics.reset()
+        # Reset tick-sync transition tracking so respawn gap doesn't cause huge correction
+        ctx._turn_transition_client_tick = 0
+        ctx._turn_transition_server_tick = 0
 
         # Spawn heading — can't set local client heading (physics overwrites it),
         # but this affects how OTHER clients see your tank at spawn.
@@ -4297,7 +4302,7 @@ class WulframServer:
                     effective_hz = elapsed_ticks / max(0.001, now_mono - last_transition_time)
                     ctx._yaw_transition_time = now_mono
                     ctx._yaw_transition_tick = ctx.session.tick
-                    print(
+                    yaw_msg = (
                         f"[YAW-INPUT] {transition} c{ctx.client_id} "
                         f"input={prev_input:.3f}->{raw_input:.3f} "
                         f"ang_vel={physics.angular_velocity:.4f} "
@@ -4305,9 +4310,93 @@ class WulframServer:
                         f"t={ctx.session.tick} "
                         f"wall={elapsed_ms:.0f}ms ticks={elapsed_ticks} hz={effective_hz:.1f}"
                     )
+                    print(yaw_msg)
+                    try:
+                        with open(r"C:\Users\wstri\dev\wolfram\yaw_events.log", "a") as _yf:
+                            _yf.write(yaw_msg + "\n")
+                    except Exception:
+                        pass
                 ctx.prev_raw_turn_input = raw_input
 
-                physics.step(torque, dt)
+                # Sub-tick interpolation: if turn input changed during this tick,
+                # split the physics step at the transition point.
+                ws = ctx.weapon_system
+                change_time = ws.turn_input_change_time
+                tick_start = next_tick_time - tick_period  # when this tick started
+                did_subtick = False
+
+                if self.subtick_enabled and input_changed and change_time > tick_start and change_time < next_tick_time:
+                    # Input changed mid-tick. Split into before/after.
+                    fraction_old = (change_time - tick_start) / tick_period
+                    fraction_old = max(0.0, min(1.0, fraction_old))
+                    dt_old = dt * fraction_old
+                    dt_new = dt * (1.0 - fraction_old)
+
+                    if dt_old > 0.0001 and dt_new > 0.0001:
+                        # Step 1: old input for first fraction
+                        prev_raw = ws.turn_input_prev_value
+                        # Normalize the old value the same way _get_raw_turn_input does
+                        if abs(prev_raw) > 1.5:
+                            scale = getattr(ws, "control_max", 1000.0) or 1000.0
+                            prev_raw = max(-1.0, min(1.0, prev_raw / scale))
+                        else:
+                            prev_raw = max(-1.0, min(1.0, prev_raw))
+                        if abs(prev_raw) < self.turn_deadzone:
+                            prev_raw = 0.0
+                        prev_raw *= self.turn_sign
+                        old_torque = prev_raw * self.turn_adjust
+
+                        physics.step(old_torque, dt_old)
+                        # Step 2: new input for remaining fraction
+                        physics.step(torque, dt_new)
+                        did_subtick = True
+
+                if not did_subtick:
+                    physics.step(torque, dt)
+
+                # Client-tick time correction: the client's ACTION_UPDATE includes
+                # a millisecond tick counter. By comparing the client tick delta
+                # between two input transitions to the server's physics time
+                # (ticks * dt), we can correct for frame-boundary alignment drift.
+                # Analysis shows continuous turns have zero drift, but each
+                # transition boundary can be off by up to ±33ms (~±2.7 degrees).
+                if input_changed and self.ticksync_enabled:
+                    current_client_tick = ws.turn_input_change_client_tick
+                    prev_client_tick = getattr(ctx, '_turn_transition_client_tick', 0)
+
+                    # Only update tracking when a NEW client tick arrived
+                    # (from ACTION_UPDATE). Input changes from normalization
+                    # without a new packet should not shift the baseline.
+                    if current_client_tick != prev_client_tick and current_client_tick > 0:
+                        prev_server_tick = getattr(ctx, '_turn_transition_server_tick', 0)
+
+                        if prev_client_tick > 0 and current_client_tick > prev_client_tick and prev_server_tick > 0:
+                            client_elapsed_s = (current_client_tick - prev_client_tick) / 1000.0
+                            server_ticks_elapsed = ctx.session.tick - prev_server_tick
+                            server_elapsed_s = server_ticks_elapsed * dt
+                            time_correction = client_elapsed_s - server_elapsed_s
+
+                            # Sanity: correction within 1 frame (±50ms)
+                            if abs(time_correction) < 0.050:
+                                heading_correction = physics.angular_velocity * time_correction
+                                physics.heading += heading_correction
+                                print(
+                                    f"[TICK-SYNC] c{ctx.client_id} "
+                                    f"client_dt={client_elapsed_s*1000:.0f}ms "
+                                    f"server_dt={server_elapsed_s*1000:.0f}ms "
+                                    f"correction={time_correction*1000:.1f}ms "
+                                    f"heading_adj={math.degrees(heading_correction):.3f}deg"
+                                )
+                            else:
+                                print(
+                                    f"[TICK-SYNC] c{ctx.client_id} SKIPPED "
+                                    f"client_dt={client_elapsed_s*1000:.0f}ms "
+                                    f"server_dt={server_elapsed_s*1000:.0f}ms "
+                                    f"correction={time_correction*1000:.1f}ms (>50ms)"
+                                )
+
+                        ctx._turn_transition_client_tick = current_client_tick
+                        ctx._turn_transition_server_tick = ctx.session.tick
 
                 ctx.player_heading = physics.heading
                 ctx.angular_vel_yaw = physics.angular_velocity
@@ -4660,6 +4749,7 @@ class WulframServer:
                                 ctx.tcp_handler.send(view_payload, log=False)
                 elif self.send_player_updates and not send_full_update and (send_update or correction_due):
                     # Heartbeat path: health/energy delivery + periodic correction.
+
                     weapon_type = self._get_local_state_weapon_type(ctx)
                     ammo_bits, ammo_mask = self._get_local_state_ammo_bits(ctx)
                     pt_bits, pt_angle, st_bits, st_angle = self._get_local_state_turret_bits(ctx)
@@ -4780,6 +4870,7 @@ class WulframServer:
                             rot=hb_rot,
                         )
                         pkt_label = "VIEW_UPDATE_BEAT" if use_view else "UPDATE_ARRAY_BEAT"
+
                     if include_local_state:
                         self._log_vitals(
                             ctx,

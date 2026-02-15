@@ -10,6 +10,8 @@ from pathlib import Path
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
+# Add shared protocol module to path
+sys.path.insert(0, str(Path(__file__).parent.parent / "shared"))
 
 _FAULTHANDLER_LOG = None
 

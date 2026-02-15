@@ -6,6 +6,7 @@ Tests for session state machine and phase transitions.
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent / "shared"))
 
 from wulfram.session import Phase, Session, Features
 
