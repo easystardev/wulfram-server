@@ -41,6 +41,7 @@ from .packets import (
     _encode_health_bits, _compress_value, VEC_VEL_MAX, VEC_VEL_RANGE,
 )
 from . import handlers
+from .pktlog import PacketLog
 
 # WeaponDef turret flags from azurefishy decomp (WeaponDef_init_by_entity_type).
 # Tank (entity type 0) sets +0x170 (primary turret). Scout (1) sets +0x68 (secondary).
@@ -68,7 +69,10 @@ class WulframServer:
         self.host = host or os.environ.get("WULFRAM_BIND_ADDR", "0.0.0.0")
         # Address to advertise to clients for UDP (e.g. when binding 0.0.0.0)
         self.public_addr = os.environ.get("WULFRAM_PUBLIC_ADDR", self.host)
-        self.port = port
+        try:
+            self.port = int(os.environ.get("WULFRAM_PORT", str(port)))
+        except ValueError:
+            self.port = port
         self.logger = PacketLogger()
         self.udp_handler: Optional[UDPHandler] = None
         self.running = False
@@ -709,30 +713,23 @@ class WulframServer:
         except ValueError:
             self.linear_damp_coasting = 2.0
 
-        # Periodic correction: send real entity pos+rot to correct client drift.
-        # 0 = disabled (default), >0 = interval in seconds between corrections.
-        # WARNING: Corrections send UPDATE_ARRAY with player's own entity ID.
-        # Single-entity UPDATE_ARRAY for local player triggers client state_sync,
-        # switching entity to network-controlled mode and freezing local physics.
-        # Use dual_entity mode to avoid this (sends 2 entities, skips state_sync).
-        try:
-            self.correction_interval = float(os.environ.get("WULFRAM_CORRECTION_INTERVAL", "0"))
-        except ValueError:
-            self.correction_interval = 0
-        # Correction mode: full, rot_only, pos_only, dual_entity, view_update
-        # dual_entity: sends 2 entities so client skips state_sync (no freeze)
-        # rot_only/pos_only/full: single-entity, triggers state_sync freeze
-        self.correction_mode = os.environ.get("WULFRAM_CORRECTION_MODE", "dual_entity")
+        # NOTE: Local player corrections (sending UPDATE_ARRAY with the player's own
+        # entity ID) do NOT work. The client runs lockstep deterministic physics and
+        # overwrites server position/rotation every frame. Reconciliation only triggers
+        # on collision (dead on flat ground). Tested exhaustively: dual_entity, single
+        # entity, pos-only, rot-only, teleport — none visually correct the local player.
+        # Server physics match (0.001% position, 0.00° heading) is the sync mechanism.
 
         print(
             f"[CONFIG-HEADING] turn_adjust={self.turn_adjust} turn_sign={self.turn_sign} "
             f"deadzone={self.turn_deadzone} damp_coeff={self.damp_coeff} "
             f"linear_damp=driving:{self.linear_damp_driving}/coast:{self.linear_damp_coasting} "
-            f"tick_rate={self.tick_rate_hz}Hz "
-            f"correction_interval={self.correction_interval}s"
+            f"tick_rate={self.tick_rate_hz}Hz"
         )
 
         self.estimated_speed = 15.0  # Units per second (tunable)
+        # Packet traffic logger for debugging freezes
+        self.pktlog = PacketLog()
         # Ghost rejoin: auto-create session from orphan UDP (e.g., VM snapshot restore)
         self.ghost_rejoin = os.environ.get("WULFRAM_GHOST_REJOIN", "1") == "1"
         self._ghost_rejoin_attempted: set = set()  # Track addrs we already tried
@@ -740,9 +737,6 @@ class WulframServer:
     def _sync_tick_offset(self, ctx: ClientContext, client_tick: int) -> None:
         """Align server ticks to client tick domain for UPDATE_ARRAY gating."""
         if client_tick <= 0:
-            return
-        if not self.use_client_ticks:
-            ctx.last_client_tick = client_tick
             return
         server_tick = get_ticks()
         new_offset = client_tick - server_tick
@@ -1960,7 +1954,7 @@ class WulframServer:
         import math
         spawn_heading_env = os.environ.get("WULFRAM_SPAWN_HEADING")
         spawn_yaw = math.radians(float(spawn_heading_env)) if spawn_heading_env else 0.0
-        ctx.player_yaw = spawn_yaw
+        ctx.player_yaw = -spawn_yaw
         ctx.player_heading = spawn_yaw
         ctx.vehicle_physics.heading = spawn_yaw
         ctx.last_action_dump_time = time.monotonic()  # Reset timer for position tracking
@@ -3163,6 +3157,19 @@ class WulframServer:
                 ctx.session.input_ready = True
                 ctx.session.input_ready_time = time.monotonic()
                 print(f"[GAME] Client {ctx.client_id}: input ready (ACTION_UPDATE)")
+
+            # Backdating is DISABLED: GetTickCount() ±15ms jitter makes offset-based
+            # time mapping unreliable for low-latency connections. With VM latency
+            # of 1-2ms, packet arrival time (set in weapons.py) is more accurate
+            # than any backdated estimate. The subtick system uses arrival time for
+            # SPLIT (intra-tick positioning), and TICK-SYNC handles inter-transition
+            # cumulative timing drift using raw client tick deltas (which ARE accurate).
+            #
+            # Without backdating, change_time = time.monotonic() at packet arrival,
+            # which falls WITHIN the current tick → triggers SPLIT (correct).
+            # With backdating, change_time was 30-60ms in the past → triggered RETRO
+            # corrections that injected ±2.7°/s angular velocity error (incorrect).
+
             self._update_player_aim(ctx)
             # Yaw is tracked via VIEWPOINT_INFO when available; otherwise input-based fallback is used.
             # Position is simulated in the tick loop from behavior slots.
@@ -3317,6 +3324,20 @@ class WulframServer:
                     is_static=self.projectile_spawn_snap,
                 )
                 self.udp_handler.send_to(packet, target.session.udp_addr)
+                if self.pktlog.enabled:
+                    self.pktlog.log(
+                        client_id=target.client_id,
+                        label="PROJ_SPAWN",
+                        tick=tick,
+                        payload=packet,
+                        transport="UDP",
+                        entity_count=1,
+                        entity_ids=(proj.entity_id,),
+                        mask_bits=(0b1111,),  # pos+vel+rot+type_info
+                        has_local_state=self.projectile_local_stats,
+                        health=self._get_health_value(target) if self.projectile_local_stats else -1.0,
+                        extra=f"proj_type={proj.entity_type}",
+                    )
                 sent_count += 1
         if sent_count:
             print(f"[WEAPON] Sent projectile spawn via UDP: id={proj.entity_id} targets={sent_count}")
@@ -3351,6 +3372,19 @@ class WulframServer:
                 fuel=1.0,
             )
             self.udp_handler.send_to(hb_packet, ctx.session.udp_addr)
+            if self.pktlog.enabled:
+                self.pktlog.log(
+                    client_id=ctx.client_id,
+                    label="PROJ_FIRE_HEARTBEAT",
+                    tick=hb_tick,
+                    payload=hb_packet,
+                    transport="UDP",
+                    entity_count=1,
+                    entity_ids=(0xFFFFFFFE,),
+                    mask_bits=(0,),
+                    has_local_state=True,
+                    health=hb_health,
+                )
             print(f"[PROJ-HEARTBEAT] Sent post-fire heartbeat UPDATE_ARRAY (health={hb_health:.2f})")
 
         if self.debug_projectiles and proj.debug_context:
@@ -3745,6 +3779,19 @@ class WulframServer:
                             fuel=1.0,
                         )
                         self.udp_handler.send_to(pkt, target.session.udp_addr)
+                        if self.pktlog.enabled:
+                            self.pktlog.log(
+                                client_id=target.client_id,
+                                label="PROJ_UPDATE",
+                                tick=tick,
+                                payload=pkt,
+                                transport="UDP",
+                                entity_count=1,
+                                entity_ids=(proj.entity_id,),
+                                mask_bits=(0b0010,),  # pos only
+                                has_local_state=self.projectile_local_stats,
+                                health=self._get_health_value(target) if self.projectile_local_stats else -1.0,
+                            )
 
                 if i % 15 == 0:  # Log every 0.5 sec at 30Hz
                     print(f"[PROJ] id={proj.entity_id} pos=({proj.pos[0]:.1f},{proj.pos[1]:.1f},{proj.pos[2]:.1f}) vel=({proj.vel[0]:.0f},{proj.vel[1]:.0f},{proj.vel[2]:.0f}) tick={tick}")
@@ -3758,6 +3805,15 @@ class WulframServer:
             delete_pkt = build_delete_object(tick, [proj.entity_id], with_effects=False)
             for client in self._snapshot_in_game_clients():
                 self._send_packet_to_client(client, delete_pkt, prefer_tcp=True)
+                if self.pktlog.enabled:
+                    self.pktlog.log(
+                        client_id=client.client_id,
+                        label="PROJ_DELETE",
+                        tick=tick,
+                        payload=delete_pkt,
+                        transport="TCP",
+                        extra=f"proj_id=0x{proj.entity_id:X}",
+                    )
             print(f"[PROJ] id={proj.entity_id} expired — DELETE sent")
 
         # Add to active list and start thread
@@ -3840,6 +3896,20 @@ class WulframServer:
                 fuel=1.0,
             )
             self.udp_handler.send_to(health_pkt, target.session.udp_addr)
+            if self.pktlog.enabled:
+                self.pktlog.log(
+                    client_id=target.client_id,
+                    label="DAMAGE_HEARTBEAT",
+                    tick=tick,
+                    payload=health_pkt,
+                    transport="UDP",
+                    entity_count=1,
+                    entity_ids=(0xFFFFFFFE,),
+                    mask_bits=(0,),
+                    has_local_state=True,
+                    health=self._get_health_value(target),
+                    extra=f"dmg={damage}",
+                )
 
         # DELETE projectile with explosion effects
         tick = self._get_network_tick(attacker)
@@ -4210,8 +4280,6 @@ class WulframServer:
         print(f"[TICK] Starting tick loop for client {ctx.client_id}")
         tcp_failed = False
         tick_start_time = time.monotonic()
-        # Delay first correction to avoid interfering with spawn transition
-        ctx.last_correction_send = tick_start_time
         logged_wait_translation = False
         logged_wait_client_tick = False
         grace_period_logged = False
@@ -4318,66 +4386,127 @@ class WulframServer:
                         pass
                 ctx.prev_raw_turn_input = raw_input
 
-                # Sub-tick interpolation: if turn input changed during this tick,
-                # split the physics step at the transition point.
+                # Sub-tick interpolation: use client-tick-backdated change_time
+                # to determine exactly when the input transition happened
+                # relative to our tick boundaries.
+                #
+                # Three cases:
+                #   A) change_time falls in current tick → split step
+                #   B) change_time falls before current tick → retroactive correction
+                #   C) no input change → normal full-tick step
                 ws = ctx.weapon_system
-                change_time = ws.turn_input_change_time
-                tick_start = next_tick_time - tick_period  # when this tick started
+                change_time = ws.turn_input_change_time  # backdated in _handle_action_update
+                tick_start = next_tick_time - tick_period
                 did_subtick = False
 
-                if self.subtick_enabled and input_changed and change_time > tick_start and change_time < next_tick_time:
-                    # Input changed mid-tick. Split into before/after.
-                    fraction_old = (change_time - tick_start) / tick_period
-                    fraction_old = max(0.0, min(1.0, fraction_old))
-                    dt_old = dt * fraction_old
-                    dt_new = dt * (1.0 - fraction_old)
+                if self.subtick_enabled and input_changed:
+                    print(
+                        f"[SUBTICK-DBG] c{ctx.client_id} "
+                        f"change_time={change_time:.4f} "
+                        f"tick_start={tick_start:.4f} "
+                        f"next_tick={next_tick_time:.4f} "
+                        f"in_tick={tick_start < change_time < next_tick_time} "
+                        f"before_tick={change_time > 0 and change_time <= tick_start}"
+                    )
+                    # Normalize the old input value the same way _get_raw_turn_input does
+                    prev_raw = ws.turn_input_prev_value
+                    if abs(prev_raw) > 1.5:
+                        scale = getattr(ws, "control_max", 1000.0) or 1000.0
+                        prev_raw = max(-1.0, min(1.0, prev_raw / scale))
+                    else:
+                        prev_raw = max(-1.0, min(1.0, prev_raw))
+                    if abs(prev_raw) < self.turn_deadzone:
+                        prev_raw = 0.0
+                    prev_raw *= self.turn_sign
+                    old_torque = prev_raw * self.turn_adjust
 
-                    if dt_old > 0.0001 and dt_new > 0.0001:
-                        # Step 1: old input for first fraction
-                        prev_raw = ws.turn_input_prev_value
-                        # Normalize the old value the same way _get_raw_turn_input does
-                        if abs(prev_raw) > 1.5:
-                            scale = getattr(ws, "control_max", 1000.0) or 1000.0
-                            prev_raw = max(-1.0, min(1.0, prev_raw / scale))
-                        else:
-                            prev_raw = max(-1.0, min(1.0, prev_raw))
-                        if abs(prev_raw) < self.turn_deadzone:
-                            prev_raw = 0.0
-                        prev_raw *= self.turn_sign
-                        old_torque = prev_raw * self.turn_adjust
+                    if change_time > tick_start and change_time < next_tick_time:
+                        # Case A: input changed within this tick — split step
+                        fraction_old = (change_time - tick_start) / tick_period
+                        fraction_old = max(0.0, min(1.0, fraction_old))
+                        dt_old = dt * fraction_old
+                        dt_new = dt * (1.0 - fraction_old)
 
-                        physics.step(old_torque, dt_old)
-                        # Step 2: new input for remaining fraction
-                        physics.step(torque, dt_new)
-                        did_subtick = True
+                        if dt_old > 0.0001 and dt_new > 0.0001:
+                            physics.step(old_torque, dt_old)
+                            physics.step(torque, dt_new)
+                            did_subtick = True
+                            print(
+                                f"[SUBTICK] c{ctx.client_id} SPLIT "
+                                f"frac_old={fraction_old:.3f} "
+                                f"old_t={math.degrees(old_torque/self.turn_adjust if self.turn_adjust else 0):.3f} "
+                                f"new_t={math.degrees(torque/self.turn_adjust if self.turn_adjust else 0):.3f}"
+                            )
+
+                    elif change_time > 0 and change_time <= tick_start:
+                        # Case B: input changed BEFORE this tick — we already
+                        # integrated the previous tick(s) with the wrong input.
+                        # Compute how far back the change was and apply a
+                        # retroactive heading correction.
+                        #
+                        # The error: we ran N ticks (or fraction) with old_torque
+                        # when we should have been using new torque.
+                        late_s = tick_start - change_time
+                        # Clamp to max 2 ticks (66ms) to avoid wild corrections
+                        late_s = min(late_s, 2.0 * dt)
+
+                        # The heading error from applying wrong torque for late_s:
+                        # Over that time, angular velocity was evolving under old_torque.
+                        # The difference in angular acceleration is:
+                        #   d_acc = (new_torque - old_torque) [damp terms cancel]
+                        # The heading error ≈ d_acc * late_s * dt
+                        # (one dt for the ang_vel change, late_s for how long it was wrong)
+                        # More precisely: the ang_vel should have changed (late_s/dt) ticks
+                        # earlier, each tick's heading integrates ang_vel * dt.
+                        torque_delta = torque - old_torque
+                        # Heading correction: the torque difference should have been
+                        # applied for late_s seconds. Each second of wrong torque
+                        # produces ~torque_delta * late_s of angular velocity error,
+                        # which integrates into ~torque_delta * late_s * late_s / 2
+                        # heading error. But for small late_s (< 66ms), the simpler
+                        # first-order correction works well:
+                        heading_correction = torque_delta * late_s * dt
+                        physics.heading += heading_correction
+
+                        # Also correct angular velocity: it should have been evolving
+                        # under new_torque for late_s instead of old_torque
+                        ang_vel_correction = torque_delta * late_s
+                        # But scale down to avoid oscillation — we only want the
+                        # first-order effect
+                        physics.angular_velocity += ang_vel_correction * 0.5
+
+                        did_subtick = True  # skip normal step, do corrected step
+                        physics.step(torque, dt)
+
+                        print(
+                            f"[SUBTICK] c{ctx.client_id} RETRO "
+                            f"late={late_s*1000:.1f}ms "
+                            f"torque_delta={torque_delta:.3f} "
+                            f"heading_adj={math.degrees(heading_correction):.3f}deg "
+                            f"angvel_adj={math.degrees(ang_vel_correction * 0.5):.3f}deg/s"
+                        )
 
                 if not did_subtick:
                     physics.step(torque, dt)
 
-                # Client-tick time correction: the client's ACTION_UPDATE includes
-                # a millisecond tick counter. By comparing the client tick delta
-                # between two input transitions to the server's physics time
-                # (ticks * dt), we can correct for frame-boundary alignment drift.
-                # Analysis shows continuous turns have zero drift, but each
-                # transition boundary can be off by up to ±33ms (~±2.7 degrees).
+                # TICK-SYNC: inter-transition timing correction.
+                # The sub-tick SPLIT handles intra-tick positioning, but
+                # cumulative timing drift between transitions needs correction.
+                # Compare client-reported elapsed time between transitions to
+                # server-counted ticks * dt.
                 if input_changed and self.ticksync_enabled:
                     current_client_tick = ws.turn_input_change_client_tick
                     prev_client_tick = getattr(ctx, '_turn_transition_client_tick', 0)
-
-                    # Only update tracking when a NEW client tick arrived
-                    # (from ACTION_UPDATE). Input changes from normalization
-                    # without a new packet should not shift the baseline.
                     if current_client_tick != prev_client_tick and current_client_tick > 0:
                         prev_server_tick = getattr(ctx, '_turn_transition_server_tick', 0)
-
                         if prev_client_tick > 0 and current_client_tick > prev_client_tick and prev_server_tick > 0:
                             client_elapsed_s = (current_client_tick - prev_client_tick) / 1000.0
                             server_ticks_elapsed = ctx.session.tick - prev_server_tick
                             server_elapsed_s = server_ticks_elapsed * dt
                             time_correction = client_elapsed_s - server_elapsed_s
-
-                            # Sanity: correction within 1 frame (±50ms)
-                            if abs(time_correction) < 0.050:
+                            # Cap at 150ms to handle higher Hz rates where
+                            # the same wall-clock jitter maps to more ticks
+                            if abs(time_correction) < 0.150:
                                 heading_correction = physics.angular_velocity * time_correction
                                 physics.heading += heading_correction
                                 print(
@@ -4387,21 +4516,13 @@ class WulframServer:
                                     f"correction={time_correction*1000:.1f}ms "
                                     f"heading_adj={math.degrees(heading_correction):.3f}deg"
                                 )
-                            else:
-                                print(
-                                    f"[TICK-SYNC] c{ctx.client_id} SKIPPED "
-                                    f"client_dt={client_elapsed_s*1000:.0f}ms "
-                                    f"server_dt={server_elapsed_s*1000:.0f}ms "
-                                    f"correction={time_correction*1000:.1f}ms (>50ms)"
-                                )
-
                         ctx._turn_transition_client_tick = current_client_tick
                         ctx._turn_transition_server_tick = ctx.session.tick
 
                 ctx.player_heading = physics.heading
                 ctx.angular_vel_yaw = physics.angular_velocity
-                ctx.player_yaw = ctx.player_heading
-                ctx.player_pose["yaw"] = ctx.player_heading
+                ctx.player_yaw = -ctx.player_heading
+                ctx.player_pose["yaw"] = -ctx.player_heading
 
                 # YAW-TRACK: disabled to avoid per-tick console I/O slowing tick loop
                 # if abs(ctx.angular_vel_yaw) > 0.01:
@@ -4460,11 +4581,6 @@ class WulframServer:
                 send_payload = False
 
                 send_update = True
-                # Precompute correction_due so it can bypass heartbeat throttle.
-                correction_due = (
-                    self.correction_interval > 0
-                    and (now - ctx.last_correction_send) >= self.correction_interval
-                )
                 if self.update_on_change:
                     pos_changed = any(abs(a - b) > self.update_epsilon for a, b in zip(send_pos, ctx.last_sent_pos))
                     vel_changed = any(abs(a - b) > self.update_epsilon for a, b in zip(ctx.player_vel, ctx.last_sent_vel))
@@ -4521,7 +4637,7 @@ class WulframServer:
                                 "rot": (
                                     ctx.player_pose.get("roll", 0.0),
                                     0.0,
-                                    ctx.player_yaw,
+                                    ctx.player_heading,  # entity+0x38 convention
                                 ),
                                 "include_pos": include_lpos,
                                 "include_vel": include_lvel,
@@ -4551,7 +4667,7 @@ class WulframServer:
                                         "rot": (
                                             other.player_pose.get("roll", 0.0),
                                             0.0,
-                                            other.player_yaw,
+                                            other.player_heading,  # entity+0x38 convention
                                         ),
                                         "include_pos": include_rpos,
                                         "include_vel": include_rvel,
@@ -4747,8 +4863,8 @@ class WulframServer:
                                 self.udp_handler.send_to(view_payload, ctx.session.udp_addr)
                             elif ctx.tcp_handler:
                                 ctx.tcp_handler.send(view_payload, log=False)
-                elif self.send_player_updates and not send_full_update and (send_update or correction_due):
-                    # Heartbeat path: health/energy delivery + periodic correction.
+                elif self.send_player_updates and not send_full_update and send_update:
+                    # Heartbeat path: health/energy delivery (no position correction).
 
                     weapon_type = self._get_local_state_weapon_type(ctx)
                     ammo_bits, ammo_mask = self._get_local_state_ammo_bits(ctx)
@@ -4766,110 +4882,37 @@ class WulframServer:
                         self.update_local_state_mode,
                     )
 
-                    # correction_due was precomputed above (before heartbeat throttle gate)
-                    # so corrections can bypass the heartbeat interval when needed.
-                    if correction_due:
-                        corr_pos = self._to_client_pos(ctx.player_pos)
-                        corr_rot = (
+                    # Heartbeat: dummy-entity packet (health only, no position override).
+                    # NOTE: Local player corrections were removed — the client runs
+                    # lockstep deterministic physics and overwrites any server position/
+                    # rotation corrections every frame. See server __init__ for details.
+                    use_view = self.heartbeat_view_update
+                    hb_rot = None
+                    if self.heartbeat_include_rot:
+                        hb_rot = (
                             ctx.player_pose.get("roll", 0.0),
                             0.0,
-                            ctx.player_yaw,
+                            ctx.player_heading,  # entity+0x38 convention
                         )
-                        cmode = self.correction_mode
-                        inc_pos = cmode in ("full", "pos_only", "dual_entity", "view_update")
-                        inc_vel = cmode in ("full", "pos_only", "dual_entity", "view_update")
-                        inc_rot = cmode in ("full", "rot_only", "dual_entity", "view_update")
-
-                        common_kw = dict(
-                            include_local_state=include_local_state,
-                            weapon_id=weapon_type,
-                            health=health_val,
-                            fuel=fuel_val,
-                            ammo_count_bits=ammo_bits,
-                            ammo_count=ammo_mask,
-                            primary_turret_bits=pt_bits,
-                            primary_turret_angle=pt_angle,
-                            secondary_turret_bits=st_bits,
-                            secondary_turret_angle=st_angle,
-                            turret_max=self.local_state_turret_max,
-                            turret_range=self.local_state_turret_range,
-                        )
-
-                        if cmode == "view_update":
-                            payload = build_view_update_player_update(
-                                tick, ctx.session.entity_id,
-                                pos=corr_pos, vel=ctx.player_vel, rot=corr_rot,
-                                include_pos=inc_pos, include_vel=inc_vel,
-                                include_rot=inc_rot, **common_kw,
-                            )
-                        elif cmode == "dual_entity":
-                            # 2 entities: real entity with correction + dummy.
-                            # Client only triggers state_sync when entity_count==1
-                            # and entity==local_player. With 2 entities it skips that.
-                            ent_real = dict(
-                                entity_id=ctx.session.entity_id,
-                                is_manned=True,
-                                pos=corr_pos, vel=ctx.player_vel, rot=corr_rot,
-                                include_pos=inc_pos, include_vel=inc_vel,
-                                include_rot=inc_rot,
-                            )
-                            ent_dummy = dict(
-                                entity_id=0xFFFFFFFE,
-                                is_manned=True,
-                                pos=(0, 0, 0), vel=(0, 0, 0), rot=(0, 0, 0),
-                                include_pos=False, include_vel=False,
-                                include_rot=False,
-                            )
-                            payload = build_update_array_multi(
-                                tick, entities=[ent_real, ent_dummy],
-                                **common_kw,
-                            )
-                        else:
-                            # full, rot_only, pos_only
-                            payload = build_update_array_player_update(
-                                tick, ctx.session.entity_id,
-                                pos=corr_pos, vel=ctx.player_vel, rot=corr_rot,
-                                include_pos=inc_pos, include_vel=inc_vel,
-                                include_rot=inc_rot, **common_kw,
-                            )
-
-                        ctx.last_correction_send = now
-                        pkt_label = f"CORRECTION({cmode})"
-                        print(
-                            f"[CORRECTION] mode={cmode} client={ctx.client_id} "
-                            f"pos=({corr_pos[0]:.1f},{corr_pos[1]:.1f},{corr_pos[2]:.1f}) "
-                            f"heading={math.degrees(ctx.player_heading):.1f}deg "
-                            f"inc_pos={inc_pos} inc_rot={inc_rot}"
-                        )
-                    else:
-                        # Normal dummy-entity heartbeat (health only, no position override).
-                        use_view = self.heartbeat_view_update
-                        hb_rot = None
-                        if self.heartbeat_include_rot:
-                            hb_rot = (
-                                ctx.player_pose.get("roll", 0.0),
-                                0.0,
-                                ctx.player_yaw,
-                            )
-                        payload = build_update_array_heartbeat(
-                            tick,
-                            ctx.session.entity_id,
-                            include_health=include_local_state,
-                            weapon_id=weapon_type,
-                            health=health_val,
-                            fuel=fuel_val,
-                            ammo_count_bits=ammo_bits,
-                            ammo_count=ammo_mask,
-                            primary_turret_bits=pt_bits,
-                            primary_turret_angle=pt_angle,
-                            secondary_turret_bits=st_bits,
-                            secondary_turret_angle=st_angle,
-                            turret_max=self.local_state_turret_max,
-                            turret_range=self.local_state_turret_range,
-                            is_view_update=use_view,
-                            rot=hb_rot,
-                        )
-                        pkt_label = "VIEW_UPDATE_BEAT" if use_view else "UPDATE_ARRAY_BEAT"
+                    payload = build_update_array_heartbeat(
+                        tick,
+                        ctx.session.entity_id,
+                        include_health=include_local_state,
+                        weapon_id=weapon_type,
+                        health=health_val,
+                        fuel=fuel_val,
+                        ammo_count_bits=ammo_bits,
+                        ammo_count=ammo_mask,
+                        primary_turret_bits=pt_bits,
+                        primary_turret_angle=pt_angle,
+                        secondary_turret_bits=st_bits,
+                        secondary_turret_angle=st_angle,
+                        turret_max=self.local_state_turret_max,
+                        turret_range=self.local_state_turret_range,
+                        is_view_update=use_view,
+                        rot=hb_rot,
+                    )
+                    pkt_label = "VIEW_UPDATE_BEAT" if use_view else "UPDATE_ARRAY_BEAT"
 
                     if include_local_state:
                         self._log_vitals(
@@ -4895,11 +4938,14 @@ class WulframServer:
                     send_payload = True
 
                 if self.send_player_updates and send_payload and payload is not None:
+                    # Determine transport for logging
+                    _transports = []
                     # Try TCP first, fall back to UDP if TCP fails
                     # Client may close TCP after spawn and use UDP only
                     if self.send_updates_tcp and not tcp_failed and ctx.tcp_handler:
                         try:
                             ctx.tcp_handler.send(payload, log=False)
+                            _transports.append("TCP")
                         except Exception as tcp_err:
                             print(f"[TICK] Client {ctx.client_id}: TCP failed ({tcp_err}), switching to UDP-only")
                             tcp_failed = True
@@ -4907,6 +4953,25 @@ class WulframServer:
                     # Always send via UDP as well for reliability
                     if self.send_updates_udp and self.udp_handler and ctx.session.udp_addr:
                         self.udp_handler.send_to(payload, ctx.session.udp_addr)
+                        _transports.append("UDP")
+
+                    # Log packet for traffic analysis
+                    if self.pktlog.enabled:
+                        _log_ents = (0xFFFFFFFE,)
+                        _log_masks = (0,)
+                        self.pktlog.log(
+                            client_id=ctx.client_id,
+                            label=pkt_label,
+                            tick=tick,
+                            payload=payload,
+                            transport="+".join(_transports),
+                            entity_count=len(_log_ents),
+                            entity_ids=_log_ents,
+                            mask_bits=_log_masks,
+                            has_local_state=include_local_state,
+                            health=health_val if include_local_state else -1.0,
+                        )
+
                     ctx.last_update_send = now
                     ctx.last_sent_pos = send_pos
                     ctx.last_sent_vel = ctx.player_vel
@@ -4944,6 +5009,17 @@ class WulframServer:
                         )
                         if self.udp_handler and ctx.session.udp_addr:
                             self.udp_handler.send_to(vitals_packet, ctx.session.udp_addr)
+                            if self.pktlog.enabled:
+                                self.pktlog.log(
+                                    client_id=ctx.client_id,
+                                    label="TANK_VITALS",
+                                    tick=tick,
+                                    payload=vitals_packet,
+                                    transport="UDP",
+                                    has_local_state=True,
+                                    health=health_val,
+                                    extra="TankPacket",
+                                )
                             print(
                                 "[VITALS] "
                                 f"client={ctx.client_id} net_id={ctx.session.entity_id} "

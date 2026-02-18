@@ -36,7 +36,6 @@ from .packets import (
     build_login_status, build_bps_response, build_game_clock,
     build_udp_tank_packet_wf,
     build_delete_object,
-    build_update_array_teleport,
 )
 
 
@@ -239,8 +238,8 @@ class ControlServer:
             return self._cmd_heading(args)
         elif cmd == 'fire':
             return self._cmd_fire(args)
-        elif cmd == 'correction' or cmd == 'corr':
-            return self._cmd_correction(args)
+        elif cmd == 'pktlog':
+            return self._cmd_pktlog(args)
         elif cmd == 'behavior' or cmd == 'beh':
             return self._cmd_behavior(args)
         elif cmd == 'physics' or cmd == 'phys':
@@ -264,10 +263,6 @@ class ControlServer:
             return self._cmd_move(args)
         elif cmd == 'damage' or cmd == 'dmg':
             return self._cmd_damage(args)
-        elif cmd == 'heal':
-            return self._cmd_heal(args)
-        elif cmd == 'teleport' or cmd == 'tp':
-            return self._cmd_teleport(args)
         elif cmd == 'resend':
             return self._cmd_resend(args)
         elif cmd == 'terrain' or cmd == 'ter':
@@ -299,7 +294,7 @@ class ControlServer:
   barrel [param] [value] - Show/set barrel offsets (forward, right, up)
   heading [param] [value]- Show/set heading & aim params (offset, aim_offset, source, reset)
   fire [count|at <deg>]  - Force-fire projectile at current/specified heading
-  correction [secs|on|off|now] - Drift correction (pos+rot sync to client)
+  pktlog [on|off|dump|save|analyze|clear] - Packet traffic logger
   physics [param] [value] - Yaw physics params (damp, reset)
   respawn / rs           - Re-send TankPacket to reset client entity position + heading
   despawn / ds [c<id>]   - Kill & despawn player (DELETE + reset to TEAM_SELECT)
@@ -611,7 +606,7 @@ Examples:
                 lines.append(f"  heading_offset   = (no client)")
                 lines.append(f"  aim_yaw_offset   = (no client)")
             if ctx_ref:
-                srv_hdg = math.degrees(ctx_ref.player_heading)
+                srv_hdg = math.degrees(-ctx_ref.player_heading)
                 vp_yaw = math.degrees(ctx_ref.player_aim_yaw)
                 vp_age = time.monotonic() - ctx_ref.player_aim_time
                 delta = vp_yaw - srv_hdg
@@ -852,70 +847,47 @@ Examples:
 
         return '\n'.join(results)
 
-    def _cmd_correction(self, args: list) -> str:
-        """Show or set drift correction parameters at runtime.
+    def _cmd_pktlog(self, args: list) -> str:
+        """Packet traffic logger for debugging freezes.
 
         Usage:
-          correction                - Show correction settings
-          correction on             - Enable correction (5s default)
-          correction off            - Disable correction
-          correction <seconds>      - Set interval (0=off)
-          correction now            - Force immediate correction
-          correction mode <name>    - Set mode: full, rot_only, pos_only, dual_entity, view_update
+          pktlog              - Show status
+          pktlog on           - Start logging
+          pktlog off          - Stop logging
+          pktlog dump [N]     - Show last N packets (default 50)
+          pktlog save [path]  - Save to file
+          pktlog analyze      - Timing/frequency analysis
+          pktlog clear        - Clear buffer
         """
         if not self.server:
             return "Error: No server reference"
 
+        log = self.server.pktlog
         if not args:
-            interval = self.server.correction_interval
-            status = "ON" if interval > 0 else "OFF"
-            mode = self.server.correction_mode
-            lines = [
-                f"Drift correction: {status}  mode={mode}",
-                f"  interval = {interval:.1f}s (0=disabled)",
-            ]
-            # Show per-client last correction time
-            for ctx in self.server._snapshot_in_game_clients():
-                age = time.monotonic() - ctx.last_correction_send if ctx.last_correction_send > 0 else -1
-                lines.append(f"  client {ctx.client_id}: last_correction={age:.1f}s ago" if age >= 0 else f"  client {ctx.client_id}: no corrections sent yet")
-            lines.append("")
-            lines.append("Usage: correction <seconds|on|off|now|mode <name>>")
-            lines.append("Modes: full, rot_only, pos_only, dual_entity, view_update")
-            return '\n'.join(lines)
+            status = "ON" if log.enabled else "OFF"
+            count = len(log._entries)
+            return f"Packet log: {status} ({count} entries buffered)"
 
         subcmd = args[0].lower()
         if subcmd == 'on':
-            if self.server.correction_interval <= 0:
-                self.server.correction_interval = 5.0
-            return f"Correction ON (interval={self.server.correction_interval:.1f}s)"
+            log.start()
+            return "Packet logging ON"
         elif subcmd == 'off':
-            self.server.correction_interval = 0.0
-            return "Correction OFF"
-        elif subcmd == 'now':
-            # Force immediate correction on next tick for all clients
-            for ctx in self.server._snapshot_in_game_clients():
-                ctx.last_correction_send = 0.0
-            return f"Forced correction on next tick (mode={self.server.correction_mode})"
-        elif subcmd == 'mode':
-            valid_modes = ("full", "rot_only", "pos_only", "dual_entity", "view_update")
-            if len(args) < 2:
-                return f"Current mode: {self.server.correction_mode}\nModes: {', '.join(valid_modes)}"
-            new_mode = args[1].lower()
-            if new_mode not in valid_modes:
-                return f"Invalid mode: {new_mode}\nModes: {', '.join(valid_modes)}"
-            old = self.server.correction_mode
-            self.server.correction_mode = new_mode
-            print(f"[CONTROL] correction mode: {old} -> {new_mode}")
-            return f"Correction mode: {old} -> {new_mode}"
+            log.stop()
+            return f"Packet logging OFF ({len(log._entries)} entries)"
+        elif subcmd == 'dump':
+            n = int(args[1]) if len(args) > 1 else 50
+            return log.dump(n)
+        elif subcmd == 'save':
+            path = args[1] if len(args) > 1 else "pktlog.txt"
+            return log.save(path)
+        elif subcmd == 'analyze':
+            return log.analyze()
+        elif subcmd == 'clear':
+            log.clear()
+            return "Packet log cleared"
         else:
-            try:
-                val = float(subcmd)
-                old = self.server.correction_interval
-                self.server.correction_interval = val
-                print(f"[CONTROL] correction interval: {old:.1f} -> {val:.1f}")
-                return f"Set correction interval = {val:.1f}s" + (" (OFF)" if val <= 0 else "")
-            except ValueError:
-                return f"Invalid value: {subcmd}. Use a number, 'on', 'off', or 'now'."
+            return f"Unknown: {subcmd}. Use on/off/dump/save/analyze/clear."
 
     def _cmd_physics(self, args: list) -> str:
         """
@@ -942,7 +914,7 @@ Examples:
                 p = ctx_ref.vehicle_physics
                 lines.append(f"  damp_coeff      = {p.damp_coeff:.4f}")
                 lines.append(f"  angular_vel     = {p.angular_velocity:.4f} rad/s")
-                lines.append(f"  heading         = {math.degrees(p.heading):.1f}deg")
+                lines.append(f"  heading         = {math.degrees(-p.heading):.1f}deg")
                 ss = self.server.turn_adjust / p.damp_coeff if p.damp_coeff > 0 else float('inf')
                 lines.append(f"  steady_state    = {ss:.2f} rad/s ({math.degrees(ss):.0f}deg/s)")
             else:
@@ -1229,7 +1201,7 @@ Examples:
                     "team_id": ctx.session.team_id if ctx.session else 0,
                     "pos": list(ctx.player_pos),
                     "vel": list(ctx.player_vel),
-                    "heading_deg": round(math.degrees(ctx.player_heading), 1),
+                    "heading_deg": round(math.degrees(-ctx.player_heading), 1),
                     "aim_yaw_deg": round(math.degrees(ctx.player_aim_yaw), 1),
                     "aim_pitch_deg": round(math.degrees(ctx.player_aim_pitch), 1),
                     "health_pct": round(ctx.player_health * 100),
@@ -1283,7 +1255,7 @@ Examples:
                     lines.append(
                         f"C{ctx.client_id}: turn={turn:.4f} fwd={fwd:.4f} side={side:.4f} "
                         f"fire={fire:.0f} thrust={thrust:.4f} s6={s6:.4f} s7={s7:.4f} | "
-                        f"raw={raw_input:.4f} av={ang_vel:.4f} hdg={_math.degrees(ctx.player_heading):.1f}"
+                        f"raw={raw_input:.4f} av={ang_vel:.4f} hdg={_math.degrees(-ctx.player_heading):.1f}"
                     )
             return "\n".join(lines) if lines else "No connected clients"
         except Exception as e:
@@ -1341,15 +1313,17 @@ Examples:
         elif direction in ("right", "r"):
             strafe_val = 0.549
         elif direction in ("turnleft", "tl"):
-            turn_val = 0.641  # Matches actual client full-key turn input (ACTION_UPDATE slot 1)
-        elif direction in ("turnright", "tr"):
+            # Positive slot value = right, negative = left (matches ACTION_UPDATE slot 1)
+            # _get_raw_turn_input applies turn_sign=-1 to injected_turn
             turn_val = -0.641
+        elif direction in ("turnright", "tr"):
+            turn_val = 0.641
         elif direction in ("fwdright", "fr"):
             fwd_val = 0.549
-            turn_val = -0.641
+            turn_val = 0.641
         elif direction in ("fwdleft", "fl"):
             fwd_val = 0.549
-            turn_val = 0.641
+            turn_val = -0.641
         elif direction == "stop":
             for ctx in targets:
                 ctx.injected_input = None
@@ -1449,61 +1423,6 @@ Examples:
             f"Client {ctx.client_id}: {old_health*100:.0f}% → {new_health*100:.0f}%"
         )
 
-    def _cmd_heal(self, args: list) -> str:
-        """Reset player health to 100% and send health update.
-
-        Usage:
-          heal          - Heal active client
-          heal c<id>    - Heal specific client
-          heal all      - Heal all in-game clients
-        """
-        if not self.server:
-            return "Error: No server reference"
-
-        from .packets import build_update_array_heartbeat
-
-        def _heal_one(ctx) -> str:
-            old = ctx.player_health
-            ctx.player_health = 1.0
-            entity_id = ctx.session.entity_id or ctx.entity_id
-            tick = self.server._get_network_tick(ctx)
-            weapon_type = self.server._get_local_state_weapon_type(ctx)
-            pkt = build_update_array_heartbeat(
-                tick=tick,
-                entity_id=entity_id,
-                include_health=True,
-                weapon_id=weapon_type,
-                health=self.server._get_health_value(ctx),
-                fuel=1.0,
-            )
-            # Send via TCP (reliable) first
-            if ctx.tcp_handler:
-                ctx.tcp_handler.send(pkt)
-            # Also send via UDP 3x for redundancy
-            if self.server.udp_handler and ctx.session and ctx.session.udp_addr:
-                import time as _time
-                for _ in range(3):
-                    self.server.udp_handler.send_to(pkt, ctx.session.udp_addr)
-                    _time.sleep(0.05)
-            return f"c{ctx.client_id}: {old*100:.0f}% -> 100%"
-
-        if args and args[0].lower() == "all":
-            results = []
-            for c in self.server._snapshot_in_game_clients():
-                results.append(_heal_one(c))
-            return "\n".join(results) if results else "No in-game clients"
-
-        if args and args[0].lower().startswith("c") and args[0][1:].isdigit():
-            ctx, _ = self._get_client_by_id(int(args[0][1:]))
-            if not ctx:
-                return f"Error: No client with id {args[0][1:]}"
-        else:
-            ctx, _ = self._get_active_client()
-        if not ctx:
-            return "Error: No connected client"
-
-        return _heal_one(ctx)
-
     def _do_respawn(self, ctx, pos: tuple = None, offset_x: float = 0.0, team: int = None) -> str:
         """Core respawn logic for a single client. Returns status string.
 
@@ -1532,8 +1451,6 @@ Examples:
         if ctx.vehicle_physics:
             ctx.vehicle_physics.heading = 0.0
             ctx.vehicle_physics._angular_velocity = 0.0
-        ctx.last_correction_send = time.monotonic()
-
         pos_str = f"({spawn_pos[0]:.1f},{spawn_pos[1]:.1f},{spawn_pos[2]:.1f})" if spawn_pos else "default"
         print(f"[RESPAWN] DELETE entity {entity_id} with effects, spawn={pos_str}")
         delete_pkt = build_delete_object(
@@ -1676,51 +1593,6 @@ Examples:
                         f"pitch={math.degrees(pitch):.1f}deg delta_z={z - (h + offset):.2f}"
                     )
         return "\n".join(lines)
-
-    def _cmd_teleport(self, args: list) -> str:
-        """Teleport: offset server position and force correction to test if client moves.
-
-        Usage:
-          teleport <dx> <dy> [dz]  - Offset position by (dx,dy,dz) and send correction
-          teleport <x> <y> <z> abs - Set absolute position and send correction
-        """
-        if not self.server:
-            return "Error: No server reference"
-
-        clients = self.server._snapshot_in_game_clients()
-        if not clients:
-            return "No in-game clients"
-        ctx = clients[0]
-
-        if not args:
-            return "Usage: teleport <dx> <dy> [dz] | teleport <x> <y> <z> abs"
-
-        try:
-            absolute = len(args) > 3 and args[-1].lower() == 'abs'
-            x = float(args[0])
-            y = float(args[1]) if len(args) > 1 else 0.0
-            z = float(args[2]) if len(args) > 2 and args[2].lower() != 'abs' else 0.0
-
-            old_pos = ctx.player_pos
-            if absolute:
-                ctx.player_pos = (x, y, z)
-            else:
-                ctx.player_pos = (old_pos[0] + x, old_pos[1] + y, old_pos[2] + z)
-
-            # Zero velocity so server doesn't keep moving from old trajectory
-            ctx.player_vel = (0.0, 0.0, 0.0)
-
-            # Force immediate correction
-            ctx.last_correction_send = 0.0
-
-            new_pos = ctx.player_pos
-            print(f"[TELEPORT] ({old_pos[0]:.1f},{old_pos[1]:.1f},{old_pos[2]:.1f}) -> "
-                  f"({new_pos[0]:.1f},{new_pos[1]:.1f},{new_pos[2]:.1f})")
-            return (f"Teleported: ({old_pos[0]:.1f},{old_pos[1]:.1f},{old_pos[2]:.1f}) -> "
-                    f"({new_pos[0]:.1f},{new_pos[1]:.1f},{new_pos[2]:.1f})\n"
-                    f"Correction will fire on next tick")
-        except (ValueError, IndexError) as e:
-            return f"Error: {e}"
 
     def _cmd_resend(self, args: list) -> str:
         """Force re-send entity creation packets to all clients.
@@ -2445,35 +2317,57 @@ Examples:
 
     def _cmd_player_pos(self, args: list) -> str:
         """
-        Show or set player position for projectile spawning.
+        Show or set player position.
         Usage:
-          pos           - Show current player position (from VIEWPOINT_INFO)
+          pos           - Show current player position/heading/velocity
           pos x y z     - Set player position (for testing)
         """
         if not self.server:
             return "Error: No server reference"
 
+        ctx = None
+        with self.server.clients_lock:
+            for c in self.server.clients.values():
+                if c.session and c.session.udp_addr:
+                    ctx = c
+                    break
+        if not ctx:
+            return "Error: No active client"
+
         if args:
-            # Set position (for testing)
             try:
                 x = float(args[0])
-                y = float(args[1]) if len(args) > 1 else self.server.player_pose["pos"][1]
-                z = float(args[2]) if len(args) > 2 else self.server.player_pose["pos"][2]
-                self.server.player_pose["pos"] = (x, y, z)
-                self.server.player_pose["source"] = "manual"
-                self.server.player_pos = (x, y, z)
+                y = float(args[1]) if len(args) > 1 else ctx.player_pos[1]
+                z = float(args[2]) if len(args) > 2 else ctx.player_pos[2]
+                ctx.player_pos = (x, y, z)
+                ctx.player_pose["pos"] = (x, y, z)
                 return f"Set player pos to ({x:.1f}, {y:.1f}, {z:.1f})"
             except (ValueError, IndexError) as e:
                 return f"pos arg error: {e}"
         else:
-            # Show ACTUAL tracked position (from input slots), not player_pose
-            import math
-            px, py, pz = self.server.player_pos
-            yaw_deg = math.degrees(self.server.player_yaw)
-            # Also show player_pose for comparison
-            pose = self.server.player_pose
-            pose_src = pose.get("source", "unknown")
-            return f"Tracked pos: ({px:.1f}, {py:.1f}, {pz:.1f}) yaw: {yaw_deg:.1f}° | pose_source: {pose_src}"
+            try:
+                import math
+                px, py, pz = ctx.player_pos
+                vx, vy, vz = ctx.player_vel
+                yaw_deg = math.degrees(-ctx.player_heading)
+                speed = math.sqrt(vx*vx + vy*vy + vz*vz)
+                ang_vel = math.degrees(ctx.vehicle_physics.angular_velocity) if ctx.vehicle_physics else 0.0
+                lines = [
+                    f"pos=({px:.1f}, {py:.1f}, {pz:.1f})",
+                    f"vel=({vx:.1f}, {vy:.1f}, {vz:.1f}) speed={speed:.1f}",
+                    f"heading={yaw_deg:.2f}deg ang_vel={ang_vel:.2f}deg/s",
+                ]
+                if ctx.weapon_system:
+                    from .weapons import BehaviorSlot
+                    ws = ctx.weapon_system
+                    turn = ws.behavior_slots[BehaviorSlot.TURNING]
+                    fwd = ws.behavior_slots[BehaviorSlot.MOVING_FORWARD]
+                    strafe = ws.behavior_slots[BehaviorSlot.MOVING_SIDEWAYS]
+                    lines.append(f"input: turn={turn:.3f} fwd={fwd:.3f} strafe={strafe:.3f}")
+                return "\n".join(lines)
+            except Exception as e:
+                import traceback
+                return f"Error reading pos: {e}\n{traceback.format_exc()}"
 
     def _cmd_test_velocity(self, args: list) -> str:
         """

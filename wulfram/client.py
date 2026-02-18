@@ -86,6 +86,7 @@ class ClientContext:
     last_client_tick: int = 0
     last_heading_client_tick: int = 0  # Client tick at last heading update
     tick_offset: Optional[int] = None
+    tick_offset_smooth: Optional[float] = None  # EMA-smoothed offset for backdating
 
     last_sent_tick: int = 0
     tick_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -114,8 +115,6 @@ class ClientContext:
     last_view_update_send: float = field(default_factory=time.monotonic)
     # Update throttling (server-authoritative snapshots)
     last_update_send: float = field(default_factory=time.monotonic)
-    # Periodic correction (real entity pos+rot to correct drift)
-    last_correction_send: float = 0.0
     # Remote player update throttle
     last_remote_update_send: float = 0.0
     # Pending respawn position (set by respawn command, consumed by auto_join_team)
