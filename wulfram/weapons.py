@@ -34,11 +34,21 @@ class WeaponSystem:
 
     def __init__(self):
         self.behavior_slots: List[float] = [0.0] * 22  # Current behavior values
+        self.client_frame_counter: int = 0  # frame counter from ACTION_UPDATE
         # Sub-tick input timing: records when the TURNING slot last changed
         # so the tick loop can split the physics step at the transition point.
         self.turn_input_change_time: float = 0.0  # monotonic time of last turn input change
         self.turn_input_prev_value: float = 0.0    # value before the change
         self.turn_input_change_client_tick: int = 0  # client tick (ms) at last TURNING change
+        self.prev_action_client_tick: int = 0  # previous ACTION_UPDATE client tick (ms)
+        self.client_frame_dt: float = 0.0  # client frame duration at last turn change (seconds)
+        # Client frame dt — cannot be measured from packets (INPUT_FEEDBACK is 200ms
+        # throttled, not per-frame; frame counter is always 0). Must be configured.
+        # Tunable via WULFRAM_CLIENT_FRAME_DT_MS env var.
+        self.prev_dump_tick: int = 0
+        self.input_feedback_count: int = 0  # INPUT_FEEDBACK packets since last ACTION_DUMP
+        frame_dt_ms = float(os.environ.get("WULFRAM_CLIENT_FRAME_DT_MS", "84"))
+        self.avg_frame_dt: float = frame_dt_ms / 1000.0
         self.prev_fire_state: float = 0.0
         self.fire_cooldown: float = 0.0  # Time until can fire again
         self.last_update_time: float = time.monotonic()
@@ -151,6 +161,10 @@ class WeaponSystem:
         # Default to pulse cannon for testing projectile visibility
         self.current_weapon: int = 4  # WeaponType.PULSE_CANNON
 
+    def on_input_feedback(self):
+        """Called when an INPUT_FEEDBACK packet is received. Counts frames between dumps."""
+        self.input_feedback_count += 1
+
     def decode_action_dump(self, data: bytes) -> bool:
         """
         Decode ACTION_DUMP packet (0x09).
@@ -210,6 +224,23 @@ class WeaponSystem:
             raw_s6 = raw_values.get(6, 0)
             raw_s7 = raw_values.get(7, 0)
 
+            # Track client tick for client_frame_dt computation
+            # ACTION_DUMP sent every ~830ms — gives baseline tick for next ACTION_UPDATE
+            if tick > 0:
+                self.prev_action_client_tick = tick
+            # Estimate per-frame dt from ACTION_DUMP tick intervals.
+            # ACTION_DUMP is sent every N client frames (N=10 default).
+            # frame_dt = dump_interval / N
+            if tick > 0 and self.prev_dump_tick > 0:
+                tick_diff = tick - self.prev_dump_tick
+                # Log dump interval (ACTION_DUMP is time-throttled at 832ms, not frame-based)
+                # INPUT_FEEDBACK is 200ms throttled, NOT per-frame — count is informational only
+                print(f"[FRAME-DT] dump_interval={tick_diff}ms fb={self.input_feedback_count} "
+                      f"using_frame_dt={self.avg_frame_dt*1000:.1f}ms")
+            if tick > 0:
+                self.prev_dump_tick = tick
+            self.input_feedback_count = 0  # reset counter for next interval
+
             # Always log raw data and decoded values for debugging
             print(f"[ACTION_DUMP] tick={tick} frame={frame}")
             s6 = self.behavior_slots[BehaviorSlot.SLOT6]
@@ -250,6 +281,8 @@ class WeaponSystem:
         except ValueError:
             return False
 
+        self.client_frame_counter = frame
+
         updated_any = False
         changed = []
         max_updates = min(count, 64)
@@ -268,11 +301,18 @@ class WeaponSystem:
                         self.turn_input_prev_value = old_val
                         self.turn_input_change_time = time.monotonic()
                         self.turn_input_change_client_tick = tick
+                        # Compute client frame dt from consecutive ACTION_UPDATE ticks
+                        if self.prev_action_client_tick > 0 and tick > self.prev_action_client_tick:
+                            self.client_frame_dt = (tick - self.prev_action_client_tick) / 1000.0
                     if slot_idx == BehaviorSlot.FIRE and abs(value - old_val) > 0.01:
                         print(f"[WEAPON] FIRE: {old_val:.3f} -> {value:.3f}")
         except ValueError:
             # Partial packet - still apply what we decoded so far.
             pass
+
+        # Always update prev tick for client_frame_dt calculation on next packet
+        if tick > 0:
+            self.prev_action_client_tick = tick
 
         if updated_any:
             # Always log ACTION_UPDATE changes for debugging

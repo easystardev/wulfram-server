@@ -649,6 +649,14 @@ class WulframServer:
             self.turn_deadzone = 0.05
         self.subtick_enabled = os.environ.get("WULFRAM_SUBTICK", "1") == "1"
         self.ticksync_enabled = os.environ.get("WULFRAM_TICKSYNC", "1") == "1"
+        # Client-frame-driven physics: use client's actual frame dt and substep algorithm
+        # at input transitions instead of splitting server ticks. Supersedes SUBTICK/TICK-SYNC.
+        self.client_frame_physics = os.environ.get("WULFRAM_CLIENT_FRAME_PHYSICS", "1") == "1"
+        # float32 precision matching: quantize heading/ang_vel to float32 after each step
+        self.f32_physics = os.environ.get("WULFRAM_F32_PHYSICS", "1") == "1"
+        # Frame-locked physics: tie physics steps to ACTION_UPDATE frame_counter
+        # instead of wall-clock accumulator. Both sides step exactly N frames.
+        self.frame_locked = os.environ.get("WULFRAM_FRAME_LOCKED", "0") == "1"
         try:
             self.turn_sign = float(os.environ.get("WULFRAM_TURN_SIGN", "-1.0"))
         except ValueError:
@@ -677,6 +685,7 @@ class WulframServer:
         # Send server rotation in heartbeat UPDATE_ARRAY to prevent client angular velocity zeroing.
         # Default ON - entity entries with mask=0 (no rotation) cause client to zero angular velocity.
         self.heartbeat_include_rot = os.environ.get("WULFRAM_HEARTBEAT_ROT", "1") == "1"
+        self.heartbeat_include_pos = os.environ.get("WULFRAM_HEARTBEAT_POS", "0") == "1"
         try:
             self.aim_hold_time = float(os.environ.get("WULFRAM_AIM_HOLD", "0.4"))
         except ValueError:
@@ -3268,9 +3277,10 @@ class WulframServer:
         """
         if len(data) >= 5:
             frame_counter = struct.unpack(">I", data[1:5])[0]
-            # Only log occasionally to reduce spam
-            if frame_counter % 100 == 0:
-                print(f"[INPUT] INPUT_FEEDBACK frame={frame_counter} len={len(data)}")
+            # Count INPUT_FEEDBACK for frame-rate estimation
+            if ctx is not None:
+                ws = ctx.weapon_system
+                ws.on_input_feedback()
             # Additional data might contain input flags
             if len(data) > 5:
                 extra = data[5:]
@@ -3517,7 +3527,7 @@ class WulframServer:
         ctx.player_aim_source = "input"
         ctx.player_aim_time = 0.0
 
-    def _update_player_position(self, ctx: ClientContext):
+    def _update_player_position(self, ctx: ClientContext, dt_override: float = 0.0, heading_override: float = None):
         """
         Simulate player position using damped persistent velocity model.
 
@@ -3546,7 +3556,7 @@ class WulframServer:
                 return max(-1.0, min(1.0, val / scale))
             return max(-1.0, min(1.0, val))
 
-        dt = 1.0 / self.tick_rate_hz
+        dt = dt_override if dt_override > 0 else 1.0 / self.tick_rate_hz
 
         # Read movement input (slot 2 = forward, slot 3 = strafe)
         if ctx.injected_input is not None:
@@ -3569,7 +3579,7 @@ class WulframServer:
         has_input = abs(throttle_input) > 0.0 or abs(strafe_input) > 0.0
         linear_damp = self.linear_damp_driving if has_input else self.linear_damp_coasting
 
-        yaw = ctx.player_heading
+        yaw = heading_override if heading_override is not None else ctx.player_heading
         cos_yaw = math.cos(yaw)
         sin_yaw = math.sin(yaw)
 
@@ -3652,6 +3662,16 @@ class WulframServer:
         new_vel_x = vel_x + acc_x * dt
         new_vel_y = vel_y + acc_y * dt
         new_vel_z = vel_z + acc_z * dt
+
+        # Float32 quantization: client stores pos/vel as float32
+        if self.f32_physics:
+            from .physics import _f32
+            new_x = _f32(new_x)
+            new_y = _f32(new_y)
+            new_z = _f32(new_z)
+            new_vel_x = _f32(new_vel_x)
+            new_vel_y = _f32(new_vel_y)
+            new_vel_z = _f32(new_vel_z)
 
         # Clamp to world bounds
         if self.up_axis == "z":
@@ -4296,6 +4316,11 @@ class WulframServer:
         # accumulator to guarantee exactly tick_rate_hz ticks per wall-clock second.
         next_tick_time = time.monotonic()
         tick_period = 1.0 / self.tick_rate_hz if self.tick_rate_hz > 0 else 0.1
+        # Physics accumulator: accumulate tick time, step physics at client frame rate
+        # instead of server tick rate to match client's integration step sizes.
+        physics_accumulator = 0.0
+        ctx.physics_step_count = 0
+        ctx.server_frame_counter = 0
 
         while ctx.running and ctx.session.in_game:
             try:
@@ -4336,33 +4361,20 @@ class WulframServer:
                 # Once translation is ready, make sure this client sees others and vice versa.
                 self._ensure_multiplayer_visibility(ctx)
 
-                # Integration order must match client (RigidBody_step in Physics.c:5144):
-                #   1. Vehicle controller computes velocity impulse using CURRENT heading
-                #   2. Physics_substep_integrate: rotation update (heading += ang_vel * dt)
-                #   3. RigidBody_integrate_position: pos += impulse * dt
-                # The impulse was computed from heading[N-1] BEFORE rotation updated.
-                # So we must compute position BEFORE updating heading.
-
-                self._update_player_position(ctx)
-                self._update_player_aim(ctx)
-
-                # Direct-impulse yaw physics (matches client Vehicles.c:1193).
-                # Client uses raw turning input directly for yaw — no piecewise curve.
-                # torque = lateral_mobility * turn_adjust * raw_input (per frame)
-                # ang_vel += (torque - ang_vel * damp_coeff) * dt
+                # Read current input state (needed every tick for transition detection)
                 raw_input = self._get_raw_turn_input(ctx)
                 prev_input = getattr(ctx, 'prev_raw_turn_input', 0.0)
                 torque = raw_input * self.turn_adjust  # lateral_mobility=1.0 for now
 
                 physics = ctx.vehicle_physics
-                dt = 1.0 / self.tick_rate_hz
+                ws = ctx.weapon_system
+                use_f32 = self.f32_physics
 
-                # Log input transitions (key press/release) for yaw drift analysis
+                # Log input transitions (key press/release)
                 input_changed = abs(raw_input - prev_input) > 0.001
                 now_mono = time.monotonic()
                 if input_changed:
                     transition = "PRESS" if abs(raw_input) > abs(prev_input) else "RELEASE"
-                    # Calculate elapsed wall-clock since last transition
                     last_transition_time = getattr(ctx, '_yaw_transition_time', now_mono)
                     last_transition_tick = getattr(ctx, '_yaw_transition_tick', ctx.session.tick)
                     elapsed_ms = (now_mono - last_transition_time) * 1000
@@ -4384,145 +4396,70 @@ class WulframServer:
                             _yf.write(yaw_msg + "\n")
                     except Exception:
                         pass
+
+                # prev_input is already normalized (from _get_raw_turn_input on previous tick)
+                prev_torque = prev_input * self.turn_adjust
                 ctx.prev_raw_turn_input = raw_input
 
-                # Sub-tick interpolation: use client-tick-backdated change_time
-                # to determine exactly when the input transition happened
-                # relative to our tick boundaries.
-                #
-                # Three cases:
-                #   A) change_time falls in current tick → split step
-                #   B) change_time falls before current tick → retroactive correction
-                #   C) no input change → normal full-tick step
-                ws = ctx.weapon_system
-                change_time = ws.turn_input_change_time  # backdated in _handle_action_update
-                tick_start = next_tick_time - tick_period
-                did_subtick = False
+                # === PHYSICS STEPPING ===
+                client_dt = ws.avg_frame_dt if self.client_frame_physics else (1.0 / self.tick_rate_hz)
 
-                if self.subtick_enabled and input_changed:
-                    print(
-                        f"[SUBTICK-DBG] c{ctx.client_id} "
-                        f"change_time={change_time:.4f} "
-                        f"tick_start={tick_start:.4f} "
-                        f"next_tick={next_tick_time:.4f} "
-                        f"in_tick={tick_start < change_time < next_tick_time} "
-                        f"before_tick={change_time > 0 and change_time <= tick_start}"
-                    )
-                    # Normalize the old input value the same way _get_raw_turn_input does
-                    prev_raw = ws.turn_input_prev_value
-                    if abs(prev_raw) > 1.5:
-                        scale = getattr(ws, "control_max", 1000.0) or 1000.0
-                        prev_raw = max(-1.0, min(1.0, prev_raw / scale))
-                    else:
-                        prev_raw = max(-1.0, min(1.0, prev_raw))
-                    if abs(prev_raw) < self.turn_deadzone:
-                        prev_raw = 0.0
-                    prev_raw *= self.turn_sign
-                    old_torque = prev_raw * self.turn_adjust
+                if self.frame_locked:
+                    # Frame-locked mode: step physics exactly when client's frame_counter
+                    # advances. Both sides execute the same number of steps with the same
+                    # input — true lockstep, no wall-clock drift.
+                    client_frame = ws.client_frame_counter
+                    server_frame = ctx.server_frame_counter
+                    while server_frame < client_frame:
+                        server_frame += 1
+                        ctx.physics_step_count += 1
+                        old_heading = ctx.player_heading
+                        physics.step_client_substeps(torque, client_dt, use_f32=use_f32)
+                        ctx.player_heading = physics.heading
+                        ctx.angular_vel_yaw = physics.angular_velocity
+                        ctx.player_yaw = -ctx.player_heading
+                        ctx.player_pose["yaw"] = -ctx.player_heading
+                        self._update_player_position(ctx, dt_override=client_dt, heading_override=old_heading)
+                        self._update_player_aim(ctx)
+                    ctx.server_frame_counter = server_frame
+                else:
+                    # Accumulator-based mode: step physics at client frame rate using
+                    # wall-clock tick accumulation with input-transition forcing.
+                    physics_accumulator += tick_period
+                    do_physics = False
 
-                    if change_time > tick_start and change_time < next_tick_time:
-                        # Case A: input changed within this tick — split step
-                        fraction_old = (change_time - tick_start) / tick_period
-                        fraction_old = max(0.0, min(1.0, fraction_old))
-                        dt_old = dt * fraction_old
-                        dt_new = dt * (1.0 - fraction_old)
+                    if input_changed and self.client_frame_physics and physics_accumulator > 0.001:
+                        frame_dt = client_dt
+                        physics_accumulator = 0.0
+                        do_physics = True
+                    elif physics_accumulator >= client_dt - 0.001:
+                        frame_dt = client_dt
+                        physics_accumulator -= client_dt
+                        do_physics = True
 
-                        if dt_old > 0.0001 and dt_new > 0.0001:
-                            physics.step(old_torque, dt_old)
-                            physics.step(torque, dt_new)
-                            did_subtick = True
+                    if do_physics:
+                        ctx.physics_step_count += 1
+                        old_heading = ctx.player_heading
+
+                        if input_changed and self.client_frame_physics:
+                            physics.step_client_substeps(prev_torque, frame_dt, use_f32=use_f32)
                             print(
-                                f"[SUBTICK] c{ctx.client_id} SPLIT "
-                                f"frac_old={fraction_old:.3f} "
-                                f"old_t={math.degrees(old_torque/self.turn_adjust if self.turn_adjust else 0):.3f} "
-                                f"new_t={math.degrees(torque/self.turn_adjust if self.turn_adjust else 0):.3f}"
+                                f"[CLIENT-FRAME] c{ctx.client_id} "
+                                f"frame_dt={frame_dt*1000:.1f}ms "
+                                f"old_torque={prev_torque:.3f} new_torque={torque:.3f} "
+                                f"heading={math.degrees(physics.heading):.2f}deg "
+                                f"ang_vel={math.degrees(physics.angular_velocity):.2f}deg/s"
                             )
+                        else:
+                            physics.step_client_substeps(torque, frame_dt, use_f32=use_f32)
 
-                    elif change_time > 0 and change_time <= tick_start:
-                        # Case B: input changed BEFORE this tick — we already
-                        # integrated the previous tick(s) with the wrong input.
-                        # Compute how far back the change was and apply a
-                        # retroactive heading correction.
-                        #
-                        # The error: we ran N ticks (or fraction) with old_torque
-                        # when we should have been using new torque.
-                        late_s = tick_start - change_time
-                        # Clamp to max 2 ticks (66ms) to avoid wild corrections
-                        late_s = min(late_s, 2.0 * dt)
+                        ctx.player_heading = physics.heading
+                        ctx.angular_vel_yaw = physics.angular_velocity
+                        ctx.player_yaw = -ctx.player_heading
+                        ctx.player_pose["yaw"] = -ctx.player_heading
 
-                        # The heading error from applying wrong torque for late_s:
-                        # Over that time, angular velocity was evolving under old_torque.
-                        # The difference in angular acceleration is:
-                        #   d_acc = (new_torque - old_torque) [damp terms cancel]
-                        # The heading error ≈ d_acc * late_s * dt
-                        # (one dt for the ang_vel change, late_s for how long it was wrong)
-                        # More precisely: the ang_vel should have changed (late_s/dt) ticks
-                        # earlier, each tick's heading integrates ang_vel * dt.
-                        torque_delta = torque - old_torque
-                        # Heading correction: the torque difference should have been
-                        # applied for late_s seconds. Each second of wrong torque
-                        # produces ~torque_delta * late_s of angular velocity error,
-                        # which integrates into ~torque_delta * late_s * late_s / 2
-                        # heading error. But for small late_s (< 66ms), the simpler
-                        # first-order correction works well:
-                        heading_correction = torque_delta * late_s * dt
-                        physics.heading += heading_correction
-
-                        # Also correct angular velocity: it should have been evolving
-                        # under new_torque for late_s instead of old_torque
-                        ang_vel_correction = torque_delta * late_s
-                        # But scale down to avoid oscillation — we only want the
-                        # first-order effect
-                        physics.angular_velocity += ang_vel_correction * 0.5
-
-                        did_subtick = True  # skip normal step, do corrected step
-                        physics.step(torque, dt)
-
-                        print(
-                            f"[SUBTICK] c{ctx.client_id} RETRO "
-                            f"late={late_s*1000:.1f}ms "
-                            f"torque_delta={torque_delta:.3f} "
-                            f"heading_adj={math.degrees(heading_correction):.3f}deg "
-                            f"angvel_adj={math.degrees(ang_vel_correction * 0.5):.3f}deg/s"
-                        )
-
-                if not did_subtick:
-                    physics.step(torque, dt)
-
-                # TICK-SYNC: inter-transition timing correction.
-                # The sub-tick SPLIT handles intra-tick positioning, but
-                # cumulative timing drift between transitions needs correction.
-                # Compare client-reported elapsed time between transitions to
-                # server-counted ticks * dt.
-                if input_changed and self.ticksync_enabled:
-                    current_client_tick = ws.turn_input_change_client_tick
-                    prev_client_tick = getattr(ctx, '_turn_transition_client_tick', 0)
-                    if current_client_tick != prev_client_tick and current_client_tick > 0:
-                        prev_server_tick = getattr(ctx, '_turn_transition_server_tick', 0)
-                        if prev_client_tick > 0 and current_client_tick > prev_client_tick and prev_server_tick > 0:
-                            client_elapsed_s = (current_client_tick - prev_client_tick) / 1000.0
-                            server_ticks_elapsed = ctx.session.tick - prev_server_tick
-                            server_elapsed_s = server_ticks_elapsed * dt
-                            time_correction = client_elapsed_s - server_elapsed_s
-                            # Cap at 150ms to handle higher Hz rates where
-                            # the same wall-clock jitter maps to more ticks
-                            if abs(time_correction) < 0.150:
-                                heading_correction = physics.angular_velocity * time_correction
-                                physics.heading += heading_correction
-                                print(
-                                    f"[TICK-SYNC] c{ctx.client_id} "
-                                    f"client_dt={client_elapsed_s*1000:.0f}ms "
-                                    f"server_dt={server_elapsed_s*1000:.0f}ms "
-                                    f"correction={time_correction*1000:.1f}ms "
-                                    f"heading_adj={math.degrees(heading_correction):.3f}deg"
-                                )
-                        ctx._turn_transition_client_tick = current_client_tick
-                        ctx._turn_transition_server_tick = ctx.session.tick
-
-                ctx.player_heading = physics.heading
-                ctx.angular_vel_yaw = physics.angular_velocity
-                ctx.player_yaw = -ctx.player_heading
-                ctx.player_pose["yaw"] = -ctx.player_heading
+                        self._update_player_position(ctx, dt_override=frame_dt, heading_override=old_heading)
+                        self._update_player_aim(ctx)
 
                 # YAW-TRACK: disabled to avoid per-tick console I/O slowing tick loop
                 # if abs(ctx.angular_vel_yaw) > 0.01:
@@ -4894,6 +4831,9 @@ class WulframServer:
                             0.0,
                             ctx.player_heading,  # entity+0x38 convention
                         )
+                    hb_pos = None
+                    if self.heartbeat_include_pos:
+                        hb_pos = self._to_client_pos(ctx.player_pos)
                     payload = build_update_array_heartbeat(
                         tick,
                         ctx.session.entity_id,
@@ -4911,6 +4851,7 @@ class WulframServer:
                         turret_range=self.local_state_turret_range,
                         is_view_update=use_view,
                         rot=hb_rot,
+                        pos=hb_pos,
                     )
                     pkt_label = "VIEW_UPDATE_BEAT" if use_view else "UPDATE_ARRAY_BEAT"
 

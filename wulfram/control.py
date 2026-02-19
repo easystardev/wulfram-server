@@ -267,6 +267,8 @@ class ControlServer:
             return self._cmd_resend(args)
         elif cmd == 'terrain' or cmd == 'ter':
             return self._cmd_terrain(args)
+        elif cmd == 'framdt' or cmd == 'fdt':
+            return self._cmd_framdt(args)
         elif cmd == 'despawn' or cmd == 'ds':
             return self._cmd_despawn(args)
         elif cmd == 'quit' or cmd == 'exit':
@@ -296,6 +298,7 @@ class ControlServer:
   fire [count|at <deg>]  - Force-fire projectile at current/specified heading
   pktlog [on|off|dump|save|analyze|clear] - Packet traffic logger
   physics [param] [value] - Yaw physics params (damp, reset)
+  framdt [ms]            - Show/set client frame dt in ms (for physics sync tuning)
   respawn / rs           - Re-send TankPacket to reset client entity position + heading
   despawn / ds [c<id>]   - Kill & despawn player (DELETE + reset to TEAM_SELECT)
   damage <amt> [c<id>]   - Apply damage (0.2=20%, or 20=20%)
@@ -1555,6 +1558,44 @@ Examples:
 
         return _despawn_one(ctx)
 
+    def _cmd_framdt(self, args: list) -> str:
+        """Show or set client frame dt for physics sync tuning.
+
+        Usage:
+          framdt          - Show current frame dt for all clients
+          framdt <ms>     - Set frame dt in milliseconds (e.g. framdt 120)
+        """
+        if not self.server:
+            return "Error: No server reference"
+
+        if args:
+            try:
+                ms = float(args[0])
+            except ValueError:
+                return f"Invalid value: {args[0]} (expected number in ms)"
+            if ms < 10 or ms > 500:
+                return f"Out of range: {ms}ms (expected 10-500)"
+            new_dt = ms / 1000.0
+            count = 0
+            with self.server.clients_lock:
+                for ctx in self.server.clients.values():
+                    if hasattr(ctx, 'weapon_system'):
+                        old_ms = ctx.weapon_system.avg_frame_dt * 1000
+                        ctx.weapon_system.avg_frame_dt = new_dt
+                        count += 1
+            return f"Set frame_dt={ms:.1f}ms (was {old_ms:.1f}ms) on {count} client(s)"
+
+        # Show current values
+        lines = []
+        with self.server.clients_lock:
+            for ctx in self.server.clients.values():
+                if hasattr(ctx, 'weapon_system'):
+                    ws = ctx.weapon_system
+                    lines.append(f"  c{ctx.client_id}: frame_dt={ws.avg_frame_dt*1000:.1f}ms")
+        if not lines:
+            return "No clients with weapon_system"
+        return "Client frame dt:\n" + "\n".join(lines)
+
     def _cmd_terrain(self, args: list) -> str:
         """Show terrain info at player positions or arbitrary coordinates.
 
@@ -2364,6 +2405,9 @@ Examples:
                     fwd = ws.behavior_slots[BehaviorSlot.MOVING_FORWARD]
                     strafe = ws.behavior_slots[BehaviorSlot.MOVING_SIDEWAYS]
                     lines.append(f"input: turn={turn:.3f} fwd={fwd:.3f} strafe={strafe:.3f}")
+                    lines.append(f"frame_dt={ws.avg_frame_dt*1000:.1f}ms")
+                steps = getattr(ctx, "physics_step_count", "?")
+                lines.append(f"physics_steps={steps}")
                 return "\n".join(lines)
             except Exception as e:
                 import traceback

@@ -26,6 +26,12 @@ Client references:
 """
 
 import math
+import struct
+
+
+def _f32(v: float) -> float:
+    """Round-trip a float through float32 to match client precision."""
+    return struct.unpack('<f', struct.pack('<f', v))[0]
 
 
 class VehiclePhysics:
@@ -81,6 +87,75 @@ class VehiclePhysics:
             self._heading -= 2 * math.pi * ((self._heading + math.pi) // (2 * math.pi))
         elif self._heading < -math.pi:
             self._heading += 2 * math.pi * ((-self._heading + math.pi) // (2 * math.pi))
+
+    def step_f32(self, torque: float, dt: float):
+        """Like step(), but quantize results to float32 after each substep.
+
+        Matches the client's float32 storage for heading and angular_velocity.
+        """
+        self.step(torque, dt)
+        self._heading = _f32(self._heading)
+        self._angular_velocity = _f32(self._angular_velocity)
+
+    def step_client_substeps(self, torque: float, frame_dt: float, use_f32: bool = False):
+        """Step physics using the client's exact two-level substep algorithm.
+
+        Matches decompile EXACTLY:
+          Outer (GUESS5_GameSim_substep_update):
+            - elapsed clamped to 550ms max
+            - num_substeps = elapsed_ms // 110 + 1, capped at 5
+            - per_substep = elapsed_ms // num_substeps (INTEGER division)
+            - last substep gets the remainder
+          Inner (GUESS4_Physics_substep_integrate):
+            - inner_max = 0.04s (40ms)
+            - if dt > 0.08s: inner_max = dt * 0.5
+            - subtraction loop: step inner_max until remainder, last gets remainder
+
+        Args:
+            torque: pre-computed yaw torque (turn_adjust * raw_input)
+            frame_dt: the client's actual frame duration in seconds
+            use_f32: if True, quantize heading/ang_vel to float32 after each inner step
+        """
+        step_fn = self.step_f32 if use_f32 else self.step
+
+        # Convert to integer ms, matching client's integer arithmetic
+        elapsed_ms = int(frame_dt * 1000.0)
+
+        # Clamp to 550ms max (0x226)
+        if elapsed_ms > 550:
+            elapsed_ms = 550
+
+        # Outer substep count: elapsed_ms // 110 + 1, capped at 5
+        outer_count = min(elapsed_ms // 110 + 1, 5)
+        # Per-substep dt in integer ms (floor division)
+        outer_dt_ms = elapsed_ms // outer_count
+        remaining_ms = elapsed_ms
+
+        for i in range(outer_count):
+            # Last substep gets remainder, others get floor-divided dt
+            if i == outer_count - 1:
+                this_outer_ms = remaining_ms
+            else:
+                this_outer_ms = outer_dt_ms
+                remaining_ms -= outer_dt_ms
+
+            # Convert to seconds for inner substep
+            this_outer_s = this_outer_ms / 1000.0
+
+            # Inner substep (GUESS4_Physics_substep_integrate)
+            # Subtraction loop with fixed inner_max, last step gets remainder
+            inner_max_s = 0.04  # 40ms default
+            if this_outer_s > 0.08:
+                inner_max_s = this_outer_s * 0.5
+
+            inner_remaining = this_outer_s
+            while inner_remaining > 0.0:
+                if inner_remaining <= inner_max_s:
+                    step_fn(torque, inner_remaining)
+                    inner_remaining = 0.0
+                else:
+                    step_fn(torque, inner_max_s)
+                    inner_remaining -= inner_max_s
 
     @property
     def heading(self) -> float:

@@ -428,7 +428,8 @@ def build_update_array_heartbeat(tick: int, entity_id: int, include_health: bool
                                  turret_max: float = 6.3,
                                  turret_range: float = 12.6,
                                  is_view_update: bool = False,
-                                 rot: tuple = None) -> bytes:
+                                 rot: tuple = None,
+                                 pos: tuple = None) -> bytes:
     """Build UPDATE_ARRAY/VIEW_UPDATE with entity heartbeat and optional health data."""
     if is_view_update:
         timestamp = get_ticks()
@@ -456,7 +457,8 @@ def build_update_array_heartbeat(tick: int, entity_id: int, include_health: bool
     )
 
     DUMMY_ENTITY_ID = 0xFFFFFFFE
-    entity_count = 2 if rot is not None else 1
+    has_player_entity = rot is not None or pos is not None
+    entity_count = 2 if has_player_entity else 1
     bw.write_bits(8, entity_count)
 
     bw.write_bits(32, DUMMY_ENTITY_ID)
@@ -464,14 +466,26 @@ def build_update_array_heartbeat(tick: int, entity_id: int, include_health: bool
     bw.write_bits(10, 0)
     bw.write_bits(16, 0)
 
-    if rot is not None:
+    if has_player_entity:
+        mask = 0
+        if pos is not None:
+            mask |= (1 << 1)  # bit 1 = position
+        if rot is not None:
+            mask |= (1 << 3)  # bit 3 = rotation
         bw.write_bits(32, entity_id)
         bw.write_bits(1, 1)
-        bw.write_bits(10, (1 << 3))
+        bw.write_bits(10, mask)
         bw.write_bits(16, 0)
-        bw.write_bits(4, 15)
-        for v in rot:
-            bw.write_bits(16, _compress_value(v, 6.3, 12.6, total_bits=16))
+
+        if pos is not None:
+            bw.write_bits(4, 15)
+            for v in pos:
+                bw.write_bits(16, _compress_value(v, VEC_POS_MAX, VEC_POS_RANGE, total_bits=16))
+
+        if rot is not None:
+            bw.write_bits(4, 15)
+            for v in rot:
+                bw.write_bits(16, _compress_value(v, 6.3, 12.6, total_bits=16))
 
     return header + bw.get_bytes()
 
