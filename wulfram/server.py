@@ -2726,9 +2726,26 @@ class WulframServer:
         ctx.tcp_handler.send(build_login_status(5))  # Code 5 = request handle
 
         if FEATURES.auto_login:
-            # Skip waiting for client handle input - auto-advance to team select
-            time.sleep(0.3)  # Let client process the status 5
-            ctx.session.username = f"Player{ctx.client_id}"
+            # Wait briefly for client's LOGIN_REQUEST which carries the username,
+            # then auto-advance to team select regardless.
+            ctx.tcp_handler.sock.settimeout(1.0)
+            try:
+                for _ in range(5):  # read up to 5 packets within timeout
+                    packet = ctx.tcp_handler.recv()
+                    if packet and len(packet) >= 2 and packet[0] == PacketType.LOGIN_REQUEST:
+                        # Extract username directly (offset 2 = length-prefixed string)
+                        username, _ = handlers.decode_lp_string(packet, 2)
+                        if username:
+                            ctx.session.username = username
+                        break
+                    elif packet and len(packet) >= 1 and packet[0] == PacketType.HELLO:
+                        self._handle_hello(ctx, packet)
+            except Exception:
+                pass  # timeout or read error — proceed with default name
+            finally:
+                ctx.tcp_handler.sock.settimeout(None)
+            if not ctx.session.username:
+                ctx.session.username = f"Player{ctx.client_id}"
             ctx.session.login_complete = True
             ctx.session.transition_to(Phase.TEAM_SELECT)
             handlers.send_initial_game_data(self, ctx)
@@ -3343,13 +3360,17 @@ class WulframServer:
                     is_static=self.projectile_spawn_snap,
                 )
                 self.udp_handler.send_to(packet, target.session.udp_addr)
+                # Also send via TCP for reliability — UDP projectile spawns
+                # can be lost, causing the client to never see the projectile.
+                if target.tcp_handler:
+                    target.tcp_handler.send(packet)
                 if self.pktlog.enabled:
                     self.pktlog.log(
                         client_id=target.client_id,
                         label="PROJ_SPAWN",
                         tick=tick,
                         payload=packet,
-                        transport="UDP",
+                        transport="UDP+TCP",
                         entity_count=1,
                         entity_ids=(proj.entity_id,),
                         mask_bits=(0b1111,),  # pos+vel+rot+type_info
@@ -3359,7 +3380,7 @@ class WulframServer:
                     )
                 sent_count += 1
         if sent_count:
-            print(f"[WEAPON] Sent projectile spawn via UDP: id={proj.entity_id} targets={sent_count}")
+            print(f"[WEAPON] Sent projectile spawn via UDP+TCP: id={proj.entity_id} targets={sent_count}")
         if self.debug_projectiles:
             print(
                 f"[PROJ-SPAWN] id={proj.entity_id} type={proj.entity_type} "
@@ -3999,6 +4020,15 @@ class WulframServer:
             for other in self._snapshot_in_game_clients():
                 if other is not target:
                     other.known_entity_ids.discard(target_entity_id)
+
+            # Clear dead player's own known entities and retry tracking.
+            # On respawn, _sync_clients_on_spawn will re-create all entities
+            # for this player.  Without this, the stale known_entity_ids +
+            # expired _entity_create_times retry window would cause
+            # _send_entity_create to skip re-creation after respawn.
+            target.known_entity_ids.clear()
+            if hasattr(target, '_entity_create_times'):
+                target._entity_create_times.clear()
 
             # Reset server-side state for next spawn
             target.player_health = 1.0

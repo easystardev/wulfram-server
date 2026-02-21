@@ -1489,6 +1489,11 @@ Examples:
         # Stop tick loop (entity no longer exists on client)
         ctx.session.in_game = False
 
+        # Clear dead player's own known entities so respawn re-creates all
+        ctx.known_entity_ids.clear()
+        if hasattr(ctx, '_entity_create_times'):
+            ctx._entity_create_times.clear()
+
         # Store pending respawn pos for _auto_join_team to use
         if spawn_pos:
             ctx.pending_respawn_pos = spawn_pos
