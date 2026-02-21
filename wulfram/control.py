@@ -271,6 +271,8 @@ class ControlServer:
             return self._cmd_framdt(args)
         elif cmd == 'despawn' or cmd == 'ds':
             return self._cmd_despawn(args)
+        elif cmd == 'kick':
+            return self._cmd_kick(args)
         elif cmd == 'quit' or cmd == 'exit':
             return "Goodbye!"
         else:
@@ -301,6 +303,7 @@ class ControlServer:
   framdt [ms]            - Show/set client frame dt in ms (for physics sync tuning)
   respawn / rs           - Re-send TankPacket to reset client entity position + heading
   despawn / ds [c<id>]   - Kill & despawn player (DELETE + reset to TEAM_SELECT)
+  kick [c<id>|all]       - Despawn entity + fully disconnect client
   damage <amt> [c<id>]   - Apply damage (0.2=20%, or 20=20%)
   health [c<id>]         - Show player health
   health set <val> [c<id>] - Set health directly (0.0-1.0)
@@ -687,6 +690,18 @@ Examples:
         except ValueError:
             return f"Invalid value: {args[1]}"
 
+        if param == 'remote_offset' or param == 'roff':
+            old_val = math.degrees(self.server.remote_yaw_offset)
+            self.server.remote_yaw_offset = math.radians(value)
+            print(f"[CONTROL] remote_yaw_offset: {old_val} -> {value}")
+            return f"Set remote_yaw_offset = {value}deg (was {old_val}deg)"
+
+        if param == 'remote_negate' or param == 'rneg':
+            old_val = self.server.remote_yaw_negate
+            self.server.remote_yaw_negate = (value != 0)
+            print(f"[CONTROL] remote_yaw_negate: {old_val} -> {self.server.remote_yaw_negate}")
+            return f"Set remote_yaw_negate = {self.server.remote_yaw_negate} (was {old_val})"
+
         if param == 'offset':
             updated = 0
             old_val = None
@@ -1011,7 +1026,7 @@ Examples:
                 f"  susp_dampening   = {pkt.BEHAVIOR_SUSPENSION_DAMPENING}",
                 f"  mass             = 33000  (hardcoded)",
                 f"  -- Section 6 (Active Vehicle, Tank) --",
-                f"  turn_adjust      = 4.25  (empirical, binary has 4.5 but effective rate is lower)",
+                f"  turn_adjust      = 4.5  (from decompile VehiclePhysics_init_tank +0x10)",
                 f"  move_adjust      = 85.0  (hardcoded)",
                 f"  strafe_adjust    = 69.7  (hardcoded)",
                 f"  max_velocity     = 80.0  (hardcoded)",
@@ -1557,6 +1572,83 @@ Examples:
             return "Error: No connected client"
 
         return _despawn_one(ctx)
+
+    def _cmd_kick(self, args: list) -> str:
+        """Kick a player: despawn their entity and force-disconnect.
+
+        Removes the entity from all clients via DELETE_OBJECT, then closes
+        the TCP socket which triggers the server's normal cleanup (removes
+        client from tracking dicts, clears UDP/session mappings).
+
+        Usage:
+          kick           - Kick the active client
+          kick c<id>     - Kick specific client
+          kick all       - Kick all connected clients
+        """
+        if not self.server:
+            return "Error: No server reference"
+
+        def _kick_one(ctx) -> str:
+            cid = ctx.client_id
+            entity_id = ctx.entity_id or (ctx.session.entity_id if ctx.session else 0)
+
+            # Remove entity from all clients if spawned
+            if entity_id:
+                delete_pkt = build_delete_object(
+                    tick=self.server._get_network_tick(ctx),
+                    entity_ids=[entity_id],
+                    with_effects=False,
+                )
+                for other in self.server._snapshot_in_game_clients():
+                    if other is ctx:
+                        continue
+                    other.known_entity_ids.discard(entity_id)
+                    if other.tcp_handler:
+                        try:
+                            other.tcp_handler.send(delete_pkt)
+                        except Exception:
+                            pass
+
+            # Signal game loop to stop
+            ctx.running = False
+
+            # Force-close TCP socket — triggers recv() to fail,
+            # game loop exits, finally block handles full cleanup
+            if ctx.tcp_handler:
+                try:
+                    ctx.tcp_handler.sock.close()
+                except Exception:
+                    pass
+
+            suffix = f" (entity {entity_id})" if entity_id else ""
+            print(f"[KICK] Client {cid}{suffix} kicked")
+            return f"Kicked client {cid}{suffix}"
+
+        # Handle "kick all"
+        if args and args[0].lower() == "all":
+            results = []
+            for c in self.server._snapshot_clients():
+                results.append(_kick_one(c))
+            return "\n".join(results) if results else "No connected clients"
+
+        # Target specific client or active client
+        # For kick, find client even without UDP (may be stuck in handshake)
+        if args and args[0].lower().startswith("c") and args[0][1:].isdigit():
+            target_id = int(args[0][1:])
+            ctx = None
+            with self.server.clients_lock:
+                for c in self.server.clients.values():
+                    if c.client_id == target_id:
+                        ctx = c
+                        break
+            if not ctx:
+                return f"Error: No client with id {target_id}"
+        else:
+            ctx, _ = self._get_active_client()
+        if not ctx:
+            return "Error: No connected client"
+
+        return _kick_one(ctx)
 
     def _cmd_framdt(self, args: list) -> str:
         """Show or set client frame dt for physics sync tuning.

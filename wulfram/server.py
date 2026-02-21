@@ -24,7 +24,10 @@ from .transport import TCPHandler, UDPHandler, PacketLogger, print_packet
 from .codec import BitReader
 from .control import ControlServer
 from .terrain import Terrain
-from .weapons import WeaponSystem, build_projectile_spawn_packet, EntityType, BehaviorSlot
+from .weapons import (
+    WeaponSystem, build_projectile_spawn_packet, EntityType, BehaviorSlot,
+    VEHICLE_PHYSICS_CONFIGS,
+)
 from .jump_jets import JumpJetSystem
 from .client import ClientContext
 from .packets import (
@@ -204,7 +207,7 @@ class WulframServer:
         self.local_update_mode = os.environ.get("WULFRAM_LOCAL_UPDATE_MODE", "pos_vel_rot").strip().lower()
         # Remote update shape to avoid malformed packets destabilizing HUD state in multi-client.
         # Modes: pos, pos_rot, pos_vel_rot, heartbeat, off (default: pos_rot).
-        self.remote_update_mode = os.environ.get("WULFRAM_REMOTE_UPDATE_MODE", "pos_rot").strip().lower()
+        self.remote_update_mode = os.environ.get("WULFRAM_REMOTE_UPDATE_MODE", "pos_vel_rot").strip().lower()
         # Throttle remote player updates: interval in seconds (0 = every tick).
         # 30Hz tick rate = every tick; lower values reduce packet flood.
         try:
@@ -213,6 +216,10 @@ class WulframServer:
             self.remote_update_interval = 0
         # For remote player updates, set is_manned bit (likely required for player vehicles).
         self.remote_update_is_manned = os.environ.get("WULFRAM_REMOTE_IS_MANNED", "0") == "1"
+        # Yaw offset for remote entities (degrees). Tunable via control cmd: heading remote_offset <deg>
+        self.remote_yaw_offset = math.radians(float(os.environ.get("WULFRAM_REMOTE_YAW_OFFSET_DEG", "0")))
+        # Negate remote yaw before sending (applies after offset)
+        self.remote_yaw_negate = os.environ.get("WULFRAM_REMOTE_YAW_NEGATE", "0") == "1"
         # Combine local + remote updates into a single UPDATE_ARRAY per tick.
         self.combine_update_arrays = os.environ.get("WULFRAM_COMBINE_UPDATE_ARRAYS", "0") == "1"
         # Local stats in projectile packets: owner-only local-state keeps HUD vitals
@@ -640,9 +647,9 @@ class WulframServer:
         except ValueError:
             self.aim_pitch_adjust = 2.5
         try:
-            self.turn_adjust = float(os.environ.get("WULFRAM_TURN_ADJUST", "4.25"))
+            self.turn_adjust = float(os.environ.get("WULFRAM_TURN_ADJUST", "4.5"))
         except ValueError:
-            self.turn_adjust = 4.25
+            self.turn_adjust = 4.5
         try:
             self.turn_deadzone = float(os.environ.get("WULFRAM_TURN_DEADZONE", "0.05"))
         except ValueError:
@@ -1106,12 +1113,14 @@ class WulframServer:
                 vel=other.player_vel,
                 rot=(
                     other.player_pose.get("roll", 0.0),
-                    other.player_pose.get("pitch", 0.0),
-                    other.player_yaw,
+                    0.0,
+                    (-other.player_heading if self.remote_yaw_negate else other.player_heading) + self.remote_yaw_offset,
                 ),
                 include_pos=include_pos,
                 include_vel=include_vel,
                 include_rot=include_rot,
+                include_spin=include_rot,
+                spin=(0.0, 0.0, other.angular_vel_yaw),
                 include_local_state=include_local_state,
                 include_entity_vitals=False,
                 is_manned=True,
@@ -2046,7 +2055,7 @@ class WulframServer:
                 team=team_id,
                 pos=send_pos,
                 behavior_type=0,
-                include_health=self.update_local_state,
+                include_health=False,  # local_player_state ammo/turret bits crash client
                 include_entity_vitals=self.update_entity_vitals,
                 health=health_val,
                 fuel=fuel_val,
@@ -3572,8 +3581,10 @@ class WulframServer:
         if abs(strafe_input) < 0.05:
             strafe_input = 0.0
 
-        move_adjust = 85.0
-        strafe_adjust = 69.7
+        # Per-vehicle-type physics from shared config (decompile-verified)
+        veh_config = VEHICLE_PHYSICS_CONFIGS.get(ctx.entity_type)
+        move_adjust = veh_config.move_adjust if veh_config else 85.0
+        strafe_adjust = veh_config.strafe_adjust if veh_config else 69.7
         # Dual-damp: client uses 0.8 when driving, 2.0 when coasting
         # (from Tank_read_throttle_input and Tank_compute_mobility_factors in Vehicles.c)
         has_input = abs(throttle_input) > 0.0 or abs(strafe_input) > 0.0
@@ -4321,6 +4332,8 @@ class WulframServer:
         physics_accumulator = 0.0
         ctx.physics_step_count = 0
         ctx.server_frame_counter = 0
+        ctx.prev_client_frame_counter = 0
+        ctx.use_frame_locked = self.frame_locked  # per-client, may disable at runtime
 
         while ctx.running and ctx.session.in_game:
             try:
@@ -4364,7 +4377,11 @@ class WulframServer:
                 # Read current input state (needed every tick for transition detection)
                 raw_input = self._get_raw_turn_input(ctx)
                 prev_input = getattr(ctx, 'prev_raw_turn_input', 0.0)
-                torque = raw_input * self.turn_adjust  # lateral_mobility=1.0 for now
+                # Client: entity[0x50] += turn_mobility * (float)turn_adjust * yaw_axis
+                # turn_adjust read as double from config+0x10, cast to float32 BEFORE multiply
+                from .physics import _f32
+                _f32_turn_adjust = _f32(float(self.turn_adjust))
+                torque = _f32(_f32_turn_adjust * _f32(raw_input))  # lateral_mobility=1.0
 
                 physics = ctx.vehicle_physics
                 ws = ctx.weapon_system
@@ -4398,13 +4415,27 @@ class WulframServer:
                         pass
 
                 # prev_input is already normalized (from _get_raw_turn_input on previous tick)
-                prev_torque = prev_input * self.turn_adjust
+                prev_torque = _f32(_f32_turn_adjust * _f32(prev_input))
                 ctx.prev_raw_turn_input = raw_input
 
                 # === PHYSICS STEPPING ===
                 client_dt = ws.avg_frame_dt if self.client_frame_physics else (1.0 / self.tick_rate_hz)
 
-                if self.frame_locked:
+                # Auto-detect frame-locked viability: if client frame_counter
+                # jumps by >10 or stays at 0 after multiple ticks, fall back to
+                # accumulator mode (OG client may not increment by 1).
+                if ctx.use_frame_locked:
+                    client_frame = ws.client_frame_counter
+                    delta = client_frame - ctx.prev_client_frame_counter
+                    if delta > 10 and ctx.prev_client_frame_counter > 0:
+                        print(f"[FRAME-LOCKED] c{ctx.client_id} frame_counter jumped by {delta} — disabling frame-locked mode")
+                        ctx.use_frame_locked = False
+                    elif ctx.session.tick > 60 and client_frame == 0:
+                        print(f"[FRAME-LOCKED] c{ctx.client_id} frame_counter stuck at 0 after {ctx.session.tick} ticks — disabling frame-locked mode")
+                        ctx.use_frame_locked = False
+                    ctx.prev_client_frame_counter = client_frame
+
+                if ctx.use_frame_locked:
                     # Frame-locked mode: step physics exactly when client's frame_counter
                     # advances. Both sides execute the same number of steps with the same
                     # input — true lockstep, no wall-clock drift.
@@ -4604,11 +4635,13 @@ class WulframServer:
                                         "rot": (
                                             other.player_pose.get("roll", 0.0),
                                             0.0,
-                                            other.player_heading,  # entity+0x38 convention
+                                            (-other.player_heading if self.remote_yaw_negate else other.player_heading) + self.remote_yaw_offset,
                                         ),
                                         "include_pos": include_rpos,
                                         "include_vel": include_rvel,
                                         "include_rot": include_rrot,
+                                        "include_spin": include_rrot,
+                                        "spin": (0.0, 0.0, other.angular_vel_yaw),
                                         "include_entity_vitals": False,
                                     }
                                 )

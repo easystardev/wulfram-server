@@ -498,6 +498,8 @@ def build_update_array_player_update(tick: int, entity_id: int,
                                      include_pos: bool = True,
                                      include_vel: bool = True,
                                      include_rot: bool = True,
+                                     include_spin: bool = False,
+                                     spin: Tuple[float, float, float] = (0.0, 0.0, 0.0),
                                      include_local_state: bool = True,
                                      include_entity_vitals: bool = False,
                                      is_manned: bool = True,
@@ -544,6 +546,8 @@ def build_update_array_player_update(tick: int, entity_id: int,
         update_mask |= (1 << 2)
     if include_rot:
         update_mask |= (1 << 3)
+    if include_spin:
+        update_mask |= (1 << 4)
     if include_entity_vitals:
         update_mask |= (1 << 5)
         update_mask |= (1 << 7)
@@ -564,6 +568,11 @@ def build_update_array_player_update(tick: int, entity_id: int,
         bw.write_bits(4, 15)
         for v in rot:
             bw.write_bits(16, _compress_value(v, 6.3, 12.6, total_bits=16))
+
+    if include_spin:
+        bw.write_bits(4, 15)
+        for v in spin:
+            bw.write_bits(16, _compress_value(v, VEC_SPIN_MAX, VEC_SPIN_RANGE, total_bits=16))
 
     if include_entity_vitals:
         if ENTITY_VITALS_MODE in ("health", "vitals"):
@@ -861,7 +870,7 @@ def build_update_array_spawn_points(tick: int, spawn_points: list) -> bytes:
         bw.write_bits(8, 27)
         bw.write_bits(8, config & 0xFF)
         bw.write_bits(8, team & 0xFF)
-        bw.write_bits(1, 1)
+        bw.write_bits(1, 0)  # Must be 0 — matches create_tank; 1 causes bitstream shift crash
 
         bw.write_bits(4, 15)
         for coord in (x, y, z):
@@ -910,7 +919,7 @@ def build_view_update_spawn_points(tick: int,
         bw.write_bits(8, 27)
         bw.write_bits(8, config & 0xFF)
         bw.write_bits(8, team & 0xFF)
-        bw.write_bits(1, 1)
+        bw.write_bits(1, 0)  # Must be 0 — matches create_tank; 1 causes bitstream shift crash
 
         bw.write_bits(4, 15)
         for coord in (x, y, z):
@@ -1164,10 +1173,21 @@ def build_translation_packet() -> bytes:
         payload.extend(_write_string(range_str))
 
     scalar_configs = [(16, 0, "1000.0", "2000.0") for _ in range(16)]
-    scalar_configs[1] = (5, 0, "0.0", "0.0")
-    scalar_configs[2] = (8, 0, "0.0", "0.0")
-    scalar_configs[3] = (8, 0, "0.0", "0.0")
-    scalar_configs[4] = (8, 0, "0.0", "0.0")
+    # Slots 1-4: input axes — must match server decode (control_bits=16, max=1000, range=2000)
+    # OG client uses these to configure ValueQuantizer for ACTION_UPDATE encoding
+    # Slot 1 (weapon type): must be 5 bits to match write_local_player_state's hardcoded
+    # 5-bit weapon field.  Client reads weapon using this quantizer from TRANSLATION.
+    # Mismatch (16 vs 5) causes bitstream shift → crash in Render_prepare_frame.
+    scalar_configs[1] = (5, 0, "1000.0", "2000.0")
+    # Slot 2 (entity_type in UPDATE_ARRAY definition block): client reads via
+    # g_network_quantizer_array[0x20] = entry 2.  Must be 8 bits to match
+    # the 8-bit entity_type written by build_update_array_create_tank and
+    # build_update_array_spawn_points.
+    scalar_configs[2] = (8, 0, "1.0", "1.0")
+    # Slot 3 (parent_id / team_id in definition block): client reads via
+    # g_network_quantizer_array[0x30] = entry 3.  Used TWICE (parent + team),
+    # each 8 bits.
+    scalar_configs[3] = (8, 0, "1.0", "1.0")
     scalar_configs[5] = (10, 0, f"{HEALTH_MAX}", f"{HEALTH_RANGE}")
     scalar_configs[8] = (10, 0, f"{ENERGY_MAX}", f"{ENERGY_RANGE}")
     scalar_configs[13] = (8, 0, "1.0", "1.0")

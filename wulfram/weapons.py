@@ -23,6 +23,8 @@ from wulfram2_protocol.entities import (  # noqa: F401 — re-export for existin
     WeaponType,
     WEAPON_NAMES,
     TANK_WEAPON_SLOTS,
+    VehiclePhysicsConfig,
+    VEHICLE_PHYSICS_CONFIGS,
     Projectile,
 )
 
