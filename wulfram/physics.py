@@ -32,15 +32,19 @@ Client references (from azurefishy decompile):
   - GUESS2_Vec3_normalize_safe (addr 0x004e1c00): Euler extraction via atan2
 """
 
+import array as _array
 import math
 import struct
 
 TWO_PI = 2.0 * math.pi
 
+_f32_buf = _array.array('f', [0.0])
+
 
 def _f32(v: float) -> float:
     """Round-trip a float through float32 to match client precision."""
-    return struct.unpack('<f', struct.pack('<f', v))[0]
+    _f32_buf[0] = v
+    return _f32_buf[0]
 
 
 # Float32 2*pi constant from decompile (exact value used in Math_normalize_angle_radians)
