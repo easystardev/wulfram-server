@@ -35,13 +35,15 @@ from .packets import (
     build_hello_udp_config, build_hello_verified,
     build_identified_udp, build_login_status, build_tank_packet,
     build_udp_tank_packet_wf, build_update_array_heartbeat,
-    build_chat_message, build_add_to_roster, build_player, build_player_info,
+    build_chat_message, build_add_to_roster, build_update_stats, build_player, build_player_info,
     build_birth_notice, build_game_clock, build_reincarnate,
     build_update_array_create_tank, build_update_array_player_update,
     build_update_array_multi, build_view_update_multi, build_view_update_player_update,
     get_behavior_weapon_capability_counts, build_world_stats,
     build_delete_object,
     _encode_health_bits, _compress_value, VEC_VEL_MAX, VEC_VEL_RANGE,
+    build_transient_array, FX_CHAIN_GUN_FIRE, FX_PULSE_FIRE,
+    FX_FLAK_FIRE, FX_MISSILE_FIRE,
 )
 from . import handlers
 from .pktlog import PacketLog
@@ -656,14 +658,13 @@ class WulframServer:
             self.turn_deadzone = 0.05
         self.subtick_enabled = os.environ.get("WULFRAM_SUBTICK", "1") == "1"
         self.ticksync_enabled = os.environ.get("WULFRAM_TICKSYNC", "1") == "1"
-        # Client-frame-driven physics: use client's actual frame dt and substep algorithm
-        # at input transitions instead of splitting server ticks. Supersedes SUBTICK/TICK-SYNC.
-        self.client_frame_physics = os.environ.get("WULFRAM_CLIENT_FRAME_PHYSICS", "1") == "1"
+        # Client-frame-driven physics: use client's actual frame dt instead of server tick.
+        # Default OFF: server runs at native 30Hz (1/tick_rate), matching decompile.
+        # Client also runs at 30Hz via accumulator (decoupled from packet send rate).
+        self.client_frame_physics = os.environ.get("WULFRAM_CLIENT_FRAME_PHYSICS", "0") == "1"
         # float32 precision matching: quantize heading/ang_vel to float32 after each step
         self.f32_physics = os.environ.get("WULFRAM_F32_PHYSICS", "1") == "1"
-        # Frame-locked physics: tie physics steps to ACTION_UPDATE frame_counter
-        # instead of wall-clock accumulator. Both sides step exactly N frames.
-        self.frame_locked = os.environ.get("WULFRAM_FRAME_LOCKED", "0") == "1"
+        # (frame_locked mode removed — not part of original decompile architecture)
         try:
             self.turn_sign = float(os.environ.get("WULFRAM_TURN_SIGN", "-1.0"))
         except ValueError:
@@ -693,6 +694,9 @@ class WulframServer:
         # Default ON - entity entries with mask=0 (no rotation) cause client to zero angular velocity.
         self.heartbeat_include_rot = os.environ.get("WULFRAM_HEARTBEAT_ROT", "1") == "1"
         self.heartbeat_include_pos = os.environ.get("WULFRAM_HEARTBEAT_POS", "0") == "1"
+        # DEBUG_SYNC: send authoritative physics state to client after each step
+        # for measuring client-server divergence (opcode 0x60, 49 bytes, ~12Hz).
+        self.debug_sync = os.environ.get("WULFRAM_DEBUG_SYNC", "0") == "1"
         try:
             self.aim_hold_time = float(os.environ.get("WULFRAM_AIM_HOLD", "0.4"))
         except ValueError:
@@ -766,8 +770,12 @@ class WulframServer:
         tick = get_ticks()
         if self.use_client_ticks and ctx.tick_offset is not None:
             tick = tick + ctx.tick_offset
-        if ctx.last_client_tick and tick < ctx.last_client_tick:
-            tick = ctx.last_client_tick
+            # Only clamp to client tick when we're in client-tick mode;
+            # otherwise the server-domain tick is much smaller than the
+            # client's GetTickCount() and clamping causes a massive jump
+            # that breaks remote entity interpolation.
+            if ctx.last_client_tick and tick < ctx.last_client_tick:
+                tick = ctx.last_client_tick
         if ctx.last_sent_tick and tick <= ctx.last_sent_tick:
             tick = ctx.last_sent_tick + 1
         ctx.last_sent_tick = tick & 0xFFFFFFFF
@@ -961,11 +969,28 @@ class WulframServer:
             entity_id=player_id,
             name=name,
             team=team,
+            kills=player_ctx.kills,
+            deaths=player_ctx.deaths,
         )
         if not self._send_packet_to_client(target_ctx, payload, prefer_tcp=True):
             return
         target_ctx.known_roster_ids.add(player_id)
         print(f"[MULTI] Sent roster {name} (id={player_id}) -> client {target_ctx.client_id}")
+
+    def _broadcast_player_stats(self, player_ctx: ClientContext) -> None:
+        """Send UPDATE_STATS for player_ctx to all connected clients."""
+        player_id = player_ctx.session.player_id or player_ctx.entity_id
+        entity_id = player_ctx.entity_id
+        team = player_ctx.session.team_id or 1
+        pkt = build_update_stats(
+            player_id=player_id,
+            entity_id=entity_id,
+            kills=player_ctx.kills,
+            deaths=player_ctx.deaths,
+            team_id=team,
+        )
+        for client in self._snapshot_in_game_clients():
+            self._send_packet_to_client(client, pkt, prefer_tcp=True)
 
     def _send_entity_create(self, target_ctx: ClientContext, player_ctx: ClientContext, *, is_retry: bool = False) -> None:
         """Announce player_ctx's entity to target_ctx via UPDATE_ARRAY DEFINITION.
@@ -992,19 +1017,26 @@ class WulframServer:
             target_ctx._entity_create_times = {}  # entity_id → (first_send_time, last_send_time)
 
         now = time.monotonic()
-        retry_window = float(os.environ.get("WULFRAM_ENTITY_CREATE_RETRY_SECS", "10"))
-        retry_interval = float(os.environ.get("WULFRAM_ENTITY_CREATE_RETRY_INTERVAL", "0.5"))
+        # Fast retries for the first N seconds, then slow periodic re-announce.
+        # The client's tick guard (g_tick_count < g_next_periodic_send_tick) can
+        # block Entity_apply_network_transform indefinitely.  DEFINITION packets
+        # bypass the guard via Entity_create_from_network (entity+0xAC=0 path),
+        # so periodic re-announce keeps entities visible even after the guard
+        # activates.
+        fast_window = float(os.environ.get("WULFRAM_ENTITY_CREATE_RETRY_SECS", "10"))
+        fast_interval = float(os.environ.get("WULFRAM_ENTITY_CREATE_RETRY_INTERVAL", "0.5"))
+        slow_interval = float(os.environ.get("WULFRAM_ENTITY_REANNOUNCE_INTERVAL", "5.0"))
 
         if entity_id in target_ctx.known_entity_ids:
-            # Already sent at least once.  Check if we should retry.
+            # Already sent at least once.  Check if we should retry/re-announce.
             times = target_ctx._entity_create_times.get(entity_id)
             if times is None:
                 return  # No tracking info — legacy, don't retry.
             first_send, last_send = times
-            if (now - first_send) > retry_window:
-                return  # Retry window expired.
-            if (now - last_send) < retry_interval:
-                return  # Too soon since last retry.
+            in_fast_window = (now - first_send) <= fast_window
+            interval = fast_interval if in_fast_window else slow_interval
+            if (now - last_send) < interval:
+                return  # Too soon since last retry/re-announce.
             is_retry = True
 
         pos = self._to_client_pos(player_ctx.player_pos)
@@ -1036,7 +1068,9 @@ class WulframServer:
             first_send = target_ctx._entity_create_times[entity_id][0]
             target_ctx._entity_create_times[entity_id] = (first_send, now)
             elapsed = now - first_send
-            print(f"[MULTI] Sent entity create RETRY -> client {target_ctx.client_id} ({elapsed:.1f}s since first)")
+            phase = "RETRY" if elapsed <= fast_window else "REANNOUNCE"
+            if phase == "RETRY" or int(elapsed) % 30 == 0:  # Log retries always, re-announces every 30s
+                print(f"[MULTI] Sent entity create {phase} -> client {target_ctx.client_id} ({elapsed:.1f}s since first)")
 
     def _ensure_multiplayer_visibility(self, ctx: ClientContext) -> None:
         """Ensure ctx sees other players and vice versa once translation is ready."""
@@ -3326,6 +3360,34 @@ class WulframServer:
                 msg = build_chat_message(f"*{weapon_name.lower()} fired*", source_id=ctx.session.player_id or ctx.entity_id)
             ctx.tcp_handler.send(msg)
 
+    def _broadcast_weapon_fire_fx(self, ctx: ClientContext, proj):
+        """Broadcast TRANSIENT_ARRAY weapon fire FX to all clients except the firer."""
+        # Map projectile entity types to FX types
+        _PROJ_TO_FX = {
+            EntityType.FLAK_SHELL: FX_FLAK_FIRE,
+            EntityType.PULSE_SHELL: FX_PULSE_FIRE,
+            EntityType.HUNTER: FX_MISSILE_FIRE,
+            EntityType.PIERCER: FX_PULSE_FIRE,
+            EntityType.THUMPER: FX_FLAK_FIRE,
+        }
+        fx_type = _PROJ_TO_FX.get(proj.entity_type, FX_CHAIN_GUN_FIRE)
+
+        events = [{
+            'type': fx_type,
+            'pos': proj.pos,
+            'entity_id': ctx.entity_id,
+        }]
+        pkt = build_transient_array(events)
+        if not pkt:
+            return
+
+        # Send to all in-game clients except the firing player
+        for target in self._snapshot_in_game_clients():
+            if target is ctx:
+                continue
+            if target.tcp_handler:
+                target.tcp_handler.send(pkt)
+
     def _on_projectile_spawn(self, ctx: ClientContext, proj):
         """Callback when a projectile is spawned."""
         print(f"[WEAPON] Projectile spawned: id={proj.entity_id} type={proj.entity_type.name}")
@@ -3729,6 +3791,10 @@ class WulframServer:
             new_z = max(-self.world_bound, min(self.world_bound, new_z))
             new_y = max(ground_level, new_y)
 
+        # Building AABB collision (matching client-side)
+        new_x, new_y, new_vel_x, new_vel_y = self._check_building_collisions(
+            ctx, new_x, new_y, new_vel_x, new_vel_y)
+
         old_pos = ctx.player_pos
         ctx.player_pos = (new_x, new_y, new_z)
         ctx.player_vel = (new_vel_x, new_vel_y, new_vel_z)
@@ -3745,6 +3811,90 @@ class WulframServer:
             print(f"[POS] Client {ctx.client_id} at ({new_x:.1f}, {new_y:.1f}, {new_z:.1f}) yaw={math.degrees(yaw):.1f} deg")
 
 
+    # Building AABB half-extents matching client-side table
+    _BUILDING_HALF_EXTENTS = {
+        25: (12.0, 12.0), 26: (8.0, 8.0), 27: (6.0, 6.0), 28: (5.0, 5.0),
+        29: (10.0, 10.0), 30: (7.0, 7.0), 31: (6.0, 6.0), 32: (8.0, 8.0),
+        33: (5.0, 5.0), 34: (4.0, 4.0), 35: (6.0, 6.0), 36: (5.0, 5.0),
+        37: (7.0, 7.0),
+    }
+    _TANK_RADIUS = 4.0
+
+    def _check_building_collisions(self, ctx, px, py, vx, vy):
+        """Check AABB collision against building entities. Returns (new_x, new_y, new_vx, new_vy)."""
+        for other_ctx in self._snapshot_in_game_clients():
+            if other_ctx is ctx:
+                continue
+            # Check entity-to-entity blocking (tank vs tank)
+            ox, oy, oz = other_ctx.player_pos
+            dx, dy = px - ox, py - oy
+            dist_sq = dx * dx + dy * dy
+            min_dist = self._TANK_RADIUS * 2.0
+            if dist_sq < min_dist * min_dist and dist_sq > 0.01:
+                dist = math.sqrt(dist_sq)
+                overlap = min_dist - dist
+                nx, ny = dx / dist, dy / dist
+                px += nx * overlap * 0.5
+                py += ny * overlap * 0.5
+                vel_dot = vx * nx + vy * ny
+                if vel_dot < 0:
+                    vx -= nx * vel_dot
+                    vy -= ny * vel_dot
+
+        # Check buildings from entity registry (stored on server during heartbeat)
+        building_entities = getattr(self, '_building_entities', {})
+        for eid, (bx, by, bz, etype) in building_entities.items():
+            hx, hy = self._BUILDING_HALF_EXTENTS.get(etype, (8.0, 8.0))
+            r = self._TANK_RADIUS
+            if (px > bx - hx - r and px < bx + hx + r and
+                    py > by - hy - r and py < by + hy + r):
+                push_xp = (bx + hx + r) - px
+                push_xn = px - (bx - hx - r)
+                push_yp = (by + hy + r) - py
+                push_yn = py - (by - hy - r)
+                mp = min(push_xp, push_xn, push_yp, push_yn)
+                if mp == push_xp:
+                    px = bx + hx + r
+                    if vx < 0: vx = 0.0
+                elif mp == push_xn:
+                    px = bx - hx - r
+                    if vx > 0: vx = 0.0
+                elif mp == push_yp:
+                    py = by + hy + r
+                    if vy < 0: vy = 0.0
+                elif mp == push_yn:
+                    py = by - hy - r
+                    if vy > 0: vy = 0.0
+
+        return px, py, vx, vy
+
+    def _send_debug_sync(self, ctx: ClientContext, frame_counter: int,
+                         turn_input: float, fwd_input: float, strafe_input: float):
+        """Send DEBUG_SYNC packet (0x60) with server's authoritative state.
+
+        49-byte UDP packet sent after each physics step for measuring
+        client-server divergence. Opcode 0x60 is unused by the original protocol.
+        """
+        pos = ctx.player_pos
+        heading = ctx.player_heading
+        vel = ctx.player_vel
+        ang_vel = ctx.vehicle_physics.angular_velocity if ctx.vehicle_physics else 0.0
+        steps = ctx.physics_step_count
+
+        payload = struct.pack(
+            ">BII3f1f3f1f3f",
+            0x60,
+            frame_counter,
+            steps,
+            pos[0], pos[1], pos[2],
+            heading,
+            vel[0], vel[1], vel[2],
+            ang_vel,
+            turn_input, fwd_input, strafe_input,
+        )
+        if self.udp_handler and ctx.session.udp_addr:
+            self.udp_handler.send_to(payload, ctx.session.udp_addr)
+
     def _spawn_moving_projectile(self, ctx: ClientContext, proj, addr: tuple):
         """Spawn a projectile and start sending movement updates."""
         import time
@@ -3758,6 +3908,9 @@ class WulframServer:
 
         # Send initial spawn packet
         self._send_projectile_spawn(ctx, proj, addr)
+
+        # Broadcast TRANSIENT_ARRAY (weapon fire FX) to all other clients
+        self._broadcast_weapon_fire_fx(ctx, proj)
 
         # Start background thread for movement updates
         def update_loop():
@@ -3998,12 +4151,20 @@ class WulframServer:
 
         # If target is dead, delete their entity with explosion and schedule respawn
         if target.player_health <= 0.0:
-            print(f"[COMBAT] {target_name} (c{target.client_id}) DESTROYED by {attacker_name} (c{attacker.client_id})")
+            # Track kill/death stats
+            attacker.kills += 1
+            target.deaths += 1
+            print(f"[COMBAT] {target_name} (c{target.client_id}) DESTROYED by {attacker_name} (c{attacker.client_id})"
+                  f" [K:{attacker.kills} D:{target.deaths}]")
             kill_msg = f"KILL! {attacker_name} destroyed {target_name}!"
             kill_chat = build_chat_message(kill_msg, source_id=attacker.session.player_id or attacker.entity_id)
             for client in self._snapshot_in_game_clients():
                 if client.tcp_handler:
                     client.tcp_handler.send(kill_chat)
+
+            # Broadcast updated stats for attacker and target
+            self._broadcast_player_stats(attacker)
+            self._broadcast_player_stats(target)
 
             target_entity_id = target.session.entity_id or target.entity_id
 
@@ -4357,13 +4518,9 @@ class WulframServer:
         # accumulator to guarantee exactly tick_rate_hz ticks per wall-clock second.
         next_tick_time = time.monotonic()
         tick_period = 1.0 / self.tick_rate_hz if self.tick_rate_hz > 0 else 0.1
-        # Physics accumulator: accumulate tick time, step physics at client frame rate
-        # instead of server tick rate to match client's integration step sizes.
-        physics_accumulator = 0.0
+        # Physics steps once per tick at native 30Hz (no accumulator needed).
         ctx.physics_step_count = 0
-        ctx.server_frame_counter = 0
-        ctx.prev_client_frame_counter = 0
-        ctx.use_frame_locked = self.frame_locked  # per-client, may disable at runtime
+        # (frame_locked mode removed — not part of original decompile)
 
         while ctx.running and ctx.session.in_game:
             try:
@@ -4444,83 +4601,25 @@ class WulframServer:
                     except Exception:
                         pass
 
-                # prev_input is already normalized (from _get_raw_turn_input on previous tick)
-                prev_torque = _f32(_f32_turn_adjust * _f32(prev_input))
                 ctx.prev_raw_turn_input = raw_input
 
                 # === PHYSICS STEPPING ===
-                client_dt = ws.avg_frame_dt if self.client_frame_physics else (1.0 / self.tick_rate_hz)
+                # Physics steps once per server tick at native 30Hz (dt=1/tick_rate).
+                # Matches client's 30Hz accumulator stepping.
+                physics_dt = 1.0 / self.tick_rate_hz
 
-                # Auto-detect frame-locked viability: if client frame_counter
-                # jumps by >10 or stays at 0 after multiple ticks, fall back to
-                # accumulator mode (OG client may not increment by 1).
-                if ctx.use_frame_locked:
-                    client_frame = ws.client_frame_counter
-                    delta = client_frame - ctx.prev_client_frame_counter
-                    if delta > 10 and ctx.prev_client_frame_counter > 0:
-                        print(f"[FRAME-LOCKED] c{ctx.client_id} frame_counter jumped by {delta} — disabling frame-locked mode")
-                        ctx.use_frame_locked = False
-                    elif ctx.session.tick > 60 and client_frame == 0:
-                        print(f"[FRAME-LOCKED] c{ctx.client_id} frame_counter stuck at 0 after {ctx.session.tick} ticks — disabling frame-locked mode")
-                        ctx.use_frame_locked = False
-                    ctx.prev_client_frame_counter = client_frame
+                ctx.physics_step_count += 1
+                old_heading = ctx.player_heading
 
-                if ctx.use_frame_locked:
-                    # Frame-locked mode: step physics exactly when client's frame_counter
-                    # advances. Both sides execute the same number of steps with the same
-                    # input — true lockstep, no wall-clock drift.
-                    client_frame = ws.client_frame_counter
-                    server_frame = ctx.server_frame_counter
-                    while server_frame < client_frame:
-                        server_frame += 1
-                        ctx.physics_step_count += 1
-                        old_heading = ctx.player_heading
-                        physics.step_client_substeps(torque, client_dt, use_f32=use_f32)
-                        ctx.player_heading = physics.heading
-                        ctx.angular_vel_yaw = physics.angular_velocity
-                        ctx.player_yaw = -ctx.player_heading
-                        ctx.player_pose["yaw"] = -ctx.player_heading
-                        self._update_player_position(ctx, dt_override=client_dt, heading_override=old_heading)
-                        self._update_player_aim(ctx)
-                    ctx.server_frame_counter = server_frame
-                else:
-                    # Accumulator-based mode: step physics at client frame rate using
-                    # wall-clock tick accumulation with input-transition forcing.
-                    physics_accumulator += tick_period
-                    do_physics = False
+                physics.step_client_substeps(torque, physics_dt, use_f32=use_f32)
 
-                    if input_changed and self.client_frame_physics and physics_accumulator > 0.001:
-                        frame_dt = client_dt
-                        physics_accumulator = 0.0
-                        do_physics = True
-                    elif physics_accumulator >= client_dt - 0.001:
-                        frame_dt = client_dt
-                        physics_accumulator -= client_dt
-                        do_physics = True
+                ctx.player_heading = physics.heading
+                ctx.angular_vel_yaw = physics.angular_velocity
+                ctx.player_yaw = -ctx.player_heading
+                ctx.player_pose["yaw"] = -ctx.player_heading
 
-                    if do_physics:
-                        ctx.physics_step_count += 1
-                        old_heading = ctx.player_heading
-
-                        if input_changed and self.client_frame_physics:
-                            physics.step_client_substeps(prev_torque, frame_dt, use_f32=use_f32)
-                            print(
-                                f"[CLIENT-FRAME] c{ctx.client_id} "
-                                f"frame_dt={frame_dt*1000:.1f}ms "
-                                f"old_torque={prev_torque:.3f} new_torque={torque:.3f} "
-                                f"heading={math.degrees(physics.heading):.2f}deg "
-                                f"ang_vel={math.degrees(physics.angular_velocity):.2f}deg/s"
-                            )
-                        else:
-                            physics.step_client_substeps(torque, frame_dt, use_f32=use_f32)
-
-                        ctx.player_heading = physics.heading
-                        ctx.angular_vel_yaw = physics.angular_velocity
-                        ctx.player_yaw = -ctx.player_heading
-                        ctx.player_pose["yaw"] = -ctx.player_heading
-
-                        self._update_player_position(ctx, dt_override=frame_dt, heading_override=old_heading)
-                        self._update_player_aim(ctx)
+                self._update_player_position(ctx, dt_override=physics_dt, heading_override=old_heading)
+                self._update_player_aim(ctx)
 
                 # YAW-TRACK: disabled to avoid per-tick console I/O slowing tick loop
                 # if abs(ctx.angular_vel_yaw) > 0.01:

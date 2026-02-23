@@ -2076,7 +2076,7 @@ Examples:
         self.tcp_handler.send(build_add_to_roster(
             player_id=entity_id, entity_id=entity_id, name=name, team=team_id
         ))
-        self.tcp_handler.send(build_update_stats(account_id=entity_id, team_id=team_id))
+        self.tcp_handler.send(build_update_stats(player_id=entity_id, entity_id=entity_id, team_id=team_id))
 
         # 4) Create entity via UPDATE_ARRAY (presence bit 0)
         self.tcp_handler.send(build_update_array_create_tank(
@@ -2987,7 +2987,7 @@ Examples:
         return build_add_to_roster(int(player_id), int(entity_id), name, int(team))
 
     def _build_update_stats(self, account_id: str = "1337", team_id: str = "2") -> bytes:
-        return build_update_stats(int(account_id), int(team_id))
+        return build_update_stats(player_id=int(account_id), entity_id=int(account_id), team_id=int(team_id))
 
     def _build_birth_notice(self, entity_id: str = "1337") -> bytes:
         return build_birth_notice(int(entity_id))

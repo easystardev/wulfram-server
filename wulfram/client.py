@@ -117,6 +117,10 @@ class ClientContext:
     last_update_send: float = field(default_factory=time.monotonic)
     # Remote player update throttle
     last_remote_update_send: float = 0.0
+    # Combat stats
+    kills: int = 0
+    deaths: int = 0
+
     # Pending respawn position (set by respawn command, consumed by auto_join_team)
     pending_respawn_pos: Optional[tuple] = None
     # Server-injected movement input override (fwd, strafe) - persists until cleared

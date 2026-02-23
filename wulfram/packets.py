@@ -175,37 +175,51 @@ def build_reincarnate(code: int, message: str) -> bytes:
     return b'\x25' + struct.pack("B", code) + struct.pack(">H", len(msg_bytes)) + msg_bytes
 
 
-def build_add_to_roster(player_id: int, entity_id: int, name: str, team: int, clan: str = "") -> bytes:
-    """Build ADD_TO_ROSTER packet."""
+def build_add_to_roster(player_id: int, entity_id: int, name: str, team: int,
+                        clan: str = "", kills: int = 0, deaths: int = 0) -> bytes:
+    """Build ADD_TO_ROSTER packet (0x1A).
+
+    Format per decompile (GUESS5_PacketHandler_ADD_TO_ROSTER):
+      u32 player_oid, u32 team_id, u16 kills, u16 deaths,
+      string name, string clan, u16 stat_a, u16 stat_b,
+      fixed16 ping, u32 flags
+    """
     name_bytes = (name + '\x00').encode('ascii')
     clan_bytes = (clan + '\x00').encode('ascii')
     payload = b'\x1A'
     payload += struct.pack(">I", player_id)
-    payload += struct.pack(">I", 0)
-    payload += struct.pack(">H", team & 0xFFFF)
-    payload += struct.pack(">H", 2)
+    payload += struct.pack(">I", team & 0xFFFFFFFF)
+    payload += struct.pack(">H", kills & 0xFFFF)
+    payload += struct.pack(">H", deaths & 0xFFFF)
     payload += struct.pack(">H", len(name_bytes)) + name_bytes
     payload += struct.pack(">H", len(clan_bytes)) + clan_bytes
-    payload += struct.pack(">H", 2)
-    payload += struct.pack(">H", 2)
-    payload += pack_fixed16(6.9)
-    payload += struct.pack(">I", 2)
+    payload += struct.pack(">H", 0)       # stat_a
+    payload += struct.pack(">H", 0)       # stat_b
+    payload += pack_fixed16(0.0)          # ping
+    payload += struct.pack(">I", 0)       # flags
     return payload
 
 
-def build_update_stats(account_id: int, team_id: int) -> bytes:
-    """Build UPDATE_STATS packet."""
+def build_update_stats(player_id: int, entity_id: int, kills: int = 0,
+                       deaths: int = 0, team_id: int = 0) -> bytes:
+    """Build UPDATE_STATS packet (0x1C).
+
+    Format per decompile (GUESS5_PacketHandler_UPDATE_STATS):
+      u32 player_oid, u32 entity_oid, u16 kills, u16 deaths,
+      u16 assists, u16 damage_dealt, u16 team_id,
+      fixed16 ping, fixed16 score, u32 flags
+    """
     payload = b'\x1C'
-    payload += struct.pack(">I", account_id)
-    payload += struct.pack(">I", 6)
-    payload += struct.pack(">H", team_id)
-    payload += struct.pack(">H", 0x21)
-    payload += struct.pack(">H", 3)
-    payload += struct.pack(">H", 5)
-    payload += struct.pack(">H", 9)
-    payload += pack_fixed16(1.0)
-    payload += pack_fixed16(1.0)
-    payload += struct.pack(">I", 10)
+    payload += struct.pack(">I", player_id)
+    payload += struct.pack(">I", entity_id)
+    payload += struct.pack(">H", kills & 0xFFFF)
+    payload += struct.pack(">H", deaths & 0xFFFF)
+    payload += struct.pack(">H", 0)           # assists
+    payload += struct.pack(">H", 0)           # damage_dealt
+    payload += struct.pack(">H", team_id & 0xFFFF)
+    payload += pack_fixed16(0.0)              # ping
+    payload += pack_fixed16(0.0)              # score
+    payload += struct.pack(">I", 0)           # flags
     return payload
 
 
@@ -1208,3 +1222,66 @@ def build_translation_packet() -> bytes:
             _write_entry(*cfg)
 
     return bytes(payload)
+
+
+# --- TRANSIENT_ARRAY (0x0D) — Remote FX Events ---
+# Simplified format: we control both server and client, so use fixed-width
+# fields rather than the original bitstream format.
+
+# FX event types (subset of decompile's 40 types)
+FX_CHAIN_GUN_FIRE = 0
+FX_PULSE_FIRE = 1
+FX_FLAK_FIRE = 2
+FX_MISSILE_FIRE = 3
+FX_TURRET_FIRE = 5
+FX_IMPACT_GENERIC = 9
+FX_IMPACT_VEHICLE = 10
+FX_IMPACT_BUILDING = 11
+FX_IMPACT_TERRAIN = 12
+
+
+def build_transient_array(events: list) -> bytes:
+    """Build TRANSIENT_ARRAY (0x0D) packet with FX events.
+
+    Each event is a dict with:
+        type: int (FX_* constant)
+        pos: optional (x, y, z) tuple
+        entity_id: optional int (source entity)
+
+    Wire format (simplified):
+        u8  opcode (0x0D)
+        u8  count
+        per event:
+            u8  fx_type
+            u8  flags (bit 0 = has_pos, bit 1 = has_entity)
+            [3×f32 pos]       (if has_pos)
+            [u32 entity_id]   (if has_entity)
+    """
+    if not events:
+        return b''
+
+    count = min(len(events), 255)
+    buf = bytearray()
+    buf.append(0x0D)
+    buf.append(count)
+
+    for ev in events[:count]:
+        fx_type = ev.get('type', 0)
+        pos = ev.get('pos')
+        eid = ev.get('entity_id', 0)
+
+        flags = 0
+        if pos is not None:
+            flags |= 0x01
+        if eid:
+            flags |= 0x02
+
+        buf.append(fx_type & 0xFF)
+        buf.append(flags)
+
+        if pos is not None:
+            buf.extend(struct.pack('>3f', pos[0], pos[1], pos[2]))
+        if eid:
+            buf.extend(struct.pack('>I', eid))
+
+    return bytes(buf)

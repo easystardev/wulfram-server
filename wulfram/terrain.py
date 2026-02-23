@@ -43,10 +43,11 @@ class Terrain:
         self.inv_cell_x = 1.0 / self.cell_x
         self.inv_cell_z = 1.0 / self.cell_z
 
-        # Parse heights into flat array: heights[x * num_z + z]
+        # Parse heights and cell types into flat arrays: [x * num_z + z]
         # File order: outer loop z, inner loop x (matching client loader)
         total = self.num_x * self.num_z
         self._heights = [0.0] * total
+        self._cell_types = [0] * total  # per-vertex texture ID from land file
 
         line_idx = 2
         for gz in range(self.num_z):
@@ -54,6 +55,7 @@ class Terrain:
                 if line_idx < len(lines):
                     parts = lines[line_idx].strip().split()
                     if len(parts) >= 2:
+                        self._cell_types[gx * self.num_z + gz] = int(parts[0])
                         self._heights[gx * self.num_z + gz] = float(parts[1])
                 line_idx += 1
 
@@ -72,6 +74,12 @@ class Terrain:
         gx = max(0, min(gx, self.num_x - 1))
         gz = max(0, min(gz, self.num_z - 1))
         return self._heights[gx * self.num_z + gz]
+
+    def get_cell_type(self, gx: int, gz: int) -> int:
+        """Get cell texture type at grid coords (clamped)."""
+        gx = max(0, min(gx, self.num_x - 1))
+        gz = max(0, min(gz, self.num_z - 1))
+        return self._cell_types[gx * self.num_z + gz]
 
     def get_height(self, wx: float, wy: float) -> float:
         """Get terrain height at server coords (wx=X, wy=Y) via bilinear interpolation.

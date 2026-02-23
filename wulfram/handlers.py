@@ -154,7 +154,7 @@ def send_initial_game_data(server: "WulframServer", ctx: "ClientContext"):
 
 def _broadcast_update_stats(server: "WulframServer", account_id: int, team_id: int) -> int:
     """Broadcast UPDATE_STATS to all connected clients with a known transport."""
-    packet = build_update_stats(account_id=account_id, team_id=team_id)
+    packet = build_update_stats(player_id=account_id, entity_id=account_id, team_id=team_id)
     sent = 0
     lock = getattr(server, "clients_lock", None)
     clients = getattr(server, "clients", {})
@@ -400,7 +400,8 @@ def handle_reincarnate_tcp(server: "WulframServer", ctx: "ClientContext", packet
     )
     if sent <= 0:
         tcp.send(build_update_stats(
-            account_id=session.player_id or ctx.entity_id,
+            player_id=session.player_id or ctx.entity_id,
+            entity_id=ctx.entity_id,
             team_id=team_id
         ))
 
@@ -638,7 +639,8 @@ def handle_team_switch(server: "WulframServer", ctx: "ClientContext", team_id: i
     )
     if sent <= 0 and server.udp_handler and addr:
         update_stats_pkt = build_update_stats(
-            account_id=session.player_id or ctx.entity_id,
+            player_id=session.player_id or ctx.entity_id,
+            entity_id=ctx.entity_id,
             team_id=team_id
         )
         server.udp_handler.send_to(update_stats_pkt, addr)
