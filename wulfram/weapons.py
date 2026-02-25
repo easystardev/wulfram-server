@@ -28,6 +28,9 @@ from wulfram2_protocol.entities import (  # noqa: F401 — re-export for existin
     Projectile,
 )
 
+# Module-level debug flag — gated by WULFRAM_DEBUG_SYNC env var
+_debug_sync = os.environ.get("WULFRAM_DEBUG_SYNC", "0").strip().lower() in ("1", "true", "on", "yes")
+
 
 class WeaponSystem:
     """
@@ -64,6 +67,18 @@ class WeaponSystem:
         # Weapon configs
         self.chain_gun_cooldown: float = 0.1  # 100ms between shots
         self.pulse_cannon_cooldown: float = 0.5  # 500ms between shots
+        self.weapon_energy_costs = {
+            WeaponType.CHAIN_GUN: 2.0,
+            WeaponType.PULSE_CANNON: 8.0,
+            WeaponType.FLAK: 10.0,
+            WeaponType.GUIDED_MISSILE: 12.0,
+            WeaponType.HUNTER_SEEKER: 14.0,
+            WeaponType.MINE: 6.0,
+            WeaponType.THUMPER: 16.0,
+            WeaponType.MORTAR: 12.0,
+            WeaponType.PIERCER: 10.0,
+        }
+        self.default_weapon_energy_cost: float = 8.0
 
         # === EXPERIMENTAL: Projectile velocity settings ===
         # Try different values to see what client displays correctly
@@ -159,9 +174,9 @@ class WeaponSystem:
         self.player_team: int = 1
         self.player_id: int = 1337
 
-        # Current weapon (from slot 4)
-        # Default to pulse cannon for testing projectile visibility
-        self.current_weapon: int = 4  # WeaponType.PULSE_CANNON
+        # Current weapon (from slot 4, read in update())
+        # Default to chain gun (original game default — Space fires autocannon)
+        self.current_weapon: int = 0  # WeaponType.CHAIN_GUN
 
     def on_input_feedback(self):
         """Called when an INPUT_FEEDBACK packet is received. Counts frames between dumps."""
@@ -201,14 +216,6 @@ class WeaponSystem:
                 except ValueError:
                     break
                 if 0 <= slot_idx < len(self.behavior_slots):
-                    # Never let ACTION_DUMP set analog control slots to non-zero.
-                    # Only ACTION_UPDATE should set these — the client encodes
-                    # with off-by-one raw values between the two packet types
-                    # (e.g. raw 32750 vs 32751 for MOVING_FORWARD), and
-                    # ACTION_DUMP can race ahead of ACTION_UPDATE at key press.
-                    if slot_idx in (BehaviorSlot.TURNING, BehaviorSlot.MOVING_FORWARD,
-                                    BehaviorSlot.MOVING_SIDEWAYS) and abs(value) > 0.01:
-                        continue
                     self.behavior_slots[slot_idx] = value
 
             # Debug: log movement-related slots with RAW values
@@ -235,27 +242,26 @@ class WeaponSystem:
             # frame_dt = dump_interval / N
             if tick > 0 and self.prev_dump_tick > 0:
                 tick_diff = tick - self.prev_dump_tick
-                # Log dump interval (ACTION_DUMP is time-throttled at 832ms, not frame-based)
-                # INPUT_FEEDBACK is 200ms throttled, NOT per-frame — count is informational only
-                print(f"[FRAME-DT] dump_interval={tick_diff}ms fb={self.input_feedback_count} "
-                      f"using_frame_dt={self.avg_frame_dt*1000:.1f}ms")
+                if _debug_sync:
+                    print(f"[FRAME-DT] dump_interval={tick_diff}ms fb={self.input_feedback_count} "
+                          f"using_frame_dt={self.avg_frame_dt*1000:.1f}ms")
             if tick > 0:
                 self.prev_dump_tick = tick
             self.input_feedback_count = 0  # reset counter for next interval
 
-            # Always log raw data and decoded values for debugging
-            print(f"[ACTION_DUMP] tick={tick} frame={frame}")
-            s6 = self.behavior_slots[BehaviorSlot.SLOT6]
-            s7 = self.behavior_slots[BehaviorSlot.SLOT7]
-            print(
-                f"[ACTION_DUMP] raw_hex={data[9:17].hex()} | "
-                f"turn: raw={raw_turn} val={turn:.3f} | fwd: raw={raw_fwd} val={fwd:.3f} | "
-                f"s6: raw={raw_s6} val={s6:.3f} | s7: raw={raw_s7} val={s7:.3f}"
-            )
-            print(
-                f"[ACTION_DUMP] strafe: raw={raw_strafe} val={strafe:.3f} | "
-                f"thrust: raw={raw_thrust} val={thrust:.3f} | fire={fire:.1f}"
-            )
+            if _debug_sync:
+                print(f"[ACTION_DUMP] tick={tick} frame={frame}")
+                s6 = self.behavior_slots[BehaviorSlot.SLOT6]
+                s7 = self.behavior_slots[BehaviorSlot.SLOT7]
+                print(
+                    f"[ACTION_DUMP] raw_hex={data[9:17].hex()} | "
+                    f"turn: raw={raw_turn} val={turn:.3f} | fwd: raw={raw_fwd} val={fwd:.3f} | "
+                    f"s6: raw={raw_s6} val={s6:.3f} | s7: raw={raw_s7} val={s7:.3f}"
+                )
+                print(
+                    f"[ACTION_DUMP] strafe: raw={raw_strafe} val={strafe:.3f} | "
+                    f"thrust: raw={raw_thrust} val={thrust:.3f} | fire={fire:.1f}"
+                )
             return True
         except Exception as e:
             print(f"[WEAPON] Error decoding ACTION_DUMP: {e}")
@@ -317,8 +323,7 @@ class WeaponSystem:
             self.prev_action_client_tick = tick
 
         if updated_any:
-            # Always log ACTION_UPDATE changes for debugging
-            if changed:
+            if _debug_sync and changed:
                 print(f"[ACTION_UPDATE] tick={tick} frame={frame} changes={changed}")
             return True
 
@@ -363,7 +368,8 @@ class WeaponSystem:
             raw = reader.read_bits(self.zoom_bits)
             return self._decode_quantized(raw, self.zoom_bits, self.zoom_max, self.zoom_range)
         if slot_idx in (BehaviorSlot.UNUSED0, BehaviorSlot.TURNING, BehaviorSlot.MOVING_FORWARD,
-                        BehaviorSlot.MOVING_SIDEWAYS, BehaviorSlot.SLOT6, BehaviorSlot.SLOT7):
+                        BehaviorSlot.MOVING_SIDEWAYS, BehaviorSlot.WEAPON_SELECT,
+                        BehaviorSlot.SLOT6, BehaviorSlot.SLOT7):
             raw = reader.read_bits(self.control_bits)
             return self._decode_quantized(raw, self.control_bits, self.control_max, self.control_range)
         # Other slots are binary (1 bit)
@@ -376,14 +382,23 @@ class WeaponSystem:
             raw = reader.read_bits(self.zoom_bits)
             return self._decode_quantized(raw, self.zoom_bits, self.zoom_max, self.zoom_range), raw
         if slot_idx in (BehaviorSlot.UNUSED0, BehaviorSlot.TURNING, BehaviorSlot.MOVING_FORWARD,
-                        BehaviorSlot.MOVING_SIDEWAYS, BehaviorSlot.SLOT6, BehaviorSlot.SLOT7):
+                        BehaviorSlot.MOVING_SIDEWAYS, BehaviorSlot.WEAPON_SELECT,
+                        BehaviorSlot.SLOT6, BehaviorSlot.SLOT7):
             raw = reader.read_bits(self.control_bits)
             return self._decode_quantized(raw, self.control_bits, self.control_max, self.control_range), raw
         # Other slots are binary
         raw = reader.read_bits(1)
         return (1.0 if raw else 0.0), raw
 
-    def update(self, dt: float = None) -> List[Projectile]:
+    def _get_weapon_energy_cost(self, weapon_slot: int) -> float:
+        """Return the configured energy cost for a weapon slot."""
+        if weapon_slot in self.weapon_energy_costs:
+            return float(self.weapon_energy_costs[weapon_slot])
+        if weapon_slot in TANK_WEAPON_SLOTS:
+            return self.default_weapon_energy_cost
+        return 0.0
+
+    def update(self, dt: float = None, available_energy: Optional[float] = None) -> Tuple[List[Projectile], float]:
         """
         Process weapon state changes and return any new projectiles.
         Call this after decoding input packets.
@@ -396,21 +411,19 @@ class WeaponSystem:
         # Update cooldowns
         self.fire_cooldown = max(0.0, self.fire_cooldown - dt)
 
-        # DISABLED: Reading weapon from slot 4 during testing
-        # The client sends weapon slot 0 (chaingun), which overwrites our forced
-        # pulse cannon setting. Skip this until weapon switching is fully implemented.
-        #
-        # # Update current weapon from slot 4 (5-bit quantized, so 0-31 range)
-        # weapon_val = self.behavior_slots[BehaviorSlot.WEAPON_SELECT]
-        # # Convert normalized 0-1 back to weapon slot index (0-31)
-        # weapon_slot = int(weapon_val * 31 + 0.5)  # Round to nearest
-        # if weapon_slot != self.current_weapon:
-        #     old_name = WEAPON_NAMES.get(self.current_weapon, f"Slot {self.current_weapon}")
-        #     new_name = WEAPON_NAMES.get(weapon_slot, f"Slot {weapon_slot}")
-        #     print(f"[WEAPON] Weapon changed: {old_name} -> {new_name} (raw={weapon_val:.3f})")
-        #     self.current_weapon = weapon_slot
+        # Read weapon from slot 4 (WEAPON_SELECT).
+        # Client sends actual weapon slot ID (0, 4, 7, 8, 9, 11, 13, 17) via
+        # 16-bit control quantizer. Round to nearest integer to recover weapon ID.
+        weapon_val = self.behavior_slots[BehaviorSlot.WEAPON_SELECT]
+        weapon_slot = round(weapon_val)
+        if weapon_slot != self.current_weapon:
+            old_name = WEAPON_NAMES.get(self.current_weapon, f"Slot {self.current_weapon}")
+            new_name = WEAPON_NAMES.get(weapon_slot, f"Slot {weapon_slot}")
+            print(f"[WEAPON] Weapon changed: {old_name} -> {new_name} (raw={weapon_val:.3f})")
+            self.current_weapon = weapon_slot
 
         new_projectiles = []
+        energy_spent = 0.0
 
         # Check fire state (behavior slot FIRE)
         fire_val = self.behavior_slots[BehaviorSlot.FIRE]
@@ -434,37 +447,52 @@ class WeaponSystem:
 
         if fire_trigger:
             weapon_name = WEAPON_NAMES.get(self.current_weapon, f"Slot {self.current_weapon}")
-
-            if self.current_weapon == WeaponType.CHAIN_GUN:
-                # Chain gun: instant hit, no projectile
-                self._fire_chain_gun()
-                self.fire_cooldown = self.chain_gun_cooldown
-
-            elif self.current_weapon == WeaponType.PULSE_CANNON:
-                # Pulse cannon: energy projectile
-                proj = self._fire_pulse_cannon()
-                if proj:
-                    new_projectiles.append(proj)
-                    self.projectiles.append(proj)
-                self.fire_cooldown = self.pulse_cannon_cooldown
-
-            elif self.current_weapon in TANK_WEAPON_SLOTS:
-                # Other Tank weapons - log and send feedback
-                print(f"[WEAPON] {weapon_name} fired! pos={self.player_pos}")
-                if self.on_chain_gun_fire:
-                    # Use chain gun callback for now to send feedback
-                    self.on_chain_gun_fire(
-                        pos=self.player_pos,
-                        rot=self.player_rot,
-                        team=self.player_team,
-                        weapon_name=weapon_name
+            energy_cost = self._get_weapon_energy_cost(self.current_weapon)
+            if available_energy is not None and energy_cost > 0.0 and available_energy + 1e-6 < energy_cost:
+                if _debug_sync:
+                    print(
+                        f"[WEAPON] Insufficient energy for {weapon_name}: "
+                        f"need={energy_cost:.1f} have={available_energy:.1f}"
                     )
-                self.fire_cooldown = 0.5  # Generic cooldown
-
             else:
-                # Invalid weapon slot
-                print(f"[WEAPON] Fire attempt with invalid slot {self.current_weapon}")
-                self.fire_cooldown = 0.5
+                fired = False
+
+                if self.current_weapon == WeaponType.CHAIN_GUN:
+                    # Chain gun: instant hit, no projectile
+                    self._fire_chain_gun()
+                    self.fire_cooldown = self.chain_gun_cooldown
+                    fired = True
+
+                elif self.current_weapon == WeaponType.PULSE_CANNON:
+                    # Pulse cannon: energy projectile
+                    proj = self._fire_pulse_cannon()
+                    if proj:
+                        new_projectiles.append(proj)
+                        self.projectiles.append(proj)
+                        fired = True
+                    self.fire_cooldown = self.pulse_cannon_cooldown
+
+                elif self.current_weapon in TANK_WEAPON_SLOTS:
+                    # Other Tank weapons - log and send feedback
+                    print(f"[WEAPON] {weapon_name} fired! pos={self.player_pos}")
+                    if self.on_chain_gun_fire:
+                        # Use chain gun callback for now to send feedback
+                        self.on_chain_gun_fire(
+                            pos=self.player_pos,
+                            rot=self.player_rot,
+                            team=self.player_team,
+                            weapon_name=weapon_name
+                        )
+                    self.fire_cooldown = 0.5  # Generic cooldown
+                    fired = True
+
+                else:
+                    # Invalid weapon slot
+                    print(f"[WEAPON] Fire attempt with invalid slot {self.current_weapon}")
+                    self.fire_cooldown = 0.5
+
+                if fired and energy_cost > 0.0:
+                    energy_spent = energy_cost
 
         self.prev_fire_state = fire_val
 
@@ -472,7 +500,7 @@ class WeaponSystem:
         self.projectiles = [p for p in self.projectiles
                           if now - p.spawn_time < p.lifetime]
 
-        return new_projectiles
+        return (new_projectiles, energy_spent)
 
     def _fire_chain_gun(self):
         """Fire chain gun (instant hit weapon)."""

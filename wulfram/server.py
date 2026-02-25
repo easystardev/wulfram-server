@@ -250,6 +250,21 @@ class WulframServer:
             self.viewpoint_timeout = float(os.environ.get("WULFRAM_VIEWPOINT_TIMEOUT", "1.0"))
         except ValueError:
             self.viewpoint_timeout = 1.0
+        self.debug_viewpoint = os.environ.get("WULFRAM_DEBUG_VIEWPOINT", "0") == "1"
+        self.debug_udp_raw = os.environ.get("WULFRAM_DEBUG_UDP_RAW", "0") == "1"
+        self.weapon_energy_enabled = os.environ.get("WULFRAM_WEAPON_ENERGY_ENABLED", "1") == "1"
+        try:
+            self.player_energy_max = float(os.environ.get("WULFRAM_PLAYER_ENERGY_MAX", "100.0"))
+        except ValueError:
+            self.player_energy_max = 100.0
+        if self.player_energy_max <= 0.0:
+            self.player_energy_max = 100.0
+        try:
+            self.player_energy_regen = float(os.environ.get("WULFRAM_PLAYER_ENERGY_REGEN", "10.0"))
+        except ValueError:
+            self.player_energy_regen = 10.0
+        if self.player_energy_regen < 0.0:
+            self.player_energy_regen = 0.0
         # VIEW_UPDATE is optional and has been less stable than UPDATE_ARRAY.
         self.view_update_enabled = os.environ.get("WULFRAM_VIEW_UPDATE", "0") == "1"
         # Periodic VIEW_UPDATE loop (separate from initial snapshot). Default OFF for stability.
@@ -411,6 +426,9 @@ class WulframServer:
         self.map_spawn_points = self._parse_spawn_points_env(os.environ.get("WULFRAM_SPAWN_POINTS", ""))
         default_use_map_spawn = "1" if self.map_name.lower() == "crossroads" else "0"
         self.use_map_spawn_points = os.environ.get("WULFRAM_USE_MAP_SPAWN", default_use_map_spawn) == "1"
+        # Load building entities for collision detection
+        self._building_entities = {}
+        self._load_map_buildings()
         gravity_env = os.environ.get("WULFRAM_GRAVITY")
         try:
             self.gravity = float(gravity_env) if gravity_env is not None else -50.0
@@ -640,6 +658,12 @@ class WulframServer:
             f"projectile_aim_source={self.projectile_aim_source} "
             f"use_slot_aim={int(self.use_slot_aim)}"
         )
+        print(
+            "[CONFIG] energy "
+            f"weapon_enabled={int(self.weapon_energy_enabled)} "
+            f"max={self.player_energy_max:.1f} regen={self.player_energy_regen:.1f}/s "
+            f"debug_viewpoint={int(self.debug_viewpoint)} debug_udp_raw={int(self.debug_udp_raw)}"
+        )
         try:
             self.aim_turn_adjust = float(os.environ.get("WULFRAM_AIM_TURN_ADJUST", "4.5"))
         except ValueError:
@@ -656,12 +680,7 @@ class WulframServer:
             self.turn_deadzone = float(os.environ.get("WULFRAM_TURN_DEADZONE", "0.05"))
         except ValueError:
             self.turn_deadzone = 0.05
-        self.subtick_enabled = os.environ.get("WULFRAM_SUBTICK", "1") == "1"
-        self.ticksync_enabled = os.environ.get("WULFRAM_TICKSYNC", "1") == "1"
-        # Client-frame-driven physics: use client's actual frame dt instead of server tick.
-        # Default OFF: server runs at native 30Hz (1/tick_rate), matching decompile.
-        # Client also runs at 30Hz via accumulator (decoupled from packet send rate).
-        self.client_frame_physics = os.environ.get("WULFRAM_CLIENT_FRAME_PHYSICS", "0") == "1"
+        # (subtick/ticksync/client_frame_physics removed — dead scaffolding, never used in tick loop)
         # float32 precision matching: quantize heading/ang_vel to float32 after each step
         self.f32_physics = os.environ.get("WULFRAM_F32_PHYSICS", "1") == "1"
         # (frame_locked mode removed — not part of original decompile architecture)
@@ -669,15 +688,7 @@ class WulframServer:
             self.turn_sign = float(os.environ.get("WULFRAM_TURN_SIGN", "-1.0"))
         except ValueError:
             self.turn_sign = -1.0
-        # Input transition compensation: when turning input drops to zero,
-        # the server has been applying torque for ~0.5 ticks too long due to
-        # network delay (ACTION_UPDATE arrives after client already stopped).
-        # This factor corrects the over-rotation: heading -= ang_vel * dt * factor
-        # Default 0.5 = assume input changed halfway through the previous tick.
-        try:
-            self.yaw_input_compensation = float(os.environ.get("WULFRAM_YAW_INPUT_COMPENSATION", "0.5"))
-        except ValueError:
-            self.yaw_input_compensation = 0.5
+        # (yaw_input_compensation removed — dead scaffolding, never used in tick loop)
         # Steering curve: piecewise-linear dead-zone curve from client
         # (azurefishy-src Vehicles.c:1030 Piecewise_interpolate).
         # 10 samples over domain 0.0-1.0, looked up with abs(input).
@@ -907,6 +918,32 @@ class WulframServer:
             return 1.0
         return value
 
+    def _get_energy_value(self, ctx: Optional[ClientContext]) -> float:
+        """Return normalized local-state energy (0..1) from per-client energy pool."""
+        if ctx is None:
+            return 1.0
+        max_energy = self.player_energy_max if self.player_energy_max > 0.0 else 100.0
+        value = max(0.0, min(max_energy, ctx.player_energy))
+        return value / max_energy
+
+    def _consume_player_energy(self, ctx: Optional[ClientContext], amount: float) -> float:
+        """Consume energy from a client and return the amount actually consumed."""
+        if ctx is None or amount <= 0.0:
+            return 0.0
+        if not self.weapon_energy_enabled:
+            return 0.0
+        available = max(0.0, ctx.player_energy)
+        used = min(available, amount)
+        ctx.player_energy = available - used
+        return used
+
+    def _regen_player_energy(self, ctx: Optional[ClientContext], dt: float) -> None:
+        """Regenerate player energy over time."""
+        if ctx is None or dt <= 0.0 or self.player_energy_regen <= 0.0:
+            return
+        max_energy = self.player_energy_max if self.player_energy_max > 0.0 else 100.0
+        ctx.player_energy = min(max_energy, ctx.player_energy + (self.player_energy_regen * dt))
+
     def _log_vitals(self, ctx: ClientContext, source: str, *,
                     include_vitals: bool,
                     health: float,
@@ -1110,7 +1147,7 @@ class WulframServer:
         include_pos = mode not in ("heartbeat", "mask0")
         include_vel = mode in ("pos_vel", "pos_vel_rot", "full", "all")
         include_rot = mode in ("pos_rot", "pos_vel_rot", "full", "all")
-        fuel_val = 1.0
+        viewer_fuel = self._get_energy_value(ctx)
         others = self._snapshot_in_game_clients()
         if tick % 300 == 0:
             other_ids = [(c.client_id, c.session.entity_id or c.entity_id) for c in others if c is not ctx]
@@ -1160,7 +1197,7 @@ class WulframServer:
                 is_manned=True,
                 weapon_id=weapon_type,
                 health=health_val,
-                fuel=fuel_val,
+                fuel=viewer_fuel,
                 ammo_count_bits=ammo_bits,
                 ammo_count=ammo_mask,
                 primary_turret_bits=pt_bits,
@@ -1201,6 +1238,7 @@ class WulframServer:
             player_pos=init_pos,
         )
         ctx.entity_type = 0
+        ctx.player_energy = self.player_energy_max
         ctx.vehicle_physics.damp_coeff = self.damp_coeff
 
         # Update pose dict
@@ -1300,10 +1338,10 @@ class WulframServer:
             ctx = self.udp_addr_to_client.get(addr)
 
             # Debug: log raw datagrams that might contain ACTION packets
-            if len(data) > 5 and 0x09 in data:
+            if self.debug_udp_raw and len(data) > 5 and 0x09 in data:
                 print(f"[UDP-RAW] Datagram with 0x09: len={len(data)} data={data[:40].hex()}")
             # Debug: log raw datagrams that might contain VIEWPOINT_INFO (0x35)
-            if 0x35 in data:
+            if self.debug_udp_raw and 0x35 in data:
                 indices = [i for i, b in enumerate(data) if b == 0x35]
                 if indices:
                     idx = indices[0]
@@ -1313,7 +1351,7 @@ class WulframServer:
                     print(f"[UDP-RAW] Datagram with 0x35: len={len(data)} idxs={indices} snippet={snippet}")
                     print(f"[UDP-RAW] Datagram with 0x35 full={data.hex()}")
             # If 0x35 appears inside a 0x10 wrapper, dump full hex for analysis.
-            if data[0] == 0x10 and 0x35 in data:
+            if self.debug_udp_raw and data[0] == 0x10 and 0x35 in data:
                 print(f"[UDP-RAW] 0x10 wrapper: len={len(data)} hex={data.hex()}")
 
             # Parse multiple packets from a single UDP datagram
@@ -1418,7 +1456,8 @@ class WulframServer:
         # First pass: extract viewpoint payloads from any UDP datagram.
         extracted_viewpoints = _extract_viewpoint_payloads(data)
         for pos, pkt in extracted_viewpoints:
-            print(f"[VIEWPOINT-EXTRACT] payload at offset {pos} len={len(pkt)}")
+            if self.debug_viewpoint:
+                print(f"[VIEWPOINT-EXTRACT] payload at offset {pos} len={len(pkt)}")
             yield pkt
 
         cursor = 0
@@ -1457,13 +1496,15 @@ class WulframServer:
                             start = max(0, pos - 4)
                             end = min(len(raw), pos + 20)
                             context = raw[start:end].hex()
-                            print(f"[0x10-SCAN] Found 0x35 at offset {pos}: ...{context}...")
+                            if self.debug_viewpoint:
+                                print(f"[0x10-SCAN] Found 0x35 at offset {pos}: ...{context}...")
                             if pos + 5 <= len(raw):
                                 potential_pkt = raw[pos:]
                                 if len(potential_pkt) >= 5 and potential_pkt[3:5] == b"\x00\x14":
                                     pkt_len = 20
                                     if pos + pkt_len <= len(raw):
-                                        print(f"[0x10-EXTRACT] Extracting 0x35 at offset {pos}, declared len={pkt_len}")
+                                        if self.debug_viewpoint:
+                                            print(f"[0x10-EXTRACT] Extracting 0x35 at offset {pos}, declared len={pkt_len}")
                                         yield potential_pkt[:pkt_len]
 
                 # Consume entire 0x10 packet
@@ -1546,8 +1587,11 @@ class WulframServer:
         # For some packet types (HELLO, D_HANDSHAKE), we may not have ctx yet
         # These packets help identify/register the client
 
-        # Diagnostic: log all reliable stream packets to debug 0x35 visibility
-        if pkt_type in (0x33, 0x35, 0x25, 0x20, 0x3a):
+        # Diagnostic: log reliable stream packets when debugging packet flow.
+        if (
+            pkt_type in (0x33, 0x35, 0x25, 0x20, 0x3a)
+            and (self.debug_udp_raw or (self.debug_viewpoint and pkt_type == 0x35))
+        ):
             print(f"[UDP-RELIABLE] 0x{pkt_type:02X} len={len(data)} head={data[:min(16,len(data))].hex()}")
 
         # Handle UDP HELLO (session key verification)
@@ -1637,7 +1681,8 @@ class WulframServer:
         elif pkt_type == 0x35:
             # VIEWPOINT_INFO - client sends camera/view position and orientation
             # This is the ACTUAL player pose, not reconstructed from inputs!
-            print(f"[UDP] VIEWPOINT_INFO 0x35 len={len(data)} data={data[:32].hex()}...")
+            if self.debug_viewpoint:
+                print(f"[UDP] VIEWPOINT_INFO 0x35 len={len(data)} data={data[:32].hex()}...")
             if len(data) >= 3:
                 seq_num = struct.unpack(">H", data[1:3])[0]
                 self._send_udp_ack(ctx, addr, 0x35, seq_num)
@@ -1653,7 +1698,8 @@ class WulframServer:
             # ACTION_DUMP - full behavior slot dump (includes fire state)
             if ctx is None:
                 ctx = self._ghost_rejoin(addr)
-            print(f"[UDP] ACTION_DUMP received: len={len(data)} data={data[:24].hex()}")
+            if self.debug_sync:
+                print(f"[UDP] ACTION_DUMP received: len={len(data)} data={data[:24].hex()}")
             self._handle_action_dump(ctx, data, addr)
 
         elif pkt_type == 0x0A:
@@ -1678,7 +1724,8 @@ class WulframServer:
 
         elif pkt_type == 0x0C:
             # STATE_REQUEST - may contain state/position info
-            print(f"[UDP] STATE_REQUEST 0x0C len={len(data)} data={data.hex()}")
+            if self.debug_sync:
+                print(f"[UDP] STATE_REQUEST 0x0C len={len(data)} data={data.hex()}")
             self._handle_state_request(ctx, data, addr)
 
         else:
@@ -1803,6 +1850,7 @@ class WulframServer:
             entity_id=entity_id,
         )
         ctx.tcp_handler = None  # No TCP for ghost clients
+        ctx.player_energy = self.player_energy_max
         ctx.vehicle_physics.damp_coeff = self.damp_coeff
 
         # Set up weapon/jump systems.
@@ -2008,6 +2056,7 @@ class WulframServer:
         spawn_yaw = math.radians(float(spawn_heading_env)) if spawn_heading_env else 0.0
         ctx.player_yaw = -spawn_yaw
         ctx.player_heading = spawn_yaw
+        ctx.player_energy = self.player_energy_max
         ctx.vehicle_physics.heading = spawn_yaw
         ctx.last_action_dump_time = time.monotonic()  # Reset timer for position tracking
         if self.spawn_sets_ground_level:
@@ -2081,7 +2130,7 @@ class WulframServer:
         # Optional: create the entity via UPDATE_ARRAY before PLAYER_INFO.
         if self.spawn_send_update_array:
             health_val = self._get_health_value(ctx)
-            fuel_val = 1.0
+            fuel_val = self._get_energy_value(ctx)
             ua_packet = build_update_array_create_tank(
                 tick=self._get_network_tick(ctx),
                 entity_id=net_id,
@@ -2397,6 +2446,7 @@ class WulframServer:
                 ctx.ground_level_override = spawn_pos[1]
         else:
             ctx.ground_level_override = None
+        ctx.player_energy = self.player_energy_max
         tank_packet = build_udp_tank_packet_wf(
             net_id=net_id,
             unit_type=0,
@@ -2634,6 +2684,87 @@ class WulframServer:
             self.map_spawn_points = points
 
         return self.map_spawn_points
+
+    # Unit code → entity type mapping for building collision
+    _BUILDING_UNIT_CODES = {
+        'e': 25,  # ENERGY_BUILDING
+        'f': 26,  # FUEL_BUILDING
+        'r': 27,  # REPAIR_BUILDING
+        'S': 28,  # SPECIAL_STRUCTURE
+        's': 29,  # SENSOR_BUILDING
+        'g': 30,  # GUN_TURRET
+        'E': 31,  # ENERGY_STRUCTURE
+        'L': 32,  # LAUNCHER
+        'p': 33,  # PAD
+        'o': 34,  # ORBITAL_BUILDING
+        'd': 35,  # DARK_LIGHT
+        'b': 36,  # BUILDING
+        '*': 37,  # STRUCTURE
+    }
+
+    def _load_map_buildings(self):
+        """Load building entities from the map state file for collision."""
+        repo_root = Path(__file__).resolve().parents[2]
+        maps_root = repo_root / "slurpysoft-wulfram" / "data" / "maps"
+        map_name = self.map_name
+        state_path = maps_root / map_name / "state"
+
+        if not state_path.exists() and maps_root.exists():
+            for entry in maps_root.iterdir():
+                if entry.is_dir() and entry.name.lower() == map_name.lower():
+                    candidate = entry / "state"
+                    if candidate.exists():
+                        state_path = candidate
+                        break
+
+        if not state_path.exists():
+            print(f"[MAP] No state file found for buildings: {state_path}")
+            self._building_entities = {}
+            return
+
+        try:
+            lines = state_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except OSError:
+            self._building_entities = {}
+            return
+
+        buildings = {}
+        oid = 10001  # Offset from spawn point OIDs (5001+)
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if not parts:
+                continue
+
+            # Handle optional crate prefix: "c <code> ..."
+            data_start = 1
+            unit_code = parts[0]
+            if unit_code == "c":
+                if len(parts) < 2:
+                    continue
+                unit_code = parts[1]
+                data_start = 2
+
+            entity_type = self._BUILDING_UNIT_CODES.get(unit_code)
+            if entity_type is None:
+                continue
+
+            try:
+                # team = int(parts[data_start])  # unused for collision
+                x = float(parts[data_start + 1])
+                y = float(parts[data_start + 2])
+                z = float(parts[data_start + 3])
+            except (ValueError, IndexError):
+                continue
+
+            buildings[oid] = (x, y, z, entity_type)
+            oid += 1
+
+        self._building_entities = buildings
+        if buildings:
+            print(f"[MAP] Loaded {len(buildings)} building entities for collision from {state_path}")
 
     def get_spawn_points(self) -> list:
         """Return spawn point list for current map/config."""
@@ -2920,14 +3051,14 @@ class WulframServer:
                     flags=1,
                     include_vitals=self.tank_vitals,
                     health=1.0,
-                    energy=1.0
+                    energy=self._get_energy_value(ctx)
                 )
                 self._log_vitals(
                     ctx,
                     "TANK_TCP_RESEND",
                     include_vitals=self.tank_vitals,
                     health=1.0,
-                    energy=1.0,
+                    energy=self._get_energy_value(ctx),
                     weapon_id=self.weapon_id,
                     note=f"net_id={entity_id}",
                 )
@@ -2996,14 +3127,14 @@ class WulframServer:
             flags=1,
             include_vitals=self.tank_vitals,
             health=1.0,
-            energy=1.0
+            energy=self._get_energy_value(ctx)
         )
         self._log_vitals(
             ctx,
             "TANK_TCP_SPAWN",
             include_vitals=self.tank_vitals,
             health=1.0,
-            energy=1.0,
+            energy=self._get_energy_value(ctx),
             weapon_id=self.weapon_id,
             note=f"net_id={entity_id}",
         )
@@ -3027,12 +3158,12 @@ class WulframServer:
         if ctx is None:
             return
 
-        # Log all VIEWPOINT packets for format analysis
-        print(f"[UDP] VIEWPOINT_INFO 0x35 len={len(data)} data={data.hex()[:40]}...")
+        if self.debug_viewpoint:
+            print(f"[UDP] VIEWPOINT_INFO 0x35 len={len(data)} data={data.hex()[:40]}...")
 
         if len(data) < 20:
             # Short packet - might be different subtype, log for analysis
-            if len(data) >= 5:
+            if self.debug_viewpoint and len(data) >= 5:
                 print(f"[VIEWPOINT-SHORT] len={len(data)} bytes={data.hex()}")
             return
 
@@ -3081,17 +3212,19 @@ class WulframServer:
                     delta_deg -= 360.0
                 while delta_deg < -180.0:
                     delta_deg += 360.0
-                print(
-                    f"[VIEWPOINT #{ctx.viewpoint_count}] pitch={pitch_deg:.1f} "
-                    f"yaw={yaw_deg:.1f} (was {old_yaw_deg:.1f})"
-                )
-                print(
-                    f"[HEADING-COMPARE] server={heading_deg:.1f} client={yaw_deg:.1f} "
-                    f"delta={delta_deg:.1f}deg"
-                )
+                if self.debug_viewpoint:
+                    print(
+                        f"[VIEWPOINT #{ctx.viewpoint_count}] pitch={pitch_deg:.1f} "
+                        f"yaw={yaw_deg:.1f} (was {old_yaw_deg:.1f})"
+                    )
+                    print(
+                        f"[HEADING-COMPARE] server={heading_deg:.1f} client={yaw_deg:.1f} "
+                        f"delta={delta_deg:.1f}deg"
+                    )
                 return
             except (IndexError, ValueError, struct.error) as e:
-                print(f"[VIEWPOINT-ERR] Failed to decode: {e}")
+                if self.debug_viewpoint:
+                    print(f"[VIEWPOINT-ERR] Failed to decode: {e}")
 
         # Fallback: attempt double decode if payload is larger in other variants.
         if len(payload) >= 17:
@@ -3106,12 +3239,14 @@ class WulframServer:
                 ctx.player_aim_time = time.monotonic()
 
                 ctx.viewpoint_count = ctx.viewpoint_count + 1
-                print(
-                    f"[VIEWPOINT #{ctx.viewpoint_count}] pitch={math.degrees(pitch):.1f} "
-                    f"yaw={math.degrees(yaw):.1f} (was {math.degrees(old_yaw):.1f})"
-                )
+                if self.debug_viewpoint:
+                    print(
+                        f"[VIEWPOINT #{ctx.viewpoint_count}] pitch={math.degrees(pitch):.1f} "
+                        f"yaw={math.degrees(yaw):.1f} (was {math.degrees(old_yaw):.1f})"
+                    )
             except struct.error as e:
-                print(f"[VIEWPOINT-ERR] Failed to decode (double): {e}")
+                if self.debug_viewpoint:
+                    print(f"[VIEWPOINT-ERR] Failed to decode (double): {e}")
 
     def _handle_state_request(self, ctx: Optional[ClientContext], data: bytes, addr: tuple):
         """
@@ -3181,12 +3316,15 @@ class WulframServer:
                 aim_yaw,
             )
             ctx.weapon_system.projectile_aim_source = aim_override if aim_override != "auto" else aim_src
-            # Force pulse cannon for testing
-            ctx.weapon_system.current_weapon = 4  # PULSE_CANNON
 
             # Weapon spawning with wulf-forge encoding
             if self.projectiles_enabled:
-                new_projectiles = ctx.weapon_system.update()
+                energy_available = ctx.player_energy if self.weapon_energy_enabled else None
+                new_projectiles, energy_spent = ctx.weapon_system.update(
+                    available_energy=energy_available
+                )
+                if energy_spent > 0.0:
+                    self._consume_player_energy(ctx, energy_spent)
                 if new_projectiles:
                     yaw_deg = math.degrees(ctx.player_yaw)
                     turn_val = ctx.weapon_system.behavior_slots[BehaviorSlot.TURNING]
@@ -3212,7 +3350,8 @@ class WulframServer:
         if ctx is None:
             return
 
-        print(f"[UDP] ACTION_UPDATE received: len={len(data)} data={data.hex()}")
+        if self.debug_sync:
+            print(f"[UDP] ACTION_UPDATE received: len={len(data)} data={data.hex()}")
         client_tick = 0
         if len(data) >= 6:
             try:
@@ -3268,12 +3407,15 @@ class WulframServer:
                 aim_yaw,
             )
             ctx.weapon_system.projectile_aim_source = aim_override if aim_override != "auto" else aim_src
-            # Force pulse cannon for testing
-            ctx.weapon_system.current_weapon = 4  # PULSE_CANNON
 
             # Weapon spawning with wulf-forge encoding
             if self.projectiles_enabled:
-                new_projectiles = ctx.weapon_system.update()
+                energy_available = ctx.player_energy if self.weapon_energy_enabled else None
+                new_projectiles, energy_spent = ctx.weapon_system.update(
+                    available_energy=energy_available
+                )
+                if energy_spent > 0.0:
+                    self._consume_player_energy(ctx, energy_spent)
                 if new_projectiles:
                     turn_val = ctx.weapon_system.behavior_slots[BehaviorSlot.TURNING]
                     vp_yaw = math.degrees(ctx.player_aim_yaw)
@@ -3417,7 +3559,7 @@ class WulframServer:
                     include_local_state=self.projectile_local_stats,
                     weapon_id=self._get_local_state_weapon_type(target),
                     health=self._get_health_value(target),
-                    fuel=1.0,
+                    fuel=self._get_energy_value(target),
                     entity_config=self.projectile_config,
                     is_static=self.projectile_spawn_snap,
                 )
@@ -3471,7 +3613,7 @@ class WulframServer:
                 include_health=True,
                 weapon_id=hb_weapon,
                 health=hb_health,
-                fuel=1.0,
+                fuel=self._get_energy_value(ctx),
             )
             self.udp_handler.send_to(hb_packet, ctx.session.udp_addr)
             if self.pktlog.enabled:
@@ -3841,8 +3983,8 @@ class WulframServer:
                     vx -= nx * vel_dot
                     vy -= ny * vel_dot
 
-        # Check buildings from entity registry (stored on server during heartbeat)
-        building_entities = getattr(self, '_building_entities', {})
+        # Check buildings loaded from map state file
+        building_entities = self._building_entities
         for eid, (bx, by, bz, etype) in building_entities.items():
             hx, hy = self._BUILDING_HALF_EXTENTS.get(etype, (8.0, 8.0))
             r = self._TANK_RADIUS
@@ -3981,7 +4123,7 @@ class WulframServer:
                             include_local_state=self.projectile_local_stats,
                             weapon_id=self._get_local_state_weapon_type(target),
                             health=self._get_health_value(target),
-                            fuel=1.0,
+                            fuel=self._get_energy_value(target),
                         )
                         self.udp_handler.send_to(pkt, target.session.udp_addr)
                         if self.pktlog.enabled:
@@ -4098,7 +4240,7 @@ class WulframServer:
                 include_health=True,
                 weapon_id=weapon_type,
                 health=self._get_health_value(target),
-                fuel=1.0,
+                fuel=self._get_energy_value(target),
             )
             self.udp_handler.send_to(health_pkt, target.session.udp_addr)
             if self.pktlog.enabled:
@@ -4145,7 +4287,7 @@ class WulframServer:
                     include_health=True,
                     weapon_id=c_weapon,
                     health=self._get_health_value(client),
-                    fuel=1.0,
+                    fuel=self._get_energy_value(client),
                 )
                 self.udp_handler.send_to(c_pkt, client.session.udp_addr)
 
@@ -4388,7 +4530,7 @@ class WulframServer:
             # Consume fuel (if using energy system)
             fuel_cost = ctx.jump_jet_system.get_fuel_cost(entity_type)
             if fuel_cost > 0:
-                ctx.player_energy = max(0.0, ctx.player_energy - fuel_cost)
+                self._consume_player_energy(ctx, fuel_cost)
 
             # Send position/velocity update to client
             self._send_jump_velocity_update(ctx, addr)
@@ -4441,7 +4583,7 @@ class WulframServer:
             include=True,
             weapon_id=self._get_local_state_weapon_type(ctx),
             health=1.0,
-            fuel=1.0,
+            fuel=self._get_energy_value(ctx),
             include_ammo_turrets=False,
         )
 
@@ -4489,13 +4631,7 @@ class WulframServer:
                     key, _, val = line.partition("=")
                     os.environ[key.strip()] = val.strip()
 
-        # Config values that may be added in new code
-        try:
-            comp = float(os.environ.get("WULFRAM_YAW_INPUT_COMPENSATION", "0.5"))
-        except ValueError:
-            comp = 0.5
-        _default("yaw_input_compensation", comp)
-        print(f"[RELOAD] _apply_reload_defaults done (yaw_comp={self.yaw_input_compensation})")
+        print("[RELOAD] _apply_reload_defaults done")
 
     def _tick_loop(self, ctx: ClientContext):
         """Game tick loop - sends UPDATE_ARRAY periodically."""
@@ -4566,8 +4702,11 @@ class WulframServer:
                 prev_input = getattr(ctx, 'prev_raw_turn_input', 0.0)
                 # Client: entity[0x50] += turn_mobility * (float)turn_adjust * yaw_axis
                 # turn_adjust read as double from config+0x10, cast to float32 BEFORE multiply
+                # Use per-vehicle turn_adjust from shared config (matches client behavior)
                 from .physics import _f32
-                _f32_turn_adjust = _f32(float(self.turn_adjust))
+                veh_cfg = VEHICLE_PHYSICS_CONFIGS.get(ctx.entity_type)
+                turn_adj = veh_cfg.turn_adjust if veh_cfg else self.turn_adjust
+                _f32_turn_adjust = _f32(float(turn_adj))
                 torque = _f32(_f32_turn_adjust * _f32(raw_input))  # lateral_mobility=1.0
 
                 physics = ctx.vehicle_physics
@@ -4586,20 +4725,21 @@ class WulframServer:
                     effective_hz = elapsed_ticks / max(0.001, now_mono - last_transition_time)
                     ctx._yaw_transition_time = now_mono
                     ctx._yaw_transition_tick = ctx.session.tick
-                    yaw_msg = (
-                        f"[YAW-INPUT] {transition} c{ctx.client_id} "
-                        f"input={prev_input:.3f}->{raw_input:.3f} "
-                        f"ang_vel={physics.angular_velocity:.4f} "
-                        f"heading={math.degrees(physics.heading):.2f}deg "
-                        f"t={ctx.session.tick} "
-                        f"wall={elapsed_ms:.0f}ms ticks={elapsed_ticks} hz={effective_hz:.1f}"
-                    )
-                    print(yaw_msg)
-                    try:
-                        with open(r"C:\Users\wstri\dev\wolfram\yaw_events.log", "a") as _yf:
-                            _yf.write(yaw_msg + "\n")
-                    except Exception:
-                        pass
+                    if self.debug_sync:
+                        yaw_msg = (
+                            f"[YAW-INPUT] {transition} c{ctx.client_id} "
+                            f"input={prev_input:.3f}->{raw_input:.3f} "
+                            f"ang_vel={physics.angular_velocity:.4f} "
+                            f"heading={math.degrees(physics.heading):.2f}deg "
+                            f"t={ctx.session.tick} "
+                            f"wall={elapsed_ms:.0f}ms ticks={elapsed_ticks} hz={effective_hz:.1f}"
+                        )
+                        print(yaw_msg)
+                        try:
+                            with open(r"C:\Users\wstri\dev\wolfram\yaw_events.log", "a") as _yf:
+                                _yf.write(yaw_msg + "\n")
+                        except Exception:
+                            pass
 
                 ctx.prev_raw_turn_input = raw_input
 
@@ -4620,6 +4760,14 @@ class WulframServer:
 
                 self._update_player_position(ctx, dt_override=physics_dt, heading_override=old_heading)
                 self._update_player_aim(ctx)
+                self._regen_player_energy(ctx, physics_dt)
+
+                # Send debug sync state for measuring client-server divergence
+                if self.debug_sync:
+                    fwd_input = ws.behavior_slots[BehaviorSlot.MOVING_FORWARD]
+                    strafe_input = ws.behavior_slots[BehaviorSlot.MOVING_SIDEWAYS]
+                    self._send_debug_sync(ctx, ws.client_frame_counter,
+                                          raw_input, fwd_input, strafe_input)
 
                 # YAW-TRACK: disabled to avoid per-tick console I/O slowing tick loop
                 # if abs(ctx.angular_vel_yaw) > 0.01:
@@ -4665,7 +4813,7 @@ class WulframServer:
                 if ctx.session.tick % 300 == 0:
                     print(f"[TICK-DEBUG] Client {ctx.client_id}: network_tick={tick} client_tick={ctx.last_client_tick} offset={ctx.tick_offset}")
                 health_val = self._get_health_value(ctx)
-                fuel_val = 1.0
+                fuel_val = self._get_energy_value(ctx)
                 # Full position updates (server authoritative).
                 # Default OFF: wulf-forge does NOT send the local player's position
                 # in UPDATE_ARRAY. Sending position overrides the client's own physics
@@ -4741,7 +4889,7 @@ class WulframServer:
                                 "include_rot": include_lrot,
                                 "include_entity_vitals": self.update_entity_vitals,
                                 "speed_scale": 1.0,
-                                "fuel": 1.0,
+                                "fuel": fuel_val,
                             }
                         ]
                         mode = self.remote_update_mode
@@ -4929,7 +5077,7 @@ class WulframServer:
                                     "include_rot": True,
                                     "include_entity_vitals": self.view_update_entity_vitals,
                                     "speed_scale": 1.0,
-                                    "fuel": 1.0,
+                                    "fuel": fuel_val,
                                 }
                             ]
                             view_payload = build_view_update_multi(
@@ -5159,7 +5307,7 @@ class WulframServer:
                     }
 
                 # Log every 10 ticks to trace movement + health sends
-                if ctx.session.tick % 10 == 0:
+                if self.debug_sync and ctx.session.tick % 10 == 0:
                     px, py, pz = ctx.player_pos
                     vx, vy, vz = ctx.player_vel
                     yaw_deg = math.degrees(ctx.player_yaw)
