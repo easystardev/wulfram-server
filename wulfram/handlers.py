@@ -14,7 +14,7 @@ from .packets import (
     build_login_status, build_player, build_team_info,
     build_world_stats, build_bps_response, build_chat_message,
     build_add_to_roster, build_update_stats, build_tank_packet,
-    build_update_array_empty, build_update_array_spawn_points, build_view_update_spawn_points, build_view_update_multi, get_ticks,
+    build_update_array_empty, build_update_array_spawn_points, get_ticks,
     build_behavior_packet, build_translation_packet, build_game_clock,
     build_motd, build_reincarnate,
 )
@@ -292,21 +292,9 @@ def handle_want_updates(server: "WulframServer", ctx: "ClientContext", packet: b
     # Send welcome chat
     tcp.send(build_chat_message("System: Welcome to Wulfram!"))
 
-    # Send initial VIEW_UPDATE snapshot (wulf-forge does this on WANT_UPDATES)
-    if getattr(server, "view_update_enabled", False):
-        tick = get_ticks()
-        include_local = (
-            getattr(server, "view_update_local_stats", False)
-            and session.translation_ack_received
-        )
-        tcp.send(build_view_update_multi(
-            tick,
-            include_local_state=include_local,
-            weapon_id=0,
-            health=1.0,
-            fuel=1.0,
-            entities=[],
-        ))
+    # NOTE: VIEW_UPDATE initial snapshot disabled over TCP — OG client's
+    # undecompiled handler causes TCP stream desync -> MAX_STREAM_DATA crash.
+    # Re-enable when OG handler wire format is verified via Ghidra.
 
     # Send empty update array
     if FEATURES.send_update_array_empty:
@@ -321,21 +309,9 @@ def handle_want_updates(server: "WulframServer", ctx: "ClientContext", packet: b
                 sp["x"], sp["y"], sp["z"] = x, y, z
         print(f"[GAME] Client {ctx.client_id}: Sending {len(spawn_points)} spawn points")
         tick = get_ticks()
-        if getattr(server, "view_update_enabled", False):
-            include_local = (
-                getattr(server, "view_update_local_stats", False)
-                and session.translation_ack_received
-            )
-            tcp.send(build_view_update_spawn_points(
-                tick,
-                spawn_points,
-                include_local_state=include_local,
-                weapon_id=0,
-                health=1.0,
-                fuel=1.0,
-            ))
-        else:
-            tcp.send(build_update_array_spawn_points(tick, spawn_points))
+        # Always use UPDATE_ARRAY for spawn points — VIEW_UPDATE over TCP
+        # crashes OG client (TCP stream desync -> MAX_STREAM_DATA).
+        tcp.send(build_update_array_spawn_points(tick, spawn_points))
 
     # Optional legacy path: spawn directly from team-select state.
     if session.pending_spawn_team_id:

@@ -16,8 +16,11 @@ from .packets import (
     VEC_POS_MAX, VEC_POS_RANGE,
     VEC_VEL_MAX, VEC_VEL_RANGE,
     VEC_ROT_MAX, VEC_ROT_RANGE,
+    compress_value as _compress_value,
 )
 from wulfram2_protocol.entities import (  # noqa: F401 — re-export for existing importers
+    ACTION_ANALOG_SLOTS,
+    ACTION_DUMP_CONTROL_SLOTS,
     BehaviorSlot,
     EntityType,
     WeaponType,
@@ -167,6 +170,9 @@ class WeaponSystem:
         self.slot_index_bits = int(os.environ.get("WULFRAM_SLOT_INDEX_BITS", "16"))
         self.debug_inputs = os.environ.get("WULFRAM_DEBUG_INPUT", "0") == "1"
         self.debug_input_time = os.environ.get("WULFRAM_DEBUG_INPUT_TIME", "0") == "1"
+        # High-fidelity default: slot 4 is not a control-quantized weapon ID in
+        # ACTION_UPDATE/ACTION_DUMP. Keep this opt-in only for legacy experiments.
+        self.weapon_from_slot4 = os.environ.get("WULFRAM_WEAPON_FROM_SLOT4", "0") == "1"
 
         # Player state (set by server)
         self.player_pos: Tuple[float, float, float] = (0.0, 0.0, 0.0)
@@ -187,10 +193,10 @@ class WeaponSystem:
         Decode ACTION_DUMP packet (0x09).
         Format: [opcode:1] [tick:4] [frame:4] [slot_values:bit-packed]
 
-        Slot encoding (from decompilation):
+        Slot encoding (from decompile):
         - Slot 5 (UPWARD_THRUST) uses zoom quantizer (index 10)
         - Slots 1-3 and 6-7 use control quantizer (index 11)
-        - All other slots use 1 bit (boolean)
+        - Slot 4 and slots 8+ use raw 1-bit values
 
         Returns True if successfully decoded.
         """
@@ -204,19 +210,18 @@ class WeaponSystem:
 
             # Debug: capture raw values before decoding
             raw_values = {}
+            decoded_slots = self.behavior_slots.copy()
 
             # Slot indices 1..21 (slot 0 is not transmitted)
             for slot_idx in range(1, 22):
-                try:
-                    # Track raw bits for debugging control slots
-                    start_byte = reader.byte_pos
-                    start_bit = reader.bit_pos
-                    value, raw_val = self._read_behavior_value_debug(slot_idx, reader)
-                    raw_values[slot_idx] = raw_val
-                except ValueError:
-                    break
-                if 0 <= slot_idx < len(self.behavior_slots):
-                    self.behavior_slots[slot_idx] = value
+                # Track raw bits for debugging control slots
+                value, raw_val = self._read_behavior_value_debug(slot_idx, reader)
+                raw_values[slot_idx] = raw_val
+                if 0 <= slot_idx < len(decoded_slots):
+                    decoded_slots[slot_idx] = value
+
+            # Apply atomically so malformed dumps cannot partially corrupt state.
+            self.behavior_slots = decoded_slots
 
             # Debug: log movement-related slots with RAW values
             turn = self.behavior_slots[BehaviorSlot.TURNING]
@@ -293,30 +298,36 @@ class WeaponSystem:
 
         updated_any = False
         changed = []
+        decoded_updates = []
         max_updates = min(count, 64)
 
         try:
             for _ in range(max_updates):
                 slot_idx = reader.read_bits(self.slot_index_bits)
+                if slot_idx < 0 or slot_idx >= len(self.behavior_slots):
+                    return False
                 value = self._read_behavior_value_update(slot_idx, reader)
-                if 0 <= slot_idx < len(self.behavior_slots):
-                    old_val = self.behavior_slots[slot_idx]
-                    self.behavior_slots[slot_idx] = value
-                    updated_any = True
-                    if abs(value - old_val) > 0.01:
-                        changed.append((slot_idx, value))
-                    if slot_idx == BehaviorSlot.TURNING and abs(value - old_val) > 0.01:
-                        self.turn_input_prev_value = old_val
-                        self.turn_input_change_time = time.monotonic()
-                        self.turn_input_change_client_tick = tick
-                        # Compute client frame dt from consecutive ACTION_UPDATE ticks
-                        if self.prev_action_client_tick > 0 and tick > self.prev_action_client_tick:
-                            self.client_frame_dt = (tick - self.prev_action_client_tick) / 1000.0
-                    if slot_idx == BehaviorSlot.FIRE and abs(value - old_val) > 0.01:
-                        print(f"[WEAPON] FIRE: {old_val:.3f} -> {value:.3f}")
+                decoded_updates.append((slot_idx, value))
         except ValueError:
-            # Partial packet - still apply what we decoded so far.
-            pass
+            return False
+
+        # Apply updates only after full packet decode succeeds.
+        now_mono = time.monotonic()
+        for slot_idx, value in decoded_updates:
+            old_val = self.behavior_slots[slot_idx]
+            self.behavior_slots[slot_idx] = value
+            updated_any = True
+            if abs(value - old_val) > 0.01:
+                changed.append((slot_idx, value))
+            if slot_idx == BehaviorSlot.TURNING and abs(value - old_val) > 0.01:
+                self.turn_input_prev_value = old_val
+                self.turn_input_change_time = now_mono
+                self.turn_input_change_client_tick = tick
+                # Compute client frame dt from consecutive ACTION_UPDATE ticks
+                if self.prev_action_client_tick > 0 and tick > self.prev_action_client_tick:
+                    self.client_frame_dt = (tick - self.prev_action_client_tick) / 1000.0
+            if slot_idx == BehaviorSlot.FIRE and abs(value - old_val) > 0.01:
+                print(f"[WEAPON] FIRE: {old_val:.3f} -> {value:.3f}")
 
         # Always update prev tick for client_frame_dt calculation on next packet
         if tick > 0:
@@ -351,8 +362,7 @@ class WeaponSystem:
         if slot_idx == BehaviorSlot.UPWARD_THRUST:
             raw = reader.read_bits(self.zoom_bits)
             return self._decode_quantized(raw, self.zoom_bits, self.zoom_max, self.zoom_range)
-        if slot_idx in (BehaviorSlot.UNUSED0, BehaviorSlot.TURNING, BehaviorSlot.MOVING_FORWARD,
-                        BehaviorSlot.MOVING_SIDEWAYS, BehaviorSlot.SLOT6, BehaviorSlot.SLOT7):
+        if slot_idx in ACTION_DUMP_CONTROL_SLOTS:
             raw = reader.read_bits(self.control_bits)
             return self._decode_quantized(raw, self.control_bits, self.control_max, self.control_range)
         # Other slots are binary
@@ -367,9 +377,7 @@ class WeaponSystem:
         if slot_idx == BehaviorSlot.UPWARD_THRUST:
             raw = reader.read_bits(self.zoom_bits)
             return self._decode_quantized(raw, self.zoom_bits, self.zoom_max, self.zoom_range)
-        if slot_idx in (BehaviorSlot.UNUSED0, BehaviorSlot.TURNING, BehaviorSlot.MOVING_FORWARD,
-                        BehaviorSlot.MOVING_SIDEWAYS, BehaviorSlot.WEAPON_SELECT,
-                        BehaviorSlot.SLOT6, BehaviorSlot.SLOT7):
+        if slot_idx in ACTION_ANALOG_SLOTS:
             raw = reader.read_bits(self.control_bits)
             return self._decode_quantized(raw, self.control_bits, self.control_max, self.control_range)
         # Other slots are binary (1 bit)
@@ -381,9 +389,7 @@ class WeaponSystem:
         if slot_idx == BehaviorSlot.UPWARD_THRUST:
             raw = reader.read_bits(self.zoom_bits)
             return self._decode_quantized(raw, self.zoom_bits, self.zoom_max, self.zoom_range), raw
-        if slot_idx in (BehaviorSlot.UNUSED0, BehaviorSlot.TURNING, BehaviorSlot.MOVING_FORWARD,
-                        BehaviorSlot.MOVING_SIDEWAYS, BehaviorSlot.WEAPON_SELECT,
-                        BehaviorSlot.SLOT6, BehaviorSlot.SLOT7):
+        if slot_idx in ACTION_DUMP_CONTROL_SLOTS:
             raw = reader.read_bits(self.control_bits)
             return self._decode_quantized(raw, self.control_bits, self.control_max, self.control_range), raw
         # Other slots are binary
@@ -411,16 +417,16 @@ class WeaponSystem:
         # Update cooldowns
         self.fire_cooldown = max(0.0, self.fire_cooldown - dt)
 
-        # Read weapon from slot 4 (WEAPON_SELECT).
-        # Client sends actual weapon slot ID (0, 4, 7, 8, 9, 11, 13, 17) via
-        # 16-bit control quantizer. Round to nearest integer to recover weapon ID.
-        weapon_val = self.behavior_slots[BehaviorSlot.WEAPON_SELECT]
-        weapon_slot = round(weapon_val)
-        if weapon_slot != self.current_weapon:
-            old_name = WEAPON_NAMES.get(self.current_weapon, f"Slot {self.current_weapon}")
-            new_name = WEAPON_NAMES.get(weapon_slot, f"Slot {weapon_slot}")
-            print(f"[WEAPON] Weapon changed: {old_name} -> {new_name} (raw={weapon_val:.3f})")
-            self.current_weapon = weapon_slot
+        # Decompile fidelity: slot 4 is not control-quantized. Weapon selection is
+        # driven by WEAPON_DEMAND and other explicit game actions, not slot-4 analog.
+        if self.weapon_from_slot4:
+            weapon_val = self.behavior_slots[BehaviorSlot.WEAPON_SELECT]
+            weapon_slot = round(weapon_val)
+            if 0 <= weapon_slot <= 31 and weapon_slot != self.current_weapon:
+                old_name = WEAPON_NAMES.get(self.current_weapon, f"Slot {self.current_weapon}")
+                new_name = WEAPON_NAMES.get(weapon_slot, f"Slot {weapon_slot}")
+                print(f"[WEAPON] Weapon changed: {old_name} -> {new_name} (raw={weapon_val:.3f})")
+                self.current_weapon = weapon_slot
 
         new_projectiles = []
         energy_spent = 0.0
@@ -919,37 +925,6 @@ def build_projectile_spawn_packet(
     # denom = (1 << 16) - 2 = 65534
     # raw = ((max - val) * denom / range) + 1
 
-    def compress_value(val: float, max_val: float, range_val: float, total_bits: int = 16) -> int:
-        """Compress value using wulf-forge's algorithm.
-
-        Args:
-            val: Value to compress
-            max_val: Maximum value in range
-            range_val: Total range (max - min)
-            total_bits: Number of bits to use (16 for position, 14 for velocity)
-        """
-        min_val = max_val - range_val
-
-        # Special case: exactly 0
-        if val == 0.0:
-            return 0
-
-        # Clamp to valid range
-        if val > max_val:
-            val = max_val
-        if val < min_val:
-            val = min_val
-
-        # Denominator based on bit count
-        denom = (1 << total_bits) - 2
-
-        # Inverse quantization: raw = ((max - val) * denom / range) + 1
-        delta = max_val - val
-        scaled = (delta * denom) / range_val
-        raw = int(scaled) + 1
-
-        return raw
-
     def decode_value(raw: int, max_val: float, range_val: float, total_bits: int) -> float:
         """Decode quantized integer to float using ValueQuantizer formula."""
         if raw == 0:
@@ -965,7 +940,7 @@ def build_projectile_spawn_packet(
     pos_raw = []
     pos_dec = []
     for v in proj.pos:
-        compressed = compress_value(v, VEC_POS_MAX, VEC_POS_RANGE)
+        compressed = _compress_value(v, VEC_POS_MAX, VEC_POS_RANGE)
         pos_raw.append(compressed)
         if debug_quant:
             pos_dec.append(decode_value(compressed, VEC_POS_MAX, VEC_POS_RANGE, 16))
@@ -1043,32 +1018,18 @@ def build_projectile_update_packet(
     # Value 0 selects bank 0 (quantizer array index 16)
     bw.write_bits(16, 0)
 
-    # Position compression
-    def compress_value(val: float, max_val: float, range_val: float, total_bits: int = 16) -> int:
-        min_val = max_val - range_val
-        if val == 0.0:
-            return 0
-        if val > max_val:
-            val = max_val
-        if val < min_val:
-            val = min_val
-        denom = (1 << total_bits) - 2
-        delta = max_val - val
-        scaled = (delta * denom) / range_val
-        return int(scaled) + 1
-
     # Position: 4-bit header + 16 bits × 3
     # wulf-forge VEC_POS: max=8192, range=16384
     bw.write_bits(4, 15)
     for v in proj.pos:
-        compressed = compress_value(v, VEC_POS_MAX, VEC_POS_RANGE, total_bits=16)
+        compressed = _compress_value(v, VEC_POS_MAX, VEC_POS_RANGE, total_bits=16)
         bw.write_bits(16, compressed)
 
     # Velocity: 4-bit header + 16 bits × 3
     # wulf-forge VEC_VEL: max=1000, range=2000
     bw.write_bits(4, 15)
     for v in proj.vel:
-        compressed = compress_value(v, VEC_VEL_MAX, VEC_VEL_RANGE, total_bits=16)
+        compressed = _compress_value(v, VEC_VEL_MAX, VEC_VEL_RANGE, total_bits=16)
         bw.write_bits(16, compressed)
 
     # Rotation: 4-bit header + 16 bits × 3 (REQUIRED for non-static entities!)
@@ -1091,7 +1052,7 @@ def build_projectile_update_packet(
 
     bw.write_bits(4, 15)
     for v in rot:
-        compressed = compress_value(v, VEC_ROT_MAX, VEC_ROT_RANGE)
+        compressed = _compress_value(v, VEC_ROT_MAX, VEC_ROT_RANGE)
         bw.write_bits(16, compressed)
 
     return b'\x0E' + tick_bytes + bw.get_bytes()

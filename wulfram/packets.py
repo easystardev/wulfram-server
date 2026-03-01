@@ -14,7 +14,7 @@ import os
 from typing import Optional, Tuple, List
 
 from wulfram2_protocol.codec import BitWriter, pack_fixed16, frame_packet
-from wulfram2_protocol.packets import (  # noqa: F401 — re-export for existing importers
+from wulfram2_protocol.packets import (  # noqa: F401 - re-export for existing importers
     PacketType,
     PACKET_NAMES,
     get_packet_name,
@@ -787,7 +787,8 @@ def build_update_array_create_tank(tick: int, entity_id: int, entity_type: int, 
                                     health: float = 1.0,
                                     fuel: float = 1.0,
                                     is_manned: bool = True,
-                                    weapon_id: int = 2) -> bytes:
+                                    weapon_id: int = 2,
+                                    rot: Tuple[float, float, float] = (0.0, 0.0, 0.0)) -> bytes:
     """Build UPDATE_ARRAY that creates a tank entity with position inline."""
     tick_bytes = struct.pack(">I", tick)
     bw = BitWriter()
@@ -817,8 +818,8 @@ def build_update_array_create_tank(tick: int, entity_id: int, entity_type: int, 
         bw.write_bits(16, quantized)
 
     bw.write_bits(4, 15)
-    for _ in range(3):
-        _, quantized = _compress_rotation(0.0)
+    for v in rot:
+        _, quantized = _compress_rotation(v)
         bw.write_bits(16, quantized)
 
     if include_entity_vitals:
@@ -884,7 +885,7 @@ def build_update_array_spawn_points(tick: int, spawn_points: list) -> bytes:
         bw.write_bits(8, 27)
         bw.write_bits(8, config & 0xFF)
         bw.write_bits(8, team & 0xFF)
-        bw.write_bits(1, 0)  # Must be 0 — matches create_tank; 1 causes bitstream shift crash
+        bw.write_bits(1, 0)  # Must be 0 - matches create_tank; 1 causes bitstream shift crash
 
         bw.write_bits(4, 15)
         for coord in (x, y, z):
@@ -933,7 +934,7 @@ def build_view_update_spawn_points(tick: int,
         bw.write_bits(8, 27)
         bw.write_bits(8, config & 0xFF)
         bw.write_bits(8, team & 0xFF)
-        bw.write_bits(1, 0)  # Must be 0 — matches create_tank; 1 causes bitstream shift crash
+        bw.write_bits(1, 0)  # Must be 0 - matches create_tank; 1 causes bitstream shift crash
 
         bw.write_bits(4, 15)
         for coord in (x, y, z):
@@ -974,10 +975,22 @@ def build_behavior_packet() -> bytes:
     assert len(payload) == 95, f"Section 1 should be 95 bytes, got {len(payload)}"
 
     # Section 2: Weapons (2340 bytes)
-    enable_slot0 = os.environ.get("WULFRAM_BEHAVIOR_SLOT0", "0") == "1"
+    # Per slot: [enabled, ammo_cap, unknown_cap, fire_capable, cooldown_cap]
+    #   - enabled: slot appears in weapon roster
+    #   - ammo_cap/cooldown_cap: must be 0 to avoid extra bits in local_player_state
+    #   - fire_capable (+0x13): client checks this before allowing fire (Components.c)
+    # Slot indices match WeaponType enum: 0=ChainGun, 4=Pulse, 5=Flak, etc.
     TANK_SLOT_CONFIG = {
-        0:  [1, 0, 0, 0, 0],
-    } if enable_slot0 else {}
+        0:  [1, 0, 0, 1, 0],   # Chain Gun
+        4:  [1, 0, 0, 1, 0],   # Pulse Cannon
+        5:  [1, 0, 0, 1, 0],   # Flak
+        6:  [1, 0, 0, 1, 0],   # Guided Missile
+        7:  [1, 0, 0, 1, 0],   # Hunter Seeker
+        8:  [1, 0, 0, 1, 0],   # Mine
+        9:  [1, 0, 0, 1, 0],   # Thumper
+        10: [1, 0, 0, 1, 0],   # Mortar
+        11: [1, 0, 0, 1, 0],   # Piercer
+    }
 
     for _unit in range(4):
         for _slot in range(13):
@@ -1172,6 +1185,8 @@ def get_behavior_weapon_capability_counts(packet: Optional[bytes] = None) -> Lis
 
 def build_translation_packet() -> bytes:
     """Build TRANSLATION/quantizer packet (0x32)."""
+    from wulfram2_protocol.quantizers import QUANTIZER_TABLE
+
     payload = bytearray()
     payload.append(0x32)
 
@@ -1186,45 +1201,18 @@ def build_translation_packet() -> bytes:
         payload.extend(_write_string(max_str))
         payload.extend(_write_string(range_str))
 
-    scalar_configs = [(16, 0, "1000.0", "2000.0") for _ in range(16)]
-    # Slots 1-4: input axes — must match server decode (control_bits=16, max=1000, range=2000)
-    # OG client uses these to configure ValueQuantizer for ACTION_UPDATE encoding
-    # Slot 1 (weapon type): must be 5 bits to match write_local_player_state's hardcoded
-    # 5-bit weapon field.  Client reads weapon using this quantizer from TRANSLATION.
-    # Mismatch (16 vs 5) causes bitstream shift → crash in Render_prepare_frame.
-    scalar_configs[1] = (5, 0, "1000.0", "2000.0")
-    # Slot 2 (entity_type in UPDATE_ARRAY definition block): client reads via
-    # g_network_quantizer_array[0x20] = entry 2.  Must be 8 bits to match
-    # the 8-bit entity_type written by build_update_array_create_tank and
-    # build_update_array_spawn_points.
-    scalar_configs[2] = (8, 0, "1.0", "1.0")
-    # Slot 3 (parent_id / team_id in definition block): client reads via
-    # g_network_quantizer_array[0x30] = entry 3.  Used TWICE (parent + team),
-    # each 8 bits.
-    scalar_configs[3] = (8, 0, "1.0", "1.0")
-    scalar_configs[5] = (10, 0, f"{HEALTH_MAX}", f"{HEALTH_RANGE}")
-    scalar_configs[8] = (10, 0, f"{ENERGY_MAX}", f"{ENERGY_RANGE}")
-    scalar_configs[13] = (8, 0, "1.0", "1.0")
-    scalar_configs[14] = (8, 0, "1.0", "1.0")
-
-    for cfg in scalar_configs:
-        _write_entry(*cfg)
-
-    vector_templates = [
-        (4, 16, f"{VEC_POS_MAX}", f"{VEC_POS_RANGE}"),
-        (4, 16, f"{VEC_VEL_MAX}", f"{VEC_VEL_RANGE}"),
-        (4, 16, f"{VEC_ROT_MAX}", f"{VEC_ROT_RANGE}"),
-        (4, 16, f"{VEC_SPIN_MAX}", f"{VEC_SPIN_RANGE}"),
-    ]
-
-    for _ in range(3):
-        for cfg in vector_templates:
-            _write_entry(*cfg)
+    for cfg in sorted(QUANTIZER_TABLE, key=lambda q: q.index):
+        _write_entry(
+            cfg.fixed_bits,
+            cfg.total_bits,
+            f"{cfg.max_value}",
+            f"{cfg.range_value}",
+        )
 
     return bytes(payload)
 
 
-# --- TRANSIENT_ARRAY (0x0D) — Remote FX Events ---
+# --- TRANSIENT_ARRAY (0x0D) - Remote FX Events ---
 # Simplified format: we control both server and client, so use fixed-width
 # fields rather than the original bitstream format.
 
@@ -1254,7 +1242,7 @@ def build_transient_array(events: list) -> bytes:
         per event:
             u8  fx_type
             u8  flags (bit 0 = has_pos, bit 1 = has_entity)
-            [3×f32 pos]       (if has_pos)
+            [3xf32 pos]       (if has_pos)
             [u32 entity_id]   (if has_entity)
     """
     if not events:
