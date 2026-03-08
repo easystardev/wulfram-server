@@ -788,12 +788,24 @@ def build_update_array_create_tank(tick: int, entity_id: int, entity_type: int, 
                                     fuel: float = 1.0,
                                     is_manned: bool = True,
                                     weapon_id: int = 2,
-                                    rot: Tuple[float, float, float] = (0.0, 0.0, 0.0)) -> bytes:
+                                    rot: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+                                    ammo_count_bits: int = 0,
+                                    ammo_count: int = 0,
+                                    primary_turret_bits: int = 0,
+                                    primary_turret_angle: float = 0.0,
+                                    secondary_turret_bits: int = 0,
+                                    secondary_turret_angle: float = 0.0,
+                                    turret_max: float = 6.3,
+                                    turret_range: float = 12.6) -> bytes:
     """Build UPDATE_ARRAY that creates a tank entity with position inline."""
     tick_bytes = struct.pack(">I", tick)
     bw = BitWriter()
 
-    _write_local_player_state(bw, include_health, weapon_id=weapon_id, health=health, fuel=fuel, include_ammo_turrets=False)
+    _write_local_player_state(bw, include_health, weapon_id=weapon_id, health=health, fuel=fuel,
+                              ammo_count_bits=ammo_count_bits, ammo_count=ammo_count,
+                              primary_turret_bits=primary_turret_bits, primary_turret_angle=primary_turret_angle,
+                              secondary_turret_bits=secondary_turret_bits, secondary_turret_angle=secondary_turret_angle,
+                              turret_max=turret_max, turret_range=turret_range)
     bw.write_bits(8, 1)
 
     bw.write_bits(32, entity_id)
@@ -835,14 +847,25 @@ def build_update_array_teleport(tick: int, entity_id: int,
                                 include_health: bool = True,
                                 weapon_id: int = 2,
                                 health: float = 1.0,
-                                fuel: float = 1.0) -> bytes:
+                                fuel: float = 1.0,
+                                ammo_count_bits: int = 0,
+                                ammo_count: int = 0,
+                                primary_turret_bits: int = 0,
+                                primary_turret_angle: float = 0.0,
+                                secondary_turret_bits: int = 0,
+                                secondary_turret_angle: float = 0.0,
+                                turret_max: float = 6.3,
+                                turret_range: float = 12.6) -> bytes:
     """Build UPDATE_ARRAY that teleports an existing entity to a new position."""
     tick_bytes = struct.pack(">I", tick)
     bw = BitWriter()
 
     _write_local_player_state(bw, include_health, weapon_id=weapon_id,
                               health=health, fuel=fuel,
-                              include_ammo_turrets=False)
+                              ammo_count_bits=ammo_count_bits, ammo_count=ammo_count,
+                              primary_turret_bits=primary_turret_bits, primary_turret_angle=primary_turret_angle,
+                              secondary_turret_bits=secondary_turret_bits, secondary_turret_angle=secondary_turret_angle,
+                              turret_max=turret_max, turret_range=turret_range)
 
     bw.write_bits(8, 1)
     bw.write_bits(32, entity_id)
@@ -975,10 +998,15 @@ def build_behavior_packet() -> bytes:
     assert len(payload) == 95, f"Section 1 should be 95 bytes, got {len(payload)}"
 
     # Section 2: Weapons (2340 bytes)
-    # Per slot: [enabled, ammo_cap, unknown_cap, fire_capable, cooldown_cap]
-    #   - enabled: slot appears in weapon roster
-    #   - ammo_cap/cooldown_cap: must be 0 to avoid extra bits in local_player_state
-    #   - fire_capable (+0x13): client checks this before allowing fire (Components.c)
+    # Per slot: 5 capability bytes → AmmoSlotDef offsets +0x10 through +0x14
+    #   [0] +0x10: gate flag — must be 1 for slot to participate in capability counting
+    #   [1] +0x11: ammo_count cap — if set, pool[0] increments → ammo bits in local_player_state
+    #   [2] +0x12: reload_state cap — if set, pool[4] increments → reload bits in entity state
+    #   [3] +0x13: active_flag cap — if set, pool[8] increments → active-flags bitmask
+    #              (controls WeaponCooldown_update_all auto-fire: active=1 → cooldown ticks → fire)
+    #   [4] +0x14: cooldown_cap — if set, pool[12] increments → cooldown timestamp bits
+    # NOTE: +0x00 (enabled) is always 1 from AmmoSlotDef_init, NOT part of the packet.
+    # Keep ammo_count/reload/cooldown caps at 0 to avoid extra local_player_state bits.
     # Slot indices match WeaponType enum: 0=ChainGun, 4=Pulse, 5=Flak, etc.
     TANK_SLOT_CONFIG = {
         0:  [1, 0, 0, 1, 0],   # Chain Gun
@@ -991,6 +1019,20 @@ def build_behavior_packet() -> bytes:
         10: [1, 0, 0, 1, 0],   # Mortar
         11: [1, 0, 0, 1, 0],   # Piercer
     }
+    # Fire rate (ms) per slot → AmmoSlotDef +0x20. Controls cooldown reset in
+    # WeaponCooldown_update_all(). Default 1000ms from AmmoSlotDef_init.
+    # 0 = fire every frame (BAD).
+    TANK_FIRE_RATE_MS = {
+        0:  100,    # Chain Gun — rapid fire
+        4:  500,    # Pulse Cannon
+        5:  200,    # Flak
+        6:  1500,   # Guided Missile
+        7:  2000,   # Hunter Seeker
+        8:  3000,   # Mine
+        9:  500,    # Thumper
+        10: 1000,   # Mortar
+        11: 500,    # Piercer
+    }
 
     for _unit in range(4):
         for _slot in range(13):
@@ -999,12 +1041,14 @@ def build_behavior_packet() -> bytes:
                 payload += bytes(flags)
             else:
                 payload += b'\x00\x00\x00\x00\x00'
-            payload += pack_fixed16(1.0)
-            payload += struct.pack(">I", 0) * 5
-            payload += pack_fixed16(100.0)
-            payload += pack_fixed16(1000.0)
-            payload += pack_fixed16(500.0)
-            payload += pack_fixed16(1.0)
+            payload += pack_fixed16(1.0)                            # +0x18: accuracy (cos)
+            fire_rate = TANK_FIRE_RATE_MS.get(_slot, 1000) if _unit == 0 else 1000
+            payload += struct.pack(">I", fire_rate)                 # +0x20: fire_rate_ms
+            payload += struct.pack(">I", 0) * 4                    # +0x24..+0x30: params
+            payload += pack_fixed16(100.0)                          # +0x38: param_double_0
+            payload += pack_fixed16(1000.0)                         # +0x40: min_range (250.0 default)
+            payload += pack_fixed16(500.0)                          # +0x48: max_range (450.0 default)
+            payload += pack_fixed16(1.0)                            # +0x50: spread (0.08 default)
 
     assert len(payload) == 95 + 2340, f"After Section 2: expected 2435, got {len(payload)}"
 

@@ -73,6 +73,7 @@ class Session:
     udp_addr: Optional[tuple] = None
     udp_verified: bool = False
     udp_outgoing_seq: int = 0
+    udp_config_sent_time: float = 0.0
     udp_d_handshake_received: bool = False
     translation_ack_received: bool = False
     translation_ack_time: float = 0.0
@@ -108,6 +109,7 @@ class Session:
         self.udp_addr = None
         self.udp_verified = False
         self.udp_outgoing_seq = 0
+        self.udp_config_sent_time = 0.0
         self.udp_d_handshake_received = False
         self.translation_ack_received = False
         self.translation_ack_time = 0.0

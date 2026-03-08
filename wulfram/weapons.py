@@ -115,7 +115,7 @@ class WeaponSystem:
         # Projectile spawn tuning via hardpoints (shape data).
         # Hardpoint data is useful for tuning but not yet stable across maps/models.
         # Default to simple forward offset from authoritative server pose.
-        self.projectile_spawn_mode = os.environ.get("WULFRAM_PROJECTILE_SPAWN_MODE", "offset").lower()
+        self.projectile_spawn_mode = os.environ.get("WULFRAM_PROJECTILE_SPAWN_MODE", "auto").lower()
         self.projectile_hardpoint_name = os.environ.get("WULFRAM_PROJECTILE_HARDPOINT", "gun").strip()
         try:
             self.projectile_spawn_offset = float(os.environ.get("WULFRAM_PROJECTILE_SPAWN_OFFSET", "2.0"))
@@ -130,9 +130,9 @@ class WeaponSystem:
         except ValueError:
             self.projectile_barrel_up = 0.2
         try:
-            self.shape_coord_scale = float(os.environ.get("WULFRAM_SHAPE_COORD_SCALE", "4096.0"))
+            self.shape_coord_scale = float(os.environ.get("WULFRAM_SHAPE_COORD_SCALE", "65536.0"))
         except ValueError:
-            self.shape_coord_scale = 4096.0
+            self.shape_coord_scale = 65536.0
         self.hardpoint_order = os.environ.get("WULFRAM_HARDPOINT_ORDER", "zxy").lower()
         self.player_shape_override = os.environ.get("WULFRAM_PLAYER_SHAPE", "").strip()
         try:
@@ -561,6 +561,8 @@ class WeaponSystem:
         hardpoint_local = None
 
         spawn_mode = self.projectile_spawn_mode
+        if spawn_mode == "auto":
+            spawn_mode = "hardpoint"
         if spawn_mode == "hardpoint":
             shape_name = self.player_shape_override or (f"tank_{self.player_team}" if self.player_team in (1, 2) else "tank_1")
             hp = self._get_shape_hardpoint(shape_name, self.projectile_hardpoint_name)
@@ -845,6 +847,14 @@ def build_projectile_spawn_packet(
     weapon_id: int = 0,
     health: float = 1.0,
     fuel: float = 1.0,
+    ammo_count_bits: int = 0,
+    ammo_count: int = 0,
+    primary_turret_bits: int = 0,
+    primary_turret_angle: float = 0.0,
+    secondary_turret_bits: int = 0,
+    secondary_turret_angle: float = 0.0,
+    turret_max: float = 6.3,
+    turret_range: float = 12.6,
     entity_config: int = 0,
     is_static: bool = True,
 ) -> bytes:
@@ -875,13 +885,23 @@ def build_projectile_spawn_packet(
     tick_bytes = struct.pack(">I", tick)
     bw = BitWriter()
 
-    # Local stats section (optional)
+    # Local stats section — MUST include ammo/turret bits matching BEHAVIOR
+    # config, otherwise OG client reads past the local_player_state into
+    # entity data → bitstream misalignment → protocol mismatch crash.
     _write_local_player_state(
         bw,
         include_local_state,
         weapon_id=weapon_id,
         health=health,
         fuel=fuel,
+        ammo_count_bits=ammo_count_bits,
+        ammo_count=ammo_count,
+        primary_turret_bits=primary_turret_bits,
+        primary_turret_angle=primary_turret_angle,
+        secondary_turret_bits=secondary_turret_bits,
+        secondary_turret_angle=secondary_turret_angle,
+        turret_max=turret_max,
+        turret_range=turret_range,
     )
 
     # Entity count: 8 bits
@@ -966,6 +986,14 @@ def build_projectile_update_packet(
     weapon_id: int = 0,
     health: float = 1.0,
     fuel: float = 1.0,
+    ammo_count_bits: int = 0,
+    ammo_count: int = 0,
+    primary_turret_bits: int = 0,
+    primary_turret_angle: float = 0.0,
+    secondary_turret_bits: int = 0,
+    secondary_turret_angle: float = 0.0,
+    turret_max: float = 6.3,
+    turret_range: float = 12.6,
 ) -> bytes:
     """
     Build UPDATE_ARRAY packet to update a projectile's position.
@@ -991,13 +1019,21 @@ def build_projectile_update_packet(
     tick_bytes = struct.pack(">I", tick)
     bw = BitWriter()
 
-    # Local stats (optional)
+    # Local stats — MUST include ammo/turret bits matching BEHAVIOR config.
     _write_local_player_state(
         bw,
         include_local_state,
         weapon_id=weapon_id,
         health=health,
         fuel=fuel,
+        ammo_count_bits=ammo_count_bits,
+        ammo_count=ammo_count,
+        primary_turret_bits=primary_turret_bits,
+        primary_turret_angle=primary_turret_angle,
+        secondary_turret_bits=secondary_turret_bits,
+        secondary_turret_angle=secondary_turret_angle,
+        turret_max=turret_max,
+        turret_range=turret_range,
     )
 
     # Entity count: 1

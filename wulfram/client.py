@@ -113,6 +113,7 @@ class ClientContext:
     # Health/vitals heartbeat tracking
     last_vitals_send: float = field(default_factory=time.monotonic)
     last_view_update_send: float = field(default_factory=time.monotonic)
+    last_state_sync_send: float = field(default_factory=time.monotonic)
     # Update throttling (server-authoritative snapshots)
     last_update_send: float = field(default_factory=time.monotonic)
     # Remote player update throttle
@@ -142,6 +143,7 @@ class ClientContext:
         self.last_action_dump_time = now
         self.last_vitals_send = now
         self.last_view_update_send = now
+        self.last_state_sync_send = now
         self.last_update_send = now
         self.last_sent_pos = self.player_pos
         self.last_sent_vel = self.player_vel

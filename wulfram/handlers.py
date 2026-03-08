@@ -403,22 +403,14 @@ def handle_udp_d_handshake(server: "WulframServer", ctx: Optional["ClientContext
     stream_count = struct.unpack(">I", data[9:13])[0]
     print(f"[UDP] D_HANDSHAKE time={timestamp} id={conn_id} streams={stream_count}")
 
-    # If ctx is None, find a client waiting for UDP verification (same fallback as HELLO_ACK)
+    # If ctx is None, allow only a unique, safe recovery candidate.
     if ctx is None:
-        from .session import Phase
-        with server.clients_lock:
-            for c in server.clients.values():
-                if c.session and c.session.phase == Phase.HANDSHAKE and not c.session.udp_verified:
-                    ctx = c
-                    print(f"[UDP] D_HANDSHAKE matched to client {ctx.client_id} in HANDSHAKE state (heuristic)")
-                    break
+        ctx = server._recover_udp_client(addr, allow_handshake=True)
 
     if ctx:
         ctx.session.udp_d_handshake_received = True
         ctx.session.udp_verified = True
-        ctx.session.udp_addr = addr
-        # Register UDP address for this client
-        server.udp_addr_to_client[addr] = ctx
+        server._bind_udp_client(ctx, addr, reason="d_handshake")
         print(f"[UDP] Registered client {ctx.client_id} with UDP addr {addr}")
 
     # ACK
