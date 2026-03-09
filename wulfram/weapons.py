@@ -34,6 +34,30 @@ from wulfram2_protocol.entities import (  # noqa: F401 — re-export for existin
 # Module-level debug flag — gated by WULFRAM_DEBUG_SYNC env var
 _debug_sync = os.environ.get("WULFRAM_DEBUG_SYNC", "0").strip().lower() in ("1", "true", "on", "yes")
 
+# OG tank keymap routes number keys to dedicated behavior slots instead of
+# WEAPON_DEMAND. These are direct fire triggers, not persistent selection.
+OG_DIRECT_TRIGGER_WEAPON_SLOTS = {
+    12: WeaponType.PULSE_CANNON,   # key 1 / mouse3 -> pulse shell
+    13: WeaponType.PIERCER,        # key 2
+    14: WeaponType.THUMPER,        # key 3
+    15: EntityType.CALTROP,        # key 5
+    16: WeaponType.HUNTER_SEEKER,  # key 4
+    17: WeaponType.MINE,           # key 6
+    18: EntityType.FLARE,          # key 7
+    19: 19,                        # key 8 -> maser (not fully implemented)
+}
+
+OG_DIRECT_TRIGGER_NAMES = {
+    WeaponType.PULSE_CANNON: "Pulse Shell",
+    WeaponType.PIERCER: "Piercer",
+    WeaponType.THUMPER: "Thumper",
+    EntityType.CALTROP: "Caltrop",
+    WeaponType.HUNTER_SEEKER: "Hunter",
+    WeaponType.MINE: "Mine",
+    EntityType.FLARE: "Flare",
+    19: "Maser",
+}
+
 
 class WeaponSystem:
     """
@@ -58,6 +82,7 @@ class WeaponSystem:
         frame_dt_ms = float(os.environ.get("WULFRAM_CLIENT_FRAME_DT_MS", "84"))
         self.avg_frame_dt: float = frame_dt_ms / 1000.0
         self.prev_fire_state: float = 0.0
+        self.prev_direct_trigger_states = {slot_idx: 0.0 for slot_idx in OG_DIRECT_TRIGGER_WEAPON_SLOTS}
         self.fire_cooldown: float = 0.0  # Time until can fire again
         self.last_update_time: float = time.monotonic()
         self.projectiles: List[Projectile] = []
@@ -404,6 +429,54 @@ class WeaponSystem:
             return self.default_weapon_energy_cost
         return 0.0
 
+    def _get_active_direct_weapon_slot(self, threshold: float = 0.05) -> Optional[int]:
+        """Return the first active OG direct-fire weapon slot, if any."""
+        for trigger_slot, weapon_slot in OG_DIRECT_TRIGGER_WEAPON_SLOTS.items():
+            if self.behavior_slots[trigger_slot] > threshold:
+                return weapon_slot
+        return None
+
+    def _fire_weapon_slot(self, weapon_slot: int) -> Tuple[List[Projectile], float]:
+        """Fire the given weapon slot once and return spawned projectiles + energy."""
+        weapon_name = OG_DIRECT_TRIGGER_NAMES.get(
+            weapon_slot,
+            WEAPON_NAMES.get(weapon_slot, f"Slot {weapon_slot}")
+        )
+        energy_cost = self._get_weapon_energy_cost(weapon_slot)
+        new_projectiles: List[Projectile] = []
+        fired = False
+
+        if weapon_slot == WeaponType.CHAIN_GUN:
+            self._fire_chain_gun()
+            self.fire_cooldown = self.chain_gun_cooldown
+            fired = True
+
+        elif weapon_slot == WeaponType.PULSE_CANNON:
+            proj = self._fire_pulse_cannon()
+            if proj:
+                new_projectiles.append(proj)
+                self.projectiles.append(proj)
+                fired = True
+            self.fire_cooldown = self.pulse_cannon_cooldown
+
+        elif weapon_slot in TANK_WEAPON_SLOTS or weapon_slot in (EntityType.CALTROP, EntityType.FLARE, 19):
+            print(f"[WEAPON] {weapon_name} fired! pos={self.player_pos}")
+            if self.on_chain_gun_fire:
+                self.on_chain_gun_fire(
+                    pos=self.player_pos,
+                    rot=self.player_rot,
+                    team=self.player_team,
+                    weapon_name=weapon_name
+                )
+            self.fire_cooldown = 0.5
+            fired = True
+
+        else:
+            print(f"[WEAPON] Fire attempt with invalid slot {weapon_slot}")
+            self.fire_cooldown = 0.5
+
+        return (new_projectiles, energy_cost if fired and energy_cost > 0.0 else 0.0)
+
     def update(self, dt: float = None, available_energy: Optional[float] = None) -> Tuple[List[Projectile], float]:
         """
         Process weapon state changes and return any new projectiles.
@@ -433,6 +506,7 @@ class WeaponSystem:
 
         # Check fire state (behavior slot FIRE)
         fire_val = self.behavior_slots[BehaviorSlot.FIRE]
+        direct_weapon_slot = self._get_active_direct_weapon_slot()
 
         # Debug: log when fire value changes significantly
         if abs(fire_val - self.prev_fire_state) > 0.01:
@@ -444,14 +518,22 @@ class WeaponSystem:
         fire_pressed = fire_val > fire_threshold
         prev_pressed = self.prev_fire_state > fire_threshold
 
-        # EDGE DETECTION: Only fire on RISING EDGE (transition from not-pressed to pressed)
-        # This prevents continuous firing from held buttons or noise
-        rising_edge = fire_pressed and not prev_pressed
+        if direct_weapon_slot is not None and self.fire_cooldown <= 0.0:
+            energy_cost = self._get_weapon_energy_cost(direct_weapon_slot)
+            if available_energy is not None and energy_cost > 0.0 and available_energy + 1e-6 < energy_cost:
+                if _debug_sync:
+                    print(
+                        f"[WEAPON] Insufficient energy for "
+                        f"{OG_DIRECT_TRIGGER_NAMES.get(direct_weapon_slot, direct_weapon_slot)}: "
+                        f"need={energy_cost:.1f} have={available_energy:.1f}"
+                    )
+            else:
+                fired_projectiles, spent = self._fire_weapon_slot(direct_weapon_slot)
+                new_projectiles.extend(fired_projectiles)
+                energy_spent = spent
 
-        # Fire trigger: rising edge AND cooldown ready
-        fire_trigger = rising_edge and self.fire_cooldown <= 0
-
-        if fire_trigger:
+        # Python client path: slot 8 fires the currently selected weapon.
+        elif fire_pressed and self.fire_cooldown <= 0.0:
             weapon_name = WEAPON_NAMES.get(self.current_weapon, f"Slot {self.current_weapon}")
             energy_cost = self._get_weapon_energy_cost(self.current_weapon)
             if available_energy is not None and energy_cost > 0.0 and available_energy + 1e-6 < energy_cost:
@@ -461,46 +543,13 @@ class WeaponSystem:
                         f"need={energy_cost:.1f} have={available_energy:.1f}"
                     )
             else:
-                fired = False
-
-                if self.current_weapon == WeaponType.CHAIN_GUN:
-                    # Chain gun: instant hit, no projectile
-                    self._fire_chain_gun()
-                    self.fire_cooldown = self.chain_gun_cooldown
-                    fired = True
-
-                elif self.current_weapon == WeaponType.PULSE_CANNON:
-                    # Pulse cannon: energy projectile
-                    proj = self._fire_pulse_cannon()
-                    if proj:
-                        new_projectiles.append(proj)
-                        self.projectiles.append(proj)
-                        fired = True
-                    self.fire_cooldown = self.pulse_cannon_cooldown
-
-                elif self.current_weapon in TANK_WEAPON_SLOTS:
-                    # Other Tank weapons - log and send feedback
-                    print(f"[WEAPON] {weapon_name} fired! pos={self.player_pos}")
-                    if self.on_chain_gun_fire:
-                        # Use chain gun callback for now to send feedback
-                        self.on_chain_gun_fire(
-                            pos=self.player_pos,
-                            rot=self.player_rot,
-                            team=self.player_team,
-                            weapon_name=weapon_name
-                        )
-                    self.fire_cooldown = 0.5  # Generic cooldown
-                    fired = True
-
-                else:
-                    # Invalid weapon slot
-                    print(f"[WEAPON] Fire attempt with invalid slot {self.current_weapon}")
-                    self.fire_cooldown = 0.5
-
-                if fired and energy_cost > 0.0:
-                    energy_spent = energy_cost
+                fired_projectiles, spent = self._fire_weapon_slot(self.current_weapon)
+                new_projectiles.extend(fired_projectiles)
+                energy_spent = spent
 
         self.prev_fire_state = fire_val
+        for trigger_slot in self.prev_direct_trigger_states:
+            self.prev_direct_trigger_states[trigger_slot] = self.behavior_slots[trigger_slot]
 
         # Update projectiles (remove expired)
         self.projectiles = [p for p in self.projectiles

@@ -2129,9 +2129,11 @@ Examples:
             spawn_points.append({
                 'oid': 1000 + i,  # Unique IDs for spawn points
                 'team': team,
+                'variant': 1,
                 'x': 50.0 + i * 100,
                 'y': 0.0,
                 'z': 50.0 + i * 100,
+                'rot': (0.0, 0.0, 0.0),
             })
 
         data = build_update_array_spawn_points(0, spawn_points)

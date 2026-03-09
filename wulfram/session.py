@@ -57,6 +57,7 @@ class Session:
     translation_sent: bool = False
     roster_sent: bool = False
     world_stats_sent: bool = False
+    bootstrap_ping_sent: bool = False
     want_updates_received: bool = False
     want_updates_time: float = 0.0
     want_updates_handled: bool = False
@@ -78,6 +79,8 @@ class Session:
     translation_ack_received: bool = False
     translation_ack_time: float = 0.0
     last_udp_activity: float = 0.0  # For dead connection detection
+    pending_spawn_points: bool = False
+    spawn_points_sent: bool = False
 
     def reset(self):
         """Reset session to initial state."""
@@ -99,6 +102,7 @@ class Session:
         self.translation_sent = False
         self.roster_sent = False
         self.world_stats_sent = False
+        self.bootstrap_ping_sent = False
         self.want_updates_received = False
         self.want_updates_time = 0.0
         self.want_updates_handled = False
@@ -114,6 +118,8 @@ class Session:
         self.translation_ack_received = False
         self.translation_ack_time = 0.0
         self.last_udp_activity = 0.0
+        self.pending_spawn_points = False
+        self.spawn_points_sent = False
 
     def transition_to(self, new_phase: Phase) -> bool:
         """
@@ -165,8 +171,8 @@ class Features:
     send_behavior_packet: bool = True  # Re-enabled
     send_translation_packet: bool = True  # Required for quantizers
     send_spawn_points: bool = False  # Wulf-forge baseline: no spawn point entities
-    send_player_on_login: bool = True
-    send_world_stats_on_login: bool = True
+    send_player_on_login: bool = False
+    send_world_stats_on_login: bool = False
     # Default off: auto-spawn can trigger before world collision data is ready and crash the client.
     # Spawn should come from explicit REINCARNATE flow (team switch + spawn point selection).
     auto_login: bool = False
@@ -213,8 +219,8 @@ class Features:
             self.send_behavior_packet = True   # wulf-forge sends this!
             self.send_translation_packet = True  # wulf-forge sends this!
             self.send_spawn_points = False
-            self.send_player_on_login = True
-            self.send_world_stats_on_login = True
+            self.send_player_on_login = False
+            self.send_world_stats_on_login = False
             self.auto_join_team = True
             self.tick_loop_enabled = False  # wulf-forge doesn't have a tick loop
             self.send_update_array_empty = False  # wulf-forge doesn't send UPDATE_ARRAY

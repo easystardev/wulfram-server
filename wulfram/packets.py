@@ -101,10 +101,29 @@ def build_hello_verified() -> bytes:
     return b'\x13\x03'
 
 
-def build_ping_request() -> bytes:
-    """Build PING_REQUEST packet (0x0B) with current timestamp."""
-    ticks = int(time.time() * 1000) & 0xFFFFFFFF
-    return b'\x0B' + struct.pack(">I", ticks)
+def build_ping_request(request_id: Optional[int] = None) -> bytes:
+    """Build the server-side PING_REQUEST packet (0x0B).
+
+    OG client disassembly:
+    - inbound 0x0B handler reads a single u32
+    - no second u32 is consumed on the server->client path
+
+    Wire shape for server->client 0x0B:
+    [opcode:1][request_id:u32_be]
+    """
+    if request_id is None:
+        request_id = int(time.time() * 1000) & 0xFFFFFFFF
+    return b'\x0B' + struct.pack(">I", request_id & 0xFFFFFFFF)
+
+
+def build_ping_reply(request_id: int) -> bytes:
+    """Build the server-side 0x0C ping reply.
+
+    OG client inbound 0x0C handler reads exactly one u32 before finalizing the
+    packet, so the server->client reply must be 5 bytes:
+    [opcode:1][request_id:u32_be]
+    """
+    return b'\x0C' + struct.pack(">I", request_id & 0xFFFFFFFF)
 
 
 def build_identified_udp() -> bytes:
@@ -123,24 +142,31 @@ def build_player(entity_id: int, spectator: bool = True) -> bytes:
 
 
 def build_team_info() -> bytes:
-    """Build TEAM_INFO packet with two teams."""
+    """Build TEAM_INFO packet with the empirical OG/wulf-forge string set.
+
+    `azurefishy-src` shows TEAM_INFO as:
+      team_id + 5 strings per team
+
+    The exact string semantics are still partly inferred, so prefer the
+    captured payload values that are known to keep the original client alive.
+    """
     def pack_string(s: str) -> bytes:
         encoded = s.encode('ascii') + b'\x00'
         return struct.pack(">H", len(encoded)) + encoded
 
     payload = b'\x28'
-    # Team 1 (Crimson Federation)
+    # Team 1
     payload += struct.pack("B", 1)
+    payload += pack_string("Crimson_Federation")
     payload += pack_string("Crimson Federation")
-    payload += pack_string("Red Team")
     payload += pack_string("Crimson Base")
     payload += pack_string("The red team.")
-    payload += pack_string("Azure Alliance Wins!")
+    payload += pack_string("Crimson Federation Wins!")
 
-    # Team 2 (Azure Alliance)
+    # Team 2
     payload += struct.pack("B", 2)
+    payload += pack_string("Azure_Alliance")
     payload += pack_string("Azure Alliance")
-    payload += pack_string("Blue Team")
     payload += pack_string("Crimson Base")
     payload += pack_string("The blue team.")
     payload += pack_string("Crimson Federation Wins!")
@@ -259,12 +285,16 @@ def build_motd(message: str = "Welcome to Wulfram!") -> bytes:
 
 
 def build_chat_message(message: str, source_id: int = 0, target_id: int = 0) -> bytes:
-    """Build COMM_MESSAGE (chat) packet."""
+    """Build COMM_MESSAGE (0x1F).
+
+    Decompile (Social.c, PacketHandler_COMM_MESSAGE):
+      u16 sender_mode, u32 sender_id, u16 target_mode, u32 target_id, string
+    """
     payload = b'\x1F'
-    payload += struct.pack(">H", 0)
-    payload += struct.pack(">I", target_id)
-    payload += struct.pack(">H", 0)
-    payload += struct.pack(">I", source_id)
+    payload += struct.pack(">H", 0)           # sender_mode
+    payload += struct.pack(">I", source_id)   # sender_id
+    payload += struct.pack(">H", 0)           # target_mode
+    payload += struct.pack(">I", target_id)   # target_id
     msg_bytes = (message + '\x00').encode('ascii')
     payload += struct.pack(">H", len(msg_bytes)) + msg_bytes
     return payload
@@ -442,6 +472,8 @@ def build_update_array_heartbeat(tick: int, entity_id: int, include_health: bool
                                  turret_max: float = 6.3,
                                  turret_range: float = 12.6,
                                  is_view_update: bool = False,
+                                 include_entities: bool = True,
+                                 use_local_entity_when_no_transform: bool = False,
                                  rot: tuple = None,
                                  pos: tuple = None) -> bytes:
     """Build UPDATE_ARRAY/VIEW_UPDATE with entity heartbeat and optional health data."""
@@ -470,11 +502,22 @@ def build_update_array_heartbeat(tick: int, entity_id: int, include_health: bool
         include_ammo_turrets=include_health,
     )
 
-    DUMMY_ENTITY_ID = 0xFFFFFFFE
+    if not include_entities:
+        bw.write_bits(8, 0)
+        return header + bw.get_bytes()
+
     has_player_entity = rot is not None or pos is not None
     entity_count = 2 if has_player_entity else 1
     bw.write_bits(8, entity_count)
 
+    if use_local_entity_when_no_transform and not has_player_entity:
+        bw.write_bits(32, entity_id)
+        bw.write_bits(1, 1)
+        bw.write_bits(10, 0)
+        bw.write_bits(16, 0)
+        return header + bw.get_bytes()
+
+    DUMMY_ENTITY_ID = 0xFFFFFFFE
     bw.write_bits(32, DUMMY_ENTITY_ID)
     bw.write_bits(1, 1)
     bw.write_bits(10, 0)
@@ -887,9 +930,16 @@ def build_update_array_teleport(tick: int, entity_id: int,
 
 
 def build_update_array_spawn_points(tick: int, spawn_points: list) -> bytes:
-    """Build UPDATE_ARRAY with spawn point entities (type 27 = Repair Pad)."""
+    """Build UPDATE_ARRAY with repair-pad spawn entities.
+
+    Replication.c reads two independent spawn fields for create-bit entities:
+    `field_ec` then `field_f0`. For repair pads, `field_f0` is the visible/team
+    owner field, while `field_ec` is a separate variant/config value.
+    """
     tick_bytes = struct.pack(">I", tick)
     bw = BitWriter()
+    include_rot = os.environ.get("WULFRAM_SPAWN_POINTS_INCLUDE_ROT", "0") == "1"
+    update_mask = 0x0B if include_rot else 0x03
 
     bw.write_bits(1, 0)
     bw.write_bits(8, len(spawn_points))
@@ -897,23 +947,32 @@ def build_update_array_spawn_points(tick: int, spawn_points: list) -> bytes:
     for sp in spawn_points:
         oid = sp['oid']
         team = sp['team']
-        config = sp.get('config', team)
+        variant = sp.get('variant', sp.get('config', 1))
         x, y, z = sp.get('x', 100.0), sp.get('y', 10.0), sp.get('z', 100.0)
+        rot = sp.get('rot', (0.0, 0.0, 0.0))
 
         bw.write_bits(32, oid)
         bw.write_bits(1, 0)
-        bw.write_bits(10, 0x03)
+        bw.write_bits(10, update_mask)
         bw.write_bits(16, 0)
 
         bw.write_bits(8, 27)
-        bw.write_bits(8, config & 0xFF)
+        bw.write_bits(8, variant & 0xFF)
         bw.write_bits(8, team & 0xFF)
-        bw.write_bits(1, 0)  # Must be 0 - matches create_tank; 1 causes bitstream shift crash
+        # Repair-pad creates need the active/transform-applied branch on the OG
+        # client; leaving this cleared creates the entity but skips transform.
+        bw.write_bits(1, 1)
 
         bw.write_bits(4, 15)
         for coord in (x, y, z):
             quantized = _compress_wulfforge(coord, max_val=VEC_POS_MAX, range_val=VEC_POS_RANGE, total_bits=16)
             bw.write_bits(16, quantized)
+
+        if include_rot:
+            bw.write_bits(4, 15)
+            for angle in rot:
+                _, quantized = _compress_rotation(angle)
+                bw.write_bits(16, quantized)
 
     return b'\x0E' + tick_bytes + bw.get_bytes()
 
@@ -926,11 +985,13 @@ def build_view_update_spawn_points(tick: int,
                                    health: float = 1.0,
                                    fuel: float = 1.0,
                                    timestamp: Optional[int] = None) -> bytes:
-    """Build VIEW_UPDATE (0x0F) with spawn point entities."""
+    """Build VIEW_UPDATE (0x0F) with repair-pad spawn entities."""
     if timestamp is None:
         timestamp = get_ticks()
     header = struct.pack(">I", timestamp) + struct.pack(">I", tick)
     bw = BitWriter()
+    include_rot = os.environ.get("WULFRAM_SPAWN_POINTS_INCLUDE_ROT", "0") == "1"
+    update_mask = 0x0B if include_rot else 0x03
 
     _write_local_player_state(
         bw,
@@ -946,23 +1007,30 @@ def build_view_update_spawn_points(tick: int,
     for sp in spawn_points:
         oid = sp['oid']
         team = sp['team']
-        config = sp.get('config', team)
+        variant = sp.get('variant', sp.get('config', 1))
         x, y, z = sp.get('x', 100.0), sp.get('y', 10.0), sp.get('z', 100.0)
+        rot = sp.get('rot', (0.0, 0.0, 0.0))
 
         bw.write_bits(32, oid)
         bw.write_bits(1, 0)
-        bw.write_bits(10, 0x03)
+        bw.write_bits(10, update_mask)
         bw.write_bits(16, 0)
 
         bw.write_bits(8, 27)
-        bw.write_bits(8, config & 0xFF)
+        bw.write_bits(8, variant & 0xFF)
         bw.write_bits(8, team & 0xFF)
-        bw.write_bits(1, 0)  # Must be 0 - matches create_tank; 1 causes bitstream shift crash
+        bw.write_bits(1, 1)
 
         bw.write_bits(4, 15)
         for coord in (x, y, z):
             quantized = _compress_wulfforge(coord, max_val=VEC_POS_MAX, range_val=VEC_POS_RANGE, total_bits=16)
             bw.write_bits(16, quantized)
+
+        if include_rot:
+            bw.write_bits(4, 15)
+            for angle in rot:
+                _, quantized = _compress_rotation(angle)
+                bw.write_bits(16, quantized)
 
     return b'\x0F' + header + bw.get_bytes()
 

@@ -3,6 +3,8 @@ Packet handlers extracted from server.py.
 Contains TCP and UDP packet handling logic.
 """
 
+import ipaddress
+import os
 import struct
 import time
 import secrets
@@ -16,6 +18,7 @@ from .packets import (
     build_add_to_roster, build_update_stats, build_tank_packet,
     build_update_array_empty, build_update_array_spawn_points, get_ticks,
     build_behavior_packet, build_translation_packet, build_game_clock,
+    build_ping_request,
     build_motd, build_reincarnate,
 )
 
@@ -34,6 +37,241 @@ def decode_lp_string(data: bytes, offset: int) -> Tuple[str, int]:
     raw = data[start:end]
     text = raw.rstrip(b"\x00").decode("ascii", errors="ignore")
     return text, end
+
+
+_OG_D_HANDSHAKE_STREAMS = (
+    ("Beacon Stream", (0x3A, 0x3B)),
+    ("Squad Things", (0x42, 0x46, 0x49, 0x4A)),
+)
+
+_OG_D_HANDSHAKE_PRIVATE_MODES = (
+    (0x19, 1),
+    (0x20, 3),
+    (0x25, 3),
+    (0x26, 1),
+    (0x2B, 1),
+    (0x2E, 3),
+    (0x33, 3),
+    (0x35, 1),
+    (0x3A, 3),
+    (0x3B, 3),
+    (0x42, 3),
+    (0x46, 3),
+    (0x49, 3),
+    (0x4A, 3),
+    (0x4F, 3),
+)
+
+
+def _pack_lp_string(text: str) -> bytes:
+    raw = (text + "\x00").encode("ascii", errors="ignore")
+    return struct.pack(">H", len(raw)) + raw
+
+
+def _parse_empirical_client_d_handshake(data: bytes) -> Optional[dict]:
+    """Parse the OG-style client D_HANDSHAKE seen in live captures."""
+    if len(data) < 9 or data[0] != 0x03:
+        return None
+
+    try:
+        offset = 1
+        sequence = struct.unpack_from(">I", data, offset)[0]
+        offset += 4
+        stream_count = struct.unpack_from(">I", data, offset)[0]
+        offset += 4
+        if stream_count > 64:
+            return None
+
+        streams = []
+        for _ in range(stream_count):
+            name, offset = decode_lp_string(data, offset)
+            if not name or offset + 4 > len(data):
+                return None
+            index_count = struct.unpack_from(">I", data, offset)[0]
+            offset += 4
+            if index_count > 256:
+                return None
+            indices = []
+            for _ in range(index_count):
+                if offset + 4 > len(data):
+                    return None
+                indices.append(struct.unpack_from(">I", data, offset)[0])
+                offset += 4
+            streams.append((name, tuple(indices)))
+
+        if offset + 4 > len(data):
+            return None
+        private_count = struct.unpack_from(">I", data, offset)[0]
+        offset += 4
+        if private_count > 256:
+            return None
+
+        private_modes = []
+        for _ in range(private_count):
+            if offset + 8 > len(data):
+                return None
+            packet_id, delivery_mode = struct.unpack_from(">II", data, offset)
+            offset += 8
+            private_modes.append((packet_id, delivery_mode))
+
+        if offset != len(data):
+            return None
+
+        return {
+            "kind": "empirical",
+            "sequence": sequence,
+            "session_id": 0,
+            "streams": tuple(streams),
+            "private_modes": tuple(private_modes),
+        }
+    except struct.error:
+        return None
+
+
+def _parse_legacy_client_d_handshake(data: bytes) -> Optional[dict]:
+    """Parse the older simplified Python client D_HANDSHAKE."""
+    if len(data) < 13 or data[0] != 0x03:
+        return None
+    try:
+        sequence, session_id, stream_count = struct.unpack_from(">III", data, 1)
+    except struct.error:
+        return None
+    if stream_count > 64:
+        return None
+    return {
+        "kind": "legacy",
+        "sequence": sequence,
+        "session_id": session_id,
+        "streams": (),
+        "private_modes": (),
+        "stream_count": stream_count,
+    }
+
+
+def _build_server_d_handshake(ctx: Optional["ClientContext"]) -> bytes:
+    """Build a server D_HANDSHAKE with empirical OG stream/private mappings."""
+    sequence = int(time.monotonic() * 1000) & 0xFFFFFFFF
+    session_id = 1
+    if ctx is not None:
+        session_id = ctx.session.player_id or ctx.client_id or 1
+
+    payload = bytearray()
+    payload += struct.pack(">I", sequence)
+    payload += struct.pack(">I", session_id)
+    payload += struct.pack(">I", len(_OG_D_HANDSHAKE_STREAMS))
+
+    for name, indices in _OG_D_HANDSHAKE_STREAMS:
+        payload += _pack_lp_string(name)
+        payload += struct.pack(">I", len(indices))
+        for channel_id in indices:
+            payload += struct.pack(">I", channel_id)
+
+    payload += struct.pack(">I", len(_OG_D_HANDSHAKE_PRIVATE_MODES))
+    for packet_id, delivery_mode in _OG_D_HANDSHAKE_PRIVATE_MODES:
+        payload += struct.pack(">II", packet_id, delivery_mode)
+
+    return b"\x03" + bytes(payload)
+
+
+def _is_loopback_client(ctx: "ClientContext") -> bool:
+    """Return True when the TCP peer is loopback/local-only."""
+    addr = getattr(ctx, "client_addr", None)
+    if not addr:
+        return False
+    host = str(addr[0]).split("%", 1)[0]
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return host.lower() == "localhost"
+
+
+def _get_login_bootstrap_mode(ctx: "ClientContext") -> str:
+    """Resolve login bootstrap mode.
+
+    Modes:
+      - minimal: current Python-client-oriented bootstrap
+      - og: capture/decompile-aligned bootstrap for the original client
+      - hybrid: minimal for loopback clients, og for remote clients
+    """
+    mode = os.environ.get("WULFRAM_LOGIN_BOOTSTRAP", "hybrid").strip().lower()
+    if mode not in ("minimal", "og", "hybrid"):
+        mode = "hybrid"
+    if mode == "hybrid":
+        return "minimal" if _is_loopback_client(ctx) else "og"
+    return mode
+
+
+def _send_minimal_login_bootstrap(server: "WulframServer", ctx: "ClientContext") -> None:
+    """Send the current Python-client-oriented login bootstrap."""
+    session = ctx.session
+    tcp = ctx.tcp_handler
+
+    tcp.send(build_login_status(8, is_donor=True))
+
+    if FEATURES.send_behavior_packet and not session.behavior_sent:
+        tcp.send(build_behavior_packet())
+        session.behavior_sent = True
+
+    tcp.send(build_team_info())
+
+    if FEATURES.send_player_on_login and session.player_id == 0:
+        session.player_id = ctx.entity_id
+        tcp.send(build_player(entity_id=session.player_id, spectator=True))
+
+    if getattr(server, "send_game_clock_on_login", False):
+        tcp.send(build_game_clock())
+
+    if getattr(server, "send_request_start_on_login", False):
+        tcp.send(build_motd("Welcome to Wulfram!"))
+
+    if getattr(server, "send_roster_on_login", False) and not session.roster_sent:
+        name = session.username or f"Player{ctx.client_id}"
+        tcp.send(build_add_to_roster(
+            player_id=session.player_id,
+            entity_id=session.player_id,
+            name=name,
+            team=session.team_id if session.team_id else 0
+        ))
+        session.roster_sent = True
+
+
+def _send_og_login_bootstrap(server: "WulframServer", ctx: "ClientContext") -> None:
+    """Send the empirical/decompile-aligned OG login bootstrap."""
+    session = ctx.session
+    tcp = ctx.tcp_handler
+    if session.player_id == 0:
+        session.player_id = ctx.entity_id
+
+    player_id = session.player_id or ctx.entity_id
+    name = session.username or f"Player{ctx.client_id}"
+    team_hint = session.team_id if session.team_id else 1
+
+    tcp.send(build_team_info())
+    tcp.send(build_login_status(8, is_donor=True))
+    tcp.send(build_player(entity_id=player_id, spectator=False))
+    tcp.send(build_game_clock())
+    tcp.send(build_motd("Welcome to Wulfram!"))
+
+    if FEATURES.send_behavior_packet and not session.behavior_sent:
+        tcp.send(build_behavior_packet())
+        session.behavior_sent = True
+
+    if FEATURES.send_translation_packet and not session.translation_sent:
+        tcp.send(build_translation_packet())
+        session.translation_sent = True
+
+    if not session.roster_sent:
+        tcp.send(build_add_to_roster(
+            player_id=player_id,
+            entity_id=player_id,
+            name=name,
+            team=team_hint,
+        ))
+        session.roster_sent = True
+
+    if not session.world_stats_sent:
+        tcp.send(server.build_world_stats_packet())
+        session.world_stats_sent = True
 
 
 # ============ TCP Handlers ============
@@ -119,37 +357,19 @@ def handle_login_request(server: "WulframServer", ctx: "ClientContext", packet: 
 
 
 def send_initial_game_data(server: "WulframServer", ctx: "ClientContext"):
-    """Send packets needed for team selection screen."""
-    session = ctx.session
-    tcp = ctx.tcp_handler
+    """Send packets needed for team selection screen.
 
-    # Team info
-    tcp.send(build_team_info())
-
-    # LOGIN_STATUS(8) after TEAM_INFO
-    tcp.send(build_login_status(8, is_donor=True))
-
-    # PLAYER with spectator=True to keep client in team-select/Mode3 initialization.
-    if session.player_id == 0:
-        session.player_id = ctx.entity_id
-        tcp.send(build_player(entity_id=session.player_id, spectator=True))
-
-    # GameClock
-    tcp.send(build_game_clock())
-
-    # MOTD
-    tcp.send(build_motd("Welcome to Wulfram!"))
-
-    # ADD_TO_ROSTER
-    if not session.roster_sent:
-        name = session.username or f"Player{ctx.client_id}"
-        tcp.send(build_add_to_roster(
-            player_id=session.player_id,
-            entity_id=session.player_id,
-            name=name,
-            team=session.team_id if session.team_id else 0
-        ))
-        session.roster_sent = True
+    Bootstrap mode is selected by WULFRAM_LOGIN_BOOTSTRAP:
+      - minimal: current Python-client path
+      - og: empirical/decompile-aligned original-client path
+      - hybrid: minimal for loopback, og for remote peers
+    """
+    mode = _get_login_bootstrap_mode(ctx)
+    print(f"[LOGIN] Client {ctx.client_id}: bootstrap={mode} addr={ctx.client_addr[0]}")
+    if mode == "og":
+        _send_og_login_bootstrap(server, ctx)
+    else:
+        _send_minimal_login_bootstrap(server, ctx)
 
 
 def _broadcast_update_stats(server: "WulframServer", account_id: int, team_id: int) -> int:
@@ -242,18 +462,15 @@ def handle_bps(server: "WulframServer", ctx: "ClientContext", packet: bytes):
         print(f"[GAME] Client {ctx.client_id}: BPS request: rate={rate_index}")
         tcp.send(build_bps_response(rate_index, approved=True))
 
+        if _get_login_bootstrap_mode(ctx) == "og" and not session.bootstrap_ping_sent:
+            tcp.send(build_ping_request(get_ticks()))
+            session.bootstrap_ping_sent = True
+
         if session.phase != Phase.TEAM_SELECT:
             return
 
-        # Safe ordering: prime quantizers/config on BPS, then WORLD_STATS.
-        if FEATURES.send_behavior_packet and not session.behavior_sent:
-            tcp.send(build_behavior_packet())
-            session.behavior_sent = True
-
-        if FEATURES.send_translation_packet and not session.translation_sent:
-            tcp.send(build_translation_packet())
-            session.translation_sent = True
-
+        # Canonical flow does not require WORLD_STATS during team select.
+        # Keep this as an explicit fallback only.
         if FEATURES.send_world_stats_on_login and not session.world_stats_sent:
             time.sleep(0.15)
             print(f"[GAME] Client {ctx.client_id}: Sending WORLD_STATS after BPS request")
@@ -289,29 +506,36 @@ def handle_want_updates(server: "WulframServer", ctx: "ClientContext", packet: b
     # Start ping loop
     server._start_ping_loop(ctx)
 
-    # Send welcome chat
-    tcp.send(build_chat_message("System: Welcome to Wulfram!"))
+    if os.environ.get("WULFRAM_SEND_WELCOME_CHAT_ON_WANT_UPDATES", "0").strip().lower() in ("1", "true", "on", "yes"):
+        tcp.send(build_chat_message("System: Welcome to Wulfram!"))
 
     # NOTE: VIEW_UPDATE initial snapshot disabled over TCP — OG client's
     # undecompiled handler causes TCP stream desync -> MAX_STREAM_DATA crash.
     # Re-enable when OG handler wire format is verified via Ghidra.
 
-    # Send empty update array
-    if FEATURES.send_update_array_empty:
-        tcp.send(build_update_array_empty())
+    # OG-safe team-select bootstrap: send config once after WANT_UPDATES, then
+    # prime UPDATE_ARRAY and wait for TRANSLATION_ACK before spawn points.
+    if FEATURES.send_behavior_packet and not session.behavior_sent:
+        tcp.send(build_behavior_packet())
+        session.behavior_sent = True
 
-    # Send spawn points
+    if FEATURES.send_translation_packet and not session.translation_sent:
+        tcp.send(build_translation_packet())
+        session.translation_sent = True
+
+    tcp.send(build_update_array_empty())
+
+    # Spawn points are deferred until the client finishes UDP bootstrap AND has
+    # acknowledged TRANSLATION so quantizers are definitely active.
     if FEATURES.send_spawn_points:
-        spawn_points = server.get_spawn_points()
-        if hasattr(server, "_to_client_pos"):
-            for sp in spawn_points:
-                x, y, z = server._to_client_pos((sp["x"], sp["y"], sp["z"]))
-                sp["x"], sp["y"], sp["z"] = x, y, z
-        print(f"[GAME] Client {ctx.client_id}: Sending {len(spawn_points)} spawn points")
-        tick = get_ticks()
-        # Always use UPDATE_ARRAY for spawn points — VIEW_UPDATE over TCP
-        # crashes OG client (TCP stream desync -> MAX_STREAM_DATA).
-        tcp.send(build_update_array_spawn_points(tick, spawn_points))
+        if session.udp_d_handshake_received and session.translation_ack_received:
+            _send_spawn_points_for_client(server, ctx)
+        else:
+            session.pending_spawn_points = True
+            print(
+                f"[GAME] Client {ctx.client_id}: Deferring spawn points until "
+                "UDP D_HANDSHAKE + TRANSLATION_ACK complete"
+            )
 
     # Optional legacy path: spawn directly from team-select state.
     if session.pending_spawn_team_id:
@@ -366,42 +590,70 @@ def handle_reincarnate_tcp(server: "WulframServer", ctx: "ClientContext", packet
     print(f"[GAME] Client {ctx.client_id}: Spawn request for team {team_id}")
 
     session.team_id = team_id
+    if session.player_id == 0:
+        session.player_id = ctx.entity_id
     _schedule_team_select_spawn(server, ctx, team_id, reason="tcp_reincarnate")
-
-    # Send UPDATE_STATS (broadcast so team changes stay consistent across clients)
-    sent = _broadcast_update_stats(
-        server,
-        account_id=session.player_id or ctx.entity_id,
-        team_id=team_id,
-    )
-    if sent <= 0:
-        tcp.send(build_update_stats(
-            player_id=session.player_id or ctx.entity_id,
-            entity_id=ctx.entity_id,
-            team_id=team_id
-        ))
 
     # Mirror wulf-forge: acknowledge team switch/spawn intent with REINCARNATE code 0x11.
     if getattr(server, "team_switch_send_reincarnate", True):
         tcp.send(build_reincarnate(0x11, ""))
 
-    # Send WORLD_STATS if not sent
+    _send_post_reincarnate_entry_packets(server, ctx)
+
+
+def _send_post_reincarnate_entry_packets(server: "WulframServer", ctx: "ClientContext") -> None:
+    """Send the canonical team-entry packets after REINCARNATE."""
+    session = ctx.session
+    if session.player_id == 0:
+        session.player_id = ctx.entity_id
+
+    _safe_tcp_send(
+        ctx,
+        build_player(entity_id=session.player_id, spectator=False),
+        label="post_reincarnate_player",
+    )
+    _safe_tcp_send(ctx, build_game_clock(), label="post_reincarnate_game_clock")
+
+    if not session.roster_sent:
+        name = session.username or f"Player{ctx.client_id}"
+        _safe_tcp_send(
+            ctx,
+            build_add_to_roster(
+                player_id=session.player_id,
+                entity_id=session.player_id,
+                name=name,
+                team=session.team_id if session.team_id else 0,
+            ),
+            label="post_reincarnate_add_to_roster",
+        )
+        session.roster_sent = True
+
     if not session.world_stats_sent:
-        tcp.send(server.build_world_stats_packet())
+        _safe_tcp_send(
+            ctx,
+            server.build_world_stats_packet(),
+            label="post_reincarnate_world_stats",
+        )
         session.world_stats_sent = True
 
 
 # ============ UDP Handlers ============
 
 def handle_udp_d_handshake(server: "WulframServer", ctx: Optional["ClientContext"], data: bytes, addr: tuple):
-    """Handle UDP D_HANDSHAKE (0x03) and respond with stream definitions."""
-    if len(data) < 13:
+    """Handle UDP D_HANDSHAKE (0x03) and respond with OG-shaped stream metadata."""
+    parsed = _parse_empirical_client_d_handshake(data)
+    if parsed is None:
+        parsed = _parse_legacy_client_d_handshake(data)
+    if parsed is None:
+        print(f"[UDP] D_HANDSHAKE malformed from {addr}: len={len(data)} data={data.hex()}")
         return
 
-    timestamp = struct.unpack(">I", data[1:5])[0]
-    conn_id = struct.unpack(">I", data[5:9])[0]
-    stream_count = struct.unpack(">I", data[9:13])[0]
-    print(f"[UDP] D_HANDSHAKE time={timestamp} id={conn_id} streams={stream_count}")
+    stream_count = len(parsed["streams"]) if parsed["streams"] else parsed.get("stream_count", 0)
+    print(
+        f"[UDP] D_HANDSHAKE[{parsed['kind']}] seq={parsed['sequence']} "
+        f"id={parsed['session_id']} streams={stream_count} "
+        f"private={len(parsed['private_modes'])}"
+    )
 
     # If ctx is None, allow only a unique, safe recovery candidate.
     if ctx is None:
@@ -418,34 +670,57 @@ def handle_udp_d_handshake(server: "WulframServer", ctx: Optional["ClientContext
     server.udp_handler.send_to(ack, addr)
     print(f"[UDP SEND] D_ACK to {addr}")
 
-    # Stream definitions
-    def _pack_lp_string(text: str) -> bytes:
-        raw = (text + '\x00').encode('ascii', errors='ignore')
-        return struct.pack(">H", len(raw)) + raw
+    server_handshake = _build_server_d_handshake(ctx)
+    server.udp_handler.send_to(server_handshake, addr)
+    print(
+        f"[UDP SEND] D_HANDSHAKE seq={struct.unpack('>I', server_handshake[1:5])[0]} "
+        f"to {addr}"
+    )
 
-    payload = bytearray()
-    payload += struct.pack(">I", int(time.monotonic() * 1000) & 0xFFFFFFFF)
-    player_id = ctx.session.player_id if ctx else 1001
-    payload += struct.pack(">I", player_id or 1001)
-    payload += struct.pack(">I", 4)
+    if (
+        ctx
+        and ctx.session.pending_spawn_points
+        and not ctx.session.spawn_points_sent
+        and ctx.session.translation_ack_received
+    ):
+        _send_spawn_points_for_client(server, ctx)
 
-    for name, sid in (("Unreliable", 0), ("Reliable", 1), ("Stream 2", 2), ("Game Data", 3)):
-        payload += _pack_lp_string(name)
-        payload += struct.pack(">I", 1)
-        payload += struct.pack(">I", sid)
 
-    payload += struct.pack(">I", 4)
-    for sid in (0, 1, 2, 3):
-        payload += struct.pack(">I", sid)
-        payload += struct.pack(">I", 1)
+def _send_spawn_points_for_client(server: "WulframServer", ctx: "ClientContext") -> None:
+    session = ctx.session
+    if session.spawn_points_sent:
+        return
+    if not session.translation_ack_received:
+        session.pending_spawn_points = True
+        print(f"[GAME] Client {ctx.client_id}: Waiting for TRANSLATION_ACK before spawn points")
+        return
 
-    server.udp_handler.send_to(b'\x03' + bytes(payload), addr)
-    print(f"[UDP SEND] D_STREAM_DEFS to {addr}")
+    spawn_points = server.get_spawn_points()
+    if hasattr(server, "_to_client_pos"):
+        for sp in spawn_points:
+            x, y, z = server._to_client_pos((sp["x"], sp["y"], sp["z"]))
+            sp["x"], sp["y"], sp["z"] = x, y, z
 
-    # Unpause streams
-    for sid in (1, 3):
-        server.udp_handler.send_to(b'\x04' + struct.pack(">BH", sid, 1), addr)
-        print(f"[UDP SEND] D_UNPAUSE stream={sid} to {addr}")
+    print(f"[GAME] Client {ctx.client_id}: Sending {len(spawn_points)} spawn points")
+    tick = get_ticks()
+    spawn_pkt = build_update_array_spawn_points(tick, spawn_points)
+    spawn_transport = os.environ.get("WULFRAM_SPAWN_POINTS_TRANSPORT", "tcp").strip().lower()
+
+    if spawn_transport in ("tcp", "both"):
+        ctx.tcp_handler.send(spawn_pkt)
+    if spawn_transport in ("udp", "both"):
+        if server.udp_handler and session.udp_addr:
+            server.udp_handler.send_to(spawn_pkt, session.udp_addr)
+        else:
+            print(
+                f"[GAME] Client {ctx.client_id}: UDP not ready, keeping "
+                "spawn-point UPDATE_ARRAY deferred"
+            )
+            session.pending_spawn_points = True
+            return
+
+    session.pending_spawn_points = False
+    session.spawn_points_sent = True
 
 
 def handle_udp_chat(server: "WulframServer", ctx: Optional["ClientContext"], data: bytes, addr: tuple):
@@ -598,20 +873,9 @@ def handle_team_switch(server: "WulframServer", ctx: "ClientContext", team_id: i
 
     print(f"[UDP] Client {ctx.client_id}: Team switch to team {team_id}")
     session.team_id = team_id
+    if session.player_id == 0:
+        session.player_id = ctx.entity_id
     _schedule_team_select_spawn(server, ctx, team_id, reason="udp_team_switch")
-
-    sent = _broadcast_update_stats(
-        server,
-        account_id=session.player_id or ctx.entity_id,
-        team_id=team_id,
-    )
-    if sent <= 0 and server.udp_handler and addr:
-        update_stats_pkt = build_update_stats(
-            player_id=session.player_id or ctx.entity_id,
-            entity_id=ctx.entity_id,
-            team_id=team_id
-        )
-        server.udp_handler.send_to(update_stats_pkt, addr)
 
     # Wulf-forge-style ACK: REINCARNATE(code=17) should be seen on UDP for
     # reliable entry-map -> world transition. Fall back to TCP only when UDP
@@ -629,6 +893,8 @@ def handle_team_switch(server: "WulframServer", ctx: "ClientContext", team_id: i
         if not sent_rein and ctx.tcp_handler:
             if _safe_tcp_send(ctx, rein, label="team_switch_reincarnate_ack"):
                 print(f"[TCP] Team {team_id} switch acked with REINCARNATE 0x11 (fallback)")
+
+    _send_post_reincarnate_entry_packets(server, ctx)
 
     if getattr(server, "spawn_on_team_select", False):
         print(
@@ -733,16 +999,18 @@ def handle_spawn_at_point(server: "WulframServer", ctx: "ClientContext", spawn_p
 
 
 def send_udp_ack(server: "WulframServer", ctx: Optional["ClientContext"], addr: tuple, packet_id: int, seq_num: int, subcmd: int = 1):
-    """Send a Wulf-Forge style UDP ACK (0x02)."""
+    """Send an OG-shaped UDP D_ACK (0x02)."""
     if not server.udp_handler:
         return
-    if ctx:
-        ctx.session.udp_outgoing_seq = (ctx.session.udp_outgoing_seq + 1) & 0xFFFF
-        our_seq = ctx.session.udp_outgoing_seq
+    if subcmd == 1:
+        payload = bytes((0x02, 0x01, packet_id & 0xFF)) + struct.pack(">H", seq_num & 0xFFFF)
+    elif subcmd == 2:
+        timestamp = int(time.monotonic() * 1000) & 0xFFFFFFFF
+        payload = bytes((0x02, 0x02)) + struct.pack(">I", timestamp) + bytes((packet_id & 0xFF,)) + struct.pack(">H", seq_num & 0xFFFF)
     else:
-        our_seq = 0
-    payload = struct.pack(">HHBBH", our_seq, 9, subcmd, packet_id & 0xFF, seq_num & 0xFFFF)
-    server.udp_handler.send_to(b'\x02' + payload, addr)
+        timestamp = int(time.monotonic() * 1000) & 0xFFFFFFFF
+        payload = bytes((0x02, 0x00)) + struct.pack(">I", timestamp)
+    server.udp_handler.send_to(payload, addr)
 
 
 def _spawn_test_projectile(server: "WulframServer", ctx: "ClientContext", addr: tuple):

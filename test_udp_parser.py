@@ -4,12 +4,14 @@ Regression tests for UDP datagram splitting and packet naming.
 """
 
 import sys
+import struct
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "shared"))
 
 from wulfram.server import WulframServer
+from wulfram import handlers
 from wulfram.weapons import WeaponSystem, BehaviorSlot
 from wulfram2_protocol.packets import get_packet_name
 
@@ -71,6 +73,59 @@ def test_parse_d_set_start() -> bool:
     return True
 
 
+def test_parse_empirical_d_handshake() -> bool:
+    """Empirical client D_HANDSHAKE with named/private streams should parse cleanly."""
+    data = bytes.fromhex(
+        "03"
+        "005f6504"
+        "00000002"
+        "000e426561636f6e2053747265616d00"
+        "00000002"
+        "0000003a0000003b"
+        "000d5371756164205468696e677300"
+        "00000004"
+        "0000004200000046000000490000004a"
+        "0000000f"
+        "0000001900000001"
+        "0000002000000003"
+        "0000002500000003"
+        "0000002600000001"
+        "0000002b00000001"
+        "0000002e00000003"
+        "0000003300000003"
+        "0000003500000001"
+        "0000003a00000003"
+        "0000003b00000003"
+        "0000004200000003"
+        "0000004600000003"
+        "0000004900000003"
+        "0000004a00000003"
+        "0000004f00000003"
+    )
+    parsed = handlers._parse_empirical_client_d_handshake(data)
+    assert parsed is not None
+    assert parsed["sequence"] == 0x005F6504
+    assert parsed["streams"][0] == ("Beacon Stream", (0x3A, 0x3B))
+    assert parsed["private_modes"][0] == (0x19, 1)
+    assert parsed["private_modes"][-1] == (0x4F, 3)
+    print("test_parse_empirical_d_handshake: PASSED")
+    return True
+
+
+def test_build_server_d_handshake() -> bool:
+    """Server D_HANDSHAKE should emit the empirical OG mappings."""
+    packet = handlers._build_server_d_handshake(None)
+    assert packet[0] == 0x03
+    _sequence = struct.unpack_from(">I", packet, 1)[0]
+    session_id = struct.unpack_from(">I", packet, 5)[0]
+    stream_count = struct.unpack_from(">I", packet, 9)[0]
+    assert session_id == 1
+    assert stream_count == 2
+    assert _sequence >= 0
+    print("test_build_server_d_handshake: PASSED")
+    return True
+
+
 def test_parse_mixed_input_feedback_plus_action_dump() -> bool:
     """INPUT_FEEDBACK + ACTION_DUMP mixed datagram should split with 23-byte dump."""
     srv = _make_server_stub()
@@ -121,6 +176,8 @@ def main() -> bool:
         test_parse_two_d_ack_then_input_feedback,
         test_parse_legacy_ack_frame,
         test_parse_d_set_start,
+        test_parse_empirical_d_handshake,
+        test_build_server_d_handshake,
         test_parse_mixed_input_feedback_plus_action_dump,
         test_action_dump_slot4_not_control_quantized,
         test_packet_names_cover_previous_unknowns,
