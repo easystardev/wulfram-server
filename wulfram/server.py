@@ -771,9 +771,9 @@ class WulframServer:
         except ValueError:
             self.turn_sign = -1.0
         try:
-            self.strafe_sign = float(os.environ.get("WULFRAM_STRAFE_SIGN", "1.0"))
+            self.strafe_sign = float(os.environ.get("WULFRAM_STRAFE_SIGN", "-1.0"))
         except ValueError:
-            self.strafe_sign = 1.0
+            self.strafe_sign = -1.0
         # (yaw_input_compensation removed â€” dead scaffolding, never used in tick loop)
         # Steering curve: piecewise-linear dead-zone curve from client
         # (azurefishy-src Vehicles.c:1030 Piecewise_interpolate).
@@ -1301,21 +1301,29 @@ class WulframServer:
         The OG client clears its local input/local-state scratch at the start of
         every UPDATE_ARRAY, then runs local-player sync at the end of the
         packet. Remote OG viewers therefore still need a valid local-state
-        prefix even on projectile/entity-only updates. Loopback/Python clients
-        keep the existing entity-only path to preserve the currently working
-        decoder behavior.
+        prefix even on entity-only updates. Promoted remote viewers still
+        reject the fully expanded tank local-state on packets that do not also
+        carry the local-player sync entity block, so keep these on the same
+        short-form-safe shape as the projectile/update-array compatibility path.
+        Loopback/Python clients keep the existing entity-only path to preserve
+        the currently working decoder behavior.
         """
         if handlers._is_loopback_client(ctx):
             return False, {}
 
-        kwargs = self._get_local_state_kwargs(ctx)
-        include_local_state = self._should_send_local_state(
-            ctx,
-            kwargs["primary_turret_bits"],
-            kwargs["secondary_turret_bits"],
-            self.update_local_state_mode,
+        return True, dict(
+            weapon_id=self._get_spawn_tank_weapon_type(ctx),
+            health=self._get_health_value(ctx),
+            fuel=self._get_energy_value(ctx),
+            ammo_count_bits=0,
+            ammo_count=0,
+            primary_turret_bits=0,
+            primary_turret_angle=0.0,
+            secondary_turret_bits=0,
+            secondary_turret_angle=0.0,
+            turret_max=self.local_state_turret_max,
+            turret_range=self.local_state_turret_range,
         )
-        return include_local_state, kwargs
 
     def _get_projectile_local_state_for_viewer(self, ctx: ClientContext) -> tuple[bool, dict]:
         """Return viewer-local local_state args for projectile UPDATE_ARRAY packets.
@@ -1551,8 +1559,15 @@ class WulframServer:
         """Return a snapshot list of in-game clients (thread-safe)."""
         return [c for c in self._snapshot_clients() if c.session and c.session.in_game]
 
-    def _send_packet_to_client(self, ctx: ClientContext, payload: bytes, *, prefer_tcp: bool = True) -> bool:
-        """Send payload to a client, preferring TCP and falling back to UDP."""
+    def _send_packet_to_client(
+        self,
+        ctx: ClientContext,
+        payload: bytes,
+        *,
+        prefer_tcp: bool = True,
+        allow_udp_fallback: bool = True,
+    ) -> bool:
+        """Send payload to a client, preferring TCP and optionally falling back to UDP."""
         sent = False
         if prefer_tcp and ctx.tcp_handler:
             try:
@@ -1560,7 +1575,7 @@ class WulframServer:
                 sent = True
             except Exception as tcp_err:
                 print(f"[MULTI] Client {ctx.client_id}: TCP send failed ({tcp_err})")
-        if not sent and self.udp_handler and ctx.session.udp_addr:
+        if not sent and allow_udp_fallback and self.udp_handler and ctx.session.udp_addr:
             try:
                 self.udp_handler.send_to(payload, ctx.session.udp_addr)
                 sent = True
@@ -1583,7 +1598,12 @@ class WulframServer:
             kills=player_ctx.kills,
             deaths=player_ctx.deaths,
         )
-        if not self._send_packet_to_client(target_ctx, payload, prefer_tcp=True):
+        if not self._send_packet_to_client(
+            target_ctx,
+            payload,
+            prefer_tcp=True,
+            allow_udp_fallback=False,
+        ):
             return
         target_ctx.known_roster_ids.add(player_id)
         print(f"[MULTI] Sent roster {name} (id={player_id}) -> client {target_ctx.client_id}")
@@ -1601,7 +1621,12 @@ class WulframServer:
             team_id=team,
         )
         for client in self._snapshot_in_game_clients():
-            self._send_packet_to_client(client, pkt, prefer_tcp=True)
+            self._send_packet_to_client(
+                client,
+                pkt,
+                prefer_tcp=True,
+                allow_udp_fallback=False,
+            )
 
     def _send_entity_create(self, target_ctx: ClientContext, player_ctx: ClientContext, *, is_retry: bool = False) -> None:
         """Announce player_ctx's entity to target_ctx via UPDATE_ARRAY DEFINITION.
@@ -1663,7 +1688,7 @@ class WulframServer:
             (-player_ctx.player_heading if self.remote_yaw_negate else player_ctx.player_heading) + self.remote_yaw_offset,
         )
 
-        ls = self._get_local_state_kwargs(target_ctx)
+        include_local_state, ls = self._get_update_array_local_state_for_viewer(target_ctx)
         create_pkt = build_update_array_create_tank(
             tick=tick,
             entity_id=entity_id,
@@ -1672,6 +1697,7 @@ class WulframServer:
             pos=pos,
             is_manned=True,
             rot=rot,
+            include_health=include_local_state,
             **ls,
         )
         label = "RETRY" if is_retry else "CREATE"
@@ -1748,33 +1774,7 @@ class WulframServer:
             if entity_id not in ctx.known_entity_ids:
                 continue
             health_val = self._get_health_value(ctx)
-            # UPDATE_ARRAY local-state belongs to the VIEWER, not the replicated
-            # remote entity. Using the other player's weapon/ammo bits desyncs
-            # the bitstream for OG clients.
-            weapon_type = self._get_local_state_weapon_type(ctx)
-            ammo_bits, ammo_mask = self._get_local_state_ammo_bits(ctx)
-            pt_bits, pt_angle, st_bits, st_angle = self._get_local_state_turret_bits(ctx)
-            include_local_state = self._should_send_local_state(
-                ctx,
-                pt_bits,
-                st_bits,
-                self.update_local_state_mode,
-            )
-            if not include_local_state:
-                ammo_bits = 0
-                ammo_mask = 0
-                pt_bits = 0
-                st_bits = 0
-                pt_angle = 0.0
-                st_angle = 0.0
-            if self._wf_minimal_local_state_for_client(ctx):
-                weapon_type = self._get_spawn_tank_weapon_type(ctx)
-                ammo_bits = 0
-                ammo_mask = 0
-                pt_bits = 0
-                st_bits = 0
-                pt_angle = 0.0
-                st_angle = 0.0
+            include_local_state, local_state_kwargs = self._get_update_array_local_state_for_viewer(ctx)
             send_pos = self._to_client_pos(other.player_pos)
             payload = build_update_array_player_update(
                 tick,
@@ -1794,17 +1794,7 @@ class WulframServer:
                 include_local_state=include_local_state,
                 include_entity_vitals=False,
                 is_manned=True,
-                weapon_id=weapon_type,
-                health=health_val,
-                fuel=viewer_fuel,
-                ammo_count_bits=ammo_bits,
-                ammo_count=ammo_mask,
-                primary_turret_bits=pt_bits,
-                primary_turret_angle=pt_angle,
-                secondary_turret_bits=st_bits,
-                secondary_turret_angle=st_angle,
-                turret_max=self.local_state_turret_max,
-                turret_range=self.local_state_turret_range,
+                **local_state_kwargs,
             )
             ok = self._send_packet_to_client(ctx, payload, prefer_tcp=prefer_tcp)
             if tick % 300 == 0:
@@ -4768,6 +4758,22 @@ class WulframServer:
         frac = idx_f - idx_lo
         return samples[idx_lo] + (samples[idx_lo + 1] - samples[idx_lo]) * frac
 
+    @staticmethod
+    def _tank_low_speed_mobility_factor(current_speed: float, speed_threshold: float) -> float:
+        """Decompile-backed tank forward-mobility cap from current speed."""
+        if speed_threshold <= 0.0:
+            return 1.0
+        if current_speed < 0.0:
+            current_speed = 0.0
+        if current_speed < speed_threshold:
+            factor = (current_speed / speed_threshold) * 0.6 + 0.4
+            if factor < 0.4:
+                return 0.4
+            if factor > 1.0:
+                return 1.0
+            return factor
+        return 1.0
+
     def _normalize_turn_input_value(self, ctx: ClientContext, turn_val: float) -> float:
         """Normalize a raw TURNING slot value to signed yaw input in [-1, 1]."""
         if turn_val > 1.5 or turn_val < -1.5:
@@ -4821,9 +4827,11 @@ class WulframServer:
     def _decode_network_strafe_input(self, ctx: ClientContext, strafe_val: float) -> float:
         """Decode OG slot-3 semantics into world-space strafe.
 
-        Empirical OG captures and the decompile's tank input reader both land on
-        final strafe values where A/left is negative and D/right is positive.
-        Keep the network value as-is unless explicitly overridden.
+        `Tank_read_control_inputs` negates the button-normalized slot-3 input
+        before the tank controller consumes it. The OG client therefore sends
+        rightward strafe as a negative slot value and leftward strafe as a
+        positive slot value on the wire. Convert that back into world-space
+        strafe here so negative = left and positive = right in simulation.
         """
         return self.strafe_sign * self._normalize_behavior_axis_value(ctx, strafe_val)
 
@@ -4944,10 +4952,23 @@ class WulframServer:
         veh_config = VEHICLE_PHYSICS_CONFIGS.get(ctx.entity_type)
         move_adjust = veh_config.move_adjust if veh_config else 85.0
         strafe_adjust = veh_config.strafe_adjust if veh_config else 69.7
+        low_speed_threshold = veh_config.low_fuel_level if veh_config else 2000.0
         # Dual-damp: client uses 0.8 when driving, 2.0 when coasting
         # (from Tank_read_throttle_input and Tank_compute_mobility_factors in Vehicles.c)
         has_input = abs(throttle_input) > 0.0 or abs(strafe_input) > 0.0
         linear_damp = self.linear_damp_driving if has_input else self.linear_damp_coasting
+        vel_x, vel_y, vel_z = ctx.player_vel
+
+        # Decompile-backed flat-ground mobility gate from Tank_compute_mobility_factors:
+        # forward mobility ramps from 0.4 at rest toward 1.0 as current speed rises.
+        if ctx.entity_type == EntityType.TANK:
+            current_speed = math.sqrt(vel_x * vel_x + vel_y * vel_y + vel_z * vel_z)
+            forward_mobility = self._tank_low_speed_mobility_factor(
+                current_speed,
+                low_speed_threshold,
+            )
+        else:
+            forward_mobility = 1.0
 
         yaw = heading_override if heading_override is not None else ctx.player_heading
         cos_yaw = math.cos(yaw)
@@ -4974,8 +4995,8 @@ class WulframServer:
             vertical_idx = 1
 
         # Per-frame impulse (like entity[0x24], zeroed each frame by controller)
-        fwd_impulse = throttle_input * move_adjust
-        strafe_impulse = strafe_input * strafe_adjust
+        fwd_impulse = throttle_input * move_adjust * forward_mobility
+        strafe_impulse = strafe_input * strafe_adjust * forward_mobility
 
         impulse_x = forward[0] * fwd_impulse + right[0] * strafe_impulse
         impulse_y = forward[1] * fwd_impulse + right[1] * strafe_impulse
@@ -5014,9 +5035,6 @@ class WulframServer:
             impulse_y += gravity
             if ctx.player_pos[1] <= ground_level and ctx.player_vel[1] + gravity * dt < 0:
                 impulse_y = 0.0
-
-        # Current persistent velocity (entity[0x18])
-        vel_x, vel_y, vel_z = ctx.player_vel
 
         # Damped effective acceleration: acc = impulse - vel * linear_damp
         # (from RigidBody_integrate_position, damped mode at Physics.c:5126-5129)
@@ -5267,6 +5285,14 @@ class WulframServer:
         cross_section_radius = max(0.25, extents[1])
         return min(radius, cross_section_radius)
 
+    def _building_has_mesh_collision(self, building) -> bool:
+        if not self._building_collision.available:
+            return False
+        return self._building_collision.has_collision_model(
+            int(building.entity_type),
+            int(getattr(building, "team_id", 1)),
+        )
+
     def _check_building_collisions(self, ctx, px, py, pz, vx, vy):
         """Check mesh/AABB collision against static buildings and other tanks."""
         for other_ctx in self._snapshot_in_game_clients():
@@ -5291,8 +5317,9 @@ class WulframServer:
         # Check buildings loaded from map state file
         building_entities = self._building_entities
         for eid, building in building_entities.items():
+            has_mesh_model = self._building_has_mesh_collision(building)
             mesh_hit = False
-            if self._building_collision.available:
+            if has_mesh_model:
                 depth, normal = self._building_collision.test_sphere_collision(
                     building,
                     (px, py, pz),
@@ -5308,6 +5335,8 @@ class WulframServer:
                     mesh_hit = True
 
             if mesh_hit:
+                continue
+            if has_mesh_model:
                 continue
 
             bx, by = building.x, building.y
@@ -5393,7 +5422,8 @@ class WulframServer:
                     return ("terrain", (sample_x, sample_y, ground_z), None)
 
             for eid, building in self._building_entities.items():
-                if self._building_collision.available:
+                has_mesh_model = self._building_has_mesh_collision(building)
+                if has_mesh_model:
                     depth, normal = self._building_collision.test_sphere_collision(
                         building,
                         (sample_x, sample_y, sample_z),
@@ -5401,6 +5431,7 @@ class WulframServer:
                     )
                     if depth > 0.0 and normal is not None:
                         return ("building", (sample_x, sample_y, sample_z), eid)
+                    continue
 
                 hx, hy = self._BUILDING_HALF_EXTENTS.get(building.entity_type, (8.0, 8.0))
                 half_h = max(hx, hy, self._BUILDING_HALF_HEIGHT)

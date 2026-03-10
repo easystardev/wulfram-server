@@ -120,6 +120,20 @@ class BuildingCollisionAssets:
             sphere_radius,
         )
 
+    def has_collision_model(self, entity_type: int, team_id: int) -> bool:
+        """Return True when this building type has a real collision mesh loaded."""
+        if not self.available or self._cache is None:
+            return False
+
+        model_name = self.get_model_name(entity_type, team_id)
+        if not model_name:
+            return False
+
+        model = self.models.get(model_name)
+        mesh = getattr(model, "collision_mesh", None) if model is not None else None
+        vertices = getattr(mesh, "vertices", None) if mesh is not None else None
+        return bool(vertices)
+
     @staticmethod
     def get_model_name(entity_type: int, team_id: int) -> Optional[str]:
         names = BUILDING_MODEL_NAMES.get(entity_type)

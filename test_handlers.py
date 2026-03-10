@@ -583,6 +583,45 @@ def test_server_remote_projectile_spawn_uses_viewer_local_state():
     return True
 
 
+def test_server_remote_entity_packets_use_safe_local_state_after_promotion():
+    """Promoted remote OG entity-only UPDATE_ARRAY packets must stay short-form-safe."""
+    server = WulframServer.__new__(WulframServer)
+    server.update_local_state_mode = "wf"
+    server.local_state_weapon_type = 0
+    server.spawn_tank_weapon_type = 2
+    server.local_state_ammo_override = False
+    server.local_state_ammo_from_behavior = True
+    server.local_state_primary_override = ""
+    server.local_state_secondary_override = ""
+    server.local_state_turret_bits = 16
+    server.local_state_turret_max = 6.3
+    server.local_state_turret_range = 12.6
+    server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
+    server.debug_health_value = 1.0
+    server.debug_health_pattern = False
+    server.player_energy_max = 100.0
+
+    session = Session()
+    session.translation_ack_received = True
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=session,
+        entity_id=0x14EA,
+    )
+    ctx.remote_full_local_state_ready = True
+
+    include_local_state, kwargs = server._get_update_array_local_state_for_viewer(ctx)
+
+    assert include_local_state is True
+    assert kwargs["weapon_id"] == 2
+    assert kwargs["ammo_count_bits"] == 0
+    assert kwargs["primary_turret_bits"] == 0
+    assert kwargs["secondary_turret_bits"] == 0
+    print("test_server_remote_entity_packets_use_safe_local_state_after_promotion: PASSED")
+    return True
+
+
 def test_server_remote_projectile_update_uses_safe_local_state_after_promotion():
     """Remote OG projectile updates must stay parse-safe after full-sync promotion."""
     server = WulframServer.__new__(WulframServer)
@@ -803,14 +842,14 @@ def test_send_entity_create_uses_udp_only():
     server = WulframServer.__new__(WulframServer)
     server.remote_yaw_negate = False
     server.remote_yaw_offset = 0.0
+    server.update_local_state_mode = "wf"
+    server.spawn_tank_weapon_type = 2
+    server.local_state_turret_max = 6.3
+    server.local_state_turret_range = 12.6
+    server._get_health_value = lambda ctx: 1.0
+    server._get_energy_value = lambda ctx: 1.0
     server._to_client_pos = lambda pos: pos
     server._get_network_tick = lambda ctx: 0x12345678
-    server._get_local_state_kwargs = lambda ctx: {
-        "include_health": True,
-        "weapon_id": 0,
-        "health": 1.0,
-        "fuel": 1.0,
-    }
     calls = []
 
     def fake_send_packet(ctx, payload, *, prefer_tcp=True):
@@ -852,8 +891,8 @@ def test_send_entity_create_uses_udp_only():
     return True
 
 
-def test_entity_create_uses_viewer_full_local_state_for_og_viewer():
-    """OG viewer entity-create packets must carry the viewer's full tank local-state."""
+def test_entity_create_uses_spawn_safe_local_state_for_og_viewer():
+    """OG viewer entity-create packets must stay on the short-form-safe local-state."""
     server = WulframServer.__new__(WulframServer)
     server.remote_yaw_negate = False
     server.remote_yaw_offset = 0.0
@@ -882,7 +921,7 @@ def test_entity_create_uses_viewer_full_local_state_for_og_viewer():
     )
     viewer_ctx.remote_full_local_state_ready = True
 
-    local_state = server._get_local_state_kwargs(viewer_ctx)
+    include_local_state, local_state = server._get_update_array_local_state_for_viewer(viewer_ctx)
     payload = build_update_array_create_tank(
         tick=0x12345678,
         entity_id=1338,
@@ -891,6 +930,7 @@ def test_entity_create_uses_viewer_full_local_state_for_og_viewer():
         pos=(4980.0, 5100.0, 5.0),
         is_manned=True,
         rot=(0.0, 0.0, 0.0),
+        include_health=include_local_state,
         **local_state,
     )
 
@@ -900,15 +940,15 @@ def test_entity_create_uses_viewer_full_local_state_for_og_viewer():
     )
     assert tick == 0x12345678
     assert decoded_local_state is not None
-    assert decoded_local_state.weapon_id == 0
+    assert decoded_local_state.weapon_id == 2
     assert len(entities) == 1, entities
     assert entities[0].entity_id == 1338
-    print("test_entity_create_uses_viewer_full_local_state_for_og_viewer: PASSED")
+    print("test_entity_create_uses_spawn_safe_local_state_for_og_viewer: PASSED")
     return True
 
 
-def test_remote_player_update_uses_viewer_local_state():
-    """Remote updates must carry the viewer local-state, not the other player's."""
+def test_remote_player_update_uses_spawn_safe_viewer_local_state():
+    """Remote player updates must use the viewer's short safe local-state."""
     server = WulframServer.__new__(WulframServer)
     server.remote_update_mode = "pos_vel_rot"
     server.remote_yaw_negate = False
@@ -975,10 +1015,10 @@ def test_remote_player_update_uses_viewer_local_state():
     )
     assert tick == 0x12345678
     assert local_state is not None
-    assert local_state.weapon_id == 0
+    assert local_state.weapon_id == 2
     assert len(entities) == 1, entities
     assert entities[0].entity_id == 1338
-    print("test_remote_player_update_uses_viewer_local_state: PASSED")
+    print("test_remote_player_update_uses_spawn_safe_viewer_local_state: PASSED")
     return True
 
 
@@ -1037,7 +1077,7 @@ def test_loopback_entity_create_decodes_roundtrip():
 
 
 def test_loopback_remote_player_update_decodes_roundtrip():
-    """Loopback remote updates must decode cleanly with local-state + entity payload."""
+    """Loopback remote updates must decode cleanly on the entity-only path."""
     server = WulframServer.__new__(WulframServer)
     server.remote_update_mode = "pos_vel_rot"
     server.remote_yaw_negate = False
@@ -1102,8 +1142,7 @@ def test_loopback_remote_player_update_decodes_roundtrip():
         behavior_config=parse_behavior(build_behavior_packet()),
     )
     assert tick == 0x12345678
-    assert local_state is not None
-    assert local_state.weapon_id == 0
+    assert local_state is None
     assert len(entities) == 1, entities
     assert entities[0].entity_id == 1338
     assert entities[0].velocity is not None
@@ -1164,9 +1203,9 @@ def test_loopback_heartbeat_decodes_roundtrip():
 
 
 def test_server_network_strafe_decode_matches_og_sign():
-    """Negative slot-3 input should decode as world-left, positive as world-right."""
+    """OG slot-3 input is negated before physics: negative=right, positive=left."""
     server = WulframServer.__new__(WulframServer)
-    server.strafe_sign = 1.0
+    server.strafe_sign = -1.0
 
     ctx = ClientContext(
         client_id=1,
@@ -1179,8 +1218,8 @@ def test_server_network_strafe_decode_matches_og_sign():
     left_input = server._decode_network_strafe_input(ctx, -0.5800)
     right_input = server._decode_network_strafe_input(ctx, 0.6409)
 
-    assert left_input < 0.0, left_input
-    assert right_input > 0.0, right_input
+    assert left_input > 0.0, left_input
+    assert right_input < 0.0, right_input
     print("test_server_network_strafe_decode_matches_og_sign: PASSED")
     return True
 
@@ -1212,8 +1251,52 @@ def test_remote_client_promotes_full_local_state_after_spawn_delay():
     return True
 
 
-def test_server_tank_motion_clamps_to_max_velocity():
-    """Tank movement vector should clamp to config max_velocity before integration."""
+def test_server_tank_motion_uses_low_speed_mobility_factor():
+    """Tank forward movement should ramp from the OG 0.4 mobility floor at rest."""
+    server = WulframServer.__new__(WulframServer)
+    server.tick_rate_hz = 45.0
+    server.linear_damp_driving = 0.0
+    server.linear_damp_coasting = 0.0
+    server.up_axis = "z"
+    server.terrain = None
+    server.terrain_pitch_enabled = False
+    server.gravity = 0.0
+    server.ground_level = 0.0
+    server.world_bound = 100000.0
+    server.f32_physics = False
+    server._resolve_entity_world_collision = (
+        lambda ctx, px, py, pz, vx, vy, vz: (px, py, pz, vx, vy, vz)
+    )
+    server._check_building_collisions = (
+        lambda ctx, px, py, pz, vx, vy: (px, py, vx, vy)
+    )
+
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    ctx.injected_input = (1.0, 0.0)
+    ctx.entity_type = EntityType.TANK
+    ctx.player_pos = (0.0, 0.0, 10.0)
+    ctx.player_vel = (0.0, 0.0, 0.0)
+    ctx.player_heading = 0.0
+    ctx.ground_level_override = None
+    ctx.player_pose = {}
+
+    server._update_player_position(ctx, dt_override=1.0)
+
+    vx, vy, vz = ctx.player_vel
+    assert abs(vx - 34.0) < 1e-4, vx
+    assert abs(vy) < 1e-4, vy
+    assert abs(vz) < 1e-4, vz
+    print("test_server_tank_motion_uses_low_speed_mobility_factor: PASSED")
+    return True
+
+
+def test_server_motion_clamps_to_max_velocity():
+    """Movement vector should still clamp to config max_velocity before integration."""
     import math
 
     server = WulframServer.__new__(WulframServer)
@@ -1241,7 +1324,7 @@ def test_server_tank_motion_clamps_to_max_velocity():
         entity_id=0x14EA,
     )
     ctx.injected_input = (1.0, 1.0)
-    ctx.entity_type = EntityType.TANK
+    ctx.entity_type = EntityType.ASSAULT_PLATFORM
     ctx.player_pos = (0.0, 0.0, 10.0)
     ctx.player_vel = (0.0, 0.0, 0.0)
     ctx.player_heading = 0.0
@@ -1253,7 +1336,154 @@ def test_server_tank_motion_clamps_to_max_velocity():
     vx, vy, vz = ctx.player_vel
     speed = math.sqrt(vx * vx + vy * vy + vz * vz)
     assert abs(speed - 80.0) < 1e-4, speed
-    print("test_server_tank_motion_clamps_to_max_velocity: PASSED")
+    print("test_server_motion_clamps_to_max_velocity: PASSED")
+    return True
+
+
+def test_projectile_world_hit_skips_aabb_for_mesh_backed_building():
+    """Projectile sweep should not fall back to coarse AABB when mesh exists and is clear."""
+    server = WulframServer.__new__(WulframServer)
+    server._terrain_grid_collision = None
+    server.terrain = None
+    server.terrain_height_offset = 0.0
+    server.ground_level = 0.0
+    server.projectile_collision_radius = 0.7081
+    server._from_client_pos = lambda pos: pos
+    server._building_entities = {
+        10069: SimpleNamespace(
+            x=5047.6796875,
+            y=5078.9921875,
+            z=2.313780069351,
+            entity_type=EntityType.ENERGY_BUILDING,
+            team_id=2,
+            heading=0.564635634422,
+        )
+    }
+    server._building_collision = SimpleNamespace(
+        available=True,
+        has_collision_model=lambda entity_type, team_id: True,
+        test_sphere_collision=lambda building, sphere_pos, sphere_radius: (0.0, None),
+    )
+
+    hit = server._check_projectile_world_hit(
+        (5034.8, 5090.5, 6.2),
+        (5035.3, 5090.5, 6.2),
+        proj=None,
+    )
+    assert hit is None, hit
+    print("test_projectile_world_hit_skips_aabb_for_mesh_backed_building: PASSED")
+    return True
+
+
+def test_building_collision_skips_aabb_for_mesh_backed_building():
+    """Tank world collision should not use AABB when a real building mesh exists and is clear."""
+    server = WulframServer.__new__(WulframServer)
+    server._building_entities = {
+        10069: SimpleNamespace(
+            x=5047.6796875,
+            y=5078.9921875,
+            z=2.313780069351,
+            entity_type=EntityType.ENERGY_BUILDING,
+            team_id=2,
+            heading=0.564635634422,
+        )
+    }
+    server._building_collision = SimpleNamespace(
+        available=True,
+        has_collision_model=lambda entity_type, team_id: True,
+        test_sphere_collision=lambda building, sphere_pos, sphere_radius: (0.0, None),
+    )
+    server._snapshot_in_game_clients = lambda: []
+
+    px, py, vx, vy = server._check_building_collisions(
+        None,
+        5035.1,
+        5090.5,
+        6.2,
+        4.0,
+        -3.0,
+    )
+    assert abs(px - 5035.1) < 1e-6, px
+    assert abs(py - 5090.5) < 1e-6, py
+    assert abs(vx - 4.0) < 1e-6, vx
+    assert abs(vy + 3.0) < 1e-6, vy
+    print("test_building_collision_skips_aabb_for_mesh_backed_building: PASSED")
+    return True
+
+
+def test_roster_entry_stays_tcp_only():
+    """ADD_TO_ROSTER must not leak onto UDP when TCP is unavailable."""
+    sent_udp = []
+
+    server = WulframServer.__new__(WulframServer)
+    server.udp_handler = SimpleNamespace(send_to=lambda payload, addr: sent_udp.append((payload, addr)))
+
+    target_session = Session()
+    target_session.udp_addr = ("172.18.84.98", 62479)
+    target_ctx = ClientContext(
+        client_id=1,
+        client_addr=("172.18.84.98", 50000),
+        session=target_session,
+        entity_id=0x14EA,
+    )
+    target_ctx.tcp_handler = None
+    target_ctx.known_roster_ids = set()
+
+    player_session = Session()
+    player_session.player_id = 0x053B
+    player_session.username = "easystar"
+    player_session.team_id = 1
+    player_ctx = ClientContext(
+        client_id=3,
+        client_addr=("172.18.84.98", 50002),
+        session=player_session,
+        entity_id=0x053B,
+    )
+    player_ctx.kills = 0
+    player_ctx.deaths = 0
+
+    server._send_roster_entry(target_ctx, player_ctx)
+
+    assert sent_udp == [], sent_udp
+    assert target_ctx.known_roster_ids == set(), target_ctx.known_roster_ids
+    print("test_roster_entry_stays_tcp_only: PASSED")
+    return True
+
+
+def test_broadcast_player_stats_stays_tcp_only():
+    """UPDATE_STATS must not fall back to UDP when a client TCP stream is unavailable."""
+    sent_udp = []
+
+    server = WulframServer.__new__(WulframServer)
+    server.udp_handler = SimpleNamespace(send_to=lambda payload, addr: sent_udp.append((payload, addr)))
+
+    target_session = Session()
+    target_session.udp_addr = ("172.18.84.98", 62479)
+    target_ctx = ClientContext(
+        client_id=1,
+        client_addr=("172.18.84.98", 50000),
+        session=target_session,
+        entity_id=0x14EA,
+    )
+    target_ctx.tcp_handler = None
+    server._snapshot_clients = lambda: [target_ctx]
+
+    player_session = Session()
+    player_session.player_id = 0x053B
+    player_session.team_id = 1
+    player_ctx = ClientContext(
+        client_id=3,
+        client_addr=("172.18.84.98", 50002),
+        session=player_session,
+        entity_id=0x053B,
+    )
+    player_ctx.kills = 2
+    player_ctx.deaths = 1
+
+    server._broadcast_player_stats(player_ctx)
+
+    assert sent_udp == [], sent_udp
+    print("test_broadcast_player_stats_stays_tcp_only: PASSED")
     return True
 
 
@@ -1278,6 +1508,7 @@ def main():
         test_state_request_does_not_overwrite_client_tick_offset,
         test_translation_velocity_quantizer_matches_decompile_defaults,
         test_server_remote_local_state_kwargs_use_full_tank_shape,
+        test_server_remote_entity_packets_use_safe_local_state_after_promotion,
         test_server_remote_projectile_spawn_uses_viewer_local_state,
         test_server_remote_projectile_update_uses_safe_local_state_after_promotion,
         test_loopback_projectile_update_stays_entity_only,
@@ -1286,14 +1517,19 @@ def main():
         test_weapon_system_og_direct_trigger_slot_fires_pulse_shell,
         test_weapon_system_held_fire_repeats_on_cooldown,
         test_send_entity_create_uses_udp_only,
-        test_entity_create_uses_viewer_full_local_state_for_og_viewer,
-        test_remote_player_update_uses_viewer_local_state,
+        test_entity_create_uses_spawn_safe_local_state_for_og_viewer,
+        test_remote_player_update_uses_spawn_safe_viewer_local_state,
         test_loopback_entity_create_decodes_roundtrip,
         test_loopback_remote_player_update_decodes_roundtrip,
         test_loopback_heartbeat_decodes_roundtrip,
         test_server_network_strafe_decode_matches_og_sign,
         test_remote_client_promotes_full_local_state_after_spawn_delay,
-        test_server_tank_motion_clamps_to_max_velocity,
+        test_server_tank_motion_uses_low_speed_mobility_factor,
+        test_server_motion_clamps_to_max_velocity,
+        test_projectile_world_hit_skips_aabb_for_mesh_backed_building,
+        test_building_collision_skips_aabb_for_mesh_backed_building,
+        test_roster_entry_stays_tcp_only,
+        test_broadcast_player_stats_stays_tcp_only,
     ]
 
     passed = 0
