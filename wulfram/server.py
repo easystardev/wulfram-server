@@ -825,9 +825,9 @@ class WulframServer:
         # already emits its own ping/state timing packets, and extra server
         # pings have proven to be destabilizing during compatibility testing.
         self.server_ping_loop_enabled = os.environ.get("WULFRAM_SERVER_PING_LOOP", "0") == "1"
-        # UDP 0x0B -> 0x0C ping replies are not yet proven OG-safe. Keep them
-        # loopback-only by default until the original server semantics are nailed down.
-        udp_ping_reply_hosts = os.environ.get("WULFRAM_UDP_PING_REPLY_HOSTS", "127.0.0.1,::1").strip()
+        # UDP 0x0B -> 0x0C ping replies are part of the live OG timing path.
+        # Keep the allowlist configurable, but default to all clients.
+        udp_ping_reply_hosts = os.environ.get("WULFRAM_UDP_PING_REPLY_HOSTS", "*").strip()
         self.udp_ping_reply_allow_all = udp_ping_reply_hosts.lower() in ("*", "all", "any")
         self.udp_ping_reply_hosts = {
             self._normalize_debug_host(entry)
@@ -4202,21 +4202,8 @@ class WulframServer:
             0.0,
             ctx.player_heading,
         )
-        prev_sync_vel = getattr(ctx, "last_state_sync_vel", None)
-        prev_sync_rot = getattr(ctx, "last_state_sync_rot", None)
         include_sync_vel = True
-        if prev_sync_vel is not None:
-            include_sync_vel = any(
-                abs(curr - prev) > self.update_epsilon
-                for curr, prev in zip(ctx.player_vel, prev_sync_vel)
-            )
         include_sync_rot = True
-        if prev_sync_rot is not None:
-            include_sync_rot = (
-                abs(update_rot[0] - prev_sync_rot[0]) > self.update_epsilon
-                or abs(update_rot[1] - prev_sync_rot[1]) > self.update_epsilon
-                or abs(_wrap_angle(update_rot[2] - prev_sync_rot[2])) > self.update_epsilon
-            )
         # VIEW_UPDATE is a replay/correction wrapper over the same entity
         # transform payload as UPDATE_ARRAY. The OG reconcile path verifies the
         # buffered predicted rotation against that entity/body rotation, not the
@@ -4362,9 +4349,6 @@ class WulframServer:
                 timestamp=replay_timestamp,
             )
             self.udp_handler.send_to(view_payload, ctx.session.udp_addr)
-
-        ctx.last_state_sync_vel = ctx.player_vel
-        ctx.last_state_sync_rot = update_rot
 
         if self.pktlog.enabled:
             self.pktlog.log(

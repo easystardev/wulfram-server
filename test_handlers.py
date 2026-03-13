@@ -457,8 +457,8 @@ def test_remote_state_sync_reply_emits_view_update_with_request_timestamp():
     return True
 
 
-def test_remote_state_sync_reply_omits_unchanged_motion_when_stable():
-    """Repeated targeted sync replies should omit unchanged velocity/rotation bits."""
+def test_remote_state_sync_reply_keeps_full_motion_when_stable():
+    """Repeated targeted sync replies should keep full motion vectors for correction verify."""
     server = WulframServer.__new__(WulframServer)
     server.update_local_state_mode = "wf"
     server.update_entity_vitals = False
@@ -546,11 +546,11 @@ def test_remote_state_sync_reply_omits_unchanged_motion_when_stable():
         second_view,
         behavior_config=parse_behavior(build_behavior_packet()),
     )
-    assert second_entities[0].rotation is None
-    assert second_entities[0].velocity is None
-    assert second_view_entities[0].rotation is None
-    assert second_view_entities[0].velocity is None
-    print("test_remote_state_sync_reply_omits_unchanged_motion_when_stable: PASSED")
+    assert second_entities[0].rotation is not None
+    assert second_entities[0].velocity is not None
+    assert second_view_entities[0].rotation is not None
+    assert second_view_entities[0].velocity is not None
+    print("test_remote_state_sync_reply_keeps_full_motion_when_stable: PASSED")
     return True
 
 
@@ -576,6 +576,35 @@ def test_state_request_does_not_overwrite_client_tick_offset():
     assert ctx.last_client_tick == 0x002B61E0
     assert ctx.remote_full_local_state_ready is True
     print("test_state_request_does_not_overwrite_client_tick_offset: PASSED")
+    return True
+
+
+def test_remote_udp_ping_request_gets_og_safe_reply():
+    """Remote OG-style UDP 0x0B should receive the 5-byte 0x0C reply."""
+    sent = []
+    server = WulframServer.__new__(WulframServer)
+    server.udp_handler = SimpleNamespace(send_to=lambda payload, addr: sent.append((payload, addr)))
+    server.udp_addr_to_client = {}
+    server._recover_udp_client = lambda addr: None
+    server.debug_udp_raw = False
+    server.debug_sync = False
+    server.udp_ping_reply_allow_all = True
+    server.udp_ping_reply_hosts = set()
+    server._udp_ping_reply_blocked_clients = set()
+
+    ctx = ClientContext(
+        client_id=7,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    ctx.session.udp_addr = ("10.10.10.2", 51126)
+
+    payload = struct.pack(">BII", 0x0B, 0x12345678, 3)
+    server._handle_single_udp_packet(ctx, payload, ctx.session.udp_addr)
+
+    assert sent == [(b"\x0C\x12\x34\x56\x78", ("10.10.10.2", 51126))]
+    print("test_remote_udp_ping_request_gets_og_safe_reply: PASSED")
     return True
 
 
@@ -3170,8 +3199,9 @@ def main():
         test_server_remote_heartbeat_helper_pre_state_request_is_spawn_safe,
         test_remote_state_sync_reply_uses_safe_local_player_shape,
         test_remote_state_sync_reply_emits_view_update_with_request_timestamp,
-        test_remote_state_sync_reply_omits_unchanged_motion_when_stable,
+        test_remote_state_sync_reply_keeps_full_motion_when_stable,
         test_state_request_does_not_overwrite_client_tick_offset,
+        test_remote_udp_ping_request_gets_og_safe_reply,
         test_translation_velocity_quantizer_matches_decompile_defaults,
         test_server_remote_local_state_kwargs_use_full_tank_shape,
         test_server_remote_entity_packets_use_safe_local_state_after_promotion,
