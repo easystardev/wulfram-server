@@ -52,6 +52,10 @@ class _StaticWorldRayNode:
     max_y: float
     children: Optional[tuple[Optional["_StaticWorldRayNode"], Optional["_StaticWorldRayNode"], Optional["_StaticWorldRayNode"], Optional["_StaticWorldRayNode"]]]
     building_ids: tuple[int, ...]
+
+
+_STATIC_WORLD_RAY_STOP = object()
+
 from .packets import (
     PacketType, get_packet_name, get_ticks,
     build_hello_session_key, build_hello_udp_config, build_hello_verified,
@@ -5297,21 +5301,37 @@ class WulframServer:
                 vy -= contact.normal[1] * vel_dot
                 vz -= contact.normal[2] * vel_dot
 
-        def resolve_contact_loop():
-            resolved = False
-            for _ in range(2):
-                contact = sample_contact()
-                if contact is None or contact.penetration <= 0.001:
-                    break
-                apply_contact(contact)
-                resolved = True
-            return resolved
+        def apply_dirty_bounds_contact(contact):
+            nonlocal vx, vy, vz
+            separation = self._get_static_separation_from_contact(
+                (anchor[0], anchor[1], anchor[2]),
+                contact.position,
+            )
+            anchor[0] = contact.position[0] + contact.normal[0] * (bounding_radius + separation)
+            anchor[1] = contact.position[1] + contact.normal[1] * (bounding_radius + separation)
+            anchor[2] = contact.position[2] + contact.normal[2] * (bounding_radius + separation)
+            vel_dot = (
+                vx * contact.normal[0] +
+                vy * contact.normal[1] +
+                vz * contact.normal[2]
+            )
+            if vel_dot < 0.0:
+                vx -= contact.normal[0] * vel_dot
+                vy -= contact.normal[1] * vel_dot
+                vz -= contact.normal[2] * vel_dot
 
         def resolve_single_contact():
             contact = sample_contact()
             if contact is None or contact.penetration <= 0.001:
                 return False
             apply_contact(contact)
+            return True
+
+        def resolve_dirty_contact():
+            contact = sample_contact()
+            if contact is None:
+                return False
+            apply_dirty_bounds_contact(contact)
             return True
 
         dirty_threshold_sq = self._get_entity_dirty_threshold_sq(ctx, half_extents)
@@ -5351,8 +5371,8 @@ class WulframServer:
 
             if dirty_contact_args is not None:
                 contact = dirty_contact_fn(*dirty_contact_args)
-                if contact is not None and contact.penetration > 0.001:
-                    apply_contact(contact)
+                if contact is not None:
+                    apply_dirty_bounds_contact(contact)
                     ctx.world_collision_ref_pos = (anchor[0], anchor[1], anchor[2])
                     return anchor[0], anchor[1], anchor[2], vx, vy, vz
             else:
@@ -5369,10 +5389,10 @@ class WulframServer:
                         anchor[2] + bounding_radius,
                     )
                     if bounds_overlap_fn(dirty_aabb_min, dirty_aabb_max):
-                        if resolve_single_contact():
+                        if resolve_dirty_contact():
                             ctx.world_collision_ref_pos = (anchor[0], anchor[1], anchor[2])
                             return anchor[0], anchor[1], anchor[2], vx, vy, vz
-                elif resolve_single_contact():
+                elif resolve_dirty_contact():
                     ctx.world_collision_ref_pos = (anchor[0], anchor[1], anchor[2])
                     return anchor[0], anchor[1], anchor[2], vx, vy, vz
             terrain_hit = raycast_fn(reference_pos, (anchor[0], anchor[1], anchor[2]))
@@ -5435,8 +5455,9 @@ class WulframServer:
             ctx.world_collision_ref_pos = (anchor[0], anchor[1], anchor[2])
             return anchor[0], anchor[1], anchor[2], vx, vy, vz
 
-        # Multiple shallow terrain contacts can stack across adjacent cells.
-        resolve_contact_loop()
+        # Clean-bounds terrain/world contact now keeps the first-hit/store shape
+        # instead of locally iterating several terrain pushes in one step.
+        resolve_single_contact()
 
         return anchor[0], anchor[1], anchor[2], vx, vy, vz
 
@@ -5643,8 +5664,8 @@ class WulframServer:
             line_a * node.max_y + line_b * node.max_x + line_c,
         )
         return (
-            all(value < 0.0 for value in corners) or
-            all(value > 0.0 for value in corners)
+            all(value <= 0.0 for value in corners) or
+            all(value >= 0.0 for value in corners)
         )
 
     @staticmethod
@@ -5702,6 +5723,47 @@ class WulframServer:
         *,
         seg_len: float,
     ) -> Optional[tuple[str, tuple[float, float, float], int, float]]:
+        direction = (
+            end_pos[0] - start_pos[0],
+            end_pos[1] - start_pos[1],
+            end_pos[2] - start_pos[2],
+        )
+        if self._building_has_mesh_collision(building):
+            bounding_radius = self._building_collision.get_model_bounding_radius(
+                building.entity_type,
+                getattr(building, "team_id", 1),
+            )
+            if bounding_radius is None:
+                half_extents = self._get_building_world_half_extents(building)
+                bounding_radius = math.sqrt(
+                    half_extents[0] * half_extents[0] +
+                    half_extents[1] * half_extents[1] +
+                    half_extents[2] * half_extents[2]
+                )
+            hit_t = self._segment_sphere_hit_t(
+                start_pos,
+                end_pos,
+                (building.x, building.y, building.z),
+                bounding_radius,
+            )
+            if hit_t is None:
+                return None
+            hit_position = (
+                start_pos[0] + direction[0] * hit_t,
+                start_pos[1] + direction[1] * hit_t,
+                start_pos[2] + direction[2] * hit_t,
+            )
+            distance = seg_len * hit_t
+            raycast_fn = getattr(self._building_collision, "raycast_segment_collision", None)
+            if callable(raycast_fn):
+                mesh_hit = raycast_fn(building, start_pos, end_pos)
+                if mesh_hit is None:
+                    return None
+                hit_position, _, distance = mesh_hit
+            elif not self._building_collision.test_segment_collision(building, start_pos, end_pos):
+                return None
+            return ("building", hit_position, eid, distance)
+
         half_extents = self._get_building_world_half_extents(building)
         aabb_min = (
             building.x - half_extents[0],
@@ -5717,30 +5779,14 @@ class WulframServer:
         if hit_t is None:
             return None
 
-        direction = (
-            end_pos[0] - start_pos[0],
-            end_pos[1] - start_pos[1],
-            end_pos[2] - start_pos[2],
-        )
-        hit_kind = "building-aabb"
         hit_position = (
             start_pos[0] + direction[0] * hit_t,
             start_pos[1] + direction[1] * hit_t,
             start_pos[2] + direction[2] * hit_t,
         )
         distance = seg_len * hit_t
-        if self._building_has_mesh_collision(building):
-            raycast_fn = getattr(self._building_collision, "raycast_segment_collision", None)
-            if callable(raycast_fn):
-                mesh_hit = raycast_fn(building, start_pos, end_pos)
-                if mesh_hit is None:
-                    return None
-                hit_position, _, distance = mesh_hit
-            elif not self._building_collision.test_segment_collision(building, start_pos, end_pos):
-                return None
-            hit_kind = "building"
 
-        return (hit_kind, hit_position, eid, distance)
+        return ("building-aabb", hit_position, eid, distance)
 
     def _raycast_static_world_leaf(
         self,
@@ -5831,6 +5877,62 @@ class WulframServer:
                 return None
         return max(0.0, min(1.0, t_min))
 
+    @staticmethod
+    def _segment_sphere_hit_t(
+        start_pos: tuple[float, float, float],
+        end_pos: tuple[float, float, float],
+        sphere_center: tuple[float, float, float],
+        sphere_radius: float,
+    ) -> Optional[float]:
+        direction = (
+            end_pos[0] - start_pos[0],
+            end_pos[1] - start_pos[1],
+            end_pos[2] - start_pos[2],
+        )
+        origin_to_center = (
+            start_pos[0] - sphere_center[0],
+            start_pos[1] - sphere_center[1],
+            start_pos[2] - sphere_center[2],
+        )
+        a = (
+            direction[0] * direction[0] +
+            direction[1] * direction[1] +
+            direction[2] * direction[2]
+        )
+        if a <= 1e-12:
+            center_dist_sq = (
+                origin_to_center[0] * origin_to_center[0] +
+                origin_to_center[1] * origin_to_center[1] +
+                origin_to_center[2] * origin_to_center[2]
+            )
+            return 0.0 if center_dist_sq <= sphere_radius * sphere_radius else None
+
+        b = 2.0 * (
+            direction[0] * origin_to_center[0] +
+            direction[1] * origin_to_center[1] +
+            direction[2] * origin_to_center[2]
+        )
+        c = (
+            origin_to_center[0] * origin_to_center[0] +
+            origin_to_center[1] * origin_to_center[1] +
+            origin_to_center[2] * origin_to_center[2] -
+            sphere_radius * sphere_radius
+        )
+        discriminant = b * b - 4.0 * a * c
+        if discriminant < 0.0:
+            return None
+
+        sqrt_disc = math.sqrt(discriminant)
+        t0 = (-b - sqrt_disc) / (2.0 * a)
+        t1 = (-b + sqrt_disc) / (2.0 * a)
+        if 0.0 <= t0 <= 1.0:
+            return t0
+        if 0.0 <= t1 <= 1.0:
+            return t1
+        if c <= 0.0:
+            return 0.0
+        return None
+
     def _raycast_static_buildings(
         self,
         start_pos: tuple[float, float, float],
@@ -5847,10 +5949,18 @@ class WulframServer:
             return self._point_query_static_world(start_pos, root)
 
         def traverse(node: _StaticWorldRayNode):
+            endpoint_code = self._xy_outside_code(end_pos, node)
+            if endpoint_code & self._xy_outside_code(start_pos, node):
+                return None
             if self._ray_misses_static_world_node(start_pos, end_pos, node):
                 return None
             if node.children is None:
-                return self._raycast_static_world_leaf(node, start_pos, end_pos)
+                leaf_hit = self._raycast_static_world_leaf(node, start_pos, end_pos)
+                if leaf_hit is not None:
+                    return leaf_hit
+                if endpoint_code == 0:
+                    return _STATIC_WORLD_RAY_STOP
+                return None
 
             origin_quadrant = self._static_world_origin_quadrant(start_pos, node)
             for quadrant in self._iter_static_world_quadrants(origin_quadrant):
@@ -5858,11 +5968,16 @@ class WulframServer:
                 if child is None:
                     continue
                 child_hit = traverse(child)
+                if child_hit is _STATIC_WORLD_RAY_STOP:
+                    return _STATIC_WORLD_RAY_STOP
                 if child_hit is not None:
                     return child_hit
             return None
 
-        return traverse(root)
+        hit = traverse(root)
+        if hit is _STATIC_WORLD_RAY_STOP:
+            return None
+        return hit
 
     def _raycast_world(
         self,
@@ -5870,16 +5985,24 @@ class WulframServer:
         end_pos: tuple[float, float, float],
     ) -> Optional[tuple[str, tuple[float, float, float], Optional[int]]]:
         terrain_hit = None
+        terrain_dist_sq = None
         clipped_end = end_pos
         if self._terrain_grid_collision is not None:
             terrain_hit = self._terrain_grid_collision.raycast(start_pos, end_pos)
             if terrain_hit is not None:
                 clipped_end = terrain_hit.position
+                terrain_dist_sq = (
+                    (terrain_hit.position[0] - start_pos[0]) * (terrain_hit.position[0] - start_pos[0]) +
+                    (terrain_hit.position[1] - start_pos[1]) * (terrain_hit.position[1] - start_pos[1]) +
+                    (terrain_hit.position[2] - start_pos[2]) * (terrain_hit.position[2] - start_pos[2])
+                )
 
         building_hit = self._raycast_static_buildings(start_pos, clipped_end)
         if building_hit is not None:
-            hit_kind, hit_position, hit_id, _ = building_hit
-            return (hit_kind, hit_position, hit_id)
+            hit_kind, hit_position, hit_id, hit_distance = building_hit
+            building_dist_sq = hit_distance * hit_distance
+            if terrain_dist_sq is None or building_dist_sq <= terrain_dist_sq:
+                return (hit_kind, hit_position, hit_id)
 
         if terrain_hit is not None:
             return ("terrain", terrain_hit.position, terrain_hit.sector_index)

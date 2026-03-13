@@ -1369,6 +1369,7 @@ def test_projectile_world_hit_skips_aabb_for_mesh_backed_building():
         available=True,
         has_collision_model=lambda entity_type, team_id: True,
         get_model_half_extents=lambda entity_type, team_id: (5.0, 5.0, 5.0),
+        get_model_bounding_radius=lambda entity_type, team_id: 1.0,
         test_segment_collision=lambda building, start_pos, end_pos: False,
     )
 
@@ -1409,6 +1410,7 @@ def test_projectile_world_hit_prefers_closest_building_before_terrain():
         available=True,
         has_collision_model=lambda entity_type, team_id: True,
         get_model_half_extents=lambda entity_type, team_id: (1.0, 1.0, 1.0),
+        get_model_bounding_radius=lambda entity_type, team_id: 1.0,
         test_segment_collision=lambda building, start_pos, end_pos: True,
     )
 
@@ -1452,6 +1454,7 @@ def test_projectile_world_hit_clips_static_world_raycast_to_terrain():
         available=True,
         has_collision_model=lambda entity_type, team_id: True,
         get_model_half_extents=lambda entity_type, team_id: (1.0, 1.0, 1.0),
+        get_model_bounding_radius=lambda entity_type, team_id: 1.0,
         test_segment_collision=lambda building, start_pos, end_pos: True,
     )
 
@@ -1462,6 +1465,31 @@ def test_projectile_world_hit_clips_static_world_raycast_to_terrain():
     )
     assert hit == ("terrain", (5.0, 0.0, 0.0), 2), hit
     print("test_projectile_world_hit_clips_static_world_raycast_to_terrain: PASSED")
+    return True
+
+
+def test_projectile_world_hit_prefers_terrain_when_static_world_reports_farther_hit():
+    """Top-level world-ray selection should still prefer terrain if a clipped static-world hit reports farther distance."""
+    server = WulframServer.__new__(WulframServer)
+    server._from_client_pos = lambda pos: pos
+    server._terrain_grid_collision = SimpleNamespace(
+        raycast=lambda start, end: TerrainRaycastHit(
+            position=(5.0, 0.0, 0.0),
+            normal=(0.0, 0.0, 1.0),
+            sector_index=7,
+            cell=(0, 0),
+            distance=5.0,
+        )
+    )
+    server._raycast_static_buildings = lambda start_pos, end_pos: ("building", (5.0, 0.0, 0.0), 12345, 9.0)
+
+    hit = server._check_projectile_world_hit(
+        (0.0, 0.0, 0.0),
+        (12.0, 0.0, 0.0),
+        proj=None,
+    )
+    assert hit == ("terrain", (5.0, 0.0, 0.0), 7), hit
+    print("test_projectile_world_hit_prefers_terrain_when_static_world_reports_farther_hit: PASSED")
     return True
 
 
@@ -1484,6 +1512,7 @@ def test_projectile_world_hit_uses_exact_mesh_raycast_position():
         available=True,
         has_collision_model=lambda entity_type, team_id: True,
         get_model_half_extents=lambda entity_type, team_id: (5.0, 5.0, 5.0),
+        get_model_bounding_radius=lambda entity_type, team_id: 6.0,
         raycast_segment_collision=lambda building, start_pos, end_pos: (
             (4.0, 0.0, 0.0),
             (1.0, 0.0, 0.0),
@@ -1498,6 +1527,41 @@ def test_projectile_world_hit_uses_exact_mesh_raycast_position():
     )
     assert hit == ("building", (4.0, 0.0, 0.0), 20003), hit
     print("test_projectile_world_hit_uses_exact_mesh_raycast_position: PASSED")
+    return True
+
+
+def test_projectile_world_hit_mesh_broadphase_uses_bounding_sphere():
+    """Mesh-backed world rays should reject on the model bounding sphere before precise mesh raycast."""
+    server = WulframServer.__new__(WulframServer)
+    server._from_client_pos = lambda pos: pos
+    server._terrain_grid_collision = None
+    server._building_entities = {
+        20004: SimpleNamespace(
+            x=0.0,
+            y=0.0,
+            z=0.0,
+            entity_type=EntityType.ENERGY_BUILDING,
+            team_id=1,
+            heading=0.0,
+        )
+    }
+    raycast_calls = []
+    server._building_collision = SimpleNamespace(
+        available=True,
+        has_collision_model=lambda entity_type, team_id: True,
+        get_model_half_extents=lambda entity_type, team_id: (10.0, 10.0, 10.0),
+        get_model_bounding_radius=lambda entity_type, team_id: 1.0,
+        raycast_segment_collision=lambda building, start_pos, end_pos: raycast_calls.append((start_pos, end_pos)),
+    )
+
+    hit = server._check_projectile_world_hit(
+        (-10.0, 9.0, 0.0),
+        (10.0, 9.0, 0.0),
+        proj=None,
+    )
+    assert hit is None, hit
+    assert raycast_calls == [], raycast_calls
+    print("test_projectile_world_hit_mesh_broadphase_uses_bounding_sphere: PASSED")
     return True
 
 
@@ -1552,6 +1616,54 @@ def test_static_world_raycast_uses_point_query_for_zero_horizontal_direction():
     assert hit == ("building-aabb", (1.0, 1.0, 0.0), 10001, 0.0), hit
     assert calls == [((1.0, 1.0, 0.0), (10001,))], calls
     print("test_static_world_raycast_uses_point_query_for_zero_horizontal_direction: PASSED")
+    return True
+
+
+def test_static_world_raycast_stops_once_endpoint_leaf_is_reached():
+    """Traversal should stop once the segment endpoint lies inside a leaf, even with no hit there."""
+    server = WulframServer.__new__(WulframServer)
+    server._building_entities = {}
+    server._static_world_raycast_root = _StaticWorldRayNode(
+        0.0,
+        4.0,
+        0.0,
+        4.0,
+        (
+            _StaticWorldRayNode(2.0, 4.0, 2.0, 4.0, None, (1,)),
+            _StaticWorldRayNode(2.0, 4.0, 0.0, 2.0, None, (2,)),
+            _StaticWorldRayNode(0.0, 2.0, 2.0, 4.0, None, (3,)),
+            _StaticWorldRayNode(0.0, 2.0, 0.0, 2.0, None, (4,)),
+        ),
+        (),
+    )
+    visited = []
+
+    server._ray_misses_static_world_node = lambda start, end, node: False
+
+    def fake_leaf(node, start, end):
+        visited.append(node.building_ids[0])
+        if node.building_ids[0] == 3:
+            return ("building", (1.0, 3.0, 0.0), 3, 1.0)
+        return None
+
+    server._raycast_static_world_leaf = fake_leaf
+    hit = server._raycast_static_buildings((0.5, 0.5, 0.0), (1.5, 1.5, 0.0))
+    assert hit is None, hit
+    assert visited == [4], visited
+    print("test_static_world_raycast_stops_once_endpoint_leaf_is_reached: PASSED")
+    return True
+
+
+def test_static_world_raycast_node_cull_uses_signbit_zero_side_semantics():
+    """Node line-cull should treat zero-valued corners as part of the nonnegative side, matching the decompile sign-bit test."""
+    node = _StaticWorldRayNode(0.0, 1.0, 0.0, 1.0, None, ())
+    misses = WulframServer._ray_misses_static_world_node(
+        (0.0, 0.0, 0.0),
+        (1.0, 0.0, 0.0),
+        node,
+    )
+    assert misses is True, misses
+    print("test_static_world_raycast_node_cull_uses_signbit_zero_side_semantics: PASSED")
     return True
 
 
@@ -2000,7 +2112,7 @@ def test_entity_world_collision_prefers_mesh_contact_when_collision_model_exists
     )
 
     assert box_calls == 0, box_calls
-    assert model_calls == 2, model_calls
+    assert model_calls == 1, model_calls
     assert abs(px - 100.0) < 1e-6, px
     assert abs(py - 200.0) < 1e-6, py
     assert pz > 10.0, pz
@@ -2052,7 +2164,7 @@ def test_entity_world_collision_falls_back_to_box_without_collision_model():
         0.0,
     )
 
-    assert box_calls == 2, box_calls
+    assert box_calls == 1, box_calls
     assert px > 50.0, px
     assert abs(py - 75.0) < 1e-6, py
     assert abs(pz - 6.0) < 1e-6, pz
@@ -2275,6 +2387,128 @@ def test_entity_world_collision_uses_dirty_bounds_contact_store():
     assert abs(vy) < 1e-6, vy
     assert abs(vz) < 1e-6, vz
     print("test_entity_world_collision_uses_dirty_bounds_contact_store: PASSED")
+    return True
+
+
+def test_entity_world_collision_dirty_bounds_store_accepts_tiny_contact():
+    """Dirty bounds-phase stored contacts should apply even when penetration is below the clean-path epsilon."""
+    raycast_calls = 0
+
+    def fake_raycast(start, end):
+        nonlocal raycast_calls
+        raycast_calls += 1
+        return None
+
+    server = WulframServer.__new__(WulframServer)
+
+    def fake_model_bounds_contact(*args, **kwargs):
+        return TerrainContact(
+            position=(10.0, 0.0, 4.0),
+            normal=(0.0, 0.0, 1.0),
+            penetration=0.0001,
+            sector_index=0,
+            cell=(0, 0),
+        )
+
+    server._terrain_grid_collision = SimpleNamespace(
+        test_model_bounds_contact=fake_model_bounds_contact,
+        raycast=fake_raycast,
+        test_box_collision=lambda *args, **kwargs: None,
+        test_model_collision=lambda *args, **kwargs: None,
+    )
+    server._get_entity_world_half_extents = lambda ctx: (4.0, 4.0, 4.0)
+    server._get_entity_world_collision_model = lambda ctx: (
+        [],
+        SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=5.0)),
+        5.0,
+        0.0,
+    )
+
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    ctx.player_heading = 0.0
+    ctx.player_pos = (0.0, 0.0, 4.0)
+    ctx.world_collision_ref_pos = (0.0, 0.0, 4.0)
+
+    px, py, pz, vx, vy, vz = server._resolve_entity_world_collision(
+        ctx,
+        10.0,
+        0.0,
+        4.0,
+        1.0,
+        0.0,
+        -5.0,
+    )
+
+    assert raycast_calls == 0, raycast_calls
+    assert abs(px - 10.0) < 1e-6, px
+    assert abs(py) < 1e-6, py
+    assert pz > 4.0, pz
+    assert abs(vx - 1.0) < 1e-6, vx
+    assert abs(vy) < 1e-6, vy
+    assert abs(vz) < 1e-6, vz
+    print("test_entity_world_collision_dirty_bounds_store_accepts_tiny_contact: PASSED")
+    return True
+
+
+def test_entity_world_collision_dirty_bounds_store_uses_contact_point_radius_resolution():
+    """Dirty stored bounds contacts should resolve from the stored contact point plus bounding radius, not SAT penetration depth."""
+    server = WulframServer.__new__(WulframServer)
+
+    def fake_model_bounds_contact(*args, **kwargs):
+        return TerrainContact(
+            position=(10.0, 0.0, 4.0),
+            normal=(0.0, 0.0, 1.0),
+            penetration=0.25,
+            sector_index=0,
+            cell=(0, 0),
+        )
+
+    server._terrain_grid_collision = SimpleNamespace(
+        test_model_bounds_contact=fake_model_bounds_contact,
+        raycast=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("dirty bounds contact should win before raycast")),
+        test_box_collision=lambda *args, **kwargs: None,
+        test_model_collision=lambda *args, **kwargs: None,
+    )
+    server._get_entity_world_half_extents = lambda ctx: (4.0, 4.0, 4.0)
+    server._get_entity_world_collision_model = lambda ctx: (
+        [],
+        SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=5.0)),
+        5.0,
+        0.0,
+    )
+
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    ctx.player_heading = 0.0
+    ctx.player_pos = (0.0, 0.0, 4.0)
+    ctx.world_collision_ref_pos = (0.0, 0.0, 4.0)
+
+    px, py, pz, vx, vy, vz = server._resolve_entity_world_collision(
+        ctx,
+        10.0,
+        0.0,
+        4.0,
+        1.0,
+        0.0,
+        -5.0,
+    )
+
+    assert abs(px - 10.0) < 1e-6, px
+    assert abs(py) < 1e-6, py
+    assert abs(pz - 9.01) < 1e-6, pz
+    assert abs(vx - 1.0) < 1e-6, vx
+    assert abs(vy) < 1e-6, vy
+    assert abs(vz) < 1e-6, vz
+    print("test_entity_world_collision_dirty_bounds_store_uses_contact_point_radius_resolution: PASSED")
     return True
 
 
@@ -2684,6 +2918,67 @@ def test_entity_world_collision_static_separation_matches_decompile_clamp():
     return True
 
 
+def test_entity_world_collision_clean_path_uses_single_contact_store():
+    """Clean-bounds entity/world contact should apply the first stored contact once, not iterate multiple pushes."""
+    server = WulframServer.__new__(WulframServer)
+    server._get_entity_world_half_extents = lambda ctx: (1.0, 1.0, 1.0)
+    server._get_entity_world_collision_model = lambda ctx: None
+    server._get_entity_dirty_threshold_sq = lambda ctx, half_extents: 999999.0
+
+    calls = []
+
+    def fake_box_collision(center, half_extents, heading):
+        calls.append(center)
+        if len(calls) == 1:
+            return TerrainContact(
+                position=(0.0, 0.0, 0.0),
+                normal=(0.0, 0.0, 1.0),
+                penetration=1.0,
+                sector_index=0,
+                cell=(0, 0),
+            )
+        return TerrainContact(
+            position=(0.0, 0.0, 2.0),
+            normal=(0.0, 0.0, 1.0),
+            penetration=5.0,
+            sector_index=0,
+            cell=(0, 1),
+        )
+
+    server._terrain_grid_collision = SimpleNamespace(
+        test_box_collision=fake_box_collision,
+    )
+
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    ctx.player_heading = 0.0
+    ctx.player_pos = (0.0, 0.0, 0.0)
+
+    px, py, pz, vx, vy, vz = server._resolve_entity_world_collision(
+        ctx,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        -3.0,
+    )
+
+    assert len(calls) == 1, calls
+    assert abs(px) < 1e-6, px
+    assert abs(py) < 1e-6, py
+    assert abs(pz - 1.01) < 1e-6, pz
+    assert abs(vx) < 1e-6, vx
+    assert abs(vy) < 1e-6, vy
+    assert abs(vz) < 1e-6, vz
+    print("test_entity_world_collision_clean_path_uses_single_contact_store: PASSED")
+    return True
+
+
 def test_roster_entry_stays_tcp_only():
     """ADD_TO_ROSTER must not leak onto UDP when TCP is unavailable."""
     sent_udp = []
@@ -2802,9 +3097,12 @@ def main():
         test_projectile_world_hit_skips_aabb_for_mesh_backed_building,
         test_projectile_world_hit_prefers_closest_building_before_terrain,
         test_projectile_world_hit_clips_static_world_raycast_to_terrain,
+        test_projectile_world_hit_prefers_terrain_when_static_world_reports_farther_hit,
         test_projectile_world_hit_uses_exact_mesh_raycast_position,
         test_static_world_raycast_uses_quadtree_front_to_back_order,
         test_static_world_raycast_uses_point_query_for_zero_horizontal_direction,
+        test_static_world_raycast_stops_once_endpoint_leaf_is_reached,
+        test_static_world_raycast_node_cull_uses_signbit_zero_side_semantics,
         test_segment_raycast_cbsp_tree_uses_split_plane_normal,
         test_segment_hits_cbsp_tree_detects_plane_hit,
         test_triangle_cbsp_contact_uses_node_split_normal,
@@ -2818,6 +3116,8 @@ def main():
         test_entity_world_collision_uses_dirty_terrain_raycast_branch,
         test_entity_world_collision_uses_dirty_contact_before_raycast,
         test_entity_world_collision_uses_dirty_bounds_contact_store,
+        test_entity_world_collision_dirty_bounds_store_accepts_tiny_contact,
+        test_entity_world_collision_dirty_bounds_store_uses_contact_point_radius_resolution,
         test_entity_world_collision_dirty_bounds_phase_uses_xy_broadphase,
         test_dirty_bounds_contact_helpers_skip_triangle_prefilter,
         test_terrain_cell_triangles_match_decompile_order,
@@ -2829,6 +3129,7 @@ def main():
         test_entity_world_collision_dirty_raycast_uses_contact_separation,
         test_entity_world_collision_dirty_raycast_uses_decompile_degenerate_threshold,
         test_entity_world_collision_static_separation_matches_decompile_clamp,
+        test_entity_world_collision_clean_path_uses_single_contact_store,
         test_roster_entry_stays_tcp_only,
         test_broadcast_player_stats_stays_tcp_only,
     ]

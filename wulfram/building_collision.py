@@ -67,6 +67,7 @@ class BuildingCollisionAssets:
         self._registry = SimpleNamespace(models=self.models)
         self._cache = CollisionMeshCache() if CollisionMeshCache is not None else None
         self._half_extents_cache: dict[tuple[int, int], Optional[tuple[float, float, float]]] = {}
+        self._bounding_radius_cache: dict[tuple[int, int], Optional[float]] = {}
         self.available = False
         self.last_error = str(_IMPORT_ERROR) if _IMPORT_ERROR else ""
         self.shapes_path: Optional[Path] = None
@@ -87,6 +88,7 @@ class BuildingCollisionAssets:
             self.models = load_all_models(zip_path)
             self._registry.models = self.models
             self._half_extents_cache.clear()
+            self._bounding_radius_cache.clear()
             self.available = bool(self.models)
             self.shapes_path = zip_path
             if not self.available:
@@ -165,6 +167,42 @@ class BuildingCollisionAssets:
         )
         self._half_extents_cache[cache_key] = extents
         return extents
+
+    def get_model_bounding_radius(self, entity_type: int, team_id: int) -> Optional[float]:
+        """Return the decompile-shaped bounding sphere radius for a loaded collision mesh."""
+        cache_key = (int(entity_type), int(team_id))
+        if cache_key in self._bounding_radius_cache:
+            return self._bounding_radius_cache[cache_key]
+
+        if not self.available or self._cache is None:
+            self._bounding_radius_cache[cache_key] = None
+            return None
+
+        model_name = self.get_model_name(entity_type, team_id)
+        if not model_name:
+            self._bounding_radius_cache[cache_key] = None
+            return None
+
+        model = self.models.get(model_name)
+        cbsp_tree = getattr(model, "cbsp_tree", None) if model is not None else None
+        root = getattr(cbsp_tree, "root", None) if cbsp_tree is not None else None
+        if root is not None and getattr(root, "radius", 0.0) > 0.0:
+            radius = float(root.radius)
+            self._bounding_radius_cache[cache_key] = radius
+            return radius
+
+        mesh = getattr(model, "collision_mesh", None) if model is not None else None
+        vertices = getattr(mesh, "vertices", None) if mesh is not None else None
+        if not vertices:
+            self._bounding_radius_cache[cache_key] = None
+            return None
+
+        radius = max(
+            (v.x * v.x + v.y * v.y + v.z * v.z) ** 0.5
+            for v in vertices
+        )
+        self._bounding_radius_cache[cache_key] = radius
+        return radius
 
     @staticmethod
     def get_model_name(entity_type: int, team_id: int) -> Optional[str]:
