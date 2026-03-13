@@ -81,6 +81,18 @@ The current public server path is centered on:
 
 This is an active reverse-engineering project, so behavior is still being tightened against `azurefishy-src` and live OG client retests.
 
+## Status Tracking
+
+The canonical parity/fidelity snapshot for the wider workspace lives in:
+
+- `../web-ui/static/clone-status.json`
+
+Append-only structured history lives in:
+
+- `../web-ui/static/status-history.ndjson`
+
+If server behavior changes materially, update those status files first and then sync the supporting markdown docs in the parent workspace.
+
 ## Testing
 
 From the `server/` repo root:

@@ -1464,6 +1464,8 @@ Examples:
         ctx.player_heading = 0.0
         ctx.player_yaw = 0.0
         ctx.angular_vel_yaw = 0.0
+        ctx.world_collision_ref_pos = ctx.player_pos
+        ctx.world_collision_bounds_dirty = False
         ctx.player_pose["vel"] = (0.0, 0.0, 0.0)
         ctx.player_pose["yaw"] = 0.0
         if ctx.vehicle_physics:
@@ -1552,6 +1554,8 @@ Examples:
             ctx.player_vel = (0.0, 0.0, 0.0)
             ctx.player_heading = 0.0
             ctx.angular_vel_yaw = 0.0
+            ctx.world_collision_ref_pos = ctx.player_pos
+            ctx.world_collision_bounds_dirty = False
             if ctx.vehicle_physics:
                 ctx.vehicle_physics.heading = 0.0
                 ctx.vehicle_physics._angular_velocity = 0.0
@@ -2480,6 +2484,8 @@ Examples:
                 y = float(args[1]) if len(args) > 1 else ctx.player_pos[1]
                 z = float(args[2]) if len(args) > 2 else ctx.player_pos[2]
                 ctx.player_pos = (x, y, z)
+                ctx.world_collision_ref_pos = ctx.player_pos
+                ctx.world_collision_bounds_dirty = False
                 ctx.player_pose["pos"] = (x, y, z)
                 return f"Set player pos to ({x:.1f}, {y:.1f}, {z:.1f})"
             except (ValueError, IndexError) as e:

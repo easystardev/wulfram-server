@@ -55,6 +55,8 @@ class ClientContext:
     # Legacy accessors for compatibility
     player_pos: tuple = (100.0, 100.0, 20.0)
     player_vel: tuple = (0.0, 0.0, 0.0)
+    world_collision_ref_pos: Optional[tuple] = None
+    world_collision_bounds_dirty: bool = False
     player_yaw: float = 0.0
     player_heading: float = 0.0
     player_angular_vel: float = 0.0
@@ -148,6 +150,8 @@ class ClientContext:
         self.last_sent_pos = self.player_pos
         self.last_sent_vel = self.player_vel
         self.last_sent_yaw = self.player_yaw
+        if self.world_collision_ref_pos is None:
+            self.world_collision_ref_pos = self.player_pos
         if self.vehicle_physics is None:
             self.vehicle_physics = VehiclePhysics()
 
@@ -165,6 +169,8 @@ class ClientContext:
         """Update player position in both pose dict and legacy field."""
         self.player_pos = pos
         self.player_pose["pos"] = pos
+        if self.world_collision_ref_pos is None:
+            self.world_collision_ref_pos = pos
 
     def update_player_vel(self, vel: tuple):
         """Update player velocity in both pose dict and legacy field."""

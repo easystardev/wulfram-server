@@ -66,6 +66,7 @@ class BuildingCollisionAssets:
         self.models = {}
         self._registry = SimpleNamespace(models=self.models)
         self._cache = CollisionMeshCache() if CollisionMeshCache is not None else None
+        self._half_extents_cache: dict[tuple[int, int], Optional[tuple[float, float, float]]] = {}
         self.available = False
         self.last_error = str(_IMPORT_ERROR) if _IMPORT_ERROR else ""
         self.shapes_path: Optional[Path] = None
@@ -85,6 +86,7 @@ class BuildingCollisionAssets:
         try:
             self.models = load_all_models(zip_path)
             self._registry.models = self.models
+            self._half_extents_cache.clear()
             self.available = bool(self.models)
             self.shapes_path = zip_path
             if not self.available:
@@ -134,6 +136,36 @@ class BuildingCollisionAssets:
         vertices = getattr(mesh, "vertices", None) if mesh is not None else None
         return bool(vertices)
 
+    def get_model_half_extents(self, entity_type: int, team_id: int) -> Optional[tuple[float, float, float]]:
+        """Return model-space half-extents for a loaded collision mesh."""
+        cache_key = (int(entity_type), int(team_id))
+        if cache_key in self._half_extents_cache:
+            return self._half_extents_cache[cache_key]
+
+        if not self.available or self._cache is None:
+            self._half_extents_cache[cache_key] = None
+            return None
+
+        model_name = self.get_model_name(entity_type, team_id)
+        if not model_name:
+            self._half_extents_cache[cache_key] = None
+            return None
+
+        model = self.models.get(model_name)
+        mesh = getattr(model, "collision_mesh", None) if model is not None else None
+        vertices = getattr(mesh, "vertices", None) if mesh is not None else None
+        if not vertices:
+            self._half_extents_cache[cache_key] = None
+            return None
+
+        extents = (
+            max(abs(v.x) for v in vertices),
+            max(abs(v.y) for v in vertices),
+            max(abs(v.z) for v in vertices),
+        )
+        self._half_extents_cache[cache_key] = extents
+        return extents
+
     @staticmethod
     def get_model_name(entity_type: int, team_id: int) -> Optional[str]:
         names = BUILDING_MODEL_NAMES.get(entity_type)
@@ -144,6 +176,52 @@ class BuildingCollisionAssets:
         if team_id == 2 and len(names) > 1:
             return names[1]
         return names[0]
+
+    def test_segment_collision(
+        self,
+        building: BuildingEntity,
+        start_world_pos: tuple[float, float, float],
+        end_world_pos: tuple[float, float, float],
+    ) -> bool:
+        """Return True when a world-space segment intersects a building mesh."""
+        if not self.available or self._cache is None:
+            return False
+
+        model_name = self.get_model_name(building.entity_type, building.team_id)
+        if not model_name:
+            return False
+
+        return self._cache.test_segment_collision(
+            model_name,
+            self._registry,
+            start_world_pos,
+            end_world_pos,
+            building.pos,
+            building.heading,
+        )
+
+    def raycast_segment_collision(
+        self,
+        building: BuildingEntity,
+        start_world_pos: tuple[float, float, float],
+        end_world_pos: tuple[float, float, float],
+    ) -> Optional[tuple[tuple[float, float, float], tuple[float, float, float], float]]:
+        """Return closest world-space segment hit on a building mesh, or None."""
+        if not self.available or self._cache is None:
+            return None
+
+        model_name = self.get_model_name(building.entity_type, building.team_id)
+        if not model_name:
+            return None
+
+        return self._cache.raycast_segment_collision(
+            model_name,
+            self._registry,
+            start_world_pos,
+            end_world_pos,
+            building.pos,
+            building.heading,
+        )
 
     @staticmethod
     def _resolve_shapes_zip() -> Optional[Path]:

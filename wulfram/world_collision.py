@@ -9,8 +9,9 @@ This module starts moving the server toward the original
 - each sector traverses overlapping terrain quads
 - quads are split with the original alternating diagonal parity
 
-The current live consumer is projectile-vs-terrain collision. Tank/entity
-contact response still needs a fuller decompile-style solver.
+The current live consumers are projectile-vs-terrain collision and the
+server-side entity-vs-world terrain resolver. Tank/entity contact response
+still keeps inferred pieces around contact recording and response ordering.
 """
 
 from __future__ import annotations
@@ -143,6 +144,15 @@ class TerrainContact:
     cell: tuple[int, int]
 
 
+@dataclass(frozen=True)
+class TerrainRaycastHit:
+    position: tuple[float, float, float]
+    normal: tuple[float, float, float]
+    sector_index: int
+    cell: tuple[int, int]
+    distance: float
+
+
 class TerrainGridCollision:
     """3x3 terrain-sector collision traversal modeled after BSP.c."""
 
@@ -205,6 +215,25 @@ class TerrainGridCollision:
                         )
         return None
 
+    def test_bounds_intersection(
+        self,
+        aabb_min: tuple[float, float, float],
+        aabb_max: tuple[float, float, float],
+    ) -> bool:
+        """Test whether any terrain triangle overlaps XY bounds, mirroring the dirty-path broadphase."""
+        for sector in self._iter_aabb_sectors(aabb_min, aabb_max):
+            for cell_x, cell_y in self._iter_sector_cells(aabb_min, aabb_max, sector):
+                for tri in self._iter_cell_triangles(cell_x, cell_y):
+                    if self._triangle_overlaps_xy_bounds(
+                        tri,
+                        aabb_min[0],
+                        aabb_min[1],
+                        aabb_max[0],
+                        aabb_max[1],
+                    ):
+                        return True
+        return False
+
     def test_box_collision(
         self,
         center: tuple[float, float, float],
@@ -222,11 +251,16 @@ class TerrainGridCollision:
         cos_h = math.cos(heading)
         sin_h = math.sin(heading)
 
-        best_contact = None
         for sector in self._iter_aabb_sectors(aabb_min, aabb_max):
             for cell_x, cell_y in self._iter_sector_cells(aabb_min, aabb_max, sector):
                 for tri_world in self._iter_cell_triangles(cell_x, cell_y):
-                    if not self._triangle_overlaps_aabb(tri_world, aabb_min, aabb_max):
+                    if not self._triangle_overlaps_xy_bounds(
+                        tri_world,
+                        aabb_min[0],
+                        aabb_min[1],
+                        aabb_max[0],
+                        aabb_max[1],
+                    ):
                         continue
                     tri_local = tuple(
                         self._world_to_local_box(vertex, center, cos_h, sin_h)
@@ -246,10 +280,73 @@ class TerrainGridCollision:
                         sector_index=sector.index,
                         cell=(cell_x, cell_y),
                     )
-                    if best_contact is None or contact.penetration > best_contact.penetration:
-                        best_contact = contact
+                    return contact
 
-        return best_contact
+        return None
+
+    def test_box_bounds_contact(
+        self,
+        bounds_center: tuple[float, float, float],
+        collision_center: tuple[float, float, float],
+        half_extents: tuple[float, float, float],
+        heading: float,
+        bounding_radius: Optional[float] = None,
+    ) -> Optional[TerrainContact]:
+        """Return the first terrain contact found while scanning bounds-overlapping cells."""
+        radius = bounding_radius
+        if radius is None:
+            radius = math.sqrt(
+                half_extents[0] * half_extents[0] +
+                half_extents[1] * half_extents[1] +
+                half_extents[2] * half_extents[2]
+            )
+        aabb_min = (
+            bounds_center[0] - radius,
+            bounds_center[1] - radius,
+            bounds_center[2] - radius,
+        )
+        aabb_max = (
+            bounds_center[0] + radius,
+            bounds_center[1] + radius,
+            bounds_center[2] + radius,
+        )
+        cos_h = math.cos(heading)
+        sin_h = math.sin(heading)
+
+        for sector in self._iter_aabb_sectors(aabb_min, aabb_max):
+            for cell_x, cell_y in self._iter_sector_cells(aabb_min, aabb_max, sector):
+                for tri_world in self._iter_cell_triangles(cell_x, cell_y):
+                    tri_local = tuple(
+                        self._world_to_local_box(vertex, collision_center, cos_h, sin_h)
+                        for vertex in tri_world
+                    )
+                    sat_contact = self._triangle_box_contact(tri_local, half_extents)
+                    if sat_contact is None:
+                        continue
+                    axis_local, penetration = sat_contact
+                    axis_world = self._local_to_world_dir(axis_local, cos_h, sin_h)
+                    closest_local = _closest_point_on_triangle((0.0, 0.0, 0.0), *tri_local)
+                    closest_world = self._local_to_world_point(closest_local, collision_center, cos_h, sin_h)
+                    return TerrainContact(
+                        position=closest_world,
+                        normal=axis_world,
+                        penetration=penetration,
+                        sector_index=sector.index,
+                        cell=(cell_x, cell_y),
+                    )
+        return None
+
+    def raycast(
+        self,
+        start: tuple[float, float, float],
+        end: tuple[float, float, float],
+    ) -> Optional[TerrainRaycastHit]:
+        """Raycast a segment against terrain using patch sweep + per-patch DDA traversal."""
+        for sector in self._iter_ray_sectors(start, end):
+            hit = self._raycast_sector_cells(start, end, sector)
+            if hit is not None:
+                return hit
+        return None
 
     def test_model_collision(
         self,
@@ -265,7 +362,6 @@ class TerrainGridCollision:
         cos_h = math.cos(heading)
         sin_h = math.sin(heading)
 
-        best_contact = None
         for sector in self._iter_aabb_sectors(aabb_min, aabb_max):
             for cell_x, cell_y in self._iter_sector_cells(aabb_min, aabb_max, sector):
                 for tri_world in self._iter_cell_triangles(cell_x, cell_y):
@@ -275,7 +371,12 @@ class TerrainGridCollision:
                         self._world_to_local_box(vertex, center, cos_h, sin_h)
                         for vertex in tri_world
                     )
-                    mesh_contact = self._triangle_cbsp_contact(tri_local, vertices, cbsp_tree)
+                    mesh_contact = self._triangle_cbsp_contact(
+                        tri_local,
+                        vertices,
+                        cbsp_tree,
+                        bounding_radius,
+                    )
                     if mesh_contact is None:
                         continue
                     contact_point_local, normal_local, penetration = mesh_contact
@@ -288,10 +389,60 @@ class TerrainGridCollision:
                         sector_index=sector.index,
                         cell=(cell_x, cell_y),
                     )
-                    if best_contact is None or contact.penetration > best_contact.penetration:
-                        best_contact = contact
+                    return contact
 
-        return best_contact
+        return None
+
+    def test_model_bounds_contact(
+        self,
+        bounds_center: tuple[float, float, float],
+        collision_center: tuple[float, float, float],
+        heading: float,
+        vertices,
+        cbsp_tree,
+        bounding_radius: float,
+    ) -> Optional[TerrainContact]:
+        """Return the first model/terrain contact found while scanning bounds-overlapping cells."""
+        aabb_min = (
+            bounds_center[0] - bounding_radius,
+            bounds_center[1] - bounding_radius,
+            bounds_center[2] - bounding_radius,
+        )
+        aabb_max = (
+            bounds_center[0] + bounding_radius,
+            bounds_center[1] + bounding_radius,
+            bounds_center[2] + bounding_radius,
+        )
+        cos_h = math.cos(heading)
+        sin_h = math.sin(heading)
+
+        for sector in self._iter_aabb_sectors(aabb_min, aabb_max):
+            for cell_x, cell_y in self._iter_sector_cells(aabb_min, aabb_max, sector):
+                for tri_world in self._iter_cell_triangles(cell_x, cell_y):
+                    tri_local = tuple(
+                        self._world_to_local_box(vertex, collision_center, cos_h, sin_h)
+                        for vertex in tri_world
+                    )
+                    mesh_contact = self._triangle_cbsp_contact(
+                        tri_local,
+                        vertices,
+                        cbsp_tree,
+                        bounding_radius,
+                    )
+                    if mesh_contact is None:
+                        continue
+                    contact_point_local, normal_local, penetration = mesh_contact
+                    normal_world = self._local_to_world_dir(normal_local, cos_h, sin_h)
+                    contact_world = self._local_to_world_point(contact_point_local, collision_center, cos_h, sin_h)
+                    return TerrainContact(
+                        position=contact_world,
+                        normal=normal_world,
+                        penetration=penetration,
+                        sector_index=sector.index,
+                        cell=(cell_x, cell_y),
+                    )
+
+        return None
 
     def _build_sectors(self) -> tuple[TerrainSector, ...]:
         row_ranges = self._split_axis(self.max_cell_x + 1, self.sector_rows)
@@ -331,6 +482,17 @@ class TerrainGridCollision:
             for col in range(col_min, col_max + 1):
                 yield self.sectors[self.coords_to_index(row, col)]
 
+    def _iter_ray_sectors(self, start, end):
+        start_row, start_col = self.classify_cell(start[0], start[1])
+        end_row, end_col = self.classify_cell(end[0], end[1])
+        step_row = 1 if end_row >= start_row else -1
+        step_col = 1 if end_col >= start_col else -1
+        row_stop = end_row + step_row
+        col_stop = end_col + step_col
+        for row in range(start_row, row_stop, step_row):
+            for col in range(start_col, col_stop, step_col):
+                yield self.sectors[self.coords_to_index(row, col)]
+
     def _world_to_grid_clamped(self, wx: float, wy: float, sector: TerrainSector) -> tuple[int, int]:
         gx = int(math.floor(wx / self.cell_x)) if self.cell_x > 0.0 else 0
         gy = int(math.floor(wy / self.cell_y)) if self.cell_y > 0.0 else 0
@@ -346,6 +508,94 @@ class TerrainGridCollision:
         for cell_x in range(row_min, row_max + 1):
             for cell_y in range(col_min, col_max + 1):
                 yield cell_x, cell_y
+
+    def _raycast_sector_cells(
+        self,
+        start: tuple[float, float, float],
+        end: tuple[float, float, float],
+        sector: TerrainSector,
+    ) -> Optional[TerrainRaycastHit]:
+        start_cell_x, start_cell_y = self._world_to_grid_clamped(start[0], start[1], sector)
+        end_cell_x, end_cell_y = self._world_to_grid_clamped(end[0], end[1], sector)
+
+        current_cell_x = start_cell_x
+        current_cell_y = start_cell_y
+        x_boundary_world = current_cell_x * self.cell_x
+        y_boundary_world = current_cell_y * self.cell_y
+        axis_flags = 0
+
+        if start_cell_x < end_cell_x:
+            step_x = 1
+            x_boundary_world += self.cell_x
+            signed_cell_x = self.cell_x
+            axis_flags = 2
+        else:
+            step_x = -1
+            signed_cell_x = -self.cell_x
+
+        if start_cell_y < end_cell_y:
+            step_y = 1
+            y_boundary_world += self.cell_y
+            signed_cell_y = self.cell_y
+            axis_flags += 1
+        else:
+            step_y = -1
+            signed_cell_y = -self.cell_y
+
+        x_stop = end_cell_x + step_x
+        y_stop = end_cell_y + step_y
+        line_a = start[0] - end[0]
+        line_b = end[1] - start[1]
+        line_c = -(line_a * start[1] + start[0] * line_b)
+
+        hit = self._raycast_cell_triangles(start, end, sector, current_cell_x, current_cell_y)
+        while True:
+            if hit is not None:
+                return hit
+
+            line_side = line_b * x_boundary_world + line_a * y_boundary_world + line_c
+            if axis_flags in (0, 3):
+                step_x_next = line_side <= 0.0
+            else:
+                step_x_next = line_side > 0.0
+
+            if step_x_next:
+                current_cell_x += step_x
+                if current_cell_x == x_stop:
+                    return None
+                x_boundary_world += signed_cell_x
+            else:
+                current_cell_y += step_y
+                if current_cell_y == y_stop:
+                    return None
+                y_boundary_world += signed_cell_y
+
+            hit = self._raycast_cell_triangles(start, end, sector, current_cell_x, current_cell_y)
+
+    def _raycast_cell_triangles(
+        self,
+        start: tuple[float, float, float],
+        end: tuple[float, float, float],
+        sector: TerrainSector,
+        cell_x: int,
+        cell_y: int,
+    ) -> Optional[TerrainRaycastHit]:
+        for tri in self._iter_cell_triangles(cell_x, cell_y):
+            hit_point = self._segment_triangle_intersection(start, end, tri)
+            if hit_point is None:
+                continue
+            normal = _normalize3(_cross3(_sub3(tri[1], tri[0]), _sub3(tri[2], tri[0])))
+            if normal is None:
+                continue
+            delta = _sub3(hit_point, start)
+            return TerrainRaycastHit(
+                position=hit_point,
+                normal=normal,
+                sector_index=sector.index,
+                cell=(cell_x, cell_y),
+                distance=math.sqrt(_dot3(delta, delta)),
+            )
+        return None
 
     def _iter_cell_triangles(self, cell_x: int, cell_y: int):
         x0 = cell_x * self.cell_x
@@ -363,13 +613,16 @@ class TerrainGridCollision:
         v01 = (x0, y1, h01)
         v11 = (x1, y1, h11)
 
-        # Decompile parity: ((~row ^ col) & 1) == 0 selects the v01-v10 diagonal.
+        # Decompile parity/order from Collision_test_quad_triangles:
+        #   diagonal_flag = (~col ^ row) & 1
+        #   flag 0 -> (v01,v00,v10) then (v10,v11,v01)
+        #   flag 1 -> (v01,v00,v11) then (v00,v10,v11)
         if ((cell_x + cell_y) & 1) == 1:
-            yield (v00, v01, v10)
-            yield (v01, v11, v10)
+            yield (v01, v00, v10)
+            yield (v10, v11, v01)
         else:
-            yield (v00, v01, v11)
-            yield (v00, v11, v10)
+            yield (v01, v00, v11)
+            yield (v00, v10, v11)
 
     @staticmethod
     def _world_to_local_box(point, center, cos_h: float, sin_h: float):
@@ -406,7 +659,7 @@ class TerrainGridCollision:
             abs(axis[2]) * half_extents[2]
         )
 
-    def _triangle_cbsp_contact(self, tri_local, vertices, cbsp_tree):
+    def _triangle_cbsp_contact(self, tri_local, vertices, cbsp_tree, bounding_radius: float):
         tri_normal_raw = _cross3(_sub3(tri_local[1], tri_local[0]), _sub3(tri_local[2], tri_local[0]))
         tri_normal = _normalize3(tri_normal_raw)
         if tri_normal is None or cbsp_tree is None or not getattr(cbsp_tree, "nodes", None):
@@ -427,25 +680,22 @@ class TerrainGridCollision:
             return None
 
         plane_d = -_dot3(tri_normal, tri_local[0])
-        if plane_d > root.radius + 1e-4:
+        if plane_d > bounding_radius + 1e-4:
             return None
 
         tri_normal_len_sq = _dot3(tri_normal_raw, tri_normal_raw)
         if tri_normal_len_sq <= 1e-10:
             return None
 
-        best_contact = None
         tri_edges = (
             (tri_local[0], tri_local[1]),
             (tri_local[0], tri_local[2]),
             (tri_local[1], tri_local[2]),
         )
 
-        def record_hit(hit_point, mesh_tri):
-            nonlocal best_contact
-            penetration = self._estimate_triangle_penetration(tri_local, mesh_tri, tri_normal)
-            if best_contact is None or penetration > best_contact[2]:
-                best_contact = (hit_point, tri_normal, penetration)
+        def record_hit(hit_point, mesh_tri, hit_normal):
+            penetration = self._estimate_triangle_penetration(tri_local, mesh_tri, hit_normal)
+            return (hit_point, hit_normal, penetration)
 
         def signbits_differ(value_a: float, value_b: float) -> bool:
             return _signbit(value_a) != _signbit(value_b)
@@ -473,6 +723,11 @@ class TerrainGridCollision:
             )
 
         def leaf_test_triangles(node):
+            node_hit_normal = _normalize3(
+                (node.split_normal.x, node.split_normal.y, node.split_normal.z)
+            )
+            if node_hit_normal is None:
+                return None
             clip_points = []
             for (vert_a, vert_b), (dist_a, dist_b) in (
                 ((tri_local[0], tri_local[1]), (node_dist_a, node_dist_b)),
@@ -506,7 +761,7 @@ class TerrainGridCollision:
 
                 for clip_point in clip_points:
                     if self._point_in_triangle(clip_point, mesh_tri, mesh_normal):
-                        record_hit(clip_point, mesh_tri)
+                        return record_hit(clip_point, mesh_tri, node_hit_normal)
 
                 for edge_start, edge_end in tri_edges:
                     dist_start = _dot3(mesh_normal, edge_start) + mesh_plane_d
@@ -517,18 +772,19 @@ class TerrainGridCollision:
                     if hit_point is None:
                         continue
                     if self._point_in_triangle(hit_point, mesh_tri, mesh_normal):
-                        record_hit(hit_point, mesh_tri)
+                        return record_hit(hit_point, mesh_tri, node_hit_normal)
 
                 vertex_contact = self._terrain_triangle_vertex_contact(tri_local, mesh_tri, tri_normal)
                 if vertex_contact is not None:
                     hit_point, _ = vertex_contact
-                    record_hit(hit_point, mesh_tri)
-                    continue
+                    return record_hit(hit_point, mesh_tri, node_hit_normal)
                 hit_point = self._triangles_intersection_point(tri_local, mesh_tri)
                 if hit_point is not None:
-                    record_hit(hit_point, mesh_tri)
+                    return record_hit(hit_point, mesh_tri, node_hit_normal)
+            return None
 
         def traverse(node_index: int):
+            nonlocal best_contact
             if node_index < 0:
                 return
 
@@ -563,9 +819,14 @@ class TerrainGridCollision:
             )
 
             if straddles:
-                leaf_test_triangles(node)
+                leaf_hit = leaf_test_triangles(node)
+                if leaf_hit is not None:
+                    best_contact = leaf_hit
+                    return
                 if node.child_pos >= 0:
                     traverse(node.child_pos)
+                    if best_contact is not None:
+                        return
                 if node.child_neg >= 0:
                     traverse(node.child_neg)
                 return
@@ -578,6 +839,7 @@ class TerrainGridCollision:
         node_dist_a = 0.0
         node_dist_b = 0.0
         node_dist_c = 0.0
+        best_contact = None
         traverse(cbsp_tree.root_index)
         return best_contact
 
@@ -755,3 +1017,22 @@ class TerrainGridCollision:
             if tri_max < aabb_min[axis] or tri_min > aabb_max[axis]:
                 return False
         return True
+
+    @staticmethod
+    def _triangle_overlaps_xy_bounds(
+        tri,
+        min_x: float,
+        min_y: float,
+        max_x: float,
+        max_y: float,
+    ) -> bool:
+        tri_min_x = min(tri[0][0], tri[1][0], tri[2][0])
+        tri_max_x = max(tri[0][0], tri[1][0], tri[2][0])
+        tri_min_y = min(tri[0][1], tri[1][1], tri[2][1])
+        tri_max_y = max(tri[0][1], tri[1][1], tri[2][1])
+        return not (
+            tri_max_x < min_x or
+            tri_min_x > max_x or
+            tri_max_y < min_y or
+            tri_min_y > max_y
+        )
