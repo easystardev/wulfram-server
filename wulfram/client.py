@@ -135,6 +135,8 @@ class ClientContext:
     last_sent_pos: tuple = field(default_factory=lambda: (0.0, 0.0, 0.0))
     last_sent_vel: tuple = field(default_factory=lambda: (0.0, 0.0, 0.0))
     last_sent_yaw: float = 0.0
+    last_state_sync_vel: Optional[tuple] = None
+    last_state_sync_rot: Optional[tuple] = None
 
     def __post_init__(self):
         """Initialize time-based fields after creation."""

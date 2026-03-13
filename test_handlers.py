@@ -457,6 +457,103 @@ def test_remote_state_sync_reply_emits_view_update_with_request_timestamp():
     return True
 
 
+def test_remote_state_sync_reply_omits_unchanged_motion_when_stable():
+    """Repeated targeted sync replies should omit unchanged velocity/rotation bits."""
+    server = WulframServer.__new__(WulframServer)
+    server.update_local_state_mode = "wf"
+    server.update_entity_vitals = False
+    server.view_update_local_stats = False
+    server.view_update_entity_vitals = False
+    server.local_state_weapon_type = 0
+    server.spawn_tank_weapon_type = 2
+    server.local_state_ammo_override = False
+    server.local_state_ammo_from_behavior = True
+    server.local_state_primary_override = ""
+    server.local_state_secondary_override = ""
+    server.local_state_turret_bits = 16
+    server.local_state_turret_max = 6.3
+    server.local_state_turret_range = 12.6
+    server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
+    server.update_epsilon = 0.001
+    server._get_health_value = lambda ctx: 1.0
+    server._get_energy_value = lambda ctx: 1.0
+    server._to_client_pos = lambda pos: pos
+    server._get_network_tick = lambda ctx: 0x12345678
+    server.debug_viewpoint = False
+    server.debug_udp_raw = False
+    server.pktlog = SimpleNamespace(enabled=False)
+    captured = []
+    server.udp_handler = SimpleNamespace(send_to=lambda payload, addr: captured.append((payload, addr)))
+
+    session = Session()
+    session.translation_ack_received = True
+    session.in_game = True
+    session.entity_id = 0x14EA
+    session.udp_addr = ("10.10.10.2", 50000)
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=session,
+        entity_id=0x14EA,
+    )
+    ctx.remote_full_local_state_ready = True
+    ctx.player_pos = (4950.0, 5100.0, 5.0)
+    ctx.player_vel = (0.0, 0.0, 0.0)
+    ctx.player_pose = {"roll": 0.0}
+    ctx.player_heading = 0.25
+    ctx.player_yaw = -0.25
+    ctx.last_state_sync_send = 0.0
+
+    server._send_state_sync_snapshot(
+        ctx,
+        include_view_update=True,
+        replay_timestamp=0x89ABCDEF,
+        reason="test",
+    )
+    assert len(captured) == 2
+    first_update = captured[0][0]
+    first_view = captured[1][0]
+    _, _, first_entities = decode_update_array(
+        first_update,
+        behavior_config=parse_behavior(build_behavior_packet()),
+    )
+    _, _, _, first_view_entities = decode_view_update(
+        first_view,
+        behavior_config=parse_behavior(build_behavior_packet()),
+    )
+    assert first_entities[0].rotation is not None
+    assert first_entities[0].velocity is not None
+    assert first_view_entities[0].rotation is not None
+    assert first_view_entities[0].velocity is not None
+
+    captured.clear()
+    ctx.last_state_sync_send = 0.0
+    server._send_state_sync_snapshot(
+        ctx,
+        include_view_update=True,
+        replay_timestamp=0x89ABCDF0,
+        reason="test",
+    )
+
+    assert len(captured) == 2
+    second_update = captured[0][0]
+    second_view = captured[1][0]
+    _, _, second_entities = decode_update_array(
+        second_update,
+        behavior_config=parse_behavior(build_behavior_packet()),
+    )
+    _, _, _, second_view_entities = decode_view_update(
+        second_view,
+        behavior_config=parse_behavior(build_behavior_packet()),
+    )
+    assert second_entities[0].rotation is None
+    assert second_entities[0].velocity is None
+    assert second_view_entities[0].rotation is None
+    assert second_view_entities[0].velocity is None
+    print("test_remote_state_sync_reply_omits_unchanged_motion_when_stable: PASSED")
+    return True
+
+
 def test_state_request_does_not_overwrite_client_tick_offset():
     """STATE_REQUEST request_id must not replace the input-tick sync domain."""
     server = WulframServer.__new__(WulframServer)
@@ -3073,6 +3170,7 @@ def main():
         test_server_remote_heartbeat_helper_pre_state_request_is_spawn_safe,
         test_remote_state_sync_reply_uses_safe_local_player_shape,
         test_remote_state_sync_reply_emits_view_update_with_request_timestamp,
+        test_remote_state_sync_reply_omits_unchanged_motion_when_stable,
         test_state_request_does_not_overwrite_client_tick_offset,
         test_translation_velocity_quantizer_matches_decompile_defaults,
         test_server_remote_local_state_kwargs_use_full_tank_shape,

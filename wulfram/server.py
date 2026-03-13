@@ -1220,6 +1220,8 @@ class WulframServer:
             return self._build_remote_sync_heartbeat_update(
                 ctx,
                 tick=tick,
+                include_vel=True,
+                include_rot=True,
                 include_local_state=include_local_state,
                 health=health,
                 fuel=fuel,
@@ -1264,6 +1266,8 @@ class WulframServer:
         ctx: ClientContext,
         *,
         tick: int,
+        include_vel: bool,
+        include_rot: bool,
         include_local_state: bool,
         health: float,
         fuel: float,
@@ -1291,9 +1295,9 @@ class WulframServer:
             vel=ctx.player_vel,
             rot=hb_rot,
             include_pos=True,
-            include_vel=True,
-            include_rot=True,
-            include_spin=True,
+            include_vel=include_vel,
+            include_rot=include_rot,
+            include_spin=include_rot,
             spin=(0.0, 0.0, 0.0),
             include_local_state=include_local_state,
             include_entity_vitals=False,
@@ -2639,6 +2643,8 @@ class WulframServer:
         ctx.player_pose["pos"] = spawn_pos
         ctx.world_collision_ref_pos = spawn_pos
         ctx.world_collision_bounds_dirty = False
+        ctx.last_state_sync_vel = None
+        ctx.last_state_sync_rot = None
         ctx.player_yaw = 0.0
         ctx.player_heading = 0.0
         ctx.angular_vel_yaw = 0.0
@@ -2806,6 +2812,8 @@ class WulframServer:
         ctx.player_pose["pos"] = spawn_pos
         ctx.world_collision_ref_pos = spawn_pos
         ctx.world_collision_bounds_dirty = False
+        ctx.last_state_sync_vel = None
+        ctx.last_state_sync_rot = None
 
         ctx.player_angular_vel = 0.0
         ctx.vehicle_physics.reset()
@@ -4180,6 +4188,13 @@ class WulframServer:
             return
         ctx.last_state_sync_send = now
 
+        def _wrap_angle(angle: float) -> float:
+            while angle > math.pi:
+                angle -= 2.0 * math.pi
+            while angle < -math.pi:
+                angle += 2.0 * math.pi
+            return angle
+
         tick = self._get_network_tick(ctx)
         send_pos = self._to_client_pos(ctx.player_pos)
         update_rot = (
@@ -4187,6 +4202,21 @@ class WulframServer:
             0.0,
             ctx.player_heading,
         )
+        prev_sync_vel = getattr(ctx, "last_state_sync_vel", None)
+        prev_sync_rot = getattr(ctx, "last_state_sync_rot", None)
+        include_sync_vel = True
+        if prev_sync_vel is not None:
+            include_sync_vel = any(
+                abs(curr - prev) > self.update_epsilon
+                for curr, prev in zip(ctx.player_vel, prev_sync_vel)
+            )
+        include_sync_rot = True
+        if prev_sync_rot is not None:
+            include_sync_rot = (
+                abs(update_rot[0] - prev_sync_rot[0]) > self.update_epsilon
+                or abs(update_rot[1] - prev_sync_rot[1]) > self.update_epsilon
+                or abs(_wrap_angle(update_rot[2] - prev_sync_rot[2])) > self.update_epsilon
+            )
         # VIEW_UPDATE is a replay/correction wrapper over the same entity
         # transform payload as UPDATE_ARRAY. The OG reconcile path verifies the
         # buffered predicted rotation against that entity/body rotation, not the
@@ -4229,6 +4259,8 @@ class WulframServer:
             update_payload = self._build_remote_sync_heartbeat_update(
                 ctx,
                 tick=tick,
+                include_vel=include_sync_vel,
+                include_rot=include_sync_rot,
                 include_local_state=update_include_local_state,
                 health=health_val,
                 fuel=fuel_val,
@@ -4248,8 +4280,8 @@ class WulframServer:
                 vel=ctx.player_vel,
                 rot=update_rot,
                 include_pos=True,
-                include_vel=True,
-                include_rot=True,
+                include_vel=include_sync_vel,
+                include_rot=include_sync_rot,
                 include_local_state=update_include_local_state,
                 include_entity_vitals=self.update_entity_vitals,
                 weapon_id=weapon_type,
@@ -4310,8 +4342,8 @@ class WulframServer:
                 vel=ctx.player_vel,
                 rot=view_rot,
                 include_pos=True,
-                include_vel=True,
-                include_rot=True,
+                include_vel=include_sync_vel,
+                include_rot=include_sync_rot,
                 include_local_state=view_include_local_state,
                 include_entity_vitals=self.view_update_entity_vitals,
                 weapon_id=view_weapon_type,
@@ -4330,6 +4362,9 @@ class WulframServer:
                 timestamp=replay_timestamp,
             )
             self.udp_handler.send_to(view_payload, ctx.session.udp_addr)
+
+        ctx.last_state_sync_vel = ctx.player_vel
+        ctx.last_state_sync_rot = update_rot
 
         if self.pktlog.enabled:
             self.pktlog.log(
