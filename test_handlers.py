@@ -554,6 +554,78 @@ def test_remote_state_sync_reply_keeps_full_motion_when_stable():
     return True
 
 
+def test_local_player_sync_rotation_uses_heading_not_player_yaw():
+    """Local-player replication packets must use body heading, not camera-yaw sign."""
+    server = WulframServer.__new__(WulframServer)
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    ctx.player_pose = {"roll": 0.125}
+    ctx.player_heading = 0.25
+    ctx.player_yaw = -0.25
+
+    rot = server._local_player_sync_rotation(ctx)
+    assert rot == (0.125, 0.0, 0.25)
+    print("test_local_player_sync_rotation_uses_heading_not_player_yaw: PASSED")
+    return True
+
+
+def test_remote_sync_heartbeat_helper_uses_heading_not_player_yaw():
+    """Promoted remote heartbeat packets should decode with body heading."""
+    server = WulframServer.__new__(WulframServer)
+    server.local_state_turret_max = 6.3
+    server.local_state_turret_range = 12.6
+    server._to_client_pos = lambda pos: pos
+    server._get_spawn_tank_weapon_type = lambda ctx: 2
+
+    session = Session()
+    session.entity_id = 0x14EA
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=session,
+        entity_id=0x14EA,
+    )
+    ctx.player_pos = (4950.0, 5100.0, 5.0)
+    ctx.player_vel = (0.0, 0.0, 0.0)
+    ctx.player_pose = {"roll": 0.125}
+    ctx.player_heading = 0.25
+    ctx.player_yaw = -0.25
+
+    payload = server._build_remote_sync_heartbeat_update(
+        ctx,
+        tick=0x12345678,
+        include_vel=True,
+        include_rot=True,
+        include_local_state=True,
+        health=1.0,
+        fuel=1.0,
+        weapon_type=2,
+        ammo_bits=0,
+        ammo_mask=0,
+        pt_bits=0,
+        pt_angle=0.0,
+        st_bits=0,
+        st_angle=0.0,
+    )
+
+    tick, local_state, entities = decode_update_array(
+        payload,
+        behavior_config=parse_behavior(build_behavior_packet()),
+    )
+    assert tick == 0x12345678
+    assert local_state is not None
+    assert len(entities) == 1
+    assert entities[0].rotation is not None
+    assert abs(entities[0].rotation[0] - 0.125) < 1e-3
+    assert abs(entities[0].rotation[2] - 0.25) < 1e-3
+    print("test_remote_sync_heartbeat_helper_uses_heading_not_player_yaw: PASSED")
+    return True
+
+
 def test_state_request_does_not_overwrite_client_tick_offset():
     """STATE_REQUEST request_id must not replace the input-tick sync domain."""
     server = WulframServer.__new__(WulframServer)
@@ -3200,6 +3272,8 @@ def main():
         test_remote_state_sync_reply_uses_safe_local_player_shape,
         test_remote_state_sync_reply_emits_view_update_with_request_timestamp,
         test_remote_state_sync_reply_keeps_full_motion_when_stable,
+        test_local_player_sync_rotation_uses_heading_not_player_yaw,
+        test_remote_sync_heartbeat_helper_uses_heading_not_player_yaw,
         test_state_request_does_not_overwrite_client_tick_offset,
         test_remote_udp_ping_request_gets_og_safe_reply,
         test_translation_velocity_quantizer_matches_decompile_defaults,

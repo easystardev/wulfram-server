@@ -1281,11 +1281,7 @@ class WulframServer:
     ) -> bytes:
         """Build a safe single-local-player update for promoted remote OG heartbeats."""
         entity_id = ctx.session.entity_id or ctx.entity_id
-        hb_rot = (
-            ctx.player_pose.get("roll", 0.0),
-            0.0,
-            ctx.player_heading,
-        )
+        hb_rot = self._local_player_sync_rotation(ctx)
         hb_pos = self._to_client_pos(ctx.player_pos)
         safe_weapon_type = self._get_spawn_tank_weapon_type(ctx)
         return build_update_array_player_update(
@@ -1314,6 +1310,21 @@ class WulframServer:
             turret_range=self.local_state_turret_range,
             is_manned=True,
             speed_scale=1.0,
+        )
+
+    def _local_player_sync_rotation(self, ctx: ClientContext) -> tuple[float, float, float]:
+        """Return the body-space rotation tuple for local-player replication packets.
+
+        The old client stores entity body rotation in entity+0x30/0x34/0x38 and
+        targeted correction only became stable once STATE_REQUEST replies used
+        that body-heading tuple instead of the client camera-yaw convention.
+        Keep the ordinary local-player replication paths on the same body-space
+        rotation so UPDATE_ARRAY / VIEW_UPDATE do not fight targeted correction.
+        """
+        return (
+            ctx.player_pose.get("roll", 0.0),
+            0.0,
+            ctx.player_heading,
         )
 
     def _get_update_array_local_state_for_viewer(self, ctx: ClientContext) -> tuple[bool, dict]:
@@ -1430,11 +1441,7 @@ class WulframServer:
                 "is_manned": True,
                 "pos": send_pos,
                 "vel": ctx.player_vel,
-                "rot": (
-                    ctx.player_pose.get("roll", 0.0),
-                    0.0,
-                    ctx.player_yaw,
-                ),
+                "rot": self._local_player_sync_rotation(ctx),
                 "include_pos": True,
                 "include_vel": True,
                 "include_rot": True,
@@ -2895,11 +2902,7 @@ class WulframServer:
         else:
             print(f"[SPAWN] Sending UDP TankPacket (vitals={int(include_spawn_vitals)})")
         send_pos = self._to_client_pos(spawn_pos)
-        send_rot = (
-            ctx.player_pose.get("roll", 0.0),
-            0.0,
-            ctx.player_yaw,
-        )
+        send_rot = self._local_player_sync_rotation(ctx)
         # Local-state updates may use Tank(0), but spawn TankPacket vitals use a
         # parse-safe weapon id because 0x18 writes only weapon+health+energy bits.
         ls_weapon = self._get_local_state_weapon_type(ctx)
@@ -3901,11 +3904,7 @@ class WulframServer:
                 else:
                     tank_pos = (100.0, self.spawn_height, 15.0)
                 send_pos = self._to_client_pos(tank_pos)
-                send_rot = (
-                    ctx.player_pose.get("roll", 0.0),
-                    0.0,
-                    ctx.player_yaw,
-                )
+                send_rot = self._local_player_sync_rotation(ctx)
                 tank_packet = build_tank_packet(
                     net_id=entity_id,
                     unit_type=0,
@@ -7285,11 +7284,7 @@ class WulframServer:
                                 pos=send_pos,
                                 vel=ctx.player_vel,
                                 # Rotation vector order follows wulf-forge: (roll, pitch, yaw)
-                                rot=(
-                                    ctx.player_pose.get("roll", 0.0),
-                                    0.0,
-                                    ctx.player_yaw,
-                                ),
+                                rot=self._local_player_sync_rotation(ctx),
                                 include_pos=include_lpos,
                                 include_vel=include_lvel,
                                 include_rot=include_lrot,
@@ -7315,11 +7310,7 @@ class WulframServer:
                                 pos=send_pos,
                                 vel=ctx.player_vel,
                                 # Rotation vector order follows wulf-forge: (roll, pitch, yaw)
-                                rot=(
-                                    ctx.player_pose.get("roll", 0.0),
-                                    0.0,
-                                    ctx.player_yaw,
-                                ),
+                                rot=self._local_player_sync_rotation(ctx),
                                 include_pos=include_lpos,
                                 include_vel=include_lvel,
                                 include_rot=include_lrot,
@@ -7402,11 +7393,7 @@ class WulframServer:
                     pkt_label = "VIEW_UPDATE_BEAT" if use_view else "UPDATE_ARRAY_BEAT"
                     hb_rot = None
                     if self.heartbeat_include_rot:
-                        hb_rot = (
-                            ctx.player_pose.get("roll", 0.0),
-                            0.0,
-                            ctx.player_heading,  # entity+0x38 convention
-                        )
+                        hb_rot = self._local_player_sync_rotation(ctx)
                     hb_pos = None
                     if self.heartbeat_include_pos:
                         hb_pos = self._to_client_pos(ctx.player_pos)
@@ -7509,11 +7496,7 @@ class WulframServer:
                             unit_type=ctx.entity_type,
                             team_id=ctx.session.team_id or 1,
                             pos=self._to_client_pos(ctx.player_pos),
-                            rot=(
-                                ctx.player_pose.get("roll", 0.0),
-                                0.0,
-                                ctx.player_yaw,
-                            ),
+                            rot=self._local_player_sync_rotation(ctx),
                             tick=tick,
                             include_vitals=True,
                             weapon_id=self.weapon_id,
@@ -7569,11 +7552,7 @@ class WulframServer:
                         "time": time.monotonic(),
                         "tick": tick,
                         "pos": track_pos,
-                        "rot": (
-                            ctx.player_pose.get("roll", 0.0),
-                            0.0,
-                            ctx.player_yaw,
-                        ),
+                        "rot": self._local_player_sync_rotation(ctx),
                         "vel": ctx.player_vel,
                     }
 
