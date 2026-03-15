@@ -17,6 +17,7 @@ from wulfram.handlers import send_initial_game_data
 from wulfram.client import ClientContext
 from wulfram.session import Session
 from wulfram.server import WulframServer, _StaticWorldRayNode
+from wulfram.building_collision import BuildingCollisionAssets
 from wulfram.world_collision import TerrainContact, TerrainGridCollision, TerrainRaycastHit
 from wulfram.weapons import (
     WeaponSystem,
@@ -563,13 +564,31 @@ def test_local_player_sync_rotation_uses_heading_not_player_yaw():
         session=Session(),
         entity_id=0x14EA,
     )
-    ctx.player_pose = {"roll": 0.125}
+    ctx.player_pose = {"roll": 0.125, "pitch": -0.375}
     ctx.player_heading = 0.25
     ctx.player_yaw = -0.25
 
     rot = server._local_player_sync_rotation(ctx)
-    assert rot == (0.125, 0.0, 0.25)
+    assert rot == (0.125, -0.375, 0.25)
     print("test_local_player_sync_rotation_uses_heading_not_player_yaw: PASSED")
+    return True
+
+
+def test_player_body_rotation_preserves_pitch_for_remote_entities():
+    """Remote replicated body rotation should keep terrain-aligned pitch."""
+    server = WulframServer.__new__(WulframServer)
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    ctx.player_pose = {"roll": 0.125, "pitch": -0.375}
+    ctx.player_heading = 0.25
+
+    rot = server._player_body_rotation(ctx, negate_yaw=True, yaw_offset=0.5)
+    assert rot == (0.125, -0.375, 0.25)
+    print("test_player_body_rotation_preserves_pitch_for_remote_entities: PASSED")
     return True
 
 
@@ -591,7 +610,7 @@ def test_remote_sync_heartbeat_helper_uses_heading_not_player_yaw():
     )
     ctx.player_pos = (4950.0, 5100.0, 5.0)
     ctx.player_vel = (0.0, 0.0, 0.0)
-    ctx.player_pose = {"roll": 0.125}
+    ctx.player_pose = {"roll": 0.125, "pitch": -0.375}
     ctx.player_heading = 0.25
     ctx.player_yaw = -0.25
 
@@ -621,6 +640,7 @@ def test_remote_sync_heartbeat_helper_uses_heading_not_player_yaw():
     assert len(entities) == 1
     assert entities[0].rotation is not None
     assert abs(entities[0].rotation[0] - 0.125) < 1e-3
+    assert abs(entities[0].rotation[1] + 0.375) < 1e-3
     assert abs(entities[0].rotation[2] - 0.25) < 1e-3
     print("test_remote_sync_heartbeat_helper_uses_heading_not_player_yaw: PASSED")
     return True
@@ -1500,8 +1520,8 @@ def test_server_tank_motion_uses_low_speed_mobility_factor():
     return True
 
 
-def test_server_motion_clamps_to_max_velocity():
-    """Movement vector should still clamp to config max_velocity before integration."""
+def test_server_motion_clamps_to_move_adjust():
+    """Movement vector should clamp to move_adjust before integration."""
     import math
 
     server = WulframServer.__new__(WulframServer)
@@ -1540,8 +1560,8 @@ def test_server_motion_clamps_to_max_velocity():
 
     vx, vy, vz = ctx.player_vel
     speed = math.sqrt(vx * vx + vy * vy + vz * vz)
-    assert abs(speed - 80.0) < 1e-4, speed
-    print("test_server_motion_clamps_to_max_velocity: PASSED")
+    assert abs(speed - 85.0) < 1e-4, speed
+    print("test_server_motion_clamps_to_move_adjust: PASSED")
     return True
 
 
@@ -1814,6 +1834,43 @@ def test_static_world_raycast_uses_point_query_for_zero_horizontal_direction():
     assert hit == ("building-aabb", (1.0, 1.0, 0.0), 10001, 0.0), hit
     assert calls == [((1.0, 1.0, 0.0), (10001,))], calls
     print("test_static_world_raycast_uses_point_query_for_zero_horizontal_direction: PASSED")
+    return True
+
+
+def test_static_world_quadtree_uses_bounding_radius_for_overlap_distribution():
+    """Overlap-spanning blockers must distribute by quadtree radius, not only by half-extents or center child."""
+    server = WulframServer.__new__(WulframServer)
+    server._building_entities = {
+        10001: SimpleNamespace(entity_type=1000, team_id=1, heading=0.0, x=90.0, y=90.0, z=0.0),
+        10002: SimpleNamespace(entity_type=1000, team_id=2, heading=0.0, x=90.0, y=10.0, z=0.0),
+        10003: SimpleNamespace(entity_type=1000, team_id=2, heading=0.0, x=10.0, y=90.0, z=0.0),
+        10004: SimpleNamespace(entity_type=1000, team_id=2, heading=0.0, x=35.0, y=35.0, z=0.0),
+        10005: SimpleNamespace(entity_type=1000, team_id=2, heading=0.0, x=70.0, y=70.0, z=0.0),
+        10006: SimpleNamespace(entity_type=1000, team_id=2, heading=0.0, x=70.0, y=10.0, z=0.0),
+        10007: SimpleNamespace(entity_type=1000, team_id=2, heading=0.0, x=10.0, y=70.0, z=0.0),
+        10008: SimpleNamespace(entity_type=1000, team_id=2, heading=0.0, x=70.0, y=35.0, z=0.0),
+        10009: SimpleNamespace(entity_type=1000, team_id=2, heading=0.0, x=35.0, y=70.0, z=0.0),
+    }
+
+    def fake_half_extents(building):
+        return (3.0, 3.0, 5.0)
+
+    server._get_building_world_half_extents = fake_half_extents
+    server._get_building_quadtree_radius = lambda building: 30.0 if building.team_id == 1 else 6.0
+    server._point_hits_static_building = lambda building, point: (
+        "building-aabb",
+        point,
+        0.0,
+    ) if building.team_id == 1 else None
+    server._rebuild_static_world_raycast_index()
+    root = server._static_world_raycast_root
+    assert root is not None and root.children is not None
+
+    point_hit = server._point_query_static_world((10.0, 10.0, 5.0), root)
+    ray_hit = server._raycast_static_buildings((10.0, 10.0, 5.0), (10.0, 10.0, 12.0))
+    assert point_hit == ("building-aabb", (10.0, 10.0, 5.0), 10001, 0.0), point_hit
+    assert ray_hit == ("building-aabb", (10.0, 10.0, 5.0), 10001, 0.0), ray_hit
+    print("test_static_world_quadtree_uses_bounding_radius_for_overlap_distribution: PASSED")
     return True
 
 
@@ -2248,6 +2305,27 @@ def test_building_collision_skips_aabb_for_mesh_backed_building():
     assert abs(vx - 4.0) < 1e-6, vx
     assert abs(vy + 3.0) < 1e-6, vy
     print("test_building_collision_skips_aabb_for_mesh_backed_building: PASSED")
+    return True
+
+
+def test_building_collision_team_variant_matches_client_helper():
+    """Server building collision must resolve the same team variant as the client."""
+    assert BuildingCollisionAssets.get_model_name(EntityType.PAD, 1) == "skypump_2"
+    assert BuildingCollisionAssets.get_model_name(EntityType.PAD, 2) == "skypump_1"
+    assert BuildingCollisionAssets.get_model_name(EntityType.DARK_LIGHT, 1) == "darklight_2"
+    assert BuildingCollisionAssets.get_model_name(EntityType.DARK_LIGHT, 2) == "darklight_1"
+    print("test_building_collision_team_variant_matches_client_helper: PASSED")
+    return True
+
+
+def test_server_team_model_name_matches_client_helper():
+    """Server non-building model selection must use the same team-variant semantics."""
+    server = WulframServer(host="127.0.0.1", port=0)
+    assert server._select_team_model_name(("tank_1", "tank_2"), 1) == "tank_2"
+    assert server._select_team_model_name(("tank_1", "tank_2"), 2) == "tank_1"
+    assert server._select_team_model_name(("s_missile_1", "s_missile_2"), 1) == "s_missile_2"
+    assert server._select_team_model_name(("s_missile_1", "s_missile_2"), 2) == "s_missile_1"
+    print("test_server_team_model_name_matches_client_helper: PASSED")
     return True
 
 
@@ -2968,7 +3046,7 @@ def test_entity_world_collision_dirty_threshold_uses_mesh_min_half_extent():
     server._building_collision = SimpleNamespace(
         available=True,
         models={
-            "tank_1": SimpleNamespace(
+            "tank_2": SimpleNamespace(
                 collision_mesh=SimpleNamespace(
                     vertices=[
                         SimpleNamespace(x=-6.0, y=0.0, z=0.0),
@@ -3273,6 +3351,7 @@ def main():
         test_remote_state_sync_reply_emits_view_update_with_request_timestamp,
         test_remote_state_sync_reply_keeps_full_motion_when_stable,
         test_local_player_sync_rotation_uses_heading_not_player_yaw,
+        test_player_body_rotation_preserves_pitch_for_remote_entities,
         test_remote_sync_heartbeat_helper_uses_heading_not_player_yaw,
         test_state_request_does_not_overwrite_client_tick_offset,
         test_remote_udp_ping_request_gets_og_safe_reply,
@@ -3295,7 +3374,7 @@ def main():
         test_server_network_strafe_decode_matches_og_sign,
         test_remote_client_promotes_full_local_state_after_spawn_delay,
         test_server_tank_motion_uses_low_speed_mobility_factor,
-        test_server_motion_clamps_to_max_velocity,
+        test_server_motion_clamps_to_move_adjust,
         test_projectile_world_hit_skips_aabb_for_mesh_backed_building,
         test_projectile_world_hit_prefers_closest_building_before_terrain,
         test_projectile_world_hit_clips_static_world_raycast_to_terrain,
@@ -3303,6 +3382,7 @@ def main():
         test_projectile_world_hit_uses_exact_mesh_raycast_position,
         test_static_world_raycast_uses_quadtree_front_to_back_order,
         test_static_world_raycast_uses_point_query_for_zero_horizontal_direction,
+        test_static_world_quadtree_uses_bounding_radius_for_overlap_distribution,
         test_static_world_raycast_stops_once_endpoint_leaf_is_reached,
         test_static_world_raycast_node_cull_uses_signbit_zero_side_semantics,
         test_segment_raycast_cbsp_tree_uses_split_plane_normal,
@@ -3313,6 +3393,8 @@ def main():
         test_model_collision_returns_first_contact_in_grid_order,
         test_triangle_cbsp_contact_returns_first_leaf_hit,
         test_building_collision_skips_aabb_for_mesh_backed_building,
+        test_building_collision_team_variant_matches_client_helper,
+        test_server_team_model_name_matches_client_helper,
         test_entity_world_collision_prefers_mesh_contact_when_collision_model_exists,
         test_entity_world_collision_falls_back_to_box_without_collision_model,
         test_entity_world_collision_uses_dirty_terrain_raycast_branch,

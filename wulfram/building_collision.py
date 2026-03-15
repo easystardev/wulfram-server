@@ -23,9 +23,11 @@ for _path in (str(_REPO_ROOT), str(_REPO_ROOT / "shared")):
 try:
     from client.wulfram_client.data.models import load_all_models
     from client.wulfram_client.simulation.collision import CollisionMeshCache
+    from client.wulfram_client.team_variants import select_team_variant
 except Exception as exc:  # pragma: no cover - environment-dependent import path
     load_all_models = None
     CollisionMeshCache = None
+    select_team_variant = None
     _IMPORT_ERROR: Optional[Exception] = exc
 else:
     _IMPORT_ERROR = None
@@ -209,9 +211,11 @@ class BuildingCollisionAssets:
         names = BUILDING_MODEL_NAMES.get(entity_type)
         if names is None:
             return None
+        if select_team_variant is not None:
+            return select_team_variant(names, team_id)
         if len(names) == 1:
             return names[0]
-        if team_id == 2 and len(names) > 1:
+        if team_id == 1:
             return names[1]
         return names[0]
 

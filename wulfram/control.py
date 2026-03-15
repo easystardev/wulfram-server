@@ -1461,6 +1461,7 @@ Examples:
         # Reset server-side state
         ctx.player_health = 1.0
         ctx.player_vel = (0.0, 0.0, 0.0)
+        ctx.player_speed = 0.0
         ctx.player_heading = 0.0
         ctx.player_yaw = 0.0
         ctx.angular_vel_yaw = 0.0
@@ -1552,6 +1553,7 @@ Examples:
             # Reset physics state
             ctx.player_health = 1.0
             ctx.player_vel = (0.0, 0.0, 0.0)
+            ctx.player_speed = 0.0
             ctx.player_heading = 0.0
             ctx.angular_vel_yaw = 0.0
             ctx.world_collision_ref_pos = ctx.player_pos
@@ -2457,6 +2459,7 @@ Examples:
         self.server.player_pose["source"] = "reset"
         self.server.player_yaw = 0.0
         self.server.player_vel = (0.0, 0.0, 0.0)
+        self.server.player_speed = 0.0
         return "Reset player pos to (100, 15, 100) yaw=0"
 
     def _cmd_player_pos(self, args: list) -> str:

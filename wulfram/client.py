@@ -55,6 +55,7 @@ class ClientContext:
     # Legacy accessors for compatibility
     player_pos: tuple = (100.0, 100.0, 20.0)
     player_vel: tuple = (0.0, 0.0, 0.0)
+    player_speed: float = 0.0
     world_collision_ref_pos: Optional[tuple] = None
     world_collision_bounds_dirty: bool = False
     player_yaw: float = 0.0
@@ -137,6 +138,8 @@ class ClientContext:
     last_sent_yaw: float = 0.0
     last_state_sync_vel: Optional[tuple] = None
     last_state_sync_rot: Optional[tuple] = None
+    debug_last_controller_step: dict = field(default_factory=dict)
+    debug_last_collision: dict = field(default_factory=dict)
 
     def __post_init__(self):
         """Initialize time-based fields after creation."""

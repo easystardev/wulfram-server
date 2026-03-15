@@ -41,6 +41,11 @@ from wulfram2_protocol.entities import (
     LOCAL_STATE_PRIMARY_TURRET_WEAPON_TYPES,
     LOCAL_STATE_SECONDARY_TURRET_WEAPON_TYPES,
     WEAPON_NAMES,
+    tank_altitude_mobility_factor,
+    tank_suspension_sample_offsets,
+    tank_terrain_contact_coupling,
+    terrain_aligned_basis,
+    vehicle_runtime_speed,
 )
 
 
@@ -1323,8 +1328,23 @@ class WulframServer:
         """
         return (
             ctx.player_pose.get("roll", 0.0),
-            0.0,
+            ctx.player_pose.get("pitch", 0.0),
             ctx.player_heading,
+        )
+
+    def _player_body_rotation(
+        self,
+        ctx: ClientContext,
+        *,
+        negate_yaw: bool = False,
+        yaw_offset: float = 0.0,
+    ) -> tuple[float, float, float]:
+        """Return the current replicated body rotation tuple for an entity."""
+        yaw = -ctx.player_heading if negate_yaw else ctx.player_heading
+        return (
+            ctx.player_pose.get("roll", 0.0),
+            ctx.player_pose.get("pitch", 0.0),
+            yaw + yaw_offset,
         )
 
     def _get_update_array_local_state_for_viewer(self, ctx: ClientContext) -> tuple[bool, dict]:
@@ -1710,10 +1730,10 @@ class WulframServer:
         pos = self._to_client_pos(player_ctx.player_pos)
         team = player_ctx.session.team_id or 1
         tick = self._get_network_tick(target_ctx)
-        rot = (
-            player_ctx.player_pose.get("roll", 0.0),
-            0.0,
-            (-player_ctx.player_heading if self.remote_yaw_negate else player_ctx.player_heading) + self.remote_yaw_offset,
+        rot = self._player_body_rotation(
+            player_ctx,
+            negate_yaw=self.remote_yaw_negate,
+            yaw_offset=self.remote_yaw_offset,
         )
 
         include_local_state, ls = self._get_update_array_local_state_for_viewer(target_ctx)
@@ -1811,7 +1831,7 @@ class WulframServer:
                 vel=other.player_vel,
                 rot=(
                     other.player_pose.get("roll", 0.0),
-                    0.0,
+                    other.player_pose.get("pitch", 0.0),
                     (-other.player_heading if self.remote_yaw_negate else other.player_heading) + self.remote_yaw_offset,
                 ),
                 include_pos=include_pos,
@@ -2655,6 +2675,7 @@ class WulframServer:
         ctx.player_yaw = 0.0
         ctx.player_heading = 0.0
         ctx.angular_vel_yaw = 0.0
+        ctx.player_speed = 0.0
         ctx.vehicle_physics.reset()
         if self.spawn_sets_ground_level:
             ctx.ground_level_override = spawn_pos[2] if self.up_axis == "z" else spawn_pos[1]
@@ -2823,6 +2844,7 @@ class WulframServer:
         ctx.last_state_sync_rot = None
 
         ctx.player_angular_vel = 0.0
+        ctx.player_speed = 0.0
         ctx.vehicle_physics.reset()
         # Reset tick-sync transition tracking so respawn gap doesn't cause huge correction
         ctx._turn_transition_client_tick = 0
@@ -4198,7 +4220,7 @@ class WulframServer:
         send_pos = self._to_client_pos(ctx.player_pos)
         update_rot = (
             ctx.player_pose.get("roll", 0.0),
-            0.0,
+            ctx.player_pose.get("pitch", 0.0),
             ctx.player_heading,
         )
         include_sync_vel = True
@@ -4816,6 +4838,75 @@ class WulframServer:
             return factor
         return 1.0
 
+    def _tank_altitude_mobility(self, ctx: ClientContext) -> float:
+        """Approximate the OG tank altitude penalty from current terrain clearance."""
+        if ctx.entity_type != EntityType.TANK or self.terrain is None:
+            return 1.0
+        _avg_up, clearance_ratio = self._sample_tank_surface_state(ctx)
+        return tank_altitude_mobility_factor(clearance_ratio)
+
+    def _tank_terrain_contact_vector(self, ctx: ClientContext) -> tuple[float, float]:
+        """Approximate the OG spring contact direction from sampled terrain normals."""
+        if ctx.entity_type != EntityType.TANK or self.terrain is None:
+            return (0.0, 0.0)
+        avg_up, _clearance_ratio = self._sample_tank_surface_state(ctx)
+        return (avg_up[0] * 64.8, avg_up[1] * 64.8)
+
+    def _sample_tank_surface_state(
+        self,
+        ctx: ClientContext,
+        heading: float | None = None,
+    ) -> tuple[tuple[float, float, float], float]:
+        """Approximate spring world-state from four tank-footprint terrain samples."""
+        if ctx.entity_type != EntityType.TANK or self.terrain is None:
+            return (0.0, 0.0, 1.0), 1.0
+
+        if heading is None:
+            heading = ctx.player_heading
+
+        offsets = tank_suspension_sample_offsets(
+            heading,
+            longitudinal=self._TANK_RADIUS * 0.85,
+            lateral=self._TANK_RADIUS * 0.55,
+        )
+        sum_up_x = 0.0
+        sum_up_y = 0.0
+        sum_up_z = 0.0
+        sum_clearance = 0.0
+
+        for dx, dy in offsets:
+            sx = ctx.player_pos[0] + dx
+            sy = ctx.player_pos[1] + dy
+            raw_ground_z = self.terrain.get_height(sx, sy)
+            dh_dx, dh_dy = self.terrain.get_slope(sx, sy)
+            mag_sq = dh_dx * dh_dx + dh_dy * dh_dy + 1.0
+            if mag_sq <= 1e-10:
+                sample_up = (0.0, 0.0, 1.0)
+            else:
+                inv_mag = 1.0 / math.sqrt(mag_sq)
+                sample_up = (-dh_dx * inv_mag, -dh_dy * inv_mag, inv_mag)
+            sum_up_x += sample_up[0]
+            sum_up_y += sample_up[1]
+            sum_up_z += sample_up[2]
+            sum_clearance += ctx.player_pos[2] - raw_ground_z
+
+        inv_count = 1.0 / float(len(offsets))
+        avg_up_x = sum_up_x * inv_count
+        avg_up_y = sum_up_y * inv_count
+        avg_up_z = sum_up_z * inv_count
+        avg_mag_sq = avg_up_x * avg_up_x + avg_up_y * avg_up_y + avg_up_z * avg_up_z
+        if avg_mag_sq <= 1e-10:
+            avg_up = (0.0, 0.0, 1.0)
+        else:
+            inv_avg_mag = 1.0 / math.sqrt(avg_mag_sq)
+            avg_up = (avg_up_x * inv_avg_mag, avg_up_y * inv_avg_mag, avg_up_z * inv_avg_mag)
+
+        if self.terrain_height_offset <= 0.0:
+            clearance_ratio = 1.0
+        else:
+            clearance_ratio = (sum_clearance * inv_count) / self.terrain_height_offset
+        return avg_up, clearance_ratio
+
     def _normalize_turn_input_value(self, ctx: ClientContext, turn_val: float) -> float:
         """Normalize a raw TURNING slot value to signed yaw input in [-1, 1]."""
         if turn_val > 1.5 or turn_val < -1.5:
@@ -4841,7 +4932,8 @@ class WulframServer:
         veh_cfg = VEHICLE_PHYSICS_CONFIGS.get(ctx.entity_type)
         turn_adj = veh_cfg.turn_adjust if veh_cfg else self.turn_adjust
         _f32_turn_adjust = _f32(float(turn_adj))
-        return _f32(_f32_turn_adjust * _f32(raw_input))
+        torque = _f32(_f32_turn_adjust * _f32(raw_input))
+        return _f32(torque * _f32(self._tank_altitude_mobility(ctx)))
 
     def _get_raw_turn_input(self, ctx: ClientContext) -> float:
         """Get normalized turning input [-1, 1] with deadzone and sign applied.
@@ -5004,32 +5096,46 @@ class WulframServer:
         # Decompile-backed flat-ground mobility gate from Tank_compute_mobility_factors:
         # forward mobility ramps from 0.4 at rest toward 1.0 as current speed rises.
         if ctx.entity_type == EntityType.TANK:
-            current_speed = math.sqrt(vel_x * vel_x + vel_y * vel_y + vel_z * vel_z)
+            current_speed = ctx.player_speed
+            if current_speed <= 0.0:
+                current_speed = vehicle_runtime_speed(
+                    vel_x,
+                    vel_y,
+                    vel_z,
+                    up_axis=self.up_axis,
+                )
             forward_mobility = self._tank_low_speed_mobility_factor(
                 current_speed,
                 low_speed_threshold,
             )
+            turn_mobility = self._tank_altitude_mobility(ctx)
+            forward_mobility *= turn_mobility
         else:
+            current_speed = vehicle_runtime_speed(
+                vel_x,
+                vel_y,
+                vel_z,
+                up_axis=self.up_axis,
+            )
             forward_mobility = 1.0
+            turn_mobility = 1.0
 
         yaw = heading_override if heading_override is not None else ctx.player_heading
         cos_yaw = math.cos(yaw)
         sin_yaw = math.sin(yaw)
 
         if self.up_axis == "z":
-            # When terrain is loaded, apply pitch to forward vector so impulse
-            # on slopes has a vertical component (matching client's
-            # TankVehicle_apply_physics which rotates by full 3D orientation).
             if self.terrain and self.terrain_pitch_enabled:
-                terrain_pitch = self.terrain.get_pitch_at_heading(
-                    ctx.player_pos[0], ctx.player_pos[1], yaw
-                )
-                cos_pitch = math.cos(terrain_pitch)
-                sin_pitch = math.sin(terrain_pitch)
-                forward = (cos_pitch * cos_yaw, cos_pitch * sin_yaw, sin_pitch)
+                avg_up, _clearance_ratio = self._sample_tank_surface_state(ctx, yaw)
+                if abs(avg_up[2]) > 1e-6:
+                    dh_dx = -avg_up[0] / avg_up[2]
+                    dh_dy = -avg_up[1] / avg_up[2]
+                else:
+                    dh_dx, dh_dy = self.terrain.get_slope(ctx.player_pos[0], ctx.player_pos[1])
+                forward, right, _up = terrain_aligned_basis(dh_dx, dh_dy, yaw)
             else:
                 forward = (cos_yaw, sin_yaw, 0.0)
-            right = (-sin_yaw, cos_yaw, 0.0)
+                right = (-sin_yaw, cos_yaw, 0.0)
             vertical_idx = 2
         else:
             forward = (cos_yaw, 0.0, sin_yaw)
@@ -5038,23 +5144,35 @@ class WulframServer:
 
         # Per-frame impulse (like entity[0x24], zeroed each frame by controller)
         fwd_impulse = throttle_input * move_adjust * forward_mobility
-        strafe_impulse = strafe_input * strafe_adjust * forward_mobility
+        strafe_impulse = (
+            strafe_input * strafe_adjust * forward_mobility * turn_mobility
+        )
 
         impulse_x = forward[0] * fwd_impulse + right[0] * strafe_impulse
         impulse_y = forward[1] * fwd_impulse + right[1] * strafe_impulse
         impulse_z = forward[2] * fwd_impulse + right[2] * strafe_impulse
 
-        # TankVehicle_apply_physics clamps the movement vector by the vehicle's
-        # max_velocity before it is accumulated into linear velocity.
-        max_velocity = veh_config.max_velocity if veh_config else 80.0
+        # TankVehicle_apply_physics clamps the movement vector against the same
+        # move_adjust scalar used to build forward motion, not the separate
+        # max_velocity field.
+        move_cap = move_adjust
         move_mag = math.sqrt(
             impulse_x * impulse_x + impulse_y * impulse_y + impulse_z * impulse_z
         )
-        if move_mag > max_velocity and move_mag > 0.0:
-            scale = max_velocity / move_mag
+        if move_mag > move_cap and move_mag > 0.0:
+            scale = move_cap / move_mag
             impulse_x *= scale
             impulse_y *= scale
             impulse_z *= scale
+
+        if ctx.entity_type == EntityType.TANK:
+            contact_x, contact_y = self._tank_terrain_contact_vector(ctx)
+            impulse_x, impulse_y, _terrain_speed = tank_terrain_contact_coupling(
+                impulse_x,
+                impulse_y,
+                contact_x,
+                contact_y,
+            )
 
         # Add gravity to vertical impulse (matches GUESS3_Transform_accelerate_z)
         gravity = self.gravity
@@ -5091,6 +5209,9 @@ class WulframServer:
         else:
             if ctx.player_pos[1] <= ground_level and (vel_y + acc_y * dt) < 0:
                 acc_y = -vel_y / dt if dt > 0 else 0.0
+
+        pre_pos = ctx.player_pos
+        pre_vel = ctx.player_vel
 
         # Verlet integration: pos += vel * dt + 0.5 * acc * dtÂ²
         # (from Vec3_integrate_motion, Physics.c:4396-4410)
@@ -5139,6 +5260,8 @@ class WulframServer:
             new_z = max(-self.world_bound, min(self.world_bound, new_z))
             new_y = max(ground_level, new_y)
 
+        ctx.debug_last_collision = {}
+
         # Decompile-shaped terrain/world contact pass before static blockers.
         new_x, new_y, new_z, new_vel_x, new_vel_y, new_vel_z = self._resolve_entity_world_collision(
             ctx, new_x, new_y, new_z, new_vel_x, new_vel_y, new_vel_z
@@ -5151,8 +5274,50 @@ class WulframServer:
         old_pos = ctx.player_pos
         ctx.player_pos = (new_x, new_y, new_z)
         ctx.player_vel = (new_vel_x, new_vel_y, new_vel_z)
+        ctx.player_speed = vehicle_runtime_speed(
+            new_vel_x,
+            new_vel_y,
+            new_vel_z,
+            up_axis=self.up_axis,
+        )
         ctx.player_pose["pos"] = ctx.player_pos
         ctx.player_pose["vel"] = ctx.player_vel
+        ctx.debug_last_controller_step = {
+            "turn_input": (
+                self.turn_sign * ctx.injected_turn
+                if ctx.injected_turn is not None
+                else (
+                    self._normalize_turn_input_value(
+                        ctx,
+                        ctx.weapon_system.behavior_slots[BehaviorSlot.TURNING],
+                    )
+                    if getattr(ctx, "weapon_system", None) is not None
+                    else 0.0
+                )
+            ),
+            "forward_input": throttle_input,
+            "strafe_input": strafe_input,
+            "pre_pos": pre_pos,
+            "pre_vel": pre_vel,
+            "old_heading": yaw,
+            "new_heading": ctx.player_heading,
+            "current_speed": current_speed,
+            "forward_mobility": forward_mobility,
+            "turn_mobility": turn_mobility,
+            "terrain_up": avg_up if self.terrain and self.up_axis == "z" and self.terrain_pitch_enabled else (0.0, 0.0, 1.0),
+            "terrain_clearance_ratio": _clearance_ratio if self.terrain and self.up_axis == "z" and self.terrain_pitch_enabled else 1.0,
+            "terrain_gradient": (dh_dx, dh_dy) if self.terrain and self.up_axis == "z" and self.terrain_pitch_enabled else (0.0, 0.0),
+            "terrain_contact": (contact_x, contact_y) if ctx.entity_type == EntityType.TANK else (0.0, 0.0),
+            "basis_forward": forward,
+            "basis_right": right,
+            "raw_impulse": (fwd_impulse, strafe_impulse),
+            "move_impulse": (impulse_x, impulse_y, impulse_z),
+            "ground_level": ground_level,
+            "linear_damp": linear_damp,
+            "acceleration": (acc_x, acc_y, acc_z),
+            "pos": ctx.player_pos,
+            "vel": ctx.player_vel,
+        }
 
         # Log position changes periodically
         dist = math.sqrt(
@@ -5187,6 +5352,16 @@ class WulframServer:
         EntityType.TORPEDO: ("torpedo",),
     }
 
+    @staticmethod
+    def _select_team_model_name(model_names, team_id: int) -> Optional[str]:
+        if not model_names:
+            return None
+        if len(model_names) == 1:
+            return model_names[0]
+        if team_id == 1:
+            return model_names[1]
+        return model_names[0]
+
     def _get_entity_world_half_extents(self, ctx: ClientContext) -> tuple[float, float, float]:
         team_id = ctx.session.team_id or 1
         cache_key = (ctx.entity_type, team_id)
@@ -5197,7 +5372,7 @@ class WulframServer:
         half_extents = (self._TANK_RADIUS, self._TANK_RADIUS, self._TANK_RADIUS)
         model_names = self._ENTITY_WORLD_MODEL_NAMES.get(ctx.entity_type)
         if model_names and self._building_collision.available:
-            model_name = model_names[1] if team_id == 2 and len(model_names) > 1 else model_names[0]
+            model_name = self._select_team_model_name(model_names, team_id)
             model = self._building_collision.models.get(model_name)
             mesh = getattr(model, "collision_mesh", None) if model is not None else None
             vertices = getattr(mesh, "vertices", None) if mesh is not None else None
@@ -5230,7 +5405,7 @@ class WulframServer:
         model_names = self._ENTITY_WORLD_MODEL_NAMES.get(ctx.entity_type)
         building_collision = getattr(self, "_building_collision", None)
         if model_names and building_collision is not None and building_collision.available:
-            model_name = model_names[1] if team_id == 2 and len(model_names) > 1 else model_names[0]
+            model_name = self._select_team_model_name(model_names, team_id)
             model = building_collision.models.get(model_name)
             mesh = getattr(model, "collision_mesh", None) if model is not None else None
             vertices = getattr(mesh, "vertices", None) if mesh is not None else None
@@ -5490,7 +5665,7 @@ class WulframServer:
             self._entity_collision_model_cache[cache_key] = None
             return None
 
-        model_name = model_names[1] if team_id == 2 and len(model_names) > 1 else model_names[0]
+        model_name = self._select_team_model_name(model_names, team_id)
         model = self._building_collision.models.get(model_name)
         mesh = getattr(model, "collision_mesh", None) if model is not None else None
         vertices = getattr(mesh, "vertices", None) if mesh is not None else None
@@ -5517,7 +5692,7 @@ class WulframServer:
             return radius
 
         team_id = getattr(proj, "team", 1)
-        model_name = model_names[1] if team_id == 2 and len(model_names) > 1 else model_names[0]
+        model_name = self._select_team_model_name(model_names, team_id)
         model = self._building_collision.models.get(model_name)
         mesh = getattr(model, "collision_mesh", None) if model is not None else None
         vertices = getattr(mesh, "vertices", None) if mesh is not None else None
@@ -5563,6 +5738,17 @@ class WulframServer:
         world_hy = local_hx * sin_h + local_hy * cos_h
         return (world_hx, world_hy, local_hz)
 
+    def _get_building_quadtree_radius(self, building) -> float:
+        if self._building_has_mesh_collision(building):
+            radius = self._building_collision.get_model_bounding_radius(
+                int(building.entity_type),
+                int(getattr(building, "team_id", 1)),
+            )
+            if radius is not None:
+                return radius
+        hx, hy, hz = self._get_building_world_half_extents(building)
+        return math.sqrt(hx * hx + hy * hy + hz * hz)
+
     def _rebuild_static_world_raycast_index(self) -> None:
         building_entities = getattr(self, "_building_entities", {}) or {}
         if not building_entities:
@@ -5571,8 +5757,8 @@ class WulframServer:
 
         bounds = []
         for eid, building in building_entities.items():
-            hx, hy, _ = self._get_building_world_half_extents(building)
-            bounds.append((eid, building.x - hx, building.x + hx, building.y - hy, building.y + hy))
+            radius = self._get_building_quadtree_radius(building)
+            bounds.append((eid, building.x - radius, building.x + radius, building.y - radius, building.y + radius))
 
         min_x = min(item[1] for item in bounds)
         max_x = max(item[2] for item in bounds)
@@ -5610,27 +5796,38 @@ class WulframServer:
 
         mid_x = (min_x + max_x) * 0.5
         mid_y = (min_y + max_y) * 0.5
-        buckets = [[], [], [], []]
-        for eid in building_ids:
-            building = self._building_entities.get(eid)
-            if building is None:
-                continue
-            quadrant = 0
-            if building.y < mid_y:
-                quadrant |= 1
-            if building.x < mid_x:
-                quadrant |= 2
-            buckets[quadrant].append(eid)
-
-        if sum(1 for bucket in buckets if bucket) <= 1:
-            return _StaticWorldRayNode(min_x, max_x, min_y, max_y, None, building_ids)
-
         child_bounds = (
             (mid_x, max_x, mid_y, max_y),
             (mid_x, max_x, min_y, mid_y),
             (min_x, mid_x, mid_y, max_y),
             (min_x, mid_x, min_y, mid_y),
         )
+        buckets = [[], [], [], []]
+        for eid in building_ids:
+            building = self._building_entities.get(eid)
+            if building is None:
+                continue
+            radius = self._get_building_quadtree_radius(building)
+            west = (building.x - radius) < mid_x
+            east = (building.x + radius) > mid_x
+            north = (building.y - radius) < mid_y
+            south = (building.y + radius) > mid_y
+            if west and north:
+                buckets[2].append(eid)
+            if west and south:
+                buckets[3].append(eid)
+            if east and north:
+                buckets[0].append(eid)
+            if east and south:
+                buckets[1].append(eid)
+
+        non_empty = [bucket for bucket in buckets if bucket]
+        if len(non_empty) <= 1:
+            return _StaticWorldRayNode(min_x, max_x, min_y, max_y, None, building_ids)
+        parent_ids = set(building_ids)
+        if all(set(bucket) == parent_ids for bucket in non_empty):
+            return _StaticWorldRayNode(min_x, max_x, min_y, max_y, None, building_ids)
+
         children = []
         for quadrant, bucket in enumerate(buckets):
             if not bucket:
@@ -5849,7 +6046,24 @@ class WulframServer:
                 break
             current = child
 
-        for eid in current.building_ids:
+        def _dist_sq(eid: int) -> float:
+            building = self._building_entities.get(eid)
+            if building is None:
+                return float("inf")
+            hx, hy, _ = self._get_building_world_half_extents(building)
+            dx = 0.0
+            if start_pos[0] < building.x - hx:
+                dx = (building.x - hx) - start_pos[0]
+            elif start_pos[0] > building.x + hx:
+                dx = start_pos[0] - (building.x + hx)
+            dy = 0.0
+            if start_pos[1] < building.y - hy:
+                dy = (building.y - hy) - start_pos[1]
+            elif start_pos[1] > building.y + hy:
+                dy = start_pos[1] - (building.y + hy)
+            return dx * dx + dy * dy
+
+        for eid in sorted(current.building_ids, key=_dist_sq):
             building = self._building_entities.get(eid)
             if building is None:
                 continue
@@ -6046,6 +6260,14 @@ class WulframServer:
                 if vel_dot < 0:
                     vx -= nx * vel_dot
                     vy -= ny * vel_dot
+                ctx.debug_last_collision = {
+                    "kind": "vehicle_sphere",
+                    "point": (px, py, pz),
+                    "normal": (nx, ny, 0.0),
+                    "depth": overlap,
+                    "blocker_pos": (ox, oy, oz),
+                    "detail": f"tank-vs-tank blocker client={other_ctx.client_id}",
+                }
 
         # Check buildings loaded from map state file
         building_entities = self._building_entities
@@ -6066,6 +6288,16 @@ class WulframServer:
                         vx -= normal[0] * vel_dot
                         vy -= normal[1] * vel_dot
                     mesh_hit = True
+                    ctx.debug_last_collision = {
+                        "kind": "building_mesh",
+                        "point": (px, py, pz),
+                        "normal": normal,
+                        "depth": depth,
+                        "blocker_pos": (building.x, building.y, building.z),
+                        "entity_type": int(building.entity_type),
+                        "team_id": int(getattr(building, "team_id", 1)),
+                        "detail": f"eid={eid}",
+                    }
 
             if mesh_hit:
                 continue
@@ -6086,15 +6318,36 @@ class WulframServer:
                 if mp == push_xp:
                     px = bx + hx + r
                     if vx < 0: vx = 0.0
+                    normal = (1.0, 0.0, 0.0)
+                    depth = push_xp
                 elif mp == push_xn:
                     px = bx - hx - r
                     if vx > 0: vx = 0.0
+                    normal = (-1.0, 0.0, 0.0)
+                    depth = push_xn
                 elif mp == push_yp:
                     py = by + hy + r
                     if vy < 0: vy = 0.0
+                    normal = (0.0, 1.0, 0.0)
+                    depth = push_yp
                 elif mp == push_yn:
                     py = by - hy - r
                     if vy > 0: vy = 0.0
+                    normal = (0.0, -1.0, 0.0)
+                    depth = push_yn
+                else:
+                    normal = (0.0, 0.0, 0.0)
+                    depth = 0.0
+                ctx.debug_last_collision = {
+                    "kind": "building_aabb",
+                    "point": (px, py, pz),
+                    "normal": normal,
+                    "depth": depth,
+                    "blocker_pos": (building.x, building.y, building.z),
+                    "entity_type": int(building.entity_type),
+                    "team_id": int(getattr(building, "team_id", 1)),
+                    "detail": f"eid={eid}",
+                }
 
         return px, py, vx, vy
 
@@ -6639,6 +6892,7 @@ class WulframServer:
             # Reset server-side state for next spawn
             target.player_health = 1.0
             target.player_vel = (0.0, 0.0, 0.0)
+            target.player_speed = 0.0
             target.angular_vel_yaw = 0.0
             target.world_collision_ref_pos = target.player_pos
             target.world_collision_bounds_dirty = False
@@ -7057,9 +7311,12 @@ class WulframServer:
                 # full 30Hz step (no intra-tick split/backdating).
                 physics.step_client_substeps(torque, physics_dt, use_f32=use_f32)
 
-                ctx.player_heading = physics.heading
+                body_rot = physics.rotation
+                ctx.player_heading = body_rot[2]
                 ctx.angular_vel_yaw = physics.angular_velocity
                 ctx.player_yaw = -ctx.player_heading
+                ctx.player_pose["roll"] = body_rot[0]
+                ctx.player_pose["pitch"] = body_rot[1]
                 ctx.player_pose["yaw"] = -ctx.player_heading
 
                 self._update_player_position(ctx, dt_override=physics_dt, heading_override=old_heading)
@@ -7201,7 +7458,7 @@ class WulframServer:
                                 "vel": ctx.player_vel,
                                 "rot": (
                                     ctx.player_pose.get("roll", 0.0),
-                                    0.0,
+                                    ctx.player_pose.get("pitch", 0.0),
                                     ctx.player_heading,  # entity+0x38 convention
                                 ),
                                 "include_pos": include_lpos,
@@ -7231,7 +7488,7 @@ class WulframServer:
                                         "vel": other.player_vel,
                                         "rot": (
                                             other.player_pose.get("roll", 0.0),
-                                            0.0,
+                                            other.player_pose.get("pitch", 0.0),
                                             (-other.player_heading if self.remote_yaw_negate else other.player_heading) + self.remote_yaw_offset,
                                         ),
                                         "include_pos": include_rpos,
@@ -7613,5 +7870,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 

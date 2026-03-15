@@ -432,6 +432,11 @@ class VehiclePhysics:
         """Return internal heading in [0, 2*pi] (matches client representation)."""
         return self._euler[2]
 
+    @property
+    def rotation(self) -> tuple[float, float, float]:
+        """Return the current XYZ Euler body rotation."""
+        return (self._euler[0], self._euler[1], self._euler[2])
+
     @heading.setter
     def heading(self, val: float):
         """Set heading. Does NOT update prev_euler — triggers dirty-check matrix rebuild.
