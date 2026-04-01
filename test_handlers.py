@@ -424,6 +424,8 @@ def test_server_remote_heartbeat_helper_keeps_full_local_state():
     server.local_state_turret_range = 12.6
     server.heartbeat_view_update = False
     server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
+    server.up_axis = "z"
+    server.pos_offset = 0.0
 
     session = Session()
     session.translation_ack_received = True
@@ -482,6 +484,8 @@ def test_server_remote_heartbeat_helper_pre_state_request_is_spawn_safe():
     server.local_state_turret_range = 12.6
     server.heartbeat_view_update = False
     server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
+    server.up_axis = "z"
+    server.pos_offset = 0.0
 
     session = Session()
     session.translation_ack_received = True
@@ -515,8 +519,8 @@ def test_server_remote_heartbeat_helper_pre_state_request_is_spawn_safe():
     return True
 
 
-def test_remote_state_sync_reply_keeps_spawn_safe_local_player_shape():
-    """Remote OG STATE_REQUEST replies must keep the spawn-safe local-state shape."""
+def test_remote_state_sync_reply_uses_safe_local_player_shape_when_ready():
+    """Stable remote STATE_REQUEST replies must keep the short-form-safe local-state shape."""
     server = WulframServer.__new__(WulframServer)
     server.update_local_state_mode = "wf"
     server.update_entity_vitals = False
@@ -583,7 +587,7 @@ def test_remote_state_sync_reply_keeps_spawn_safe_local_player_shape():
     assert entities[0].velocity is not None
     assert entities[0].rotation is not None
     assert entities[0].angular_velocity is not None
-    print("test_remote_state_sync_reply_keeps_spawn_safe_local_player_shape: PASSED")
+    print("test_remote_state_sync_reply_uses_safe_local_player_shape_when_ready: PASSED")
     return True
 
 
@@ -889,7 +893,7 @@ def test_remote_state_sync_reply_emits_view_update_with_request_timestamp():
     )
     assert tick == 0x12345678
     assert local_state is not None
-    assert local_state.weapon_id == 0
+    assert local_state.weapon_id == 2
     assert len(entities) == 1
 
     timestamp, view_tick, view_local_state, view_entities = decode_view_update(
@@ -899,7 +903,7 @@ def test_remote_state_sync_reply_emits_view_update_with_request_timestamp():
     assert timestamp == 0x89ABCDEF
     assert view_tick == 0x12345678
     assert view_local_state is not None
-    assert view_local_state.weapon_id == 0
+    assert view_local_state.weapon_id == 2
     assert len(view_entities) == 1
     assert view_entities[0].entity_id == 0x14EA
     assert view_entities[0].position is not None
@@ -907,6 +911,195 @@ def test_remote_state_sync_reply_emits_view_update_with_request_timestamp():
     assert view_entities[0].rotation is not None
     assert view_entities[0].rotation == entities[0].rotation
     print("test_remote_state_sync_reply_emits_view_update_with_request_timestamp: PASSED")
+    return True
+
+
+def test_remote_state_sync_reply_uses_request_aligned_authoritative_pose():
+    """STATE_REQUEST replies should use the cached authoritative pose nearest the replay tick."""
+    server = WulframServer.__new__(WulframServer)
+    server.update_local_state_mode = "wf"
+    server.update_entity_vitals = False
+    server.view_update_local_stats = False
+    server.view_update_entity_vitals = False
+    server.remote_full_local_state_delay = 2.0
+    server.local_state_weapon_type = 0
+    server.spawn_tank_weapon_type = 2
+    server.local_state_ammo_override = False
+    server.local_state_ammo_from_behavior = True
+    server.local_state_primary_override = ""
+    server.local_state_secondary_override = ""
+    server.local_state_turret_bits = 16
+    server.local_state_turret_max = 6.3
+    server.local_state_turret_range = 12.6
+    server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
+    server._get_health_value = lambda ctx: 1.0
+    server._get_energy_value = lambda ctx: 1.0
+    server._to_client_pos = lambda pos: pos
+    server._get_network_tick = lambda ctx: 0x12345678
+    server.debug_viewpoint = False
+    server.debug_udp_raw = False
+    server.pktlog = SimpleNamespace(enabled=False)
+    captured = []
+    server.udp_handler = SimpleNamespace(send_to=lambda payload, addr: captured.append((payload, addr)))
+
+    session = Session()
+    session.translation_ack_received = True
+    session.in_game = True
+    session.entity_id = 0x14EA
+    session.udp_addr = ("10.10.10.2", 50000)
+    session.last_spawn_time = time.monotonic() - 5.0
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=session,
+        entity_id=0x14EA,
+    )
+    ctx.remote_full_local_state_ready = False
+    ctx.player_pos = (4950.0, 5100.0, 5.0)
+    ctx.player_vel = (9.0, 9.0, 0.0)
+    ctx.player_pose = {"roll": 0.0, "pitch": 0.0}
+    ctx.player_heading = 1.25
+    ctx.player_yaw = -1.25
+    ctx.last_state_sync_send = 0.0
+    ctx.authoritative_state_history.append({
+        "tick": 0x89ABCDE0,
+        "time": time.monotonic(),
+        "pos": (4900.0, 5000.0, 5.0),
+        "vel": (3.0, 0.0, 0.0),
+        "rot": (0.0, 0.0, 0.5),
+    })
+
+    server._send_state_sync_snapshot(
+        ctx,
+        include_view_update=True,
+        replay_timestamp=0x89ABCDEF,
+        reason="state_request",
+    )
+
+    assert len(captured) == 2, captured
+    update_payload = captured[0][0]
+    view_payload = captured[1][0]
+
+    tick, update_local_state, update_entities = decode_update_array(
+        update_payload,
+        behavior_config=parse_behavior(build_behavior_packet()),
+    )
+    timestamp, view_tick, view_local_state, view_entities = decode_view_update(
+        view_payload,
+        behavior_config=parse_behavior(build_behavior_packet()),
+    )
+
+    assert tick == 0x12345678
+    assert timestamp == 0x89ABCDEF
+    assert view_tick == 0x12345678
+    assert update_local_state is not None and update_local_state.weapon_id == 2
+    assert view_local_state is not None and view_local_state.weapon_id == 2
+    assert all(abs(a - b) < 0.25 for a, b in zip(update_entities[0].position, (4900.0, 5000.0, 5.0)))
+    assert all(abs(a - b) < 0.05 for a, b in zip(update_entities[0].velocity, (3.0, 0.0, 0.0)))
+    assert all(abs(a - b) < 0.001 for a, b in zip(update_entities[0].rotation, (0.0, 0.0, 0.5)))
+    assert all(abs(a - b) < 0.25 for a, b in zip(view_entities[0].position, (4900.0, 5000.0, 5.0)))
+    assert all(abs(a - b) < 0.05 for a, b in zip(view_entities[0].velocity, (3.0, 0.0, 0.0)))
+    assert all(abs(a - b) < 0.001 for a, b in zip(view_entities[0].rotation, (0.0, 0.0, 0.5)))
+    assert update_entities[0].position == view_entities[0].position
+    assert update_entities[0].velocity == view_entities[0].velocity
+    assert update_entities[0].rotation == view_entities[0].rotation
+    print("test_remote_state_sync_reply_uses_request_aligned_authoritative_pose: PASSED")
+    return True
+
+
+def test_remote_state_sync_reply_remaps_client_tick_to_server_history():
+    """STATE_REQUEST replay alignment should use ctx.tick_offset when history is server-domain."""
+    server = WulframServer.__new__(WulframServer)
+    server.update_local_state_mode = "wf"
+    server.update_entity_vitals = False
+    server.view_update_local_stats = False
+    server.view_update_entity_vitals = False
+    server.remote_full_local_state_delay = 2.0
+    server.local_state_weapon_type = 0
+    server.spawn_tank_weapon_type = 2
+    server.local_state_ammo_override = False
+    server.local_state_ammo_from_behavior = True
+    server.local_state_primary_override = ""
+    server.local_state_secondary_override = ""
+    server.local_state_turret_bits = 16
+    server.local_state_turret_max = 6.3
+    server.local_state_turret_range = 12.6
+    server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
+    server.use_client_ticks = False
+    server._get_health_value = lambda ctx: 1.0
+    server._get_energy_value = lambda ctx: 1.0
+    server._to_client_pos = lambda pos: pos
+    server._get_network_tick = lambda ctx: 0x12345678
+    server.debug_viewpoint = False
+    server.debug_udp_raw = False
+    server.pktlog = SimpleNamespace(enabled=False)
+    captured = []
+    server.udp_handler = SimpleNamespace(send_to=lambda payload, addr: captured.append((payload, addr)))
+
+    session = Session()
+    session.translation_ack_received = True
+    session.in_game = True
+    session.entity_id = 0x14EA
+    session.udp_addr = ("10.10.10.2", 50000)
+    session.last_spawn_time = time.monotonic() - 5.0
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=session,
+        entity_id=0x14EA,
+    )
+    ctx.remote_full_local_state_ready = False
+    ctx.player_pos = (4950.0, 5100.0, 5.0)
+    ctx.player_vel = (9.0, 9.0, 0.0)
+    ctx.player_pose = {"roll": 0.0, "pitch": 0.0}
+    ctx.player_heading = 1.25
+    ctx.player_yaw = -1.25
+    ctx.last_state_sync_send = 0.0
+    ctx.tick_offset = 0x002B61E0 - 0x0002D18E
+    ctx.last_client_tick = 0x002B61E0
+    ctx.authoritative_state_history.append({
+        "tick": 0x0002D180,
+        "time": time.monotonic(),
+        "pos": (4900.0, 5000.0, 5.0),
+        "vel": (3.0, 0.0, 0.0),
+        "rot": (0.0, 0.0, 0.5),
+    })
+
+    server._send_state_sync_snapshot(
+        ctx,
+        include_view_update=True,
+        replay_timestamp=0x002B61E0,
+        reason="state_request",
+    )
+
+    assert len(captured) == 2, captured
+    update_payload = captured[0][0]
+    view_payload = captured[1][0]
+
+    tick, update_local_state, update_entities = decode_update_array(
+        update_payload,
+        behavior_config=parse_behavior(build_behavior_packet()),
+    )
+    timestamp, view_tick, view_local_state, view_entities = decode_view_update(
+        view_payload,
+        behavior_config=parse_behavior(build_behavior_packet()),
+    )
+
+    assert tick == 0x12345678
+    assert timestamp == 0x002B61E0
+    assert view_tick == 0x12345678
+    assert update_local_state is not None and update_local_state.weapon_id == 2
+    assert view_local_state is not None and view_local_state.weapon_id == 2
+    assert all(abs(a - b) < 0.25 for a, b in zip(update_entities[0].position, (4900.0, 5000.0, 5.0)))
+    assert all(abs(a - b) < 0.05 for a, b in zip(update_entities[0].velocity, (3.0, 0.0, 0.0)))
+    assert all(abs(a - b) < 0.001 for a, b in zip(update_entities[0].rotation, (0.0, 0.0, 0.5)))
+    assert all(abs(a - b) < 0.25 for a, b in zip(view_entities[0].position, (4900.0, 5000.0, 5.0)))
+    assert all(abs(a - b) < 0.05 for a, b in zip(view_entities[0].velocity, (3.0, 0.0, 0.0)))
+    assert all(abs(a - b) < 0.001 for a, b in zip(view_entities[0].rotation, (0.0, 0.0, 0.5)))
+    assert update_entities[0].position == view_entities[0].position
+    assert update_entities[0].velocity == view_entities[0].velocity
+    assert update_entities[0].rotation == view_entities[0].rotation
+    print("test_remote_state_sync_reply_remaps_client_tick_to_server_history: PASSED")
     return True
 
 
@@ -1468,6 +1661,13 @@ def test_server_remote_projectile_spawn_uses_viewer_local_state():
     assert len(entities) == 1
     assert entities[0].entity_id == 21000
     assert entities[0].entity_type == EntityType.PULSE_SHELL
+    assert entities[0].velocity is not None
+    assert entities[0].rotation is not None
+    assert math.isclose(entities[0].velocity[0], proj.vel[0], abs_tol=0.1)
+    assert math.isclose(entities[0].velocity[1], proj.vel[1], abs_tol=0.1)
+    assert math.isclose(entities[0].velocity[2], proj.vel[2], abs_tol=0.1)
+    assert math.isclose(entities[0].rotation[1], 0.0, abs_tol=0.02)
+    assert math.isclose(entities[0].rotation[2], math.atan2(proj.vel[1], proj.vel[0]), abs_tol=0.02)
     print("test_server_remote_projectile_spawn_uses_viewer_local_state: PASSED")
     return True
 
@@ -4664,11 +4864,12 @@ def main():
         test_build_update_array_remote_heartbeat_shape,
         test_server_remote_heartbeat_helper_keeps_full_local_state,
         test_server_remote_heartbeat_helper_pre_state_request_is_spawn_safe,
-        test_remote_state_sync_reply_keeps_spawn_safe_local_player_shape,
+        test_remote_state_sync_reply_uses_safe_local_player_shape_when_ready,
         test_remote_state_sync_reply_stays_spawn_safe_immediately_after_spawn,
         test_remote_state_sync_reply_stays_spawn_safe_after_spawn_delay,
         test_remote_state_sync_reply_stays_safe_without_post_spawn_input_after_delay,
         test_remote_state_sync_reply_emits_view_update_with_request_timestamp,
+        test_remote_state_sync_reply_uses_request_aligned_authoritative_pose,
         test_remote_promoted_heartbeat_stays_short_form_safe,
         test_remote_state_sync_reply_keeps_full_motion_when_stable,
         test_local_player_sync_rotation_uses_heading_not_player_yaw,

@@ -31,6 +31,8 @@ from .packets import (
     build_reincarnate, build_add_to_roster, build_update_stats,
     build_birth_notice, build_chat_message, build_player_info,
     build_update_array_empty, build_update_array_heartbeat,
+    build_update_array_player_update, build_view_update_player_update,
+    build_update_array_multi,
     build_update_array_create_tank, build_update_array_spawn_points,
     build_behavior_packet, build_translation_packet,
     build_login_status, build_bps_response, build_game_clock,
@@ -319,6 +321,8 @@ class ControlServer:
             return self._cmd_behavior(args)
         elif cmd == 'physics' or cmd == 'phys':
             return self._cmd_physics(args)
+        elif cmd == 'correction' or cmd == 'corr':
+            return self._cmd_correction(args)
         elif cmd == 'subtick':
             if not self.server:
                 return "No server"
@@ -375,6 +379,7 @@ class ControlServer:
   fire [count|at <deg>]  - Force-fire projectile at current/specified heading
   pktlog [on|off|dump|save|analyze|clear] - Packet traffic logger
   physics [param] [value] - Yaw physics params (damp, reset)
+  correction [...]       - Control empirical local correction loop or send one-shot packet
   framdt [ms]            - Show/set client frame dt in ms (for physics sync tuning)
   respawn / rs           - Re-send TankPacket to reset client entity position + heading
   despawn / ds [c<id>]   - Kill & despawn player (DELETE + reset to TEAM_SELECT)
@@ -393,6 +398,9 @@ Examples:
   send REINCARNATE 17 "Welcome!"        # Spawn success
   send UPDATE_ARRAY_TANK 1337 0 2       # Create tank entity
   spawn_udp 1337 2 0 100 100 100        # UDP TANK (Wulf-Forge style)
+  correction mode view_update           # Set empirical correction packet shape
+  correction now c1                     # Queue correction on next tick for client 1
+  correction send c1                    # Send correction packet immediately for packet-shape tests
   spawn_full 2 1337 0 0 100 50 100 150 2000        # team, oid, vehicle, behavior, x y z, delay_ms, ack_timeout_ms
   spawn_full 2 1337 0 0 100 50 100 150 2000 1 2000 # ... + send_world_stats, want_timeout_ms
   spawn_full 2 1337 0 0 100 50 100 150 0 ws=1 want=2000 interp=1 strict=1  # suppress WANT_UPDATES payload"""
@@ -804,6 +812,168 @@ Examples:
             return f"Set aim_yaw_offset = {value}deg (was {old_val}deg, {updated} clients)"
 
         return f"Unknown heading param: {param}. Valid: offset, aim_offset, source, reset"
+
+    def _send_empirical_correction(self, ctx) -> str:
+        """Send one local-player correction packet immediately for packet-shape testing."""
+        import math
+
+        if not self.server or not ctx.session:
+            return "Error: No server/session reference"
+
+        local_state_kwargs = self.server._get_local_state_kwargs(ctx)
+        weapon_type = local_state_kwargs["weapon_id"]
+        ammo_bits = local_state_kwargs["ammo_count_bits"]
+        ammo_mask = local_state_kwargs["ammo_count"]
+        pt_bits = local_state_kwargs["primary_turret_bits"]
+        pt_angle = local_state_kwargs["primary_turret_angle"]
+        st_bits = local_state_kwargs["secondary_turret_bits"]
+        st_angle = local_state_kwargs["secondary_turret_angle"]
+        include_local_state = self.server._should_send_local_state(
+            ctx,
+            pt_bits,
+            st_bits,
+            self.server.update_local_state_mode,
+        )
+        tick = self.server._get_network_tick(ctx)
+        payload, label, corr_pos, corr_rot, _, _ = self.server._build_empirical_correction_payload(
+            ctx,
+            tick=tick,
+            include_local_state=include_local_state,
+            health=self.server._get_health_value(ctx),
+            fuel=self.server._get_energy_value(ctx),
+            weapon_type=weapon_type,
+            ammo_bits=ammo_bits,
+            ammo_mask=ammo_mask,
+            pt_bits=pt_bits,
+            pt_angle=pt_angle,
+            st_bits=st_bits,
+            st_angle=st_angle,
+        )
+
+        transports = []
+        if getattr(self.server, "send_updates_tcp", False) and ctx.tcp_handler:
+            try:
+                ctx.tcp_handler.send(payload, log=False)
+                transports.append("TCP")
+            except Exception as exc:
+                print(f"[CONTROL-CORRECTION] TCP send failed for client {ctx.client_id}: {exc}")
+        if getattr(self.server, "send_updates_udp", True) and self.server.udp_handler and ctx.session.udp_addr:
+            self.server.udp_handler.send_to(payload, ctx.session.udp_addr)
+            transports.append("UDP")
+        if not transports:
+            return "Error: No available transport for correction packet"
+
+        ctx.last_correction_send = time.monotonic()
+        ctx.force_correction_once = False
+        print(
+            f"[CONTROL-CORRECTION] mode={self.server.correction_mode} client={ctx.client_id} "
+            f"label={label} transports={'+'.join(transports)} "
+            f"pos=({corr_pos[0]:.1f},{corr_pos[1]:.1f},{corr_pos[2]:.1f}) "
+            f"yaw={math.degrees(corr_rot[2]):.1f}deg"
+        )
+        return (
+            f"Sent {label} to client {ctx.client_id} via {'+'.join(transports)} "
+            f"tick={tick} pos=({corr_pos[0]:.1f},{corr_pos[1]:.1f},{corr_pos[2]:.1f}) "
+            f"yaw={math.degrees(corr_rot[2]):.1f}deg"
+        )
+
+    def _cmd_correction(self, args: list) -> str:
+        """Show or control the empirical local-correction loop."""
+        if not self.server:
+            return "Error: No server reference"
+
+        valid_modes = ("full", "rot_only", "pos_only", "dual_entity", "view_update")
+        if not hasattr(self.server, "correction_mode"):
+            self.server.correction_mode = "dual_entity"
+        if not hasattr(self.server, "correction_interval"):
+            self.server.correction_interval = 0.0
+
+        if not args:
+            interval = float(getattr(self.server, "correction_interval", 0.0) or 0.0)
+            status = "ON" if interval > 0 else "OFF"
+            lines = [
+                f"Drift correction: {status} mode={self.server.correction_mode}",
+                f"  interval = {interval:.2f}s (0=disabled)",
+            ]
+            for ctx in self.server._snapshot_in_game_clients():
+                age = time.monotonic() - ctx.last_correction_send if getattr(ctx, "last_correction_send", 0.0) > 0 else -1.0
+                queued = " queued" if getattr(ctx, "force_correction_once", False) else ""
+                if age >= 0:
+                    lines.append(f"  client {ctx.client_id}: last_correction={age:.1f}s ago{queued}")
+                else:
+                    lines.append(f"  client {ctx.client_id}: no corrections sent yet{queued}")
+            lines.append("")
+            lines.append("Usage: correction <seconds|on|off|now|mode <name>|send [c<id>]>")
+            lines.append("Modes: full, rot_only, pos_only, dual_entity, view_update")
+            return "\n".join(lines)
+
+        subcmd = args[0].lower()
+        if subcmd == "on":
+            if self.server.correction_interval <= 0:
+                self.server.correction_interval = 5.0
+            return f"Correction ON (interval={self.server.correction_interval:.2f}s mode={self.server.correction_mode})"
+        if subcmd == "off":
+            self.server.correction_interval = 0.0
+            for ctx in self.server._snapshot_in_game_clients():
+                ctx.force_correction_once = False
+            return "Correction OFF"
+        if subcmd == "now":
+            target_id = None
+            if len(args) >= 2 and args[1].lower().startswith("c") and args[1][1:].isdigit():
+                target_id = int(args[1][1:])
+            targets = []
+            if target_id is not None:
+                ctx, _ = self._get_client_by_id(target_id)
+                if not ctx:
+                    return f"Error: No client with id {target_id}"
+                targets = [ctx]
+            else:
+                targets = self.server._snapshot_in_game_clients()
+            if not targets:
+                return "No in-game clients"
+            for ctx in targets:
+                ctx.force_correction_once = True
+                ctx.last_correction_send = 0.0
+            suffix = f" for client {target_id}" if target_id is not None else ""
+            return f"Queued correction on next tick{suffix} (mode={self.server.correction_mode})"
+        if subcmd == "send":
+            target_id = None
+            if len(args) >= 2 and args[1].lower().startswith("c") and args[1][1:].isdigit():
+                target_id = int(args[1][1:])
+            if target_id is not None:
+                ctx, _ = self._get_client_by_id(target_id)
+                if not ctx:
+                    return f"Error: No client with id {target_id}"
+                return self._send_empirical_correction(ctx)
+            lines = []
+            for ctx in self.server._snapshot_in_game_clients():
+                lines.append(self._send_empirical_correction(ctx))
+            return "\n".join(lines) if lines else "No in-game clients"
+        if subcmd == "mode":
+            if len(args) < 2:
+                return f"Current mode: {self.server.correction_mode}\nModes: {', '.join(valid_modes)}"
+            new_mode = args[1].lower()
+            if new_mode not in valid_modes:
+                return f"Invalid mode: {new_mode}\nModes: {', '.join(valid_modes)}"
+            old_mode = self.server.correction_mode
+            self.server.correction_mode = new_mode
+            print(f"[CONTROL] correction mode: {old_mode} -> {new_mode}")
+            return f"Correction mode: {old_mode} -> {new_mode}"
+
+        try:
+            value = float(subcmd)
+        except ValueError:
+            return (
+                f"Unknown correction subcommand: {subcmd}\n"
+                f"Usage: correction <seconds|on|off|now|mode <name>|send [c<id>]>"
+            )
+        old_interval = self.server.correction_interval
+        self.server.correction_interval = max(0.0, value)
+        print(f"[CONTROL] correction interval: {old_interval:.2f} -> {self.server.correction_interval:.2f}")
+        if self.server.correction_interval <= 0:
+            for ctx in self.server._snapshot_in_game_clients():
+                ctx.force_correction_once = False
+        return f"Set correction interval = {self.server.correction_interval:.2f}s" + (" (OFF)" if self.server.correction_interval <= 0 else "")
 
     def _cmd_fire(self, args: list) -> str:
         """

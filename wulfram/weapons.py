@@ -1027,6 +1027,24 @@ class WeaponSystem:
         self._shape_bounds_cache[shape_name] = bounds
         return bounds
 
+def _projectile_rotation_from_velocity(vel: Tuple[float, float, float]) -> tuple[float, float, float]:
+    """Derive projectile pitch/yaw from velocity for spawn/update packets."""
+    if os.environ.get("WULFRAM_PROJECTILE_ROT_FROM_VEL", "1") != "1":
+        return (0.0, 0.0, 0.0)
+
+    vx, vy, vz = vel
+    up_axis = os.environ.get("WULFRAM_UP_AXIS", "z").lower()
+    if up_axis == "z":
+        yaw = math.atan2(vy, vx) if (vx != 0.0 or vy != 0.0) else 0.0
+        horiz = math.hypot(vx, vy)
+        pitch = math.atan2(vz, horiz) if horiz != 0.0 else 0.0
+    else:
+        yaw = math.atan2(vz, vx) if (vx != 0.0 or vz != 0.0) else 0.0
+        horiz = math.hypot(vx, vz)
+        pitch = math.atan2(vy, horiz) if horiz != 0.0 else 0.0
+    return (0.0, pitch, yaw)
+
+
 def build_projectile_spawn_packet(
     proj: Projectile,
     tick: int,
@@ -1049,14 +1067,18 @@ def build_projectile_spawn_packet(
     """
     Build UPDATE_ARRAY packet to spawn a projectile entity.
 
-    Format based on wulf-forge's working implementation:
+    Spawn packets carry full motion so the client can orient/extrapolate the
+    shell correctly on frame one instead of waiting for the first follow-up
+    update.
+
+    Format based on the working projectile update shape:
     - 4 bytes: tick (sequence_id)
     - 1 bit: has_local_stats (0)
     - 8 bits: entity_count
     - Per entity:
       - 32 bits: net_id (OID)
       - 1 bit: is_manned
-      - 10 bits: update_mask (DEFINITION | POS = 0b0000000011)
+      - 10 bits: update_mask (DEFINITION | POS | VEL | ROT = 0b0000001111)
       - 16 bits: bank_selector (0 for bank 0)
       - If DEFINITION bit:
         - 8 bits: unit_type
@@ -1064,8 +1086,14 @@ def build_projectile_spawn_packet(
         - 8 bits: team_id again
         - 1 bit: is_teleport (spawn snap/teleport; should be 1 on entity create)
       - If POS bit:
-        - 4 bits: precision_header (3 = max quality)
+        - 4 bits: precision_header
         - 16 bits each: x, y, z compressed
+      - If VEL bit:
+        - 4 bits: precision_header
+        - 16 bits each: vx, vy, vz compressed
+      - If ROT bit:
+        - 4 bits: precision_header
+        - 16 bits each: roll, pitch, yaw compressed
     """
     from .codec import BitWriter
     from .packets import _write_local_player_state
@@ -1102,11 +1130,10 @@ def build_projectile_spawn_packet(
     # is_manned: 1 bit (projectiles are not manned)
     bw.write_bits(1, 0)
 
-    # Update mask: 10 bits
-    # Bit 0 = DEFINITION (create entity)
-    # Bit 1 = POS (position data)
-    # Wulf-forge-style creation uses DEFINITION | POS only.
-    update_mask = 0b0000000011  # DEFINITION | POS
+    # Update mask: DEFINITION | POS | VEL | ROT
+    # New projectile entities need motion fields immediately so the renderer
+    # does not bootstrap from a default heading/velocity until the next packet.
+    update_mask = 0b0000001111
     bw.write_bits(10, update_mask)
 
     # Bank selector: 16 bits (0 for bank 0)
@@ -1162,6 +1189,19 @@ def build_projectile_spawn_packet(
             f"pos=({pos_fmt}) raw={pos_raw} dec=({pos_dec_fmt})"
         )
 
+    # Velocity: 4-bit header + 16 bits × 3
+    bw.write_bits(4, 15)
+    for v in proj.vel:
+        compressed = _compress_value(v, VEC_VEL_MAX, VEC_VEL_RANGE, total_bits=16)
+        bw.write_bits(16, compressed)
+
+    # Rotation: 4-bit header + 16 bits × 3
+    rot = _projectile_rotation_from_velocity(proj.vel)
+    bw.write_bits(4, 15)
+    for v in rot:
+        compressed = _compress_value(v, VEC_ROT_MAX, VEC_ROT_RANGE)
+        bw.write_bits(16, compressed)
+
     return b'\x0E' + tick_bytes + bw.get_bytes()
 
 
@@ -1184,8 +1224,8 @@ def build_projectile_update_packet(
     turret_range: float = 12.6,
 ) -> bytes:
     """
-    Build UPDATE_ARRAY packet to update a projectile's position.
-    Unlike spawn packet, this only includes POS (no DEFINITION).
+    Build UPDATE_ARRAY packet to update a projectile's transform.
+    Unlike spawn packet, this omits DEFINITION but still carries POS|VEL|ROT.
 
     Args:
         proj: The projectile to update
@@ -1258,22 +1298,7 @@ def build_projectile_update_packet(
 
     # Rotation: 4-bit header + 16 bits × 3 (REQUIRED for non-static entities!)
     # wulf-forge VEC_ROT: max=6.3, range=12.6
-    rot_from_vel = os.environ.get("WULFRAM_PROJECTILE_ROT_FROM_VEL", "1") == "1"
-    if rot_from_vel:
-        vx, vy, vz = proj.vel
-        up_axis = os.environ.get("WULFRAM_UP_AXIS", "z").lower()
-        if up_axis == "z":
-            yaw = math.atan2(vy, vx) if (vx != 0.0 or vy != 0.0) else 0.0
-            horiz = math.hypot(vx, vy)
-            pitch = math.atan2(vz, horiz) if horiz != 0.0 else 0.0
-        else:
-            yaw = math.atan2(vz, vx) if (vx != 0.0 or vz != 0.0) else 0.0
-            horiz = math.hypot(vx, vz)
-            pitch = math.atan2(vy, horiz) if horiz != 0.0 else 0.0
-        rot = (0.0, pitch, yaw)
-    else:
-        rot = (0.0, 0.0, 0.0)
-
+    rot = _projectile_rotation_from_velocity(proj.vel)
     bw.write_bits(4, 15)
     for v in rot:
         compressed = _compress_value(v, VEC_ROT_MAX, VEC_ROT_RANGE)

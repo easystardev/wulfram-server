@@ -10,6 +10,7 @@ Each connected client gets its own ClientContext with:
 
 import time
 import threading
+from collections import deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional, Any
 
@@ -119,6 +120,9 @@ class ClientContext:
     last_state_sync_send: float = field(default_factory=time.monotonic)
     # Update throttling (server-authoritative snapshots)
     last_update_send: float = field(default_factory=time.monotonic)
+    # Periodic empirical correction (older local-reconcile probe path)
+    last_correction_send: float = 0.0
+    force_correction_once: bool = False
     # Remote player update throttle
     last_remote_update_send: float = 0.0
     # Combat stats
@@ -138,6 +142,7 @@ class ClientContext:
     last_sent_yaw: float = 0.0
     last_state_sync_vel: Optional[tuple] = None
     last_state_sync_rot: Optional[tuple] = None
+    authoritative_state_history: Any = field(default_factory=lambda: deque(maxlen=180))
     debug_last_controller_step: dict = field(default_factory=dict)
     debug_last_collision: dict = field(default_factory=dict)
 
@@ -169,6 +174,7 @@ class ClientContext:
             self.session.reset()
         self.known_entity_ids.clear()
         self.known_roster_ids.clear()
+        self.authoritative_state_history.clear()
 
     def update_player_pos(self, pos: tuple):
         """Update player position in both pose dict and legacy field."""

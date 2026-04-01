@@ -947,11 +947,20 @@ class WulframServer:
         # entity, pos-only, rot-only, teleport â€” none visually correct the local player.
         # Server physics match (0.001% position, 0.00Â° heading) is the sync mechanism.
 
+        try:
+            self.correction_interval = float(os.environ.get("WULFRAM_CORRECTION_INTERVAL", "0"))
+        except ValueError:
+            self.correction_interval = 0.0
+        self.correction_mode = os.environ.get("WULFRAM_CORRECTION_MODE", "dual_entity").strip().lower()
+        if self.correction_mode not in ("full", "rot_only", "pos_only", "dual_entity", "view_update"):
+            self.correction_mode = "dual_entity"
+
         print(
             f"[CONFIG-HEADING] turn_adjust={self.turn_adjust} turn_sign={self.turn_sign} "
             f"deadzone={self.turn_deadzone} damp_coeff={self.damp_coeff} "
             f"linear_damp=driving:{self.linear_damp_driving}/coast:{self.linear_damp_coasting} "
-            f"tick_rate={self.tick_rate_hz}Hz"
+            f"tick_rate={self.tick_rate_hz}Hz correction_interval={self.correction_interval}s "
+            f"correction_mode={self.correction_mode}"
         )
 
         self.estimated_speed = 15.0  # Units per second (tunable)
@@ -988,6 +997,76 @@ class WulframServer:
         ctx.last_sent_tick = tick & 0xFFFFFFFF
         return ctx.last_sent_tick
 
+    @staticmethod
+    def _tick_delta_signed(newer: int, older: int) -> int:
+        """Return the signed 32-bit tick delta `newer - older`."""
+        delta = (int(newer) - int(older)) & 0xFFFFFFFF
+        if delta & 0x80000000:
+            delta -= 0x100000000
+        return delta
+
+    def _record_authoritative_state(self, ctx: ClientContext, *, tick: int) -> None:
+        """Cache recent authoritative states for replay-aligned sync replies."""
+        history = getattr(ctx, "authoritative_state_history", None)
+        if history is None:
+            return
+        entry = {
+            "tick": tick & 0xFFFFFFFF,
+            "time": time.monotonic(),
+            "pos": self._to_client_pos(ctx.player_pos),
+            "vel": tuple(ctx.player_vel),
+            "rot": self._local_player_sync_rotation(ctx),
+        }
+        if history and history[-1]["tick"] == entry["tick"]:
+            history[-1] = entry
+        else:
+            history.append(entry)
+
+    def _select_authoritative_state_snapshot(
+        self,
+        ctx: ClientContext,
+        replay_timestamp: Optional[int],
+    ) -> Optional[dict]:
+        """Pick the cached authoritative state closest to a replay request tick."""
+        if replay_timestamp is None:
+            return None
+        history = getattr(ctx, "authoritative_state_history", None)
+        if not history:
+            return None
+
+        # STATE_REQUEST.request_id stays in the client's GetTickCount domain even
+        # when normal replication uses server-domain ticks. Replay-aligned sync
+        # still needs to pick the authoritative sample nearest that request, so
+        # compare against both domains when a stable tick offset is available.
+        candidate_ticks = [int(replay_timestamp) & 0xFFFFFFFF]
+        if not getattr(self, "use_client_ticks", False):
+            tick_offset = getattr(ctx, "tick_offset", None)
+            if tick_offset is not None:
+                mapped_tick = (candidate_ticks[0] - int(tick_offset)) & 0xFFFFFFFF
+                if mapped_tick != candidate_ticks[0]:
+                    candidate_ticks.append(mapped_tick)
+
+        best_prior = None
+        best_prior_delta = None
+        best_abs = None
+        best_abs_delta = None
+
+        for entry in history:
+            for target_tick in candidate_ticks:
+                delta = self._tick_delta_signed(target_tick, entry["tick"])
+                abs_delta = abs(delta)
+                if delta >= 0 and (best_prior is None or delta < best_prior_delta):
+                    best_prior = entry
+                    best_prior_delta = delta
+                if best_abs is None or abs_delta < best_abs_delta:
+                    best_abs = entry
+                    best_abs_delta = abs_delta
+
+        chosen = best_prior if best_prior is not None else best_abs
+        if chosen is None or best_abs_delta is None or best_abs_delta > 250:
+            return None
+        return chosen
+
     def _get_local_state_weapon_type(self, ctx: ClientContext) -> int:
         """Return weapon type index used by local player state (entity type index, not weapon slot)."""
         if self.update_local_state_mode == "wf":
@@ -1012,8 +1091,9 @@ class WulframServer:
 
         Spawn-time `TANK` / `PLAYER_INFO` / first heartbeat are still sensitive
         to local-state bit-count mismatches. Keep remote clients on the safe
-        short form until they have explicitly requested targeted sync, then
-        promote them to the full tank local-state shape for sync fidelity.
+        short form until they have explicitly requested targeted sync. Promotion
+        after that point controls the broader post-spawn sync/heartbeat path,
+        but targeted correction packets still keep the safe local-state prefix.
         """
         if self.update_local_state_mode != "wf":
             return False
@@ -1025,9 +1105,9 @@ class WulframServer:
         """Return True when remote `wf` heartbeats should use local-player sync updates.
 
         Remote OG clients need the short-form spawn-safe path first, then the
-        promoted single-local-player update shape once targeted sync is active.
-        That promoted shape is the one the current OG-safe tests and correction
-        path depend on.
+        promoted single-local-player update transport once targeted sync is
+        active. That promotion no longer implies the expanded ammo/turret
+        local-state shape on targeted correction packets.
         """
         if self.update_local_state_mode != "wf":
             return False
@@ -1042,7 +1122,7 @@ class WulframServer:
         it is also the narrowest remaining suspect when OG falls back to the
         address screen immediately after join. Keep the one-off spawn heartbeat,
         but do not stream periodic short-form heartbeats before targeted sync
-        has promoted the client into the full local-player update shape.
+        has promoted the client into the fuller post-spawn update transport.
         """
         return self._wf_minimal_local_state_for_client(ctx)
 
@@ -1053,7 +1133,7 @@ class WulframServer:
         the remote OG bootstrap path it still lands in the narrow packet window
         where protocol-mismatch falls back to the address screen. Once the
         client explicitly requests targeted sync we can leave spawn-safe mode
-        and rely on the full local-state path instead.
+        and rely on the promoted post-spawn transport instead.
         """
         return self._wf_minimal_local_state_for_client(ctx)
 
@@ -1371,11 +1451,113 @@ class WulframServer:
             pos=pos,
         )
 
+    def _build_empirical_correction_payload(
+        self,
+        ctx: ClientContext,
+        *,
+        tick: int,
+        include_local_state: bool,
+        health: float,
+        fuel: float,
+        weapon_type: int,
+        ammo_bits: int,
+        ammo_mask: int,
+        pt_bits: int,
+        pt_angle: float,
+        st_bits: int,
+        st_angle: float,
+    ) -> tuple[bytes, str, tuple[float, float, float], tuple[float, float, float], bool, bool]:
+        """Build one of the older empirical local-correction packet shapes."""
+        corr_pos = self._to_client_pos(ctx.player_pos)
+        corr_rot = (
+            ctx.player_pose.get("roll", 0.0),
+            0.0,
+            ctx.player_yaw,
+        )
+        cmode = self.correction_mode
+        inc_pos = cmode in ("full", "pos_only", "dual_entity", "view_update")
+        inc_vel = cmode in ("full", "pos_only", "dual_entity", "view_update")
+        inc_rot = cmode in ("full", "rot_only", "dual_entity", "view_update")
+
+        common_kw = dict(
+            include_local_state=include_local_state,
+            weapon_id=weapon_type,
+            health=health,
+            fuel=fuel,
+            ammo_count_bits=ammo_bits,
+            ammo_count=ammo_mask,
+            primary_turret_bits=pt_bits,
+            primary_turret_angle=pt_angle,
+            secondary_turret_bits=st_bits,
+            secondary_turret_angle=st_angle,
+            turret_max=self.local_state_turret_max,
+            turret_range=self.local_state_turret_range,
+        )
+
+        if cmode == "view_update":
+            payload = build_view_update_player_update(
+                tick=tick,
+                entity_id=ctx.session.entity_id,
+                pos=corr_pos,
+                vel=ctx.player_vel,
+                rot=corr_rot,
+                include_pos=inc_pos,
+                include_vel=inc_vel,
+                include_rot=inc_rot,
+                **common_kw,
+            )
+            label = "CORRECTION(view_update)"
+        elif cmode == "dual_entity":
+            ent_real = dict(
+                entity_id=ctx.session.entity_id,
+                is_manned=True,
+                pos=corr_pos,
+                vel=ctx.player_vel,
+                rot=corr_rot,
+                include_pos=inc_pos,
+                include_vel=inc_vel,
+                include_rot=inc_rot,
+            )
+            ent_dummy = dict(
+                entity_id=0xFFFFFFFE,
+                is_manned=True,
+                pos=(0.0, 0.0, 0.0),
+                vel=(0.0, 0.0, 0.0),
+                rot=(0.0, 0.0, 0.0),
+                include_pos=False,
+                include_vel=False,
+                include_rot=False,
+            )
+            payload = build_update_array_multi(
+                tick=tick,
+                entities=[ent_real, ent_dummy],
+                **common_kw,
+            )
+            label = "CORRECTION(dual_entity)"
+        else:
+            payload = build_update_array_player_update(
+                tick=tick,
+                entity_id=ctx.session.entity_id,
+                pos=corr_pos,
+                vel=ctx.player_vel,
+                rot=corr_rot,
+                include_pos=inc_pos,
+                include_vel=inc_vel,
+                include_rot=inc_rot,
+                **common_kw,
+            )
+            label = f"CORRECTION({cmode})"
+
+        return payload, label, corr_pos, corr_rot, inc_pos, inc_rot
+
     def _build_remote_sync_heartbeat_update(
         self,
         ctx: ClientContext,
         *,
         tick: int,
+        pos: Optional[tuple[float, float, float]] = None,
+        vel: Optional[tuple[float, float, float]] = None,
+        rot: Optional[tuple[float, float, float]] = None,
         include_vel: bool,
         include_rot: bool,
         include_local_state: bool,
@@ -1392,8 +1574,9 @@ class WulframServer:
     ) -> bytes:
         """Build a safe single-local-player update for promoted remote OG heartbeats."""
         entity_id = ctx.session.entity_id or ctx.entity_id
-        hb_rot = self._local_player_sync_rotation(ctx)
-        hb_pos = self._to_client_pos(ctx.player_pos)
+        hb_rot = rot if rot is not None else self._local_player_sync_rotation(ctx)
+        hb_pos = pos if pos is not None else self._to_client_pos(ctx.player_pos)
+        hb_vel = vel if vel is not None else ctx.player_vel
         local_weapon_type = self._get_spawn_tank_weapon_type(ctx) if safe_local_state else weapon_type
         local_ammo_bits = 0 if safe_local_state else ammo_bits
         local_ammo_mask = 0 if safe_local_state else ammo_mask
@@ -1405,7 +1588,7 @@ class WulframServer:
             tick=tick,
             entity_id=entity_id,
             pos=hb_pos,
-            vel=ctx.player_vel,
+            vel=hb_vel,
             rot=hb_rot,
             include_pos=True,
             include_vel=include_vel,
@@ -2803,6 +2986,9 @@ class WulframServer:
         ctx.world_collision_bounds_dirty = False
         ctx.last_state_sync_vel = None
         ctx.last_state_sync_rot = None
+        ctx.last_correction_send = 0.0
+        ctx.force_correction_once = False
+        ctx.authoritative_state_history.clear()
         ctx.player_yaw = 0.0
         ctx.player_heading = 0.0
         ctx.angular_vel_yaw = 0.0
@@ -2971,6 +3157,9 @@ class WulframServer:
         ctx.world_collision_bounds_dirty = False
         ctx.last_state_sync_vel = None
         ctx.last_state_sync_rot = None
+        ctx.last_correction_send = 0.0
+        ctx.force_correction_once = False
+        ctx.authoritative_state_history.clear()
 
         ctx.player_health = 1.0
         ctx.player_angular_vel = 0.0
@@ -4387,6 +4576,13 @@ class WulframServer:
         if not self._state_sync_reply_allowed_for_client(ctx):
             return
 
+        # Remote OG clients still use STATE_REQUEST as the gate out of the
+        # fragile spawn/bootstrap window, but the targeted reply itself must
+        # stay on the short-form-safe local-state prefix. Promotion here only
+        # unlocks the broader post-spawn sync path; it does not justify the
+        # expanded ammo/turret local-state on the correction packet itself.
+        self._maybe_promote_remote_full_local_state(ctx, reason="state_request")
+
         self._send_state_sync_snapshot(
             ctx,
             reason="state_request",
@@ -4440,12 +4636,19 @@ class WulframServer:
             return angle
 
         tick = self._get_network_tick(ctx)
-        send_pos = self._to_client_pos(ctx.player_pos)
-        update_rot = (
-            ctx.player_pose.get("roll", 0.0),
-            ctx.player_pose.get("pitch", 0.0),
-            ctx.player_heading,
-        )
+        snapshot = self._select_authoritative_state_snapshot(ctx, replay_timestamp)
+        if snapshot is None:
+            send_pos = self._to_client_pos(ctx.player_pos)
+            sync_vel = ctx.player_vel
+            update_rot = (
+                ctx.player_pose.get("roll", 0.0),
+                ctx.player_pose.get("pitch", 0.0),
+                ctx.player_heading,
+            )
+        else:
+            send_pos = snapshot["pos"]
+            sync_vel = snapshot["vel"]
+            update_rot = snapshot["rot"]
         include_sync_vel = True
         include_sync_rot = True
         # VIEW_UPDATE is a replay/correction wrapper over the same entity
@@ -4456,14 +4659,19 @@ class WulframServer:
         view_rot = update_rot
         health_val = self._get_health_value(ctx)
         fuel_val = self._get_energy_value(ctx)
-        force_full_remote_sync_local_state = self._remote_state_sync_can_use_promoted_local_state(
-            ctx,
-            reason=reason,
-        )
-        local_state_kwargs = self._get_local_state_kwargs(
-            ctx,
-            force_full_remote=force_full_remote_sync_local_state,
-        )
+        if handlers._is_loopback_client(ctx):
+            local_state_kwargs = self._get_local_state_kwargs(ctx)
+            update_include_local_state = self._should_send_local_state(
+                ctx,
+                local_state_kwargs["primary_turret_bits"],
+                local_state_kwargs["secondary_turret_bits"],
+                self.update_local_state_mode,
+            )
+        else:
+            # OG targeted sync is still sensitive to the local-state prefix on
+            # these packets. Keep STATE_REQUEST replies on the same short-form-
+            # safe shape that earlier live traces showed as stable.
+            update_include_local_state, local_state_kwargs = self._get_update_array_local_state_for_viewer(ctx)
         weapon_type = local_state_kwargs["weapon_id"]
         ammo_bits = local_state_kwargs["ammo_count_bits"]
         ammo_mask = local_state_kwargs["ammo_count"]
@@ -4471,17 +4679,6 @@ class WulframServer:
         pt_angle = local_state_kwargs["primary_turret_angle"]
         st_bits = local_state_kwargs["secondary_turret_bits"]
         st_angle = local_state_kwargs["secondary_turret_angle"]
-
-        update_include_local_state = self._should_send_local_state(
-            ctx,
-            pt_bits,
-            st_bits,
-            self.update_local_state_mode,
-        )
-        use_promoted_remote_sync_local_state = (
-            update_include_local_state
-            and force_full_remote_sync_local_state
-        )
         if update_include_local_state:
             update_ammo_bits = ammo_bits
             update_ammo_mask = ammo_mask
@@ -4501,6 +4698,9 @@ class WulframServer:
             update_payload = self._build_remote_sync_heartbeat_update(
                 ctx,
                 tick=tick,
+                pos=send_pos,
+                vel=sync_vel,
+                rot=update_rot,
                 include_vel=include_sync_vel,
                 include_rot=include_sync_rot,
                 include_local_state=update_include_local_state,
@@ -4513,14 +4713,14 @@ class WulframServer:
                 pt_angle=update_pt_angle,
                 st_bits=update_st_bits,
                 st_angle=update_st_angle,
-                safe_local_state=not use_promoted_remote_sync_local_state,
+                safe_local_state=not handlers._is_loopback_client(ctx),
             )
         else:
             update_payload = build_update_array_player_update(
                 tick=tick,
                 entity_id=entity_id,
                 pos=send_pos,
-                vel=ctx.player_vel,
+                vel=sync_vel,
                 rot=update_rot,
                 include_pos=True,
                 include_vel=include_sync_vel,
@@ -4572,27 +4772,23 @@ class WulframServer:
                         view_st_angle = st_angle
             else:
                 # VIEW_UPDATE shares the same local-state parser as UPDATE_ARRAY.
-                # Spawn/bootstrap still needs the short-form-safe prefix, but
-                # once the remote OG client has been promoted into explicit
-                # STATE_REQUEST-driven sync, the correction reply itself should
-                # carry the same promoted local-state shape as UPDATE_ARRAY.
-                view_include_local_state = True
-                if use_promoted_remote_sync_local_state:
-                    view_weapon_type = weapon_type
-                    view_ammo_bits = update_ammo_bits
-                    view_ammo_mask = update_ammo_mask
-                    view_pt_bits = update_pt_bits
-                    view_pt_angle = update_pt_angle
-                    view_st_bits = update_st_bits
-                    view_st_angle = update_st_angle
-                else:
-                    view_weapon_type = self._get_spawn_tank_weapon_type(ctx)
+                # Keep the replay companion on the same short-form-safe prefix as
+                # the targeted UPDATE_ARRAY reply; the transform/timestamp payload
+                # carries the correction signal, not expanded ammo/turret bits.
+                view_include_local_state = update_include_local_state
+                view_weapon_type = weapon_type
+                view_ammo_bits = update_ammo_bits
+                view_ammo_mask = update_ammo_mask
+                view_pt_bits = update_pt_bits
+                view_pt_angle = update_pt_angle
+                view_st_bits = update_st_bits
+                view_st_angle = update_st_angle
 
             view_payload = build_view_update_player_update(
                 tick=tick,
                 entity_id=entity_id,
                 pos=send_pos,
-                vel=ctx.player_vel,
+                vel=sync_vel,
                 rot=view_rot,
                 include_pos=True,
                 include_vel=include_sync_vel,
@@ -5206,28 +5402,6 @@ class WulframServer:
         strafe here so negative = left and positive = right in simulation.
         """
         return self.strafe_sign * self._normalize_behavior_axis_value(ctx, strafe_val)
-
-    def _remote_state_sync_can_use_promoted_local_state(self, ctx: ClientContext, *, reason: str = "") -> bool:
-        """Return whether an explicit remote sync reply may leave the spawn-safe local-state shape."""
-        if self.update_local_state_mode != "wf":
-            return False
-        if handlers._is_loopback_client(ctx):
-            return False
-        if not ctx.session or not ctx.session.in_game:
-            return False
-        spawn_time = getattr(ctx.session, "last_spawn_time", 0.0) or 0.0
-        if spawn_time > 0.0 and (time.monotonic() - spawn_time) < self.remote_full_local_state_delay:
-            return False
-        if reason == "state_request":
-            # Empirical traces beat prior theory here: remote OG STATE_REQUEST
-            # replies still carry full entity motion on the short-form-safe local
-            # state, while promoting the local-state bitstream causes the client
-            # to fall back to protocol mismatch after join. Keep targeted sync
-            # replies on the spawn-safe local-state layout.
-            return False
-        if not bool(getattr(ctx, "remote_full_local_state_ready", False)):
-            return False
-        return True
 
     def _maybe_promote_remote_full_local_state(self, ctx: ClientContext, *, reason: str) -> bool:
         """Leave the spawn-safe minimal remote path once the client is stably in game."""
@@ -8026,6 +8200,7 @@ class WulframServer:
         tick_period = 1.0 / self.tick_rate_hz if self.tick_rate_hz > 0 else 0.1
         # Physics steps once per tick at native 30Hz (no accumulator needed).
         ctx.physics_step_count = 0
+        last_physics_wall_time = time.monotonic()
         # (frame_locked mode removed â€” not part of original decompile)
 
         while ctx.running and ctx.session.in_game:
@@ -8114,19 +8289,64 @@ class WulframServer:
                 ctx.physics_step_count += 1
                 old_heading = ctx.player_heading
 
-                # Decompile-faithful lockstep behavior: apply current input for the
-                # full 30Hz step (no intra-tick split/backdating).
-                physics.step_client_substeps(torque, physics_dt, use_f32=use_f32)
+                # Live ACTION_UPDATE packets arrive asynchronously relative to the
+                # 30 Hz tick loop. If turning changed partway through this wall-clock
+                # tick window, split the simulated 30 Hz step so the pre-change
+                # slice uses the previous turn input and only the remainder uses
+                # the latest input.
+                step_wall_now = time.monotonic()
+                step_wall_dt = max(1e-6, step_wall_now - last_physics_wall_time)
+                transition_time = float(getattr(ws, "turn_input_change_time", 0.0) or 0.0)
+                prev_turn_slot = float(getattr(ws, "turn_input_prev_value", 0.0) or 0.0)
+                prev_turn_input = self._normalize_turn_input_value(ctx, prev_turn_slot)
+                split_turn_step = (
+                    transition_time > last_physics_wall_time and
+                    transition_time < step_wall_now and
+                    abs(prev_turn_input - raw_input) > 0.001
+                )
+                move_dt = physics_dt
+                move_heading = old_heading
+                if split_turn_step:
+                    pre_ratio = (transition_time - last_physics_wall_time) / step_wall_dt
+                    pre_ratio = max(0.0, min(1.0, pre_ratio))
+                    pre_dt = physics_dt * pre_ratio
+                    post_dt = physics_dt - pre_dt
+                    prev_torque = self._compute_turn_torque(ctx, prev_turn_input)
+                    if pre_dt > 1e-6:
+                        physics.step_client_substeps(prev_torque, pre_dt, use_f32=use_f32)
+                        body_rot = physics.rotation
+                        ctx.player_heading = physics.heading
+                        ctx.angular_vel_yaw = physics.angular_velocity
+                        ctx.player_yaw = -ctx.player_heading
+                        ctx.player_pose["roll"] = body_rot[0]
+                        ctx.player_pose["pitch"] = body_rot[1]
+                        ctx.player_pose["yaw"] = -ctx.player_heading
+                        self._update_player_position(ctx, dt_override=pre_dt, heading_override=old_heading)
+                        move_heading = ctx.player_heading
+                    if post_dt > 1e-6:
+                        physics.step_client_substeps(torque, post_dt, use_f32=use_f32)
+                    move_dt = post_dt
+                    ws.turn_input_change_time = 0.0
+                    if self.debug_sync:
+                        print(
+                            f"[YAW-SPLIT] c{ctx.client_id} "
+                            f"old={prev_turn_input:.3f} new={raw_input:.3f} "
+                            f"pre_dt={pre_dt * 1000.0:.1f}ms post_dt={post_dt * 1000.0:.1f}ms"
+                        )
+                else:
+                    physics.step_client_substeps(torque, physics_dt, use_f32=use_f32)
+                last_physics_wall_time = step_wall_now
 
                 body_rot = physics.rotation
-                ctx.player_heading = body_rot[2]
+                ctx.player_heading = physics.heading
                 ctx.angular_vel_yaw = physics.angular_velocity
                 ctx.player_yaw = -ctx.player_heading
                 ctx.player_pose["roll"] = body_rot[0]
                 ctx.player_pose["pitch"] = body_rot[1]
                 ctx.player_pose["yaw"] = -ctx.player_heading
 
-                self._update_player_position(ctx, dt_override=physics_dt, heading_override=old_heading)
+                if move_dt > 1e-6:
+                    self._update_player_position(ctx, dt_override=move_dt, heading_override=move_heading)
                 self._resolve_entity_entity_collisions(ctx)
                 self._update_player_aim(ctx)
                 self._regen_player_energy(ctx, physics_dt)
@@ -8193,6 +8413,7 @@ class WulframServer:
                     print(f"[STATUS] Client {ctx.client_id}: pos={ctx.player_pos} input={input_status}(fwd={fwd_input:.2f},strafe={strafe_input:.2f}) stuck={stuck_duration:.0f}s")
 
                 tick = self._get_network_tick(ctx)
+                self._record_authoritative_state(ctx, tick=tick)
                 # Debug: log tick value periodically
                 if ctx.session.tick % 300 == 0:
                     print(f"[TICK-DEBUG] Client {ctx.client_id}: network_tick={tick} client_tick={ctx.last_client_tick} offset={ctx.tick_offset}")
@@ -8212,6 +8433,13 @@ class WulframServer:
                 self._maybe_promote_remote_full_local_state(ctx, reason="post_spawn")
 
                 send_update = True
+                correction_due = (
+                    getattr(ctx, "force_correction_once", False)
+                    or (
+                        self.correction_interval > 0
+                        and (now - ctx.last_correction_send) >= self.correction_interval
+                    )
+                )
                 if self.update_on_change:
                     pos_changed = any(abs(a - b) > self.update_epsilon for a, b in zip(send_pos, ctx.last_sent_pos))
                     vel_changed = any(abs(a - b) > self.update_epsilon for a, b in zip(ctx.player_vel, ctx.last_sent_vel))
@@ -8419,21 +8647,22 @@ class WulframServer:
                             note="local_state=0",
                         )
                     send_payload = True
-                    self._maybe_send_view_update_loop(
-                        ctx,
-                        tick=tick,
-                        send_pos=send_pos,
-                        health_val=health_val,
-                        fuel_val=fuel_val,
-                        weapon_type=weapon_type,
-                        ammo_bits=ammo_bits,
-                        ammo_mask=ammo_mask,
-                        pt_bits=pt_bits,
-                        pt_angle=pt_angle,
-                        st_bits=st_bits,
-                        st_angle=st_angle,
-                    )
-                elif self.send_player_updates and not send_full_update and send_update:
+                    if not correction_due:
+                        self._maybe_send_view_update_loop(
+                            ctx,
+                            tick=tick,
+                            send_pos=send_pos,
+                            health_val=health_val,
+                            fuel_val=fuel_val,
+                            weapon_type=weapon_type,
+                            ammo_bits=ammo_bits,
+                            ammo_mask=ammo_mask,
+                            pt_bits=pt_bits,
+                            pt_angle=pt_angle,
+                            st_bits=st_bits,
+                            st_angle=st_angle,
+                        )
+                elif self.send_player_updates and not send_full_update and (send_update or correction_due):
                     # Heartbeat path. Remote OG clients that have left the
                     # spawn-safe path need a real single-local-player update
                     # shape here; the synthetic mask-0 stub causes the
@@ -8468,25 +8697,51 @@ class WulframServer:
                     # NOTE: Local player corrections were removed â€” the client runs
                     # lockstep deterministic physics and overwrites any server position/
                     # rotation corrections every frame. See server __init__ for details.
-                    use_view = self.heartbeat_view_update
-                    pkt_label = "VIEW_UPDATE_BEAT" if use_view else "UPDATE_ARRAY_BEAT"
-                    hb_rot = None
-                    if self.heartbeat_include_rot:
-                        hb_rot = self._local_player_sync_rotation(ctx)
-                    hb_pos = None
-                    if self.heartbeat_include_pos:
-                        hb_pos = self._to_client_pos(ctx.player_pos)
-                    payload = self._build_local_state_heartbeat(
-                        ctx,
-                        tick=tick,
-                        entity_id=ctx.session.entity_id,
-                        include_health=include_local_state,
-                        health=health_val,
-                        fuel=fuel_val,
-                        is_view_update=use_view,
-                        rot=hb_rot,
-                        pos=hb_pos,
-                    )
+                    if correction_due:
+                        payload, pkt_label, corr_pos, corr_rot, inc_pos, inc_rot = (
+                            self._build_empirical_correction_payload(
+                                ctx,
+                                tick=tick,
+                                include_local_state=include_local_state,
+                                health=health_val,
+                                fuel=fuel_val,
+                                weapon_type=weapon_type,
+                                ammo_bits=ammo_bits,
+                                ammo_mask=ammo_mask,
+                                pt_bits=pt_bits,
+                                pt_angle=pt_angle,
+                                st_bits=st_bits,
+                                st_angle=st_angle,
+                            )
+                        )
+                        ctx.last_correction_send = now
+                        ctx.force_correction_once = False
+                        print(
+                            f"[CORRECTION] mode={self.correction_mode} client={ctx.client_id} "
+                            f"pos=({corr_pos[0]:.1f},{corr_pos[1]:.1f},{corr_pos[2]:.1f}) "
+                            f"yaw={math.degrees(corr_rot[2]):.1f}deg "
+                            f"inc_pos={int(inc_pos)} inc_rot={int(inc_rot)}"
+                        )
+                    else:
+                        use_view = self.heartbeat_view_update
+                        pkt_label = "VIEW_UPDATE_BEAT" if use_view else "UPDATE_ARRAY_BEAT"
+                        hb_rot = None
+                        if self.heartbeat_include_rot:
+                            hb_rot = self._local_player_sync_rotation(ctx)
+                        hb_pos = None
+                        if self.heartbeat_include_pos:
+                            hb_pos = self._to_client_pos(ctx.player_pos)
+                        payload = self._build_local_state_heartbeat(
+                            ctx,
+                            tick=tick,
+                            entity_id=ctx.session.entity_id,
+                            include_health=include_local_state,
+                            health=health_val,
+                            fuel=fuel_val,
+                            is_view_update=use_view,
+                            rot=hb_rot,
+                            pos=hb_pos,
+                        )
 
                     if include_local_state:
                         self._log_vitals(
