@@ -4,3 +4,5 @@ traces/
 __pycache__/
 *.pyc
 server.pid
+*.log
+*.log.err
