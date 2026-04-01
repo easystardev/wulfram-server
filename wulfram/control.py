@@ -103,6 +103,81 @@ class ControlServer:
                     return c, c.session.udp_addr
         return None, None
 
+    def _apply_exact_client_pose(self, ctx, pos: tuple[float, float, float], heading_rad: float | None = None) -> None:
+        """Apply an exact authoritative pose reset for a live client.
+
+        This is stricter than respawn scheduling: it updates the current in-game
+        authoritative position/heading immediately and clears motion/collision
+        bookkeeping that would otherwise leak from the previous scenario.
+        """
+        import math
+
+        now = time.monotonic()
+        px, py, pz = (float(pos[0]), float(pos[1]), float(pos[2]))
+        heading = float(ctx.player_heading if heading_rad is None else heading_rad)
+        zero_vel = (0.0, 0.0, 0.0)
+
+        ctx.player_pos = (px, py, pz)
+        ctx.player_vel = zero_vel
+        ctx.player_speed = 0.0
+        ctx.player_heading = heading
+        ctx.player_yaw = -heading
+        ctx.player_angular_vel = 0.0
+        ctx.angular_vel_yaw = 0.0
+        ctx.world_collision_ref_pos = ctx.player_pos
+        ctx.world_collision_bounds_dirty = False
+        ctx.last_state_sync_vel = None
+        ctx.last_state_sync_rot = None
+        ctx.last_sent_pos = ctx.player_pos
+        ctx.last_sent_vel = zero_vel
+        ctx.last_sent_yaw = -heading
+        ctx.last_action_dump_time = now
+        ctx.last_position_update = now
+        ctx.last_heading_update = now
+        ctx.player_aim_yaw = heading
+        ctx.player_aim_pitch = 0.0
+        ctx.player_aim_source = "control_pos"
+        ctx.player_aim_time = now
+        ctx.pending_respawn_pos = None
+        ctx.injected_input = None
+        ctx.injected_turn = None
+        ctx.prev_raw_turn_input = 0.0
+
+        ctx.player_pose["pos"] = ctx.player_pos
+        ctx.player_pose["vel"] = zero_vel
+        ctx.player_pose["roll"] = 0.0
+        ctx.player_pose["pitch"] = 0.0
+        ctx.player_pose["yaw"] = -heading
+        ctx.player_pose["last_tick"] = self.server._get_network_tick(ctx) if self.server else 0
+
+        if ctx.weapon_system:
+            ctx.weapon_system.player_pos = ctx.player_pos
+            ctx.weapon_system.player_rot = (0.0, 0.0, heading)
+            ctx.weapon_system.behavior_slots = [0.0] * len(ctx.weapon_system.behavior_slots)
+            ctx.weapon_system.client_frame_counter = 0
+            ctx.weapon_system.turn_input_change_time = 0.0
+            ctx.weapon_system.turn_input_prev_value = 0.0
+            ctx.weapon_system.turn_input_change_client_tick = 0
+            ctx.weapon_system.prev_action_client_tick = 0
+            ctx.weapon_system.prev_dump_tick = 0
+            ctx.weapon_system.input_feedback_count = 0
+            ctx.weapon_system.prev_fire_state = 0.0
+            ctx.weapon_system.prev_direct_trigger_states = {
+                slot_idx: 0.0 for slot_idx in ctx.weapon_system.prev_direct_trigger_states
+            }
+            ctx.weapon_system.fire_cooldown = 0.0
+            ctx.weapon_system.last_update_time = now
+
+        if ctx.vehicle_physics:
+            ctx.vehicle_physics.reset()
+            ctx.vehicle_physics.heading = heading
+            ctx.vehicle_physics.angular_velocity = 0.0
+
+        if hasattr(ctx, "debug_last_controller_step"):
+            ctx.debug_last_controller_step.clear()
+        if hasattr(ctx, "debug_last_collision"):
+            ctx.debug_last_collision.clear()
+
     def _sync_to_active_client(self):
         """Update self.session/tcp_handler to match the active game client."""
         ctx, _ = self._get_active_client()
@@ -663,8 +738,8 @@ Examples:
                     if target_id is not None and ctx.client_id != target_id:
                         continue
                     ctx.player_heading = rad
-                    ctx.player_yaw = rad
-                    ctx.player_pose["yaw"] = rad
+                    ctx.player_yaw = -rad
+                    ctx.player_pose["yaw"] = -rad
                     if ctx.vehicle_physics:
                         ctx.vehicle_physics.heading = rad
                         ctx.vehicle_physics._angular_velocity = 0.0
@@ -1017,19 +1092,19 @@ Examples:
                 f"  -- Section 1 (Header) --",
                 f"  gravity_force    = 100.0  (hardcoded)",
                 f"  -- Section 4 (Vehicle Physics, x2 vehicles) --",
-                f"  speed            = 20.0  (hardcoded)",
-                f"  accel            = 4.0  (hardcoded)",
-                f"  engine_torque    = 700  (hardcoded)",
-                f"  suspension_stiff = 550  (hardcoded)",
+                f"  speed            = 20.0  (EntityParams+0x00, decompile-verified)",
+                f"  accel            = 4.0  (EntityParams+0x08, decompile-verified)",
+                f"  engine_torque    = 700  (EntityParams+0x10 max_health, decompile-verified)",
+                f"  suspension_stiff = 550  (EntityParams+0x14 energy_capacity, decompile-verified)",
                 f"  ground_friction  = {pkt.BEHAVIOR_GROUND_FRICTION}",
                 f"  turn_rate        = {pkt.BEHAVIOR_TURN_RATE}",
                 f"  susp_dampening   = {pkt.BEHAVIOR_SUSPENSION_DAMPENING}",
-                f"  mass             = 33000  (hardcoded)",
+                f"  max_fuel         = 33000  (EntityParams+0x34, decompile-verified)",
                 f"  -- Section 6 (Active Vehicle, Tank) --",
-                f"  turn_adjust      = 4.5  (from decompile VehiclePhysics_init_tank +0x10)",
-                f"  move_adjust      = 85.0  (hardcoded)",
-                f"  strafe_adjust    = 69.7  (hardcoded)",
-                f"  max_velocity     = 80.0  (hardcoded)",
+                f"  turn_adjust      = 4.5  (VehiclePhysics_init_tank +0x10, decompile-verified)",
+                f"  move_adjust      = 85.0  (VehiclePhysics_init_tank +0x18, decompile-verified)",
+                f"  strafe_adjust    = 69.7  (VehiclePhysics_init_tank +0x20, decompile-verified)",
+                f"  max_velocity     = 80.0  (VehiclePhysics_init_tank +0x28, decompile-verified)",
                 f"  max_altitude     = {pkt.BEHAVIOR_MAX_ALTITUDE}",
                 f"  gravity_pct      = {pkt.BEHAVIOR_GRAVITY_PCT}",
                 "",
@@ -1217,6 +1292,8 @@ Examples:
                     "phase": phase,
                     "username": ctx.session.username if ctx.session else "",
                     "team_id": ctx.session.team_id if ctx.session else 0,
+                    "client_addr": list(ctx.client_addr) if getattr(ctx, "client_addr", None) else None,
+                    "udp_addr": list(ctx.session.udp_addr) if ctx.session and ctx.session.udp_addr else None,
                     "pos": list(ctx.player_pos),
                     "vel": list(ctx.player_vel),
                     "heading_deg": round(math.degrees(-ctx.player_heading), 1),
@@ -2466,31 +2543,48 @@ Examples:
         """
         Show or set player position.
         Usage:
-          pos           - Show current player position/heading/velocity
-          pos x y z     - Set player position (for testing)
+          pos                 - Show active player position/heading/velocity
+          pos c<id>           - Show a specific client's state
+          pos x y z           - Set active player position
+          pos c<id> x y z     - Set a specific client's position
+          pos c<id> x y z h   - Set a specific client's position + heading degrees
         """
         if not self.server:
             return "Error: No server reference"
+        import math
 
-        ctx = None
-        with self.server.clients_lock:
-            for c in self.server.clients.values():
-                if c.session and c.session.udp_addr:
-                    ctx = c
-                    break
-        if not ctx:
-            return "Error: No active client"
+        target_id = None
+        rem = list(args)
+        if rem and rem[0].lower().startswith("c") and rem[0][1:].isdigit():
+            target_id = int(rem[0][1:])
+            rem = rem[1:]
 
-        if args:
+        if target_id is not None:
+            ctx, _ = self._get_client_by_id(target_id)
+            if not ctx:
+                return f"Error: No client with id {target_id}"
+        else:
+            ctx, _ = self._get_active_client()
+            if not ctx:
+                return "Error: No active client"
+
+        if rem:
             try:
-                x = float(args[0])
-                y = float(args[1]) if len(args) > 1 else ctx.player_pos[1]
-                z = float(args[2]) if len(args) > 2 else ctx.player_pos[2]
-                ctx.player_pos = (x, y, z)
-                ctx.world_collision_ref_pos = ctx.player_pos
-                ctx.world_collision_bounds_dirty = False
-                ctx.player_pose["pos"] = (x, y, z)
-                return f"Set player pos to ({x:.1f}, {y:.1f}, {z:.1f})"
+                x = float(rem[0])
+                y = float(rem[1]) if len(rem) > 1 else ctx.player_pos[1]
+                z = float(rem[2]) if len(rem) > 2 else ctx.player_pos[2]
+                heading_deg = float(rem[3]) if len(rem) > 3 else None
+                heading_rad = math.radians(heading_deg) if heading_deg is not None else None
+                self._apply_exact_client_pose(ctx, (x, y, z), heading_rad=heading_rad)
+                if heading_deg is None:
+                    return (
+                        f"Set client {ctx.client_id} pos to "
+                        f"({x:.1f}, {y:.1f}, {z:.1f})"
+                    )
+                return (
+                    f"Set client {ctx.client_id} pos to "
+                    f"({x:.1f}, {y:.1f}, {z:.1f}) heading={heading_deg:.2f}deg"
+                )
             except (ValueError, IndexError) as e:
                 return f"pos arg error: {e}"
         else:
@@ -2512,8 +2606,11 @@ Examples:
                     turn = ws.behavior_slots[BehaviorSlot.TURNING]
                     fwd = ws.behavior_slots[BehaviorSlot.MOVING_FORWARD]
                     strafe = ws.behavior_slots[BehaviorSlot.MOVING_SIDEWAYS]
+                    lines.insert(0, f"client_id={ctx.client_id}")
                     lines.append(f"input: turn={turn:.3f} fwd={fwd:.3f} strafe={strafe:.3f}")
                     lines.append(f"frame_dt={ws.avg_frame_dt*1000:.1f}ms")
+                else:
+                    lines.insert(0, f"client_id={ctx.client_id}")
                 steps = getattr(ctx, "physics_step_count", "?")
                 lines.append(f"physics_steps={steps}")
                 return "\n".join(lines)

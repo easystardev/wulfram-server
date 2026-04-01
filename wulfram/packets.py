@@ -1138,7 +1138,7 @@ def build_behavior_packet() -> bytes:
         payload += pack_fixed16(BEHAVIOR_TURN_RATE)
         payload += pack_fixed16(BEHAVIOR_SUSPENSION_DAMPENING)
         payload += struct.pack(">I", 0)
-        payload += struct.pack(">I", 33000)
+        payload += struct.pack(">I", 33000)  # max_fuel (NOT mass — mass is in collision table: 6700)
 
     assert len(payload) == 95 + 2340 + 468 + 72, f"After Section 4: expected 2975, got {len(payload)}"
 
@@ -1325,8 +1325,7 @@ def build_translation_packet() -> bytes:
 
 
 # --- TRANSIENT_ARRAY (0x0D) - Remote FX Events ---
-# Simplified format: we control both server and client, so use fixed-width
-# fields rather than the original bitstream format.
+# Decompile-backed quantized bitstream format (0x0046CA60).
 
 # FX event types (subset of decompile's 40 types)
 FX_CHAIN_GUN_FIRE = 0
@@ -1339,49 +1338,67 @@ FX_IMPACT_VEHICLE = 10
 FX_IMPACT_BUILDING = 11
 FX_IMPACT_TERRAIN = 12
 
+# Quantizer bit widths from decompile ValueQuantizer struct offsets:
+#   type:      g_network_quantizer_array[0x300][0x00] → entry 12, bits=16
+#   entity_id: g_network_quantizer_array[0x180][0x00] → entry 6, bits=16
+#   position:  g_network_quantizer_array[0x400] → entry 16 (pos_bank0), 16-bit values
+_TRANSIENT_TYPE_BITS = 16
+_TRANSIENT_ENTITY_BITS = 16
+_TRANSIENT_POS_BITS = 16
+
 
 def build_transient_array(events: list) -> bytes:
-    """Build TRANSIENT_ARRAY (0x0D) packet with FX events.
+    """Build TRANSIENT_ARRAY (0x0D) packet using decompile-backed quantized bitstream.
+
+    Decompile: GUESS6_PacketHandler_TRANSIENT_ARRAY (0x0046CA60)
 
     Each event is a dict with:
         type: int (FX_* constant)
         pos: optional (x, y, z) tuple
         entity_id: optional int (source entity)
 
-    Wire format (simplified):
-        u8  opcode (0x0D)
-        u8  count
+    Wire format (quantized bitstream after opcode byte):
+        8 bits: count
         per event:
-            u8  fx_type
-            u8  flags (bit 0 = has_pos, bit 1 = has_entity)
-            [3xf32 pos]       (if has_pos)
-            [u32 entity_id]   (if has_entity)
+            16 bits: fx_type (quantizer index 12)
+            1 bit:   has_pos
+            if has_pos:
+                16 bits: pos_x  (quantized via VEC_POS_MAX/RANGE)
+                16 bits: pos_y
+                16 bits: pos_z
+            1 bit:   has_entity
+            if has_entity:
+                16 bits: entity_id (quantizer index 6)
     """
+    from wulfram2_protocol.codec import BitWriter, quantize_float
+
     if not events:
         return b''
 
     count = min(len(events), 255)
-    buf = bytearray()
-    buf.append(0x0D)
-    buf.append(count)
+    bw = BitWriter()
+    bw.write_bits(8, count)
 
     for ev in events[:count]:
         fx_type = ev.get('type', 0)
         pos = ev.get('pos')
         eid = ev.get('entity_id', 0)
 
-        flags = 0
-        if pos is not None:
-            flags |= 0x01
-        if eid:
-            flags |= 0x02
-
-        buf.append(fx_type & 0xFF)
-        buf.append(flags)
+        bw.write_bits(_TRANSIENT_TYPE_BITS, fx_type & 0xFFFF)
 
         if pos is not None:
-            buf.extend(struct.pack('>3f', pos[0], pos[1], pos[2]))
-        if eid:
-            buf.extend(struct.pack('>I', eid))
+            bw.write_bits(1, 1)  # has_pos = 1
+            for v in pos:
+                raw = quantize_float(float(v), VEC_POS_MAX, VEC_POS_RANGE, _TRANSIENT_POS_BITS)
+                bw.write_bits(_TRANSIENT_POS_BITS, raw)
+        else:
+            bw.write_bits(1, 0)  # has_pos = 0
 
-    return bytes(buf)
+        if eid:
+            bw.write_bits(1, 1)  # has_entity = 1
+            bw.write_bits(_TRANSIENT_ENTITY_BITS, eid & 0xFFFF)
+        else:
+            bw.write_bits(1, 0)  # has_entity = 0
+
+    # Opcode byte + bitstream payload
+    return bytes([0x0D]) + bw.get_bytes()

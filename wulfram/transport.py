@@ -55,12 +55,23 @@ class TCPHandler:
         self.logger = logger
         self.recv_buffer = b""
 
+    # Packet types that can crash OG client when sent over TCP with entity data.
+    # 0x0E (UPDATE_ARRAY): complex bitstreams corrupt g_render_context
+    # 0x0D (TRANSIENT_ARRAY): raw format ≠ OG quantized bitstream → stream desync
+    # Small/empty 0x0E packets (priming, spawn points) are safe — only warn.
+    TCP_WARN_PACKETS = {0x0D, 0x0E}
+
     def send(self, payload: bytes, log: bool = True):
         """Send a framed packet."""
         if len(payload) == 0:
             return
 
         packet_type = payload[0]
+        if packet_type in self.TCP_WARN_PACKETS:
+            pkt_name = get_packet_name(packet_type)
+            print(f"[TCP-WARN] Sending {pkt_name} (0x{packet_type:02X}) over TCP "
+                  f"({len(payload)}B) — may crash OG client. "
+                  f"First 16B: {payload[:16].hex()}")
         framed = frame_packet(payload)
 
         try:

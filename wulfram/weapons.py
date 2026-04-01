@@ -108,10 +108,38 @@ class WeaponSystem:
         }
         self.default_weapon_energy_cost: float = 8.0
 
-        # === EXPERIMENTAL: Projectile velocity settings ===
-        # Try different values to see what client displays correctly
-        # Options: 50, 75, 100, 150, 200 (units per second)
-        self.pulse_shell_speed: float = 75.0  # Medium velocity
+        # Per-weapon projectile configs (speed, entity_type, lifetime, cooldown)
+        # Speeds are approximate — OG values are server-side only, not in client exe.
+        # See docs/decompile-findings-2026-03-16.md §8
+        self.projectile_configs = {
+            WeaponType.PULSE_CANNON: {
+                "speed": 75.0, "entity_type": EntityType.PULSE_SHELL,
+                "lifetime": 5.0, "cooldown": 0.5,
+            },
+            WeaponType.PIERCER: {
+                "speed": 120.0, "entity_type": EntityType.PIERCER,
+                "lifetime": 4.0, "cooldown": 0.8,
+            },
+            WeaponType.THUMPER: {
+                "speed": 50.0, "entity_type": EntityType.THUMPER,
+                "lifetime": 6.0, "cooldown": 1.2,
+            },
+            WeaponType.HUNTER_SEEKER: {
+                "speed": 60.0, "entity_type": EntityType.HUNTER,
+                "lifetime": 8.0, "cooldown": 1.5,
+            },
+            WeaponType.MINE: {
+                "speed": 0.0, "entity_type": EntityType.MINE,
+                "lifetime": 30.0, "cooldown": 2.0,
+            },
+            WeaponType.GUIDED_MISSILE: {
+                "speed": 80.0, "entity_type": EntityType.HEAVY_MISSILE,
+                "lifetime": 10.0, "cooldown": 2.0,
+            },
+        }
+
+        # Legacy alias for pulse shell speed
+        self.pulse_shell_speed: float = self.projectile_configs[WeaponType.PULSE_CANNON]["speed"]
 
         # Coordinate system config (defaults to z-up). Override with WULFRAM_UP_AXIS.
         self.up_axis = os.environ.get("WULFRAM_UP_AXIS", "z").lower()
@@ -451,13 +479,14 @@ class WeaponSystem:
             self.fire_cooldown = self.chain_gun_cooldown
             fired = True
 
-        elif weapon_slot == WeaponType.PULSE_CANNON:
-            proj = self._fire_pulse_cannon()
+        elif weapon_slot in self.projectile_configs:
+            proj = self._fire_projectile_type(weapon_slot)
             if proj:
                 new_projectiles.append(proj)
                 self.projectiles.append(proj)
                 fired = True
-            self.fire_cooldown = self.pulse_cannon_cooldown
+            config = self.projectile_configs[weapon_slot]
+            self.fire_cooldown = config["cooldown"]
 
         elif weapon_slot in TANK_WEAPON_SLOTS or weapon_slot in (EntityType.CALTROP, EntityType.FLARE, 19):
             print(f"[WEAPON] {weapon_name} fired! pos={self.player_pos}")
@@ -731,6 +760,116 @@ class WeaponSystem:
             spawn_time=time.monotonic(),
             lifetime=5.0,
             debug_context=debug_context
+        )
+
+        if self.on_projectile_spawn:
+            self.on_projectile_spawn(proj)
+
+        return proj
+
+    def _fire_projectile_type(self, weapon_slot: int) -> Optional[Projectile]:
+        """Fire a projectile of the given weapon type using projectile_configs.
+
+        Reuses the same spawn position, aim direction, and hardpoint logic as
+        the pulse cannon — only the speed, entity type, and lifetime differ.
+        Mines spawn stationary at the player's feet.
+        """
+        config = self.projectile_configs.get(weapon_slot)
+        if config is None:
+            return None
+
+        speed = config["speed"]
+        entity_type = config["entity_type"]
+        lifetime = config["lifetime"]
+
+        pitch = self.player_rot[1]
+        yaw = self.player_rot[2]
+        weapon_name = OG_DIRECT_TRIGGER_NAMES.get(weapon_slot, WEAPON_NAMES.get(weapon_slot, f"Slot {weapon_slot}"))
+        print(f"[WEAPON] {weapon_name} fired! pos={self.player_pos} yaw={math.degrees(yaw):.1f}deg speed={speed}")
+
+        if not self.use_pitch:
+            pitch = 0.0
+        if self.aim_yaw_invert:
+            yaw = -yaw
+        if self.aim_pitch_invert:
+            pitch = -pitch
+        yaw += self.aim_yaw_offset + self.heading_offset
+        pitch += self.aim_pitch_offset
+
+        if self.up_axis == "z":
+            fwd_x = math.cos(pitch) * math.cos(yaw)
+            fwd_y = math.cos(pitch) * math.sin(yaw)
+            fwd_z = -math.sin(pitch)
+        else:
+            fwd_x = math.cos(pitch) * math.cos(yaw)
+            fwd_y = -math.sin(pitch)
+            fwd_z = math.cos(pitch) * math.sin(yaw)
+
+        # Mines drop at player position with zero velocity
+        if entity_type == EntityType.MINE:
+            spawn_x, spawn_y, spawn_z = self.player_pos
+            vel_x, vel_y, vel_z = 0.0, 0.0, 0.0
+        else:
+            vel_x = speed * fwd_x
+            vel_y = speed * fwd_y
+            vel_z = speed * fwd_z
+
+            # Spawn position from hardpoint or forward offset
+            spawn_x, spawn_y, spawn_z = self.player_pos
+            spawn_mode = self.projectile_spawn_mode
+            if spawn_mode == "auto":
+                spawn_mode = "hardpoint"
+            if spawn_mode == "hardpoint":
+                shape_name = self.player_shape_override or (f"tank_{self.player_team}" if self.player_team in (1, 2) else "tank_1")
+                hp = self._get_shape_hardpoint(shape_name, self.projectile_hardpoint_name)
+                if hp is not None:
+                    _, hardpoint_local = hp
+                    model_x, model_y, model_z = hardpoint_local
+                    if self.hardpoint_origin_mode in ("base", "min_y"):
+                        bounds = self._get_shape_bounds(shape_name)
+                        if bounds is not None:
+                            model_y -= bounds.get("min_y", 0.0)
+                    hp_forward = model_z
+                    hp_right = model_x
+                    hp_up = model_y
+                    if self.hardpoint_swap_fr:
+                        hp_forward, hp_right = hp_right, hp_forward
+                    hp_forward *= self.hardpoint_forward_sign
+                    hp_right *= self.hardpoint_right_sign
+                    hp_up *= self.hardpoint_up_sign
+                    cy, sy = math.cos(yaw), math.sin(yaw)
+                    if self.up_axis == "z":
+                        spawn_x += hp_forward * cy - hp_right * sy
+                        spawn_y += hp_forward * sy + hp_right * cy
+                        spawn_z += hp_up
+                    else:
+                        spawn_x += hp_forward * cy - hp_right * sy
+                        spawn_y += hp_up
+                        spawn_z += hp_forward * sy + hp_right * cy
+                else:
+                    spawn_offset = self.projectile_spawn_offset
+                    spawn_x += spawn_offset * fwd_x
+                    spawn_y += spawn_offset * fwd_y
+                    spawn_z += spawn_offset * fwd_z
+            else:
+                if spawn_mode != "center":
+                    spawn_offset = self.projectile_spawn_offset
+                    spawn_x += spawn_offset * fwd_x
+                    spawn_y += spawn_offset * fwd_y
+                    spawn_z += spawn_offset * fwd_z
+
+        entity_id = self.next_entity_id
+        self.next_entity_id += 1
+
+        proj = Projectile(
+            entity_id=entity_id,
+            entity_type=entity_type,
+            owner_id=self.player_id,
+            team=self.player_team,
+            pos=(spawn_x, spawn_y, spawn_z),
+            vel=(vel_x, vel_y, vel_z),
+            spawn_time=time.monotonic(),
+            lifetime=lifetime,
         )
 
         if self.on_projectile_spawn:

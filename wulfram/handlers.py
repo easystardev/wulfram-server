@@ -305,7 +305,11 @@ def handle_login_request(server: "WulframServer", ctx: "ClientContext", packet: 
 
     session = ctx.session
     if session.login_complete:
-        print(f"[LOGIN] Client {ctx.client_id}: Ignoring LOGIN_REQUEST after login complete")
+        # OG game-service flow: client sends LOGIN_REQUEST after bootstrap.
+        # Respond with LOGIN_STATUS(8) so the client knows login succeeded.
+        # Without this response, the client times out → Protocol Mismatch.
+        print(f"[LOGIN] Client {ctx.client_id}: Late LOGIN_REQUEST after login complete → sending LOGIN_STATUS(8)")
+        ctx.tcp_handler.send(build_login_status(8, is_donor=True))
         return
 
     sub_type = packet[1]
@@ -523,7 +527,17 @@ def handle_want_updates(server: "WulframServer", ctx: "ClientContext", packet: b
         tcp.send(build_translation_packet())
         session.translation_sent = True
 
-    tcp.send(build_update_array_empty())
+    # Remote OG clients are fragile around stray UPDATE_ARRAY packets on the
+    # TCP stream during WANT_UPDATES/bootstrap. Keep the legacy empty priming
+    # packet only for loopback probes; remote clients continue over UDP once
+    # bootstrap is actually ready.
+    if _is_loopback_client(ctx):
+        tcp.send(build_update_array_empty())
+    else:
+        print(
+            f"[GAME] Client {ctx.client_id}: Suppressing empty TCP UPDATE_ARRAY "
+            "during WANT_UPDATES for remote bootstrap"
+        )
 
     # Spawn points are deferred until the client finishes UDP bootstrap AND has
     # acknowledged TRANSLATION so quantizers are definitely active.
@@ -705,6 +719,11 @@ def _send_spawn_points_for_client(server: "WulframServer", ctx: "ClientContext")
     tick = get_ticks()
     spawn_pkt = build_update_array_spawn_points(tick, spawn_points)
     spawn_transport = os.environ.get("WULFRAM_SPAWN_POINTS_TRANSPORT", "tcp").strip().lower()
+    # Remote OG clients are far more sensitive to UPDATE_ARRAY over TCP than
+    # loopback Python probes. We already defer spawn points until UDP bootstrap
+    # is complete, so prefer the UDP path for non-loopback clients.
+    if not _is_loopback_client(ctx) and spawn_transport in ("tcp", "both"):
+        spawn_transport = "udp"
 
     if spawn_transport in ("tcp", "both"):
         ctx.tcp_handler.send(spawn_pkt)
@@ -989,11 +1008,21 @@ def handle_spawn_at_point(server: "WulframServer", ctx: "ClientContext", spawn_p
             break
 
     if selected:
-        pos = (selected["x"], selected["y"], selected["z"])
         team_id = selected.get("team", ctx.session.team_id or 2)
+        requested_pos = (selected["x"], selected["y"], selected["z"])
     else:
-        pos = (100.0, 10.0, 100.0)
         team_id = ctx.session.team_id or 2
+        requested_pos = None
+
+    configured_default = server._get_configured_default_spawn_pos()
+    if configured_default is not None:
+        pos = server._resolve_spawn_pos(team_id)
+        print(
+            f"[SPAWN] Client {ctx.client_id}: overriding spawn-point {spawn_point_id} "
+            f"with default flat spawn pos={pos}"
+        )
+    else:
+        pos = server._resolve_spawn_pos(team_id, explicit_pos=requested_pos)
 
     server._spawn_wf_style(ctx, team_id=team_id, pos=pos)
 
