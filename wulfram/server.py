@@ -568,12 +568,21 @@ class WulframServer:
         # STATE_REQUEST trigger at Replication.c:1173-1177. Emits an
         # UPDATE_ARRAY with exactly one entity (the local player, with
         # pos+rot) at a modest cadence so the `entity_count == 1 && final ==
-        # local_player` gate fires regularly. Default 2.0 s interval is
-        # specifically chosen to be SLOWER than the OG client's 1.0 s
-        # `TimeSeries_prune_old_samples` window on `g_sync_request_count` —
-        # if the keepalive runs faster than the prune drains, the TimeSeries
-        # count plateaus at 5 and the `< 5` rate-limit gate locks on
-        # permanently (see `docs/state-request-gate-disasm-2026-04-18.md`).
+        # local_player` gate fires regularly.
+        #
+        # DEFAULT OFF: 2026-04-18 live smoke proved this path silently
+        # suppresses the forced-correction burst on the OG client — even
+        # with a 2.0s interval well below the 1.0s TimeSeries prune window.
+        # Keepalive OFF: main-view changed_ratio 59% on a +80u forced shift.
+        # Keepalive ON: 0%. The interaction between the 2Hz non-replay
+        # UPDATE_ARRAY pipeline and the correction-burst VIEW_UPDATE is not
+        # yet pinned — even after aligning the empirical-correction
+        # rotation tuple to the shared body-heading convention. See
+        # `docs/keepalive-breaks-correction-2026-04-18.md`. The organic
+        # STATE_REQUEST loop the keepalive was meant to feed never
+        # re-emerged in traces anyway (OG client stops emitting post-spawn
+        # for reasons we haven't fully traced), so leaving this off by
+        # default has no regression cost.
         self.solo_local_keepalive_enabled = os.environ.get("WULFRAM_SOLO_LOCAL_KEEPALIVE", "0") == "1"
         try:
             self.solo_local_keepalive_interval = float(os.environ.get("WULFRAM_SOLO_LOCAL_KEEPALIVE_INTERVAL", "2.0"))
@@ -1500,13 +1509,23 @@ class WulframServer:
         st_bits: int,
         st_angle: float,
     ) -> tuple[bytes, str, tuple[float, float, float], tuple[float, float, float], bool, bool]:
-        """Build one of the older empirical local-correction packet shapes."""
+        """Build one of the older empirical local-correction packet shapes.
+
+        The rotation tuple MUST match what every other local-player packet
+        path emits (heartbeat, full UPDATE_ARRAY, VIEW_UPDATE loop,
+        TankPacket resend, vitals heartbeat, solo-local keepalive). Those
+        all use `_local_player_sync_rotation` which returns
+        `(roll, pitch, player_heading)` — the body-heading convention.
+        This function historically used `(roll, 0.0, player_yaw)` — the
+        camera-yaw sign-flipped convention — which diverged from every
+        other path and was flagged in the 2026-03-14 audit but missed.
+        Aligning to `_local_player_sync_rotation` does not on its own
+        restore the correction burst when the keepalive is running, but
+        it removes a confounding variable. See
+        docs/keepalive-breaks-correction-2026-04-18.md.
+        """
         corr_pos = self._to_client_pos(ctx.player_pos)
-        corr_rot = (
-            ctx.player_pose.get("roll", 0.0),
-            0.0,
-            ctx.player_yaw,
-        )
+        corr_rot = self._local_player_sync_rotation(ctx)
         cmode = self.correction_mode
         inc_pos = cmode in ("full", "pos_only", "dual_entity", "view_update")
         inc_vel = cmode in ("full", "pos_only", "dual_entity", "view_update")
