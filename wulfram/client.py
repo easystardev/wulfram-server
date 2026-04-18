@@ -123,6 +123,11 @@ class ClientContext:
     # Periodic empirical correction (older local-reconcile probe path)
     last_correction_send: float = 0.0
     force_correction_once: bool = False
+    # Burst of authoritative corrections (counts down each tick send).
+    # Single VIEW_UPDATE pushes are invisible on the OG client; a short burst
+    # at ~10 Hz is visibly applied and the new pose persists after the burst.
+    correction_burst_remaining: int = 0
+    correction_burst_interval_s: float = 0.0
     # Remote player update throttle
     last_remote_update_send: float = 0.0
     # Combat stats

@@ -916,12 +916,32 @@ Examples:
             self.server.correction_interval = 0.0
             for ctx in self.server._snapshot_in_game_clients():
                 ctx.force_correction_once = False
+                ctx.correction_burst_remaining = 0
+                ctx.correction_burst_interval_s = 0.0
             return "Correction OFF"
         if subcmd == "now":
+            # Optional trailing tokens: c<id>, burst count, interval seconds.
+            # Empirically, a single VIEW_UPDATE push is invisible on the OG
+            # client — a short ~10 Hz burst is required for the correction to
+            # visibly apply and the snapped pose to persist afterwards. Default
+            # to a 10-packet, 0.1s interval burst so `correction now` behaves
+            # as a reliable one-shot snap.
             target_id = None
-            if len(args) >= 2 and args[1].lower().startswith("c") and args[1][1:].isdigit():
-                target_id = int(args[1][1:])
-            targets = []
+            burst_count = 10
+            burst_interval = 0.1
+            for token in args[1:]:
+                lower = token.lower()
+                if lower.startswith("c") and lower[1:].isdigit():
+                    target_id = int(lower[1:])
+                    continue
+                try:
+                    numeric = float(token)
+                except ValueError:
+                    continue
+                if burst_count == 10 and numeric >= 1 and numeric == int(numeric):
+                    burst_count = int(numeric)
+                else:
+                    burst_interval = max(0.01, numeric)
             if target_id is not None:
                 ctx, _ = self._get_client_by_id(target_id)
                 if not ctx:
@@ -933,9 +953,14 @@ Examples:
                 return "No in-game clients"
             for ctx in targets:
                 ctx.force_correction_once = True
+                ctx.correction_burst_remaining = max(0, burst_count - 1)
+                ctx.correction_burst_interval_s = burst_interval
                 ctx.last_correction_send = 0.0
             suffix = f" for client {target_id}" if target_id is not None else ""
-            return f"Queued correction on next tick{suffix} (mode={self.server.correction_mode})"
+            return (
+                f"Queued correction burst x{burst_count} @ {burst_interval:.2f}s{suffix} "
+                f"(mode={self.server.correction_mode})"
+            )
         if subcmd == "send":
             target_id = None
             if len(args) >= 2 and args[1].lower().startswith("c") and args[1][1:].isdigit():

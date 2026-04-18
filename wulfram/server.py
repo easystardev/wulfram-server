@@ -8522,8 +8522,15 @@ class WulframServer:
                 self._maybe_promote_remote_full_local_state(ctx, reason="post_spawn")
 
                 send_update = True
+                burst_remaining = int(getattr(ctx, "correction_burst_remaining", 0) or 0)
+                burst_interval = float(getattr(ctx, "correction_burst_interval_s", 0.0) or 0.0)
+                burst_due = (
+                    burst_remaining > 0
+                    and (now - ctx.last_correction_send) >= burst_interval
+                )
                 correction_due = (
                     getattr(ctx, "force_correction_once", False)
+                    or burst_due
                     or (
                         self.correction_interval > 0
                         and (now - ctx.last_correction_send) >= self.correction_interval
@@ -8805,11 +8812,14 @@ class WulframServer:
                         )
                         ctx.last_correction_send = now
                         ctx.force_correction_once = False
+                        if burst_remaining > 0:
+                            ctx.correction_burst_remaining = burst_remaining - 1
                         print(
                             f"[CORRECTION] mode={self.correction_mode} client={ctx.client_id} "
                             f"pos=({corr_pos[0]:.1f},{corr_pos[1]:.1f},{corr_pos[2]:.1f}) "
                             f"yaw={math.degrees(corr_rot[2]):.1f}deg "
-                            f"inc_pos={int(inc_pos)} inc_rot={int(inc_rot)}"
+                            f"inc_pos={int(inc_pos)} inc_rot={int(inc_rot)} "
+                            f"burst_left={int(getattr(ctx, 'correction_burst_remaining', 0))}"
                         )
                     else:
                         use_view = self.heartbeat_view_update
