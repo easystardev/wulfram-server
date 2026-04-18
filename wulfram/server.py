@@ -388,6 +388,10 @@ class WulframServer:
             self.projectile_collision_radius = 2.0
         if self.projectile_collision_radius < 0.25:
             self.projectile_collision_radius = 0.25
+        # Remote OG impact FX are still prone to live D_ERR disconnects.
+        # Keep TRANSIENT_ARRAY enabled for loopback/Python validation, but
+        # suppress it remotely until the 0x0D path is verified end to end.
+        self.remote_transient_fx = os.environ.get("WULFRAM_REMOTE_TRANSIENT_FX", "0") == "1"
         # TankPacket vitals OFF: flag=0 means the client skips the entire
         # local_state read (weapon, health, fuel, ammo, turret).  This ensures
         # unit_type/net_id/team/pos are parsed correctly so the entity is
@@ -1407,11 +1411,25 @@ class WulframServer:
             st_angle = 0.0
 
         if self._wf_remote_heartbeat_entity_mode(ctx) and not is_view_update:
+            remote_pos = pos
+            remote_vel = None
+            remote_rot = rot
+            if remote_rot is None and self.heartbeat_include_rot:
+                # Promoted remote heartbeats should keep body rotation live so
+                # the OG client does not zero angular velocity, but they should
+                # not silently turn into full position corrections unless the
+                # caller explicitly requested transform fields.
+                remote_rot = self._local_player_sync_rotation(ctx)
+            if remote_pos is not None:
+                remote_vel = ctx.player_vel
             return self._build_remote_sync_heartbeat_update(
                 ctx,
                 tick=tick,
-                include_vel=True,
-                include_rot=True,
+                pos=remote_pos,
+                vel=remote_vel,
+                rot=remote_rot,
+                include_vel=remote_vel is not None,
+                include_rot=remote_rot is not None,
                 include_local_state=include_local_state,
                 health=health,
                 fuel=fuel,
@@ -1572,8 +1590,17 @@ class WulframServer:
         st_angle: float,
         safe_local_state: bool = True,
     ) -> bytes:
-        """Build a safe single-local-player update for promoted remote OG heartbeats."""
+        """Build a safe promoted remote heartbeat/correction update.
+
+        Ordinary heartbeats should respect the caller's requested transform
+        fields instead of always expanding into a full pos+vel+rot packet.
+        Targeted correction snapshots still pass explicit position/velocity/
+        rotation and therefore keep the existing full-motion shape.
+        """
         entity_id = ctx.session.entity_id or ctx.entity_id
+        has_pos = pos is not None
+        has_vel = include_vel and vel is not None
+        has_rot = include_rot and rot is not None
         hb_rot = rot if rot is not None else self._local_player_sync_rotation(ctx)
         hb_pos = pos if pos is not None else self._to_client_pos(ctx.player_pos)
         hb_vel = vel if vel is not None else ctx.player_vel
@@ -1590,10 +1617,10 @@ class WulframServer:
             pos=hb_pos,
             vel=hb_vel,
             rot=hb_rot,
-            include_pos=True,
-            include_vel=include_vel,
-            include_rot=include_rot,
-            include_spin=include_rot,
+            include_pos=has_pos,
+            include_vel=has_vel,
+            include_rot=has_rot,
+            include_spin=has_rot,
             spin=(0.0, 0.0, 0.0),
             include_local_state=include_local_state,
             include_entity_vitals=False,
@@ -1611,6 +1638,51 @@ class WulframServer:
             is_manned=True,
             speed_scale=1.0,
         )
+
+    def _build_remote_spawn_bootstrap_heartbeat(
+        self,
+        ctx: ClientContext,
+        *,
+        tick: int,
+        entity_id: Optional[int] = None,
+        health: float,
+        fuel: float,
+    ) -> bytes:
+        """Build the one-off post-spawn OG heartbeat on the safe rot-only shape.
+
+        Fresh remote OG spawns still benefit from a single local-state sync
+        packet immediately after Tank/PLAYER_INFO, but the old minimal
+        no-entity heartbeat is fragile in that bootstrap window. Reuse the
+        promoted remote heartbeat layout with only body rotation enabled so the
+        client gets authoritative local-state without an immediate position
+        snap.
+        """
+        if entity_id is None:
+            entity_id = ctx.session.entity_id or ctx.entity_id
+        saved_entity_id = ctx.session.entity_id
+        if saved_entity_id != entity_id:
+            ctx.session.entity_id = entity_id
+        try:
+            return self._build_remote_sync_heartbeat_update(
+                ctx,
+                tick=tick,
+                rot=self._local_player_sync_rotation(ctx),
+                include_vel=False,
+                include_rot=True,
+                include_local_state=True,
+                health=health,
+                fuel=fuel,
+                weapon_type=self._get_spawn_tank_weapon_type(ctx),
+                ammo_bits=0,
+                ammo_mask=0,
+                pt_bits=0,
+                pt_angle=0.0,
+                st_bits=0,
+                st_angle=0.0,
+                safe_local_state=True,
+            )
+        finally:
+            ctx.session.entity_id = saved_entity_id
 
     def _local_player_sync_rotation(self, ctx: ClientContext) -> tuple[float, float, float]:
         """Return the body-space rotation tuple for local-player replication packets.
@@ -3375,7 +3447,20 @@ class WulframServer:
                 # ESI with health=1.0 so sync_local_player writes it to the
                 # HUD health meter, clearing the red overlay.
                 if self._suppress_remote_spawn_bootstrap_heartbeat(ctx):
-                    print("[SPAWN] Suppressing immediate remote bootstrap heartbeat UPDATE_ARRAY")
+                    if self.update_local_state_mode == "wf" and not handlers._is_loopback_client(ctx):
+                        time.sleep(0.05)
+                        hb_tick = self._get_network_tick(ctx)
+                        hb_packet = self._build_remote_spawn_bootstrap_heartbeat(
+                            ctx,
+                            tick=hb_tick,
+                            entity_id=net_id,
+                            health=1.0,
+                            fuel=1.0,
+                        )
+                        self.udp_handler.send_to(hb_packet, ctx.session.udp_addr)
+                        print("[SPAWN] Sent remote bootstrap heartbeat UPDATE_ARRAY (rot-only safe shape)")
+                    else:
+                        print("[SPAWN] Suppressing immediate remote bootstrap heartbeat UPDATE_ARRAY")
                 else:
                     time.sleep(0.05)
                     hb_tick = self._get_network_tick(ctx)
@@ -5102,17 +5187,28 @@ class WulframServer:
             'pos': proj.pos,
             'entity_id': ctx.entity_id,
         }]
+        self._broadcast_transient_fx(events, exclude_client=ctx)
+
+    def _transient_fx_allowed_for_client(self, ctx: ClientContext) -> bool:
+        """Return whether cosmetic TRANSIENT_ARRAY FX are currently safe for a client."""
+        if handlers._is_loopback_client(ctx):
+            return True
+        return getattr(self, "remote_transient_fx", False)
+
+    def _broadcast_transient_fx(self, events: list, *, exclude_client=None) -> bytes:
+        """Broadcast cosmetic TRANSIENT_ARRAY FX on the safest currently supported path."""
         pkt = build_transient_array(events)
         if not pkt:
-            return
+            return b""
 
-        # Broadcast via UDP only — FX is cosmetic, UDP loss is acceptable.
-        # Uses decompile-backed quantized bitstream (OG-compatible).
         for target in self._snapshot_in_game_clients():
-            if target is ctx:
+            if target is exclude_client:
+                continue
+            if not self._transient_fx_allowed_for_client(target):
                 continue
             if self.udp_handler and target.session.udp_addr:
                 self.udp_handler.send_to(pkt, target.session.udp_addr)
+        return pkt
 
     def _on_projectile_spawn(self, ctx: ClientContext, proj):
         """Callback when a projectile is spawned."""
@@ -7341,15 +7437,12 @@ class WulframServer:
                         # Apply damage to building
                         self._apply_building_damage(hit_detail, proj, ctx, hit_pos)
 
-                    # Send impact FX via TRANSIENT_ARRAY
-                    impact_pkt = build_transient_array([{
+                    # Send impact FX via TRANSIENT_ARRAY only to viewers that
+                    # can safely accept the current 0x0D path.
+                    self._broadcast_transient_fx([{
                         'type': fx_type,
                         'pos': self._to_client_pos(hit_pos),
                     }])
-                    if impact_pkt:
-                        for client in self._snapshot_in_game_clients():
-                            if self.udp_handler and client.session.udp_addr:
-                                self.udp_handler.send_to(impact_pkt, client.session.udp_addr)
                     break
 
                 # Check collision with enemy players
@@ -7529,11 +7622,7 @@ class WulframServer:
             'pos': proj.pos,
             'entity_id': target.entity_id,
         }]
-        impact_pkt = build_transient_array(impact_events)
-        if impact_pkt:
-            for client in self._snapshot_in_game_clients():
-                if self.udp_handler and client.session.udp_addr:
-                    self.udp_handler.send_to(impact_pkt, client.session.udp_addr)
+        self._broadcast_transient_fx(impact_events)
 
         # DELETE projectile with explosion effects
         tick = self._get_network_tick(attacker)

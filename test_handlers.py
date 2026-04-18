@@ -410,7 +410,7 @@ def test_build_update_array_remote_heartbeat_shape():
 
 
 def test_server_remote_heartbeat_helper_keeps_full_local_state():
-    """Promoted remote OG heartbeats must use a real local-player update shape."""
+    """Promoted remote OG heartbeats should keep local-state but avoid forced position snaps."""
     server = WulframServer.__new__(WulframServer)
     server.update_local_state_mode = "wf"
     server.local_state_weapon_type = 0
@@ -423,6 +423,7 @@ def test_server_remote_heartbeat_helper_keeps_full_local_state():
     server.local_state_turret_max = 6.3
     server.local_state_turret_range = 12.6
     server.heartbeat_view_update = False
+    server.heartbeat_include_rot = True
     server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
     server.up_axis = "z"
     server.pos_offset = 0.0
@@ -461,8 +462,8 @@ def test_server_remote_heartbeat_helper_keeps_full_local_state():
     assert local_state.weapon_id == 2
     assert len(entities) == 1
     assert entities[0].entity_id == 0x14EA
-    assert entities[0].position is not None
-    assert entities[0].velocity is not None
+    assert entities[0].position is None
+    assert entities[0].velocity is None
     assert entities[0].rotation is not None
     assert entities[0].angular_velocity is not None
     print("test_server_remote_heartbeat_helper_keeps_full_local_state: PASSED")
@@ -1119,6 +1120,7 @@ def test_remote_promoted_heartbeat_stays_short_form_safe():
     server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
     server.update_entity_vitals = False
     server.heartbeat_view_update = False
+    server.heartbeat_include_rot = True
     server._get_health_value = lambda ctx: 1.0
     server._get_energy_value = lambda ctx: 1.0
     server._to_client_pos = lambda pos: pos
@@ -1156,6 +1158,9 @@ def test_remote_promoted_heartbeat_stays_short_form_safe():
     assert local_state is not None
     assert local_state.weapon_id == 2
     assert len(entities) == 1
+    assert entities[0].position is None
+    assert entities[0].velocity is None
+    assert entities[0].rotation is not None
     print("test_remote_promoted_heartbeat_stays_short_form_safe: PASSED")
     return True
 
@@ -1431,6 +1436,7 @@ def test_remote_sync_heartbeat_helper_uses_heading_not_player_yaw():
     payload = server._build_remote_sync_heartbeat_update(
         ctx,
         tick=0x12345678,
+        rot=(0.125, -0.375, 0.25),
         include_vel=True,
         include_rot=True,
         include_local_state=True,
@@ -1452,11 +1458,62 @@ def test_remote_sync_heartbeat_helper_uses_heading_not_player_yaw():
     assert tick == 0x12345678
     assert local_state is not None
     assert len(entities) == 1
+    assert entities[0].position is None
+    assert entities[0].velocity is None
     assert entities[0].rotation is not None
     assert abs(entities[0].rotation[0] - 0.125) < 1e-3
     assert abs(entities[0].rotation[1] + 0.375) < 1e-3
     assert abs(entities[0].rotation[2] - 0.25) < 1e-3
     print("test_remote_sync_heartbeat_helper_uses_heading_not_player_yaw: PASSED")
+    return True
+
+
+def test_remote_spawn_bootstrap_heartbeat_uses_safe_rot_only_shape():
+    """Fresh remote OG spawn bootstrap should get a rot-only safe heartbeat."""
+    server = WulframServer.__new__(WulframServer)
+    server.local_state_turret_max = 6.3
+    server.local_state_turret_range = 12.6
+    server._to_client_pos = lambda pos: pos
+    server._get_spawn_tank_weapon_type = lambda ctx: 2
+
+    session = Session()
+    session.entity_id = 0x14EA
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=session,
+        entity_id=0x14EA,
+    )
+    ctx.player_pos = (4950.0, 5100.0, 5.0)
+    ctx.player_vel = (10.0, 20.0, 30.0)
+    ctx.player_pose = {"roll": 0.125, "pitch": -0.375}
+    ctx.player_heading = 0.25
+
+    payload = server._build_remote_spawn_bootstrap_heartbeat(
+        ctx,
+        tick=0x12345678,
+        entity_id=0x14EA,
+        health=1.0,
+        fuel=1.0,
+    )
+
+    tick, local_state, entities = decode_update_array(
+        payload,
+        behavior_config=parse_behavior(build_behavior_packet()),
+    )
+    assert tick == 0x12345678
+    assert local_state is not None
+    assert local_state.weapon_id == 2
+    assert len(entities) == 1
+    assert entities[0].entity_id == 0x14EA
+    assert entities[0].position is None
+    assert entities[0].velocity is None
+    assert entities[0].rotation is not None
+    assert entities[0].angular_velocity is not None
+    assert abs(entities[0].rotation[0] - 0.125) < 1e-3
+    assert abs(entities[0].rotation[1] + 0.375) < 1e-3
+    assert abs(entities[0].rotation[2] - 0.25) < 1e-3
+    print("test_remote_spawn_bootstrap_heartbeat_uses_safe_rot_only_shape: PASSED")
     return True
 
 
@@ -1977,6 +2034,86 @@ def test_send_entity_create_uses_udp_only():
     assert calls[0][2] == 0x0E, calls
     assert 1338 in target_ctx.known_entity_ids
     print("test_send_entity_create_uses_udp_only: PASSED")
+    return True
+
+
+def test_transient_fx_stays_off_for_remote_og_by_default():
+    """Remote OG viewers should not receive crash-prone cosmetic TRANSIENT_ARRAY by default."""
+    sent = []
+    server = WulframServer.__new__(WulframServer)
+    server.remote_transient_fx = False
+    server.udp_handler = SimpleNamespace(send_to=lambda payload, addr: sent.append((payload, addr)))
+
+    remote_session = Session()
+    remote_session.in_game = True
+    remote_session.udp_addr = ("10.10.10.2", 50000)
+    remote_ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=remote_session,
+        entity_id=1337,
+    )
+
+    loopback_session = Session()
+    loopback_session.in_game = True
+    loopback_session.udp_addr = ("127.0.0.1", 50001)
+    loopback_ctx = ClientContext(
+        client_id=2,
+        client_addr=("127.0.0.1", 50001),
+        session=loopback_session,
+        entity_id=1338,
+    )
+
+    server._snapshot_in_game_clients = lambda: [remote_ctx, loopback_ctx]
+
+    pkt = server._broadcast_transient_fx([{
+        "type": 12,
+        "pos": (4950.0, 5100.0, 5.0),
+    }])
+
+    assert pkt and pkt[0] == 0x0D
+    assert sent == [(pkt, ("127.0.0.1", 50001))], sent
+    print("test_transient_fx_stays_off_for_remote_og_by_default: PASSED")
+    return True
+
+
+def test_transient_fx_can_be_enabled_for_remote_clients():
+    """Loopback/Python should keep FX, and remote delivery can be explicitly re-enabled."""
+    sent = []
+    server = WulframServer.__new__(WulframServer)
+    server.remote_transient_fx = True
+    server.udp_handler = SimpleNamespace(send_to=lambda payload, addr: sent.append((payload, addr)))
+
+    remote_session = Session()
+    remote_session.in_game = True
+    remote_session.udp_addr = ("10.10.10.2", 50000)
+    remote_ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=remote_session,
+        entity_id=1337,
+    )
+
+    loopback_session = Session()
+    loopback_session.in_game = True
+    loopback_session.udp_addr = ("127.0.0.1", 50001)
+    loopback_ctx = ClientContext(
+        client_id=2,
+        client_addr=("127.0.0.1", 50001),
+        session=loopback_session,
+        entity_id=1338,
+    )
+
+    server._snapshot_in_game_clients = lambda: [remote_ctx, loopback_ctx]
+
+    pkt = server._broadcast_transient_fx([{
+        "type": 12,
+        "pos": (4950.0, 5100.0, 5.0),
+    }], exclude_client=loopback_ctx)
+
+    assert pkt and pkt[0] == 0x0D
+    assert sent == [(pkt, ("10.10.10.2", 50000))], sent
+    print("test_transient_fx_can_be_enabled_for_remote_clients: PASSED")
     return True
 
 
@@ -4877,6 +5014,7 @@ def main():
         test_spawn_wf_minimal_uses_local_player_sync_rotation,
         test_player_body_rotation_preserves_pitch_for_remote_entities,
         test_remote_sync_heartbeat_helper_uses_heading_not_player_yaw,
+        test_remote_spawn_bootstrap_heartbeat_uses_safe_rot_only_shape,
         test_state_request_does_not_overwrite_client_tick_offset,
         test_remote_udp_ping_request_gets_og_safe_reply,
         test_jump_velocity_update_packet_uses_spawn_safe_local_state_for_remote_og,
@@ -4891,6 +5029,8 @@ def main():
         test_weapon_system_og_direct_trigger_slot_fires_pulse_shell,
         test_weapon_system_held_fire_repeats_on_cooldown,
         test_send_entity_create_uses_udp_only,
+        test_transient_fx_stays_off_for_remote_og_by_default,
+        test_transient_fx_can_be_enabled_for_remote_clients,
         test_entity_create_uses_spawn_safe_local_state_for_og_viewer,
         test_remote_player_update_uses_spawn_safe_viewer_local_state,
         test_loopback_entity_create_decodes_roundtrip,
