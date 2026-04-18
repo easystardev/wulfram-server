@@ -568,14 +568,17 @@ class WulframServer:
         # STATE_REQUEST trigger at Replication.c:1173-1177. Emits an
         # UPDATE_ARRAY with exactly one entity (the local player, with
         # pos+rot) at a modest cadence so the `entity_count == 1 && final ==
-        # local_player` gate fires regularly. Disabled by default until the
-        # live smoke validates it doesn't destabilize the existing heartbeat
-        # path; set the interval explicitly (e.g. 0.5s) to enable.
+        # local_player` gate fires regularly. Default 2.0 s interval is
+        # specifically chosen to be SLOWER than the OG client's 1.0 s
+        # `TimeSeries_prune_old_samples` window on `g_sync_request_count` —
+        # if the keepalive runs faster than the prune drains, the TimeSeries
+        # count plateaus at 5 and the `< 5` rate-limit gate locks on
+        # permanently (see `docs/state-request-gate-disasm-2026-04-18.md`).
         self.solo_local_keepalive_enabled = os.environ.get("WULFRAM_SOLO_LOCAL_KEEPALIVE", "0") == "1"
         try:
-            self.solo_local_keepalive_interval = float(os.environ.get("WULFRAM_SOLO_LOCAL_KEEPALIVE_INTERVAL", "0.5"))
+            self.solo_local_keepalive_interval = float(os.environ.get("WULFRAM_SOLO_LOCAL_KEEPALIVE_INTERVAL", "2.0"))
         except ValueError:
-            self.solo_local_keepalive_interval = 0.5
+            self.solo_local_keepalive_interval = 2.0
         try:
             self.update_epsilon = float(os.environ.get("WULFRAM_UPDATE_EPSILON", "0.001"))
         except ValueError:
