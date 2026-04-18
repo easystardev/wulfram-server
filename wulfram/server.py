@@ -968,20 +968,33 @@ class WulframServer:
         except ValueError:
             self.linear_damp_coasting = 2.0
 
-        # NOTE: Local player corrections (sending UPDATE_ARRAY with the player's own
-        # entity ID) do NOT work. The client runs lockstep deterministic physics and
-        # overwrites server position/rotation every frame. Reconciliation only triggers
-        # on collision (dead on flat ground). Tested exhaustively: dual_entity, single
-        # entity, pos-only, rot-only, teleport â€” none visually correct the local player.
-        # Server physics match (0.001% position, 0.00Â° heading) is the sync mechanism.
-
+        # Local-player correction mode. UPDATE_ARRAY-based modes
+        # (`dual_entity`, `full`, `pos_only`, `rot_only`) do NOT
+        # visually reconcile the local player on the OG client: the
+        # non-replay UPDATE_ARRAY path is treated as a heartbeat, not
+        # a lag-compensation correction, so the client's lockstep
+        # physics overwrites the server state on the very next frame.
+        # Older audit notes flagged this as "corrections are
+        # architecturally impossible", but the 2026-04-18 forced-
+        # correction probe landed at 51-65% main-view pixel change
+        # using VIEW_UPDATE (opcode 0x0F): OG's VIEW_UPDATE handler
+        # routes through `apply_lag_compensation` which DOES write
+        # pos/rot directly and zero velocity for a smooth correction.
+        #
+        # So the default correction mode is `view_update`. The other
+        # modes stay available as env overrides for A/B investigation
+        # but should not be the default — they were the culprit
+        # behind the "corrections not applying" symptom (the forced-
+        # correction probe explicitly flips mode while running, but
+        # everything else hits the non-functional UPDATE_ARRAY path).
+        # See docs/view-update-correction.md.
         try:
             self.correction_interval = float(os.environ.get("WULFRAM_CORRECTION_INTERVAL", "0"))
         except ValueError:
             self.correction_interval = 0.0
-        self.correction_mode = os.environ.get("WULFRAM_CORRECTION_MODE", "dual_entity").strip().lower()
+        self.correction_mode = os.environ.get("WULFRAM_CORRECTION_MODE", "view_update").strip().lower()
         if self.correction_mode not in ("full", "rot_only", "pos_only", "dual_entity", "view_update"):
-            self.correction_mode = "dual_entity"
+            self.correction_mode = "view_update"
 
         print(
             f"[CONFIG-HEADING] turn_adjust={self.turn_adjust} turn_sign={self.turn_sign} "
