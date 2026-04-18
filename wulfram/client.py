@@ -128,6 +128,12 @@ class ClientContext:
     # at ~10 Hz is visibly applied and the new pose persists after the burst.
     correction_burst_remaining: int = 0
     correction_burst_interval_s: float = 0.0
+    # Solo-local-player keepalive — satisfies the OG client's organic
+    # STATE_REQUEST trigger at Replication.c:1173-1177 which only fires for
+    # `entity_count == 1 && final == local_player` packets. Without a steady
+    # drip of this shape, the organic correction loop dies after the spawn
+    # window.
+    last_solo_local_keepalive: float = 0.0
     # Remote player update throttle
     last_remote_update_send: float = 0.0
     # Combat stats

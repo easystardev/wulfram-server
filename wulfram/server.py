@@ -564,6 +564,18 @@ class WulframServer:
             self.update_heartbeat_interval = float(os.environ.get("WULFRAM_UPDATE_HEARTBEAT", "3.0"))
         except ValueError:
             self.update_heartbeat_interval = 3.0
+        # Solo-local-player keepalive — feeds the OG client's organic
+        # STATE_REQUEST trigger at Replication.c:1173-1177. Emits an
+        # UPDATE_ARRAY with exactly one entity (the local player, with
+        # pos+rot) at a modest cadence so the `entity_count == 1 && final ==
+        # local_player` gate fires regularly. Disabled by default until the
+        # live smoke validates it doesn't destabilize the existing heartbeat
+        # path; set the interval explicitly (e.g. 0.5s) to enable.
+        self.solo_local_keepalive_enabled = os.environ.get("WULFRAM_SOLO_LOCAL_KEEPALIVE", "0") == "1"
+        try:
+            self.solo_local_keepalive_interval = float(os.environ.get("WULFRAM_SOLO_LOCAL_KEEPALIVE_INTERVAL", "0.5"))
+        except ValueError:
+            self.solo_local_keepalive_interval = 0.5
         try:
             self.update_epsilon = float(os.environ.get("WULFRAM_UPDATE_EPSILON", "0.001"))
         except ValueError:
@@ -8918,6 +8930,80 @@ class WulframServer:
                     ctx.last_sent_pos = send_pos
                     ctx.last_sent_vel = ctx.player_vel
                     ctx.last_sent_yaw = ctx.player_yaw
+
+                # Solo-local-player keepalive — feeds the OG client's organic
+                # STATE_REQUEST trigger (Replication.c:1173-1177 requires
+                # entity_count == 1 && final == local_player). Emits a
+                # single-entity UPDATE_ARRAY with the local player's current
+                # pos+rot at the configured cadence; no-op if disabled.
+                if (
+                    self.solo_local_keepalive_enabled
+                    and self.solo_local_keepalive_interval > 0
+                    and ctx.session.entity_id
+                    and ctx.session.udp_addr
+                ):
+                    keepalive_due = (now - ctx.last_solo_local_keepalive) >= self.solo_local_keepalive_interval
+                    if keepalive_due:
+                        ctx.last_solo_local_keepalive = now
+                        keep_pos = self._to_client_pos(ctx.player_pos)
+                        keep_rot = self._local_player_sync_rotation(ctx)
+                        keep_local_state = self._should_send_local_state(
+                            ctx,
+                            0,
+                            0,
+                            self.update_local_state_mode,
+                        )
+                        keep_weapon = self._get_local_state_weapon_type(ctx) if keep_local_state else 0
+                        keep_ammo_bits, keep_ammo_mask = (
+                            self._get_local_state_ammo_bits(ctx) if keep_local_state else (0, 0)
+                        )
+                        (
+                            keep_pt_bits,
+                            keep_pt_angle,
+                            keep_st_bits,
+                            keep_st_angle,
+                        ) = (
+                            self._get_local_state_turret_bits(ctx)
+                            if keep_local_state
+                            else (0, 0.0, 0, 0.0)
+                        )
+                        keepalive_pkt = build_update_array_player_update(
+                            tick=tick,
+                            entity_id=ctx.session.entity_id,
+                            pos=keep_pos,
+                            vel=ctx.player_vel,
+                            rot=keep_rot,
+                            include_pos=True,
+                            include_vel=True,
+                            include_rot=True,
+                            include_local_state=keep_local_state,
+                            weapon_id=keep_weapon,
+                            health=self._get_health_value(ctx),
+                            fuel=self._get_energy_value(ctx),
+                            ammo_count_bits=keep_ammo_bits,
+                            ammo_count=keep_ammo_mask,
+                            primary_turret_bits=keep_pt_bits,
+                            primary_turret_angle=keep_pt_angle,
+                            secondary_turret_bits=keep_st_bits,
+                            secondary_turret_angle=keep_st_angle,
+                            turret_max=self.local_state_turret_max,
+                            turret_range=self.local_state_turret_range,
+                            is_manned=True,
+                        )
+                        self.udp_handler.send_to(keepalive_pkt, ctx.session.udp_addr)
+                        if self.pktlog.enabled:
+                            self.pktlog.log(
+                                client_id=ctx.client_id,
+                                label="SOLO_LOCAL_KEEPALIVE",
+                                tick=tick,
+                                payload=keepalive_pkt,
+                                transport="UDP",
+                                entity_count=1,
+                                entity_ids=(ctx.session.entity_id,),
+                                mask_bits=(0b1010,),
+                                has_local_state=keep_local_state,
+                                health=self._get_health_value(ctx) if keep_local_state else -1.0,
+                            )
 
                 # Periodic TankPacket vitals refresh to stabilize HUD health/energy.
                 if self.tank_vitals and self.tank_vitals_heartbeat and ctx.session.udp_addr:

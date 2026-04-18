@@ -4948,6 +4948,45 @@ def test_control_heading_set_preserves_yaw_sign_convention():
     return True
 
 
+def test_solo_local_player_keepalive_shape_triggers_og_state_request_gate():
+    """The keepalive packet must decode as entity_count=1 with the local player OID.
+
+    OG's organic STATE_REQUEST trigger at Replication.c:1173-1177 is
+    `if (entity_count == 1 && final_entity_ptr == g_local_player_entity)`.
+    The keepalive uses build_update_array_player_update which always emits
+    exactly one entity; lock that invariant here so a builder change can't
+    silently add a dummy entity and break the organic correction loop.
+    """
+    from wulfram.packets import build_update_array_player_update, build_behavior_packet
+    client_root = Path(__file__).resolve().parent.parent / "client"
+    if str(client_root) not in sys.path:
+        sys.path.insert(0, str(client_root))
+    from wulfram_client.network.decoder import decode_update_array
+    from wulfram_client.network.behavior import parse_behavior
+
+    behavior = parse_behavior(build_behavior_packet())
+    entity_id = 0x14EA
+    payload = build_update_array_player_update(
+        tick=0x1234,
+        entity_id=entity_id,
+        pos=(5100.0, 4300.0, 5.0),
+        vel=(0.0, 0.0, 0.0),
+        rot=(0.0, 0.0, 0.0),
+        include_pos=True,
+        include_vel=True,
+        include_rot=True,
+        include_local_state=True,
+        weapon_id=2,
+    )
+    _, _local, entities = decode_update_array(payload, behavior_config=behavior)
+    assert len(entities) == 1, f"keepalive must be solo-local, got {len(entities)} entities"
+    assert entities[0].entity_id == entity_id
+    assert entities[0].position is not None, "pos required — satisfies Entity_apply_network_transform assert"
+    assert entities[0].rotation is not None, "rot required — satisfies Entity_apply_network_transform assert"
+    print("test_solo_local_player_keepalive_shape_triggers_og_state_request_gate: PASSED")
+    return True
+
+
 def test_view_update_pos_without_rot_clamps_to_safe_shape():
     """OG's Entity_apply_network_transform exits on pos-without-rot for non-static entities."""
     from wulfram.packets import build_view_update_player_update, build_view_update_multi, build_behavior_packet
@@ -5147,6 +5186,7 @@ def main():
         test_broadcast_player_stats_stays_tcp_only,
         test_control_pos_exact_reset_targets_specific_client,
         test_control_heading_set_preserves_yaw_sign_convention,
+        test_solo_local_player_keepalive_shape_triggers_og_state_request_gate,
         test_view_update_pos_without_rot_clamps_to_safe_shape,
         test_players_json_includes_transport_addresses,
     ]
