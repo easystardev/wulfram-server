@@ -336,6 +336,8 @@ class ControlServer:
             return self._cmd_reload(args)
         elif cmd == 'players' or cmd == 'pl':
             return self._cmd_players(args)
+        elif cmd == 'projectiles' or cmd == 'proj':
+            return self._cmd_projectiles(args)
         elif cmd == 'input' or cmd == 'inp':
             return self._cmd_input(args)
         elif cmd == 'move' or cmd == 'mv':
@@ -388,6 +390,7 @@ class ControlServer:
   health [c<id>]         - Show player health
   health set <val> [c<id>] - Set health directly (0.0-1.0)
   players / pl [json]    - Show all connected players' positions and headings
+  projectiles / proj [json] - Dump live in-flight projectile state for divergence probes
   help                   - Show this help
   quit                   - Disconnect
 
@@ -1516,6 +1519,73 @@ Examples:
                 f"Client {c['client_id']} (entity {c['entity_id']}) [{c['phase']}]: "
                 f"pos=({x:.1f}, {y:.1f}, {z:.1f}) "
                 f"heading={c['heading_deg']}° aim={c['aim_yaw_deg']}°{vel_str}{hp_str}"
+            )
+        return "\n".join(lines)
+
+    def _cmd_projectiles(self, args: list) -> str:
+        """Dump in-flight projectile state across all clients.
+
+        Usage:
+          projectiles       - Human-readable one-line-per-projectile
+          projectiles json  - JSON array for tooling (divergence harness)
+
+        Each entry: {client_id, entity_id, entity_type, owner_id, team,
+        pos, vel, spawn_time, age_s, lifetime, lifetime_remaining_s}.
+
+        `pos` reflects the live tracked value that
+        `build_projectile_update_packet` has been integrating (it rewrites
+        `proj.pos = pos + vel*dt` on every tick that emits an update).
+        `spawn_time` is the server's `time.monotonic()` at fire; `age_s`
+        is computed against the current monotonic clock at response build.
+        """
+        import json as _json
+        import time as _time
+
+        if not self.server:
+            return "Error: No server reference"
+
+        json_mode = bool(args) and args[0].lower() == "json"
+        now = _time.monotonic()
+        entries = []
+        with self.server.clients_lock:
+            for ctx in self.server.clients.values():
+                if not ctx or not ctx.running or not ctx.weapon_system:
+                    continue
+                for proj in list(ctx.weapon_system.projectiles):
+                    age = now - proj.spawn_time
+                    entries.append(
+                        {
+                            "client_id": ctx.client_id,
+                            "entity_id": proj.entity_id,
+                            "entity_type": int(proj.entity_type),
+                            "owner_id": proj.owner_id,
+                            "team": proj.team,
+                            "pos": [float(v) for v in proj.pos],
+                            "vel": [float(v) for v in proj.vel],
+                            "spawn_time": round(proj.spawn_time, 4),
+                            "age_s": round(age, 4),
+                            "lifetime": proj.lifetime,
+                            "lifetime_remaining_s": round(max(0.0, proj.lifetime - age), 4),
+                        }
+                    )
+
+        if json_mode:
+            return _json.dumps(entries, indent=2)
+
+        if not entries:
+            return "No in-flight projectiles"
+
+        lines = []
+        for e in entries:
+            x, y, z = e["pos"]
+            vx, vy, vz = e["vel"]
+            speed = (vx * vx + vy * vy + vz * vz) ** 0.5
+            lines.append(
+                f"Client {e['client_id']} proj {e['entity_id']} "
+                f"type={e['entity_type']} team={e['team']} "
+                f"pos=({x:.2f},{y:.2f},{z:.2f}) "
+                f"vel=({vx:.2f},{vy:.2f},{vz:.2f}) speed={speed:.2f} "
+                f"age={e['age_s']:.3f}s rem={e['lifetime_remaining_s']:.3f}s"
             )
         return "\n".join(lines)
 
