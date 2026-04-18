@@ -666,7 +666,15 @@ def build_view_update_player_update(tick: int, entity_id: int,
                                     turret_max: float = 6.3,
                                     turret_range: float = 12.6,
                                     timestamp: Optional[int] = None) -> bytes:
-    """Build VIEW_UPDATE packet (0x0F) with player position/velocity updates."""
+    """Build VIEW_UPDATE packet (0x0F) with player position/velocity updates.
+
+    The OG client's `Entity_apply_network_transform` (Replication.c:683-693)
+    calls `_exit(0)` on a non-static entity whose interp record is missing
+    either a position or rotation flag. Any VIEW_UPDATE that sets position
+    must also set rotation for a manned tank. Clamp here defensively.
+    """
+    if include_pos and not include_rot:
+        include_rot = True
     if timestamp is None:
         timestamp = get_ticks()
     header = struct.pack(">I", timestamp) + struct.pack(">I", tick)
@@ -791,7 +799,13 @@ def build_view_update_multi(tick: int,
                             turret_range: float = 12.6,
                             entities: Optional[list] = None,
                             timestamp: Optional[int] = None) -> bytes:
-    """Build VIEW_UPDATE (0x0F) packet with a timestamp + update array payload."""
+    """Build VIEW_UPDATE (0x0F) packet with a timestamp + update array payload.
+
+    The OG client's `Entity_apply_network_transform` (Replication.c:683-693)
+    calls `_exit(0)` on a non-static entity whose interp record has position
+    without rotation. Clamp per-entity here so a mis-configured caller can't
+    crash the OG session.
+    """
     if timestamp is None:
         timestamp = get_ticks()
     header = struct.pack(">I", timestamp) + struct.pack(">I", tick)
@@ -817,6 +831,9 @@ def build_view_update_multi(tick: int,
     entities = entities or []
     bw.write_bits(8, len(entities))
     for ent in entities:
+        ent = dict(ent)
+        if ent.get("include_pos") and not ent.get("include_rot"):
+            ent["include_rot"] = True
         _write_update_array_entity(bw, **ent)
 
     return b'\x0F' + header + bw.get_bytes()

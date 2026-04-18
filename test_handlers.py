@@ -4948,6 +4948,58 @@ def test_control_heading_set_preserves_yaw_sign_convention():
     return True
 
 
+def test_view_update_pos_without_rot_clamps_to_safe_shape():
+    """OG's Entity_apply_network_transform exits on pos-without-rot for non-static entities."""
+    from wulfram.packets import build_view_update_player_update, build_view_update_multi, build_behavior_packet
+    client_root = Path(__file__).resolve().parent.parent / "client"
+    if str(client_root) not in sys.path:
+        sys.path.insert(0, str(client_root))
+    from wulfram_client.network.decoder import decode_view_update
+    from wulfram_client.network.behavior import parse_behavior
+
+    behavior = parse_behavior(build_behavior_packet())
+
+    # Single-entity builder: pos=True, rot=False requested — should coerce rot=True.
+    payload = build_view_update_player_update(
+        tick=0x1234,
+        entity_id=0x14EA,
+        pos=(5100.0, 4300.0, 5.0),
+        vel=(0.0, 0.0, 0.0),
+        rot=(0.0, 0.0, 0.5),
+        include_pos=True,
+        include_vel=False,
+        include_rot=False,
+        include_local_state=False,
+    )
+    _, _, _local, entities = decode_view_update(payload, behavior_config=behavior)
+    assert len(entities) == 1
+    assert entities[0].position is not None, "pos must still be included"
+    assert entities[0].rotation is not None, "rotation must be coerced on when pos is requested"
+
+    # Multi-entity builder: per-entity clamp.
+    entity = {
+        "entity_id": 0x14EA,
+        "is_manned": True,
+        "pos": (5100.0, 4300.0, 5.0),
+        "vel": (0.0, 0.0, 0.0),
+        "rot": (0.0, 0.0, 0.5),
+        "include_pos": True,
+        "include_vel": False,
+        "include_rot": False,
+    }
+    payload = build_view_update_multi(
+        tick=0x1234,
+        include_local_state=False,
+        entities=[entity],
+    )
+    _, _, _local, entities = decode_view_update(payload, behavior_config=behavior)
+    assert len(entities) == 1
+    assert entities[0].position is not None
+    assert entities[0].rotation is not None
+    print("test_view_update_pos_without_rot_clamps_to_safe_shape: PASSED")
+    return True
+
+
 def test_players_json_includes_transport_addresses():
     """Control `players json` should expose client and UDP addresses for diagnostics."""
     server = SimpleNamespace(
@@ -5095,6 +5147,7 @@ def main():
         test_broadcast_player_stats_stays_tcp_only,
         test_control_pos_exact_reset_targets_specific_client,
         test_control_heading_set_preserves_yaw_sign_convention,
+        test_view_update_pos_without_rot_clamps_to_safe_shape,
         test_players_json_includes_transport_addresses,
     ]
 
