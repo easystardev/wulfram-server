@@ -1487,6 +1487,7 @@ Examples:
                 entry = {
                     "client_id": ctx.client_id,
                     "entity_id": ctx.session.entity_id if ctx.session else None,
+                    "entity_type": getattr(ctx, "entity_type", None),
                     "phase": phase,
                     "username": ctx.session.username if ctx.session else "",
                     "team_id": ctx.session.team_id if ctx.session else 0,
