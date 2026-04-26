@@ -287,6 +287,10 @@ class ControlServer:
             return self._cmd_spawn_full(args)
         elif cmd == 'enter_game' or cmd == 'spawn_now':
             return self._cmd_enter_game(args)
+        elif cmd == 'join_team' or cmd == 'jt':
+            return self._cmd_join_team(args)
+        elif cmd == 'spawn_point' or cmd == 'sp':
+            return self._cmd_spawn_point(args)
         elif cmd == 'spawn_udp' or cmd == 'spawn_wf':
             return self._cmd_spawn_udp(args)
         elif cmd == 'projectile':
@@ -372,6 +376,8 @@ class ControlServer:
   phase <name>           - Force session phase (HANDSHAKE, LOGIN, TEAM_SELECT, etc.)
   flag <name> <0|1>      - Set feature flag
   enter_game [args]      - Force the active OG client through the real TankPacket spawn path
+  join_team [c<id>] t<team> - Run the canonical team-switch handler for automation
+  spawn_point [c<id>] [oid] [vehicle] - Run explicit map-flag spawn handler
   spawn_full [args]      - Force spawn sequence (see example)
   spawn_udp [args]       - Send UDP TANK (Wulf-Forge style)
   spawn_entity [type] [x y z] [vx vy vz] - Spawn entity (type 6=pulse, 5=flak)
@@ -405,6 +411,8 @@ Examples:
   send CHAT "Hello world"               # Chat message
   send REINCARNATE 17 "Welcome!"        # Spawn success
   send UPDATE_ARRAY_TANK 1337 0 2       # Create tank entity
+  join_team c1 t2                        # Team switch without spawning
+  spawn_point c1 5002                    # Spawn at a map repair-pad oid
   enter_game c1 t2                       # Spawn client 1 on team 2 via WF/TankPacket path
   enter_game c1 t2 2579 3041 65          # Same, with explicit spawn position
   spawn_udp 1337 2 0 100 100 100        # UDP TANK (Wulf-Forge style)
@@ -2376,6 +2384,110 @@ Examples:
             f"Entered game: client={ctx.client_id} entity={entity_id} team={team_id} "
             f"pos=({spawn_pos[0]:.1f},{spawn_pos[1]:.1f},{spawn_pos[2]:.1f}) "
             f"udp={'yes' if udp else 'no'}"
+        )
+
+    def _select_control_client(self, args: list) -> tuple[Any, Any, list]:
+        """Resolve an optional leading c<id> selector for control commands."""
+        if args and args[0].lower().startswith("c") and args[0][1:].isdigit():
+            target_id = int(args[0][1:])
+            ctx, addr = self._get_client_by_id(target_id)
+            if not ctx:
+                raise ValueError(f"No client with id {target_id}")
+            return ctx, addr, args[1:]
+        ctx, addr = self._get_active_client()
+        if not ctx:
+            raise ValueError("No connected client")
+        return ctx, addr, args
+
+    def _cmd_join_team(self, args: list) -> str:
+        """Run the same team-switch handler used by an OG REINCARNATE team click.
+
+        Usage:
+          join_team [c<id>] t<team>
+          jt c1 t2
+        """
+        if not self.server:
+            return "Error: No server reference"
+        try:
+            ctx, addr, args = self._select_control_client(args)
+        except ValueError as e:
+            return f"Error: {e}"
+        if not ctx.session or not ctx.tcp_handler:
+            return f"Error: Client {ctx.client_id} has no active TCP/session"
+        if not args or not args[0].lower().startswith("t") or not args[0][1:].isdigit():
+            return "join_team usage: join_team [c<id>] t<team>"
+
+        team_id = int(args[0][1:])
+        if team_id not in (1, 2):
+            return f"Error: invalid team {team_id}"
+        if not addr:
+            addr = ctx.session.udp_addr
+        if not addr:
+            return f"Error: Client {ctx.client_id} has no UDP address yet"
+
+        from . import handlers
+        handlers.handle_team_switch(self.server, ctx, team_id, addr)
+        self.ctx = ctx
+        self.session = ctx.session
+        self.tcp_handler = ctx.tcp_handler
+        self._sync_to_active_client()
+        return (
+            f"Joined team: client={ctx.client_id} team={team_id} "
+            f"phase={ctx.session.phase.name} udp={'yes' if ctx.session.udp_addr else 'no'}"
+        )
+
+    def _cmd_spawn_point(self, args: list) -> str:
+        """Run the explicit map-flag spawn handler by spawn-point oid.
+
+        Usage:
+          spawn_point [c<id>] [oid] [vehicle]
+          sp c1 5002
+        """
+        if not self.server:
+            return "Error: No server reference"
+        try:
+            ctx, addr, args = self._select_control_client(args)
+        except ValueError as e:
+            return f"Error: {e}"
+        if not ctx.session or not ctx.tcp_handler:
+            return f"Error: Client {ctx.client_id} has no active TCP/session"
+        if not addr:
+            addr = ctx.session.udp_addr
+        if not addr:
+            return f"Error: Client {ctx.client_id} has no UDP address yet"
+
+        spawn_points = self.server.get_spawn_points()
+        team_id = ctx.session.team_id or 2
+        spawn_point_id = 0
+        vehicle_type = 0
+        try:
+            if args:
+                spawn_point_id = int(args[0])
+                args = args[1:]
+            if args:
+                vehicle_type = int(args[0])
+        except ValueError as e:
+            return f"spawn_point arg parse error: {e}"
+
+        if spawn_point_id == 0:
+            selected = next((sp for sp in spawn_points if sp.get("team") == team_id), None)
+            if selected is None and spawn_points:
+                selected = spawn_points[0]
+            if selected is None:
+                return "Error: no spawn points available"
+            spawn_point_id = int(selected.get("oid", 0))
+
+        from . import handlers
+        handlers.handle_spawn_at_point(self.server, ctx, spawn_point_id, vehicle_type, addr)
+        self.ctx = ctx
+        self.session = ctx.session
+        self.tcp_handler = ctx.tcp_handler
+        self._sync_to_active_client()
+        pos = ctx.player_pos
+        return (
+            f"Spawn point handled: client={ctx.client_id} point={spawn_point_id} "
+            f"vehicle={vehicle_type} phase={ctx.session.phase.name} "
+            f"pos=({pos[0]:.1f},{pos[1]:.1f},{pos[2]:.1f})"
         )
 
     def _cmd_spawn_full(self, args: list) -> str:
