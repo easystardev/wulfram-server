@@ -58,12 +58,13 @@ def kill_processes_on_port(port):
 
 def is_port_in_use(port):
     """Check if port is in use."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        try:
-            s.bind(('127.0.0.1', port))
-            return False
-        except OSError:
-            return True
+    for host in ('127.0.0.1', '0.0.0.0'):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind((host, port))
+            except OSError:
+                return True
+    return False
 
 
 def get_running_pid():

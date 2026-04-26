@@ -24,7 +24,7 @@ from wulfram.handlers import (
 )
 from wulfram.client import ClientContext
 from wulfram.control import ControlServer
-from wulfram.session import Session, Phase
+from wulfram.session import Session, Phase, FEATURES
 from wulfram.server import WulframServer, _StaticWorldRayNode
 from wulfram.building_collision import BuildingCollisionAssets
 from wulfram.world_collision import TerrainContact, TerrainGridCollision, TerrainRaycastHit
@@ -144,8 +144,8 @@ def test_spawn_override_wins_over_map_spawn_points():
             os.environ["WULFRAM_SPAWN_POS"] = old_spawn_pos
 
 
-def test_spawn_at_point_uses_default_flat_spawn_when_configured():
-    """Explicit spawn-point packets should stay on the configured flat default."""
+def test_spawn_at_point_honors_clicked_pad_when_default_configured():
+    """Explicit spawn-point packets should honor the clicked pad."""
     old_spawn_pos = os.environ.get("WULFRAM_SPAWN_POS")
     try:
         os.environ["WULFRAM_SPAWN_POS"] = "4950,5100,5"
@@ -177,8 +177,8 @@ def test_spawn_at_point_uses_default_flat_spawn_when_configured():
         handle_spawn_at_point(server, ctx, 7001, 0, ("127.0.0.1", 50000))
 
         assert captured["team_id"] == 2, captured
-        assert captured["pos"] == (4950.0, 5100.0, 5.0), captured
-        print("test_spawn_at_point_uses_default_flat_spawn_when_configured: PASSED")
+        assert captured["pos"] == (6000.0, 6000.0, 90.0), captured
+        print("test_spawn_at_point_honors_clicked_pad_when_default_configured: PASSED")
         return True
     finally:
         if old_spawn_pos is None:
@@ -194,6 +194,7 @@ def test_remote_spawn_points_use_udp_not_tcp():
     class DummyTCP:
         def __init__(self):
             self.sent = []
+            self.sock = SimpleNamespace(fileno=lambda: 1)
 
         def send(self, payload):
             self.sent.append(payload)
@@ -244,6 +245,7 @@ def test_remote_want_updates_suppresses_empty_tcp_update_array():
     class DummyTCP:
         def __init__(self):
             self.sent = []
+            self.sock = SimpleNamespace(fileno=lambda: 1)
 
         def send(self, payload):
             self.sent.append(payload)
@@ -1104,6 +1106,44 @@ def test_remote_state_sync_reply_remaps_client_tick_to_server_history():
     return True
 
 
+def test_remote_state_sync_reuses_cached_sample_when_replay_window_misses():
+    """Remote OG replies should not pair an old replay id with the live/current pose."""
+    server = WulframServer.__new__(WulframServer)
+    server.use_client_ticks = False
+
+    session = Session()
+    session.in_game = True
+    session.entity_id = 0x14EA
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=session,
+        entity_id=0x14EA,
+    )
+    old_sample = {
+        "tick": 0x00001000,
+        "time": time.monotonic() - 1.0,
+        "pos": (100.0, 200.0, 5.0),
+        "vel": (1.0, 0.0, 0.0),
+        "rot": (0.0, 0.0, 0.0),
+    }
+    newer_sample = {
+        "tick": 0x00002000,
+        "time": time.monotonic(),
+        "pos": (300.0, 400.0, 5.0),
+        "vel": (2.0, 0.0, 0.0),
+        "rot": (0.0, 0.0, 0.1),
+    }
+    ctx.authoritative_state_history.append(old_sample)
+    ctx.authoritative_state_history.append(newer_sample)
+
+    selected = server._select_authoritative_state_snapshot(ctx, 0x00003000)
+
+    assert selected is newer_sample
+    print("test_remote_state_sync_reuses_cached_sample_when_replay_window_misses: PASSED")
+    return True
+
+
 def test_remote_promoted_heartbeat_stays_short_form_safe():
     """Ordinary promoted remote heartbeats should stay on the short-form-safe local-state."""
     server = WulframServer.__new__(WulframServer)
@@ -1946,6 +1986,339 @@ def test_remote_player_info_packet_short_local_state_layout():
     assert br.read_bits(32) == 0x14EA
     assert br.read_bits(8) == 2
     print("test_remote_player_info_packet_short_local_state_layout: PASSED")
+    return True
+
+
+def test_remote_spawn_entry_transition_sends_canonical_packets():
+    """Remote OG auto-spawn should reassert the team-entry transition before tank spawn."""
+    class DummyTCP:
+        def __init__(self):
+            self.sent = []
+
+        def send(self, payload):
+            self.sent.append(payload)
+
+    class DummyUDP:
+        def __init__(self):
+            self.sent = []
+
+        def send_to(self, payload, addr):
+            self.sent.append((payload, addr))
+
+    server = WulframServer.__new__(WulframServer)
+    server.spawn_entry_transition = "1"
+    server.udp_handler = DummyUDP()
+    server.build_world_stats_packet = lambda: build_world_stats()
+
+    session = Session()
+    session.username = "RemoteOG"
+    session.udp_addr = ("10.10.10.2", 55839)
+    ctx = ClientContext(
+        client_id=3,
+        client_addr=("10.10.10.2", 50000),
+        session=session,
+        entity_id=0x053B,
+    )
+    ctx.tcp_handler = DummyTCP()
+
+    server._send_spawn_entry_transition(ctx, team_id=1, net_id=0x053B)
+
+    assert len(server.udp_handler.sent) == 1
+    assert server.udp_handler.sent[0][0][0] == 0x25
+    assert server.udp_handler.sent[0][1] == ("10.10.10.2", 55839)
+    assert [payload[0] for payload in ctx.tcp_handler.sent] == [0x17, 0x2F, 0x1A, 0x16]
+    assert session.player_id == 0x053B
+    assert session.team_id == 1
+    assert session.roster_sent is True
+    assert session.world_stats_sent is True
+    print("test_remote_spawn_entry_transition_sends_canonical_packets: PASSED")
+    return True
+
+
+def test_udp_team_switch_sends_update_stats_before_reincarnate():
+    """OG team switch should mirror captured UPDATE_STATS -> REINCARNATE order."""
+    from wulfram.handlers import handle_team_switch
+
+    class DummyTCP:
+        def __init__(self):
+            self.sent = []
+            self.sock = SimpleNamespace(fileno=lambda: 1)
+
+        def send(self, payload):
+            self.sent.append(payload)
+
+    class DummyUDP:
+        def __init__(self):
+            self.sent = []
+
+        def send_to(self, payload, addr):
+            self.sent.append((payload, addr))
+
+    server = WulframServer.__new__(WulframServer)
+    server.udp_handler = DummyUDP()
+    server.spawn_on_team_select = False
+    server.spawn_force_after = 0.0
+    server.team_switch_send_update_stats = True
+    server.team_switch_update_stats_transport = "udp"
+    server.team_switch_update_stats_variant = "canonical"
+    server.team_switch_send_reincarnate = True
+    server.team_switch_send_roster = False
+    server.team_switch_send_entry_packets = True
+    server.build_world_stats_packet = lambda: build_world_stats()
+
+    session = Session()
+    session.player_id = 0x0539
+    session.roster_sent = True
+    session.world_stats_sent = True
+    ctx = ClientContext(
+        client_id=4,
+        client_addr=("10.10.10.2", 50000),
+        session=session,
+        entity_id=0x0539,
+    )
+    ctx.tcp_handler = DummyTCP()
+
+    handle_team_switch(server, ctx, 1, ("10.10.10.2", 59507))
+
+    assert [payload[0] for payload, _ in server.udp_handler.sent] == [0x1C, 0x25]
+    assert [payload[0] for payload in ctx.tcp_handler.sent] == [0x17, 0x2F]
+    assert session.team_id == 1
+    print("test_udp_team_switch_sends_update_stats_before_reincarnate: PASSED")
+    return True
+
+
+def test_udp_team_switch_can_suppress_duplicate_entry_packets():
+    """Live OG isolation can disable duplicate PLAYER/GAME_CLOCK after team click."""
+    from wulfram.handlers import handle_team_switch
+
+    class DummyTCP:
+        def __init__(self):
+            self.sent = []
+            self.sock = SimpleNamespace(fileno=lambda: 1)
+
+        def send(self, payload):
+            self.sent.append(payload)
+
+    server = WulframServer.__new__(WulframServer)
+    server.udp_handler = None
+    server.spawn_on_team_select = False
+    server.spawn_force_after = 0.0
+    server.team_switch_send_update_stats = False
+    server.team_switch_update_stats_transport = "udp"
+    server.team_switch_update_stats_variant = "canonical"
+    server.team_switch_send_reincarnate = False
+    server.team_switch_send_roster = False
+    server.team_switch_send_entry_packets = False
+    server.build_world_stats_packet = lambda: build_world_stats()
+
+    session = Session()
+    session.player_id = 0x0539
+    session.roster_sent = True
+    session.world_stats_sent = True
+    ctx = ClientContext(
+        client_id=4,
+        client_addr=("10.10.10.2", 50000),
+        session=session,
+        entity_id=0x0539,
+    )
+    ctx.tcp_handler = DummyTCP()
+
+    handle_team_switch(server, ctx, 1, ("10.10.10.2", 59507))
+
+    assert ctx.tcp_handler.sent == []
+    assert session.team_id == 1
+    print("test_udp_team_switch_can_suppress_duplicate_entry_packets: PASSED")
+    return True
+
+
+def test_udp_team_switch_can_reassert_roster_without_entry_packets():
+    """Team-click isolation can send only ADD_TO_ROSTER as the visible team mutation."""
+    from wulfram.handlers import handle_team_switch
+
+    class DummyTCP:
+        def __init__(self):
+            self.sent = []
+            self.sock = SimpleNamespace(fileno=lambda: 1)
+
+        def send(self, payload):
+            self.sent.append(payload)
+
+    server = WulframServer.__new__(WulframServer)
+    server.udp_handler = None
+    server.spawn_on_team_select = False
+    server.spawn_force_after = 0.0
+    server.team_switch_send_update_stats = False
+    server.team_switch_update_stats_transport = "udp"
+    server.team_switch_update_stats_variant = "canonical"
+    server.team_switch_send_reincarnate = False
+    server.team_switch_send_roster = True
+    server.team_switch_send_entry_packets = False
+    server.build_world_stats_packet = lambda: build_world_stats()
+
+    session = Session()
+    session.username = "RosterProbe"
+    session.player_id = 0x0539
+    session.roster_sent = True
+    session.world_stats_sent = True
+    ctx = ClientContext(
+        client_id=4,
+        client_addr=("10.10.10.2", 50000),
+        session=session,
+        entity_id=0x0539,
+    )
+    ctx.tcp_handler = DummyTCP()
+
+    handle_team_switch(server, ctx, 2, ("10.10.10.2", 59507))
+
+    assert [payload[0] for payload in ctx.tcp_handler.sent] == [0x1A]
+    assert ctx.tcp_handler.sent[0][1:5] == b"\x00\x00\x05\x39"
+    assert ctx.tcp_handler.sent[0][5:9] == b"\x00\x00\x00\x02"
+    assert session.team_id == 2
+    print("test_udp_team_switch_can_reassert_roster_without_entry_packets: PASSED")
+    return True
+
+
+def test_udp_team_switch_can_send_update_stats_over_tcp():
+    """Team switch UPDATE_STATS can be isolated onto TCP for OG live probing."""
+    from wulfram.handlers import handle_team_switch
+
+    class DummyTCP:
+        def __init__(self):
+            self.sent = []
+            self.sock = SimpleNamespace(fileno=lambda: 1)
+
+        def send(self, payload):
+            self.sent.append(payload)
+
+    class DummyUDP:
+        def __init__(self):
+            self.sent = []
+
+        def send_to(self, payload, addr):
+            self.sent.append((payload, addr))
+
+    server = WulframServer.__new__(WulframServer)
+    server.udp_handler = DummyUDP()
+    server.spawn_on_team_select = False
+    server.spawn_force_after = 0.0
+    server.team_switch_send_update_stats = True
+    server.team_switch_update_stats_transport = "tcp"
+    server.team_switch_update_stats_variant = "canonical"
+    server.team_switch_send_reincarnate = False
+    server.team_switch_send_roster = False
+    server.team_switch_send_entry_packets = False
+    server.build_world_stats_packet = lambda: build_world_stats()
+
+    session = Session()
+    session.player_id = 0x0539
+    session.roster_sent = True
+    session.world_stats_sent = True
+    ctx = ClientContext(
+        client_id=4,
+        client_addr=("10.10.10.2", 50000),
+        session=session,
+        entity_id=0x0539,
+    )
+    ctx.tcp_handler = DummyTCP()
+
+    handle_team_switch(server, ctx, 2, ("10.10.10.2", 59507))
+
+    assert server.udp_handler.sent == []
+    assert [payload[0] for payload in ctx.tcp_handler.sent] == [0x1C]
+    assert ctx.tcp_handler.sent[0][17:19] == b"\x00\x02"
+    print("test_udp_team_switch_can_send_update_stats_over_tcp: PASSED")
+    return True
+
+
+def test_udp_team_switch_can_use_team_first_update_stats_variant():
+    """OG team switch can use archived team-first UPDATE_STATS layout."""
+    from wulfram.handlers import handle_team_switch
+
+    class DummyTCP:
+        def __init__(self):
+            self.sent = []
+            self.sock = SimpleNamespace(fileno=lambda: 1)
+
+        def send(self, payload):
+            self.sent.append(payload)
+
+    class DummyUDP:
+        def __init__(self):
+            self.sent = []
+
+        def send_to(self, payload, addr):
+            self.sent.append((payload, addr))
+
+    server = WulframServer.__new__(WulframServer)
+    server.udp_handler = DummyUDP()
+    server.spawn_on_team_select = False
+    server.spawn_force_after = 0.0
+    server.team_switch_send_update_stats = True
+    server.team_switch_update_stats_transport = "udp"
+    server.team_switch_update_stats_variant = "team_first"
+    server.team_switch_send_reincarnate = False
+    server.team_switch_send_roster = False
+    server.team_switch_send_entry_packets = False
+    server.build_world_stats_packet = lambda: build_world_stats()
+
+    session = Session()
+    session.player_id = 0x0539
+    session.roster_sent = True
+    session.world_stats_sent = True
+    ctx = ClientContext(
+        client_id=4,
+        client_addr=("10.10.10.2", 50000),
+        session=session,
+        entity_id=0x0539,
+    )
+    ctx.tcp_handler = DummyTCP()
+
+    handle_team_switch(server, ctx, 2, ("10.10.10.2", 59507))
+
+    assert len(server.udp_handler.sent) == 1
+    packet = server.udp_handler.sent[0][0]
+    assert packet[9:11] == b"\x00\x02"
+    assert packet[17:19] == b"\x00\x02"
+    print("test_udp_team_switch_can_use_team_first_update_stats_variant: PASSED")
+    return True
+
+
+def test_spawn_entry_transition_stays_off_by_default():
+    """Entry transition injection should be opt-in outside real REINCARNATE handling."""
+    class DummyTCP:
+        def __init__(self):
+            self.sent = []
+
+        def send(self, payload):
+            self.sent.append(payload)
+
+    server = WulframServer.__new__(WulframServer)
+    server.spawn_entry_transition = "off"
+    server.udp_handler = None
+
+    session = Session()
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("127.0.0.1", 50000),
+        session=session,
+        entity_id=0x0539,
+    )
+    ctx.tcp_handler = DummyTCP()
+
+    server._send_spawn_entry_transition(ctx, team_id=1, net_id=0x0539)
+
+    assert ctx.tcp_handler.sent == []
+    print("test_spawn_entry_transition_stays_off_by_default: PASSED")
+    return True
+
+
+def test_control_game_clock_builder_matches_packet_signature():
+    """Control-plane GAME_CLOCK injection should use the current packet builder signature."""
+    control = ControlServer(port=0)
+    payload = control._build_game_clock("123", "true", "30000", "0")
+    assert payload[0] == 0x2F
+    assert len(payload) == 14
+    print("test_control_game_clock_builder_matches_packet_signature: PASSED")
     return True
 
 
@@ -5060,6 +5433,12 @@ def test_players_json_includes_transport_addresses():
     ctx.player_pos = (5172.77, 5093.27, 5.0)
     ctx.player_vel = (0.0, 0.0, 0.0)
     ctx.player_heading = math.radians(169.8)
+    ctx.action_packet_count = 3
+    ctx.nonzero_move_input_count = 1
+    ctx.state_request_count = 2
+    ctx.state_sync_reply_count = 2
+    ctx.state_sync_view_reply_count = 2
+    ctx.last_decoded_input = {"fwd": 0.5, "strafe": 0.0}
     server.clients[ctx.client_id] = ctx
 
     control = ControlServer(port=0)
@@ -5071,6 +5450,12 @@ def test_players_json_includes_transport_addresses():
     entry = entries[0]
     assert entry["client_addr"] == ["10.10.10.2", 52731]
     assert entry["udp_addr"] == ["10.10.10.2", 52732]
+    assert entry["telemetry"]["action_packets"] == 3
+    assert entry["telemetry"]["nonzero_move_inputs"] == 1
+    assert entry["telemetry"]["state_requests"] == 2
+    assert entry["telemetry"]["state_sync_replies"] == 2
+    assert entry["telemetry"]["state_sync_view_replies"] == 2
+    assert entry["telemetry"]["last_input"]["fwd"] == 0.5
     print("test_players_json_includes_transport_addresses: PASSED")
     return True
 
@@ -5117,6 +5502,9 @@ def main():
         test_loopback_projectile_update_stays_entity_only,
         test_server_remote_player_info_uses_spawn_safe_local_state,
         test_remote_player_info_packet_short_local_state_layout,
+        test_remote_spawn_entry_transition_sends_canonical_packets,
+        test_spawn_entry_transition_stays_off_by_default,
+        test_control_game_clock_builder_matches_packet_signature,
         test_weapon_system_og_direct_trigger_slot_fires_pulse_shell,
         test_weapon_system_held_fire_repeats_on_cooldown,
         test_send_entity_create_uses_udp_only,

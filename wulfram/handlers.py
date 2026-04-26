@@ -15,7 +15,7 @@ from .packets import (
     PacketType, build_hello_version, build_hello_session_key,
     build_login_status, build_player, build_team_info,
     build_world_stats, build_bps_response, build_chat_message,
-    build_add_to_roster, build_update_stats, build_tank_packet,
+    build_add_to_roster, build_update_stats, build_update_stats_team_first, build_tank_packet,
     build_update_array_empty, build_update_array_spawn_points, get_ticks,
     build_behavior_packet, build_translation_packet, build_game_clock,
     build_ping_request,
@@ -269,6 +269,9 @@ def _send_og_login_bootstrap(server: "WulframServer", ctx: "ClientContext") -> N
         ))
         session.roster_sent = True
 
+    # The OG client expects WORLD_STATS during the login/bootstrap edge. Sending
+    # it again immediately after a team click re-runs the client's map cleanup
+    # path and can dump back to the protocol-mismatch screen.
     if not session.world_stats_sent:
         tcp.send(server.build_world_stats_packet())
         session.world_stats_sent = True
@@ -578,11 +581,12 @@ def handle_want_updates(server: "WulframServer", ctx: "ClientContext", packet: b
     if FEATURES.auto_join_team:
         # Alternate by client_id: odd=team1, even=team2
         team = 1 + ((ctx.client_id - 1) % 2)  # client 1 -> team 1, client 2 -> team 2
-        session.delayed_spawn_time = now + server.spawn_delay_seconds
+        spawn_delay_seconds = getattr(server, "spawn_delay_seconds", 6.0)
+        session.delayed_spawn_time = now + spawn_delay_seconds
         session.delayed_spawn_team = team
         print(
             f"[GAME] Client {ctx.client_id}: Scheduled auto-spawn in "
-            f"{server.spawn_delay_seconds:.1f}s for team {team}"
+            f"{spawn_delay_seconds:.1f}s for team {team}"
         )
     else:
         print(f"[GAME] Client {ctx.client_id}: Auto-spawn disabled")
@@ -607,6 +611,8 @@ def handle_reincarnate_tcp(server: "WulframServer", ctx: "ClientContext", packet
     if session.player_id == 0:
         session.player_id = ctx.entity_id
     _schedule_team_select_spawn(server, ctx, team_id, reason="tcp_reincarnate")
+    _send_team_switch_roster(server, ctx, team_id)
+    _send_team_switch_update_stats(server, ctx, team_id)
 
     # Mirror wulf-forge: acknowledge team switch/spawn intent with REINCARNATE code 0x11.
     if getattr(server, "team_switch_send_reincarnate", True):
@@ -620,6 +626,12 @@ def _send_post_reincarnate_entry_packets(server: "WulframServer", ctx: "ClientCo
     session = ctx.session
     if session.player_id == 0:
         session.player_id = ctx.entity_id
+    if not getattr(server, "team_switch_send_entry_packets", True):
+        print(
+            f"[GAME] Client {ctx.client_id}: Post-team-switch entry packets disabled "
+            "(WULFRAM_TEAM_SWITCH_ENTRY_PACKETS=0)"
+        )
+        return
 
     _safe_tcp_send(
         ctx,
@@ -649,6 +661,73 @@ def _send_post_reincarnate_entry_packets(server: "WulframServer", ctx: "ClientCo
             label="post_reincarnate_world_stats",
         )
         session.world_stats_sent = True
+
+
+def _send_team_switch_roster(
+    server: "WulframServer",
+    ctx: "ClientContext",
+    team_id: int,
+) -> None:
+    """Optionally reassert the local player's roster entry after team select."""
+    if not getattr(server, "team_switch_send_roster", False):
+        return
+    session = ctx.session
+    player_id = session.player_id or ctx.entity_id
+    name = session.username or f"Player{ctx.client_id}"
+    if _safe_tcp_send(
+        ctx,
+        build_add_to_roster(
+            player_id=player_id,
+            entity_id=player_id,
+            name=name,
+            team=team_id,
+        ),
+        label="team_switch_add_to_roster",
+    ):
+        session.roster_sent = True
+        print(f"[TCP] Team {team_id} roster reasserted for client {ctx.client_id}")
+
+
+def _send_team_switch_update_stats(
+    server: "WulframServer",
+    ctx: "ClientContext",
+    team_id: int,
+    addr: Optional[tuple] = None,
+) -> None:
+    """Send the roster stats/team update that OG sees during team switch."""
+    if not getattr(server, "team_switch_send_update_stats", True):
+        return
+
+    session = ctx.session
+    player_id = session.player_id or ctx.entity_id
+    variant = getattr(server, "team_switch_update_stats_variant", "canonical")
+    if variant == "team_first":
+        packet = build_update_stats_team_first(
+            player_id=player_id,
+            entity_id=player_id,
+            team_id=team_id,
+        )
+    else:
+        packet = build_update_stats(player_id=player_id, entity_id=player_id, team_id=team_id)
+    target_addr = addr or session.udp_addr
+    transport = getattr(server, "team_switch_update_stats_transport", "udp")
+
+    if transport in ("udp", "auto") and server.udp_handler and target_addr:
+        try:
+            server.udp_handler.send_to(packet, target_addr)
+            print(f"[UDP] Team {team_id} UPDATE_STATS sent to {target_addr}")
+            return
+        except Exception as ex:
+            print(f"[UDP] Failed to send team-switch UPDATE_STATS: {ex}")
+            if transport == "udp":
+                return
+
+    if transport in ("tcp", "auto") and ctx.tcp_handler and _safe_tcp_send(
+        ctx,
+        packet,
+        label="team_switch_update_stats",
+    ):
+        print(f"[TCP] Team {team_id} UPDATE_STATS sent (fallback)")
 
 
 # ============ UDP Handlers ============
@@ -895,6 +974,8 @@ def handle_team_switch(server: "WulframServer", ctx: "ClientContext", team_id: i
     if session.player_id == 0:
         session.player_id = ctx.entity_id
     _schedule_team_select_spawn(server, ctx, team_id, reason="udp_team_switch")
+    _send_team_switch_roster(server, ctx, team_id)
+    _send_team_switch_update_stats(server, ctx, team_id, addr)
 
     # Wulf-forge-style ACK: REINCARNATE(code=17) should be seen on UDP for
     # reliable entry-map -> world transition. Fall back to TCP only when UDP
@@ -1014,8 +1095,13 @@ def handle_spawn_at_point(server: "WulframServer", ctx: "ClientContext", spawn_p
         team_id = ctx.session.team_id or 2
         requested_pos = None
 
-    configured_default = server._get_configured_default_spawn_pos()
-    if configured_default is not None:
+    if requested_pos is not None:
+        pos = server._resolve_spawn_pos(team_id, explicit_pos=requested_pos)
+        print(
+            f"[SPAWN] Client {ctx.client_id}: honoring spawn-point {spawn_point_id} "
+            f"pos={pos}"
+        )
+    elif server._get_configured_default_spawn_pos() is not None:
         pos = server._resolve_spawn_pos(team_id)
         print(
             f"[SPAWN] Client {ctx.client_id}: overriding spawn-point {spawn_point_id} "

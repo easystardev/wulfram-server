@@ -91,6 +91,29 @@ class ClientContext:
     last_heading_client_tick: int = 0  # Client tick at last heading update
     tick_offset: Optional[int] = None
     tick_offset_smooth: Optional[float] = None  # EMA-smoothed offset for backdating
+    action_packet_count: int = 0
+    action_update_count: int = 0
+    action_dump_count: int = 0
+    last_action_packet_time: float = 0.0
+    last_action_packet_type: str = ""
+    last_action_packet_client_tick: int = 0
+    nonzero_move_input_count: int = 0
+    last_nonzero_move_input_time: float = 0.0
+    last_decoded_input: dict = field(default_factory=dict)
+    input_feedback_count: int = 0
+    last_input_feedback_time: float = 0.0
+    state_request_count: int = 0
+    last_state_request_time: float = 0.0
+    last_state_request_id: int = 0
+    last_state_request_frame_count: int = 0
+    last_state_request_len: int = 0
+    state_sync_reply_count: int = 0
+    state_sync_view_reply_count: int = 0
+    last_state_sync_reply_time: float = 0.0
+    last_state_sync_reply_tick: int = 0
+    last_state_sync_replay_timestamp: int = 0
+    last_state_sync_snapshot_source: str = ""
+    position_change_count: int = 0
 
     last_sent_tick: int = 0
     tick_lock: threading.Lock = field(default_factory=threading.Lock)

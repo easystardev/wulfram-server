@@ -150,6 +150,30 @@ class WulframServer:
         # selection is still available by setting WULFRAM_SPAWN_ON_TEAM_SELECT=0.
         self.spawn_on_team_select = os.environ.get("WULFRAM_SPAWN_ON_TEAM_SELECT", "1") == "1"
         self.team_switch_send_reincarnate = os.environ.get("WULFRAM_TEAM_SWITCH_REINCARNATE", "1") == "1"
+        self.team_switch_send_update_stats = (
+            os.environ.get("WULFRAM_TEAM_SWITCH_UPDATE_STATS", "1").strip().lower()
+            not in ("0", "false", "off", "no")
+        )
+        self.team_switch_update_stats_transport = os.environ.get(
+            "WULFRAM_TEAM_SWITCH_UPDATE_STATS_TRANSPORT",
+            "udp",
+        ).strip().lower()
+        if self.team_switch_update_stats_transport not in ("udp", "tcp", "auto"):
+            self.team_switch_update_stats_transport = "udp"
+        self.team_switch_update_stats_variant = os.environ.get(
+            "WULFRAM_TEAM_SWITCH_UPDATE_STATS_VARIANT",
+            "canonical",
+        ).strip().lower()
+        if self.team_switch_update_stats_variant not in ("canonical", "team_first"):
+            self.team_switch_update_stats_variant = "canonical"
+        self.team_switch_send_roster = (
+            os.environ.get("WULFRAM_TEAM_SWITCH_ROSTER", "0").strip().lower()
+            not in ("0", "false", "off", "no")
+        )
+        self.team_switch_send_entry_packets = (
+            os.environ.get("WULFRAM_TEAM_SWITCH_ENTRY_PACKETS", "1").strip().lower()
+            not in ("0", "false", "off", "no")
+        )
         # Allow explicit spawn-point packets to recover clients stuck on entry-map
         # after auto-spawn already marked the session IN_GAME.
         self.spawn_allow_point_override = os.environ.get("WULFRAM_SPAWN_POINT_OVERRIDE", "1") == "1"
@@ -194,8 +218,16 @@ class WulframServer:
         # â†’ g_local_player_entity stays 0 â†’ sync_local_player skips all health writes.
         self.spawn_send_update_array = os.environ.get("WULFRAM_SPAWN_UPDATE_ARRAY", "1") == "1"
         self.spawn_send_game_clock = os.environ.get("WULFRAM_SPAWN_GAME_CLOCK", "1") == "1"
+        self.spawn_send_comm_message = (
+            os.environ.get("WULFRAM_SPAWN_COMM_MESSAGE", "0").strip().lower()
+            not in ("0", "false", "off", "no")
+        )
         # Wulf-forge does NOT send REINCARNATE(0x11) during spawn.
         self.spawn_send_reincarnate = os.environ.get("WULFRAM_SPAWN_REINCARNATE", "0") == "1"
+        spawn_entry_transition = os.environ.get("WULFRAM_SPAWN_ENTRY_TRANSITION", "off").strip().lower()
+        if spawn_entry_transition not in ("0", "1", "false", "true", "off", "on", "auto", "auto-remote"):
+            spawn_entry_transition = "off"
+        self.spawn_entry_transition = spawn_entry_transition
         self.spawn_send_birth_notice = os.environ.get("WULFRAM_SPAWN_BIRTH_NOTICE", "0") == "1"
         self.spawn_send_player_packet = os.environ.get("WULFRAM_SPAWN_PLAYER_PACKET", "0") == "1"
         self.spawn_player_spectator = os.environ.get("WULFRAM_SPAWN_PLAYER_SPECTATOR", "0") == "1"
@@ -635,7 +667,9 @@ class WulframServer:
             "[CONFIG] spawn_udp_tank="
             f"{int(self.spawn_send_udp_tank)} player_info="
             f"{('explicit-' + str(int(self.spawn_send_player_info))) if self.spawn_send_player_info_explicit else 'auto-remote'} "
-            f"game_clock={int(self.spawn_send_game_clock)} reincarnate={int(self.spawn_send_reincarnate)} "
+            f"game_clock={int(self.spawn_send_game_clock)} comm_message={int(self.spawn_send_comm_message)} "
+            f"reincarnate={int(self.spawn_send_reincarnate)} "
+            f"entry_transition={self.spawn_entry_transition} "
             f"birth_notice={int(self.spawn_send_birth_notice)} update_array={int(self.spawn_send_update_array)} "
             f"player_packet={int(self.spawn_send_player_packet)} proj_spawn_snap={int(self.projectile_spawn_snap)} "
             f"map={self.map_name} grid={self.map_grid_rows}x{self.map_grid_cols} scale={self.map_scale} "
@@ -646,6 +680,9 @@ class WulframServer:
             f"spawn_on_team_select={int(self.spawn_on_team_select)} "
             f"spawn_point_override={int(self.spawn_allow_point_override)} "
             f"team_switch_reincarnate={int(self.team_switch_send_reincarnate)} "
+            f"team_switch_roster={int(self.team_switch_send_roster)} "
+            f"team_switch_stats={int(self.team_switch_send_update_stats)}:"
+            f"{self.team_switch_update_stats_transport}/{self.team_switch_update_stats_variant} "
             f"gravity={self.gravity:.1f} tick_hz={self.tick_rate_hz:.1f} "
             f"update_on_change={int(self.update_on_change)} heartbeat={self.update_heartbeat_interval:.2f}s "
             f"map_spawns={int(self.use_map_spawn_points)} update_packet={self.update_packet_type} "
@@ -1096,17 +1133,27 @@ class WulframServer:
             for target_tick in candidate_ticks:
                 delta = self._tick_delta_signed(target_tick, entry["tick"])
                 abs_delta = abs(delta)
-                if delta >= 0 and (best_prior is None or delta < best_prior_delta):
+                if delta >= 0 and (
+                    best_prior is None or best_prior_delta is None or delta < best_prior_delta
+                ):
                     best_prior = entry
                     best_prior_delta = delta
-                if best_abs is None or abs_delta < best_abs_delta:
+                if best_abs is None or best_abs_delta is None or abs_delta < best_abs_delta:
                     best_abs = entry
                     best_abs_delta = abs_delta
 
-        chosen = best_prior if best_prior is not None else best_abs
-        if chosen is None or best_abs_delta is None or best_abs_delta > 250:
-            return None
-        return chosen
+        max_replay_delta = 250
+        if best_prior is not None and best_prior_delta is not None and best_prior_delta <= max_replay_delta:
+            return best_prior
+        if best_abs is not None and best_abs_delta is not None and best_abs_delta <= max_replay_delta:
+            return best_abs
+        if best_abs is not None and not handlers._is_loopback_client(ctx):
+            # OG prediction is more likely to reject a reply that pairs an old
+            # replay timestamp with the live/current pose than a coherent cached
+            # authoritative sample. Keep remote replies on history even when the
+            # request arrived outside our tight replay window.
+            return best_abs
+        return None
 
     def _get_local_state_weapon_type(self, ctx: ClientContext) -> int:
         """Return weapon type index used by local player state (entity type index, not weapon slot)."""
@@ -1543,6 +1590,19 @@ class WulframServer:
         inc_pos = cmode in ("full", "pos_only", "dual_entity", "view_update")
         inc_vel = cmode in ("full", "pos_only", "dual_entity", "view_update")
         inc_rot = cmode in ("full", "rot_only", "dual_entity", "view_update")
+
+        if not handlers._is_loopback_client(ctx):
+            # OG clients reject the promoted/full local-state form on targeted
+            # correction bursts. Keep this aligned with STATE_REQUEST replies:
+            # a short local-state prefix plus the transform-bearing entity.
+            include_local_state = True
+            weapon_type = self._get_spawn_tank_weapon_type(ctx)
+            ammo_bits = 0
+            ammo_mask = 0
+            pt_bits = 0
+            pt_angle = 0.0
+            st_bits = 0
+            st_angle = 0.0
 
         common_kw = dict(
             include_local_state=include_local_state,
@@ -3219,6 +3279,64 @@ class WulframServer:
         )
         self.udp_handler.send_to(payload, addr)
 
+    def _should_send_spawn_entry_transition(self, ctx: ClientContext) -> bool:
+        mode = getattr(self, "spawn_entry_transition", "off")
+        if mode in ("1", "true", "on"):
+            return True
+        if mode in ("0", "false", "off"):
+            return False
+        return not handlers._is_loopback_client(ctx)
+
+    def _send_spawn_entry_transition(self, ctx: ClientContext, team_id: int, net_id: int) -> None:
+        """Reassert the decompile-backed team-entry sequence before OG auto-spawn."""
+        if not self._should_send_spawn_entry_transition(ctx):
+            return
+        if not ctx.tcp_handler:
+            return
+
+        session = ctx.session
+        session.player_id = session.player_id or net_id
+        session.team_id = team_id
+
+        rein = build_reincarnate(0x11, "")
+        sent_rein = False
+        if self.udp_handler and session.udp_addr:
+            try:
+                self.udp_handler.send_to(rein, session.udp_addr)
+                sent_rein = True
+            except Exception as ex:
+                print(f"[SPAWN] Failed entry-transition UDP REINCARNATE(0x11): {ex}")
+        if not sent_rein:
+            ctx.tcp_handler.send(rein)
+
+        ctx.tcp_handler.send(build_player(entity_id=session.player_id, spectator=False))
+        ctx.tcp_handler.send(build_game_clock())
+
+        sent_roster = False
+        if not session.roster_sent:
+            name = session.username or f"Player{ctx.client_id}"
+            ctx.tcp_handler.send(build_add_to_roster(
+                player_id=session.player_id,
+                entity_id=session.player_id,
+                name=name,
+                team=team_id,
+            ))
+            session.roster_sent = True
+            sent_roster = True
+
+        sent_world_stats = False
+        if not session.world_stats_sent:
+            ctx.tcp_handler.send(self.build_world_stats_packet())
+            session.world_stats_sent = True
+            sent_world_stats = True
+
+        print(
+            "[SPAWN] Sent entry transition "
+            f"(REINCARNATE via {'UDP' if sent_rein else 'TCP'}, PLAYER, GAME_CLOCK"
+            f"{', ADD_TO_ROSTER' if sent_roster else ''}"
+            f"{', WORLD_STATS' if sent_world_stats else ''})"
+        )
+
     def _spawn_wf_style(self, ctx: ClientContext, team_id: int, net_id: Optional[int] = None,
                          unit_type: int = 0,
                          pos: Optional[tuple] = None,
@@ -3311,6 +3429,8 @@ class WulframServer:
         if not ctx.tcp_handler:
             print("[SPAWN] ERROR: No TCP handler")
             return
+
+        self._send_spawn_entry_transition(ctx, team_id=team_id, net_id=net_id)
 
         # Roster (already sent during login, but ensure it's there for name display)
         if not ctx.session.roster_sent:
@@ -3426,33 +3546,20 @@ class WulframServer:
         # HEX DUMP for comparison with wulf-forge
         print(f"[TANK-HEX] len={len(tank_packet)} hex={tank_packet.hex().upper()}")
 
-        # Wulf-forge order: CommMessage FIRST, then TankPacket.
-        if announce:
-            comm_pkt = build_chat_message("Spawning in...", source_id=net_id)
-            if self.udp_handler and ctx.session.udp_addr:
-                try:
-                    self.udp_handler.send_to(comm_pkt, ctx.session.udp_addr)
-                    print(f"[SPAWN] Sent UDP CommMessage for spawn to {ctx.session.udp_addr}")
-                except Exception as ex:
-                    print(f"[SPAWN] Failed to send UDP CommMessage for spawn: {ex}")
-                    if ctx.tcp_handler:
-                        ctx.tcp_handler.send(comm_pkt)
-                        print(f"[SPAWN] Sent TCP CommMessage for spawn (fallback)")
-            elif ctx.tcp_handler:
-                ctx.tcp_handler.send(comm_pkt)
-                print(f"[SPAWN] Sent TCP CommMessage for spawn (no UDP addr)")
-
         # Send TankPacket over UDP (matching wulf-forge behavior)
+        sent_tank_udp = False
         if self.spawn_send_udp_tank:
             if self.udp_handler and ctx.session.udp_addr:
                 self.udp_handler.send_to(tank_packet, ctx.session.udp_addr)
+                sent_tank_udp = True
                 print(f"[SPAWN] Sent UDP TankPacket to {ctx.session.udp_addr}")
-                # Also send via TCP as backup.  After combat kill + entity DELETE,
+                # Optional TCP backup.  After combat kill + entity DELETE,
                 # the client may not process UDP while on team-select overlay.
                 # With pre-creation UPDATE_ARRAY, entity exists in OIDTable so
                 # TCP PLAYER_INFO takes "entity found" path â†’ LocalPlayer_initialize.
-                ctx.tcp_handler.send(tank_packet)
-                print(f"[SPAWN] Also sent TCP TankPacket (backup for respawn)")
+                if os.environ.get("WULFRAM_SPAWN_TCP_TANK_BACKUP", "0").strip().lower() not in ("0", "false", "off", "no"):
+                    ctx.tcp_handler.send(tank_packet)
+                    print(f"[SPAWN] Also sent TCP TankPacket (backup for respawn)")
                 # Resend TankPacket for reliability (UDP can drop packets)
                 # Each retransmit triggers Entity_create_from_network (new
                 # entity, 0xD0=0).  This is safe as long as no velocity
@@ -3493,7 +3600,9 @@ class WulframServer:
                 # g_local_player_entity is now set.  This heartbeat populates
                 # ESI with health=1.0 so sync_local_player writes it to the
                 # HUD health meter, clearing the red overlay.
-                if self._suppress_remote_spawn_bootstrap_heartbeat(ctx):
+                if os.environ.get("WULFRAM_SPAWN_BOOTSTRAP_HEARTBEAT", "1").strip().lower() in ("0", "false", "off", "no"):
+                    print("[SPAWN] Suppressing immediate spawn bootstrap heartbeat UPDATE_ARRAY")
+                elif self._suppress_remote_spawn_bootstrap_heartbeat(ctx):
                     if self.update_local_state_mode == "wf" and not handlers._is_loopback_client(ctx):
                         time.sleep(0.05)
                         hb_tick = self._get_network_tick(ctx)
@@ -3529,6 +3638,22 @@ class WulframServer:
             # Explicit TCP fallback for spawn-isolation runs.
             ctx.tcp_handler.send(tank_packet)
             print("[SPAWN] Sent TCP TankPacket (WULFRAM_SPAWN_UDP_TANK=0)")
+
+        # Wulf-forge capture order is TankPacket first, then the spawn message.
+        if announce and self.spawn_send_comm_message:
+            comm_pkt = build_chat_message("Spawning in...", source_id=net_id)
+            if self.udp_handler and ctx.session.udp_addr and sent_tank_udp:
+                try:
+                    self.udp_handler.send_to(comm_pkt, ctx.session.udp_addr)
+                    print(f"[SPAWN] Sent UDP CommMessage for spawn to {ctx.session.udp_addr}")
+                except Exception as ex:
+                    print(f"[SPAWN] Failed to send UDP CommMessage for spawn: {ex}")
+                    if ctx.tcp_handler:
+                        ctx.tcp_handler.send(comm_pkt)
+                        print(f"[SPAWN] Sent TCP CommMessage for spawn (fallback)")
+            elif ctx.tcp_handler:
+                ctx.tcp_handler.send(comm_pkt)
+                print(f"[SPAWN] Sent TCP CommMessage for spawn (no UDP addr)")
 
         # NOTE: We rely on TankPacket (UDP) to create the entity.
         # UPDATE_ARRAY_CREATE_TANK causes crash when sent AFTER TankPacket.
@@ -4243,6 +4368,8 @@ class WulframServer:
         finally:
             # Preserve UDP addr before session reset so we can clean mapping safely.
             udp_addr = ctx.session.udp_addr
+            disconnected_entity_id = ctx.session.entity_id or ctx.entity_id
+            was_in_game = bool(ctx.session.in_game and disconnected_entity_id)
             ctx.running = False
             ctx.session.in_game = False
 
@@ -4250,6 +4377,9 @@ class WulframServer:
             with self.clients_lock:
                 if ctx.client_id in self.clients:
                     del self.clients[ctx.client_id]
+
+            if was_in_game:
+                self._broadcast_disconnected_player_delete(ctx, disconnected_entity_id)
 
             # Remove UDP address mapping only if it still points to this context.
             if udp_addr and self.udp_addr_to_client.get(udp_addr) is ctx:
@@ -4264,6 +4394,24 @@ class WulframServer:
 
             sock.close()
             print(f"[SERVER] Client {ctx.client_id} disconnected")
+
+    def _broadcast_disconnected_player_delete(self, ctx: ClientContext, entity_id: int) -> None:
+        """Tell remaining clients to remove a disconnected player's entity."""
+        tick = get_ticks()
+        delete_pkt = build_delete_object(tick, [entity_id], with_effects=False)
+        sent_count = 0
+        for other in self._snapshot_in_game_clients():
+            if other is ctx:
+                continue
+            if entity_id in other.known_entity_ids:
+                other.known_entity_ids.discard(entity_id)
+            if self._send_packet_to_client(other, delete_pkt, prefer_tcp=True):
+                sent_count += 1
+        if sent_count:
+            print(
+                f"[SERVER] Client {ctx.client_id}: deleted disconnected "
+                f"entity {entity_id} for {sent_count} client(s)"
+            )
 
     def _do_handshake(self, ctx: ClientContext):
         """Perform initial handshake."""
@@ -4697,6 +4845,12 @@ class WulframServer:
         # Decode fields
         request_id = struct.unpack(">I", data[1:5])[0] if len(data) >= 5 else 0
         frame_count = struct.unpack(">I", data[5:9])[0] if len(data) >= 9 else 0
+        now = time.monotonic()
+        ctx.state_request_count += 1
+        ctx.last_state_request_time = now
+        ctx.last_state_request_id = request_id
+        ctx.last_state_request_frame_count = frame_count
+        ctx.last_state_request_len = len(data)
 
         # Log occasionally to avoid spam
         if request_id % 1000 == 0:
@@ -4770,6 +4924,7 @@ class WulframServer:
         tick = self._get_network_tick(ctx)
         snapshot = self._select_authoritative_state_snapshot(ctx, replay_timestamp)
         if snapshot is None:
+            snapshot_source = "live"
             send_pos = self._to_client_pos(ctx.player_pos)
             sync_vel = ctx.player_vel
             update_rot = (
@@ -4778,6 +4933,7 @@ class WulframServer:
                 ctx.player_heading,
             )
         else:
+            snapshot_source = "history"
             send_pos = snapshot["pos"]
             sync_vel = snapshot["vel"]
             update_rot = snapshot["rot"]
@@ -4875,6 +5031,11 @@ class WulframServer:
             )
 
         self.udp_handler.send_to(update_payload, ctx.session.udp_addr)
+        ctx.state_sync_reply_count += 1
+        ctx.last_state_sync_reply_time = now
+        ctx.last_state_sync_reply_tick = tick
+        ctx.last_state_sync_replay_timestamp = int(replay_timestamp or 0)
+        ctx.last_state_sync_snapshot_source = snapshot_source
 
         view_include_local_state = False
         view_payload = b""
@@ -4943,6 +5104,7 @@ class WulframServer:
                 timestamp=replay_timestamp,
             )
             self.udp_handler.send_to(view_payload, ctx.session.udp_addr)
+            ctx.state_sync_view_reply_count += 1
 
         if self.pktlog.enabled:
             self.pktlog.log(
@@ -4980,6 +5142,40 @@ class WulframServer:
 
     # ============ Weapon System Handlers ============
 
+    def _log_fire_pose_context(self, ctx: ClientContext, client_tick: int, source: str) -> None:
+        """Trace pose choices used for projectile origin diagnostics."""
+        if not self.debug_projectiles:
+            return
+
+        def _fmt_vec(vec: Optional[tuple]) -> str:
+            if not vec:
+                return "None"
+            return ",".join(f"{float(v):.2f}" for v in vec)
+
+        now = time.monotonic()
+        last = ctx.last_sent_player_state or {}
+        last_pos = last.get("pos")
+        last_tick = last.get("tick")
+        last_dt = now - float(last.get("time", now))
+
+        hist = self._select_authoritative_state_snapshot(ctx, client_tick) if client_tick else None
+        hist_pos = hist.get("pos") if hist else None
+        hist_tick = hist.get("tick") if hist else None
+        hist_dt = now - float(hist.get("time", now)) if hist else 0.0
+
+        print(
+            f"[FIRE-POSE] src={source} client={ctx.client_id} "
+            f"client_tick={client_tick} server_tick={get_ticks()} "
+            f"session_tick={ctx.session.tick if ctx.session else 0} "
+            f"tick_offset={ctx.tick_offset} "
+            f"player_pos=({_fmt_vec(self._to_client_pos(ctx.player_pos))}) "
+            f"player_vel=({_fmt_vec(ctx.player_vel)}) "
+            f"last_sent_tick={last_tick} last_sent_dt={last_dt:.3f}s "
+            f"last_sent_pos=({_fmt_vec(last_pos)}) "
+            f"hist_tick={hist_tick} hist_dt={hist_dt:.3f}s "
+            f"hist_pos=({_fmt_vec(hist_pos)})"
+        )
+
     def _handle_action_dump(self, ctx: Optional[ClientContext], data: bytes, addr: tuple):
         """
         Handle ACTION_DUMP packet (0x09).
@@ -4998,6 +5194,7 @@ class WulframServer:
                 pass
         if ctx.weapon_system.decode_action_dump(data):
             ctx.last_action_dump_time = time.monotonic()
+            self._record_client_action_telemetry(ctx, "ACTION_DUMP", client_tick)
 
             if ctx.session and not ctx.session.input_ready:
                 ctx.session.input_ready = True
@@ -5049,6 +5246,7 @@ class WulframServer:
                         f"aim_yaw={math.degrees(aim_yaw):.1f} vp_yaw={vp_yaw:.1f} "
                         f"src={aim_src} turn_slot={turn_val:.3f} pos={ctx.player_pos}"
                     )
+                    self._log_fire_pose_context(ctx, client_tick, "ACTION_DUMP")
                 for proj in new_projectiles:
                     self._spawn_moving_projectile(ctx, proj, addr)
 
@@ -5074,6 +5272,7 @@ class WulframServer:
                 pass
         if ctx.weapon_system.decode_action_update(data):
             ctx.last_action_dump_time = time.monotonic()
+            self._record_client_action_telemetry(ctx, "ACTION_UPDATE", client_tick)
             if ctx.session and not ctx.session.input_ready:
                 ctx.session.input_ready = True
                 ctx.session.input_ready_time = time.monotonic()
@@ -5129,6 +5328,7 @@ class WulframServer:
                         f"src={aim_override if aim_override != 'auto' else aim_src} "
                         f"turn_slot={turn_val:.3f} pos={ctx.player_pos}"
                     )
+                    self._log_fire_pose_context(ctx, client_tick, "ACTION_UPDATE")
                 for proj in new_projectiles:
                     self._spawn_moving_projectile(ctx, proj, addr)
 
@@ -5194,6 +5394,8 @@ class WulframServer:
             if ctx is not None:
                 ws = ctx.weapon_system
                 ws.on_input_feedback()
+                ctx.input_feedback_count += 1
+                ctx.last_input_feedback_time = time.monotonic()
             # Additional data might contain input flags
             if len(data) > 5:
                 extra = data[5:]
@@ -5545,6 +5747,49 @@ class WulframServer:
         strafe here so negative = left and positive = right in simulation.
         """
         return self.strafe_sign * self._normalize_behavior_axis_value(ctx, strafe_val)
+
+    def _record_client_action_telemetry(
+        self,
+        ctx: ClientContext,
+        packet_type: str,
+        client_tick: int,
+    ) -> None:
+        """Record decoded client input so live control-plane checks are unambiguous."""
+        if ctx is None or ctx.weapon_system is None:
+            return
+
+        now = time.monotonic()
+        ws = ctx.weapon_system
+        turn_input = self._get_raw_turn_input(ctx)
+        fwd_input = self._normalize_behavior_axis_value(
+            ctx,
+            ws.behavior_slots[BehaviorSlot.MOVING_FORWARD],
+        )
+        strafe_input = self._decode_network_strafe_input(
+            ctx,
+            ws.behavior_slots[BehaviorSlot.MOVING_SIDEWAYS],
+        )
+        fire_input = ws.behavior_slots[BehaviorSlot.FIRE]
+        thrust_input = ws.behavior_slots[BehaviorSlot.UPWARD_THRUST]
+
+        ctx.action_packet_count += 1
+        if packet_type == "ACTION_UPDATE":
+            ctx.action_update_count += 1
+        elif packet_type == "ACTION_DUMP":
+            ctx.action_dump_count += 1
+        ctx.last_action_packet_time = now
+        ctx.last_action_packet_type = packet_type
+        ctx.last_action_packet_client_tick = client_tick
+        ctx.last_decoded_input = {
+            "turn": float(turn_input),
+            "fwd": float(fwd_input),
+            "strafe": float(strafe_input),
+            "fire": float(fire_input),
+            "thrust": float(thrust_input),
+        }
+        if abs(fwd_input) > 0.05 or abs(strafe_input) > 0.05:
+            ctx.nonzero_move_input_count += 1
+            ctx.last_nonzero_move_input_time = now
 
     def _maybe_promote_remote_full_local_state(self, ctx: ClientContext, *, reason: str) -> bool:
         """Leave the spawn-safe minimal remote path once the client is stably in game."""
@@ -8517,6 +8762,8 @@ class WulframServer:
                 if pos_changed:
                     last_position = ctx.player_pos
                     last_position_change_time = now
+                    ctx.last_position_update = now
+                    ctx.position_change_count += 1
                     desync_warned = False
 
                 # Check for non-zero input in behavior slots (only movement, not thrust)

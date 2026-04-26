@@ -249,6 +249,28 @@ def build_update_stats(player_id: int, entity_id: int, kills: int = 0,
     return payload
 
 
+def build_update_stats_team_first(player_id: int, entity_id: int, team_id: int = 0,
+                                  deaths: int = 0) -> bytes:
+    """Build the empirical OG team-switch UPDATE_STATS variant.
+
+    Archived OG-facing traces place the selected team in the first u16 after
+    the two u32 identifiers. Keep the canonical team field populated too so
+    Python-client parsing remains intelligible when this probe path is used.
+    """
+    payload = b'\x1C'
+    payload += struct.pack(">I", player_id)
+    payload += struct.pack(">I", entity_id)
+    payload += struct.pack(">H", team_id & 0xFFFF)  # empirical team/status field
+    payload += struct.pack(">H", deaths & 0xFFFF)
+    payload += struct.pack(">H", 0)
+    payload += struct.pack(">H", 0)
+    payload += struct.pack(">H", team_id & 0xFFFF)  # canonical team field
+    payload += pack_fixed16(0.0)
+    payload += pack_fixed16(0.0)
+    payload += struct.pack(">I", 0)
+    return payload
+
+
 def build_birth_notice(entity_id: int, owner_entity_id: Optional[int] = None) -> bytes:
     """Build BIRTH_NOTICE packet."""
     if owner_entity_id is None:

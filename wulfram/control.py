@@ -144,6 +144,8 @@ class ControlServer:
         ctx.injected_input = None
         ctx.injected_turn = None
         ctx.prev_raw_turn_input = 0.0
+        if hasattr(ctx, "authoritative_state_history"):
+            ctx.authoritative_state_history.clear()
 
         ctx.player_pose["pos"] = ctx.player_pos
         ctx.player_pose["vel"] = zero_vel
@@ -283,6 +285,8 @@ class ControlServer:
             return self._cmd_flag(args)
         elif cmd == 'spawn_full':
             return self._cmd_spawn_full(args)
+        elif cmd == 'enter_game' or cmd == 'spawn_now':
+            return self._cmd_enter_game(args)
         elif cmd == 'spawn_udp' or cmd == 'spawn_wf':
             return self._cmd_spawn_udp(args)
         elif cmd == 'projectile':
@@ -367,6 +371,7 @@ class ControlServer:
   packets                - List available packet types with args
   phase <name>           - Force session phase (HANDSHAKE, LOGIN, TEAM_SELECT, etc.)
   flag <name> <0|1>      - Set feature flag
+  enter_game [args]      - Force the active OG client through the real TankPacket spawn path
   spawn_full [args]      - Force spawn sequence (see example)
   spawn_udp [args]       - Send UDP TANK (Wulf-Forge style)
   spawn_entity [type] [x y z] [vx vy vz] - Spawn entity (type 6=pulse, 5=flak)
@@ -400,6 +405,8 @@ Examples:
   send CHAT "Hello world"               # Chat message
   send REINCARNATE 17 "Welcome!"        # Spawn success
   send UPDATE_ARRAY_TANK 1337 0 2       # Create tank entity
+  enter_game c1 t2                       # Spawn client 1 on team 2 via WF/TankPacket path
+  enter_game c1 t2 2579 3041 65          # Same, with explicit spawn position
   spawn_udp 1337 2 0 100 100 100        # UDP TANK (Wulf-Forge style)
   correction mode view_update           # Set empirical correction packet shape
   correction now c1                     # Queue correction on next tick for client 1
@@ -1479,6 +1486,13 @@ Examples:
 
         json_mode = args and args[0].lower() == "json"
         clients = []
+        now = time.monotonic()
+
+        def _age(ts: float) -> Optional[float]:
+            if not ts or ts <= 0.0:
+                return None
+            return round(max(0.0, now - float(ts)), 3)
+
         with self.server.clients_lock:
             for ctx in self.server.clients.values():
                 if not ctx or not ctx.running:
@@ -1499,6 +1513,42 @@ Examples:
                     "aim_yaw_deg": round(math.degrees(ctx.player_aim_yaw), 1),
                     "aim_pitch_deg": round(math.degrees(ctx.player_aim_pitch), 1),
                     "health_pct": round(ctx.player_health * 100),
+                    "telemetry": {
+                        "action_packets": getattr(ctx, "action_packet_count", 0),
+                        "action_updates": getattr(ctx, "action_update_count", 0),
+                        "action_dumps": getattr(ctx, "action_dump_count", 0),
+                        "input_feedback": getattr(ctx, "input_feedback_count", 0),
+                        "nonzero_move_inputs": getattr(ctx, "nonzero_move_input_count", 0),
+                        "last_action_type": getattr(ctx, "last_action_packet_type", ""),
+                        "last_action_age_s": _age(getattr(ctx, "last_action_packet_time", 0.0)),
+                        "last_nonzero_move_input_age_s": _age(
+                            getattr(ctx, "last_nonzero_move_input_time", 0.0)
+                        ),
+                        "last_input_feedback_age_s": _age(getattr(ctx, "last_input_feedback_time", 0.0)),
+                        "last_position_change_age_s": _age(getattr(ctx, "last_position_update", 0.0)),
+                        "position_changes": getattr(ctx, "position_change_count", 0),
+                        "last_input": getattr(ctx, "last_decoded_input", {}) or {},
+                        "state_requests": getattr(ctx, "state_request_count", 0),
+                        "state_sync_replies": getattr(ctx, "state_sync_reply_count", 0),
+                        "state_sync_view_replies": getattr(ctx, "state_sync_view_reply_count", 0),
+                        "last_state_request_age_s": _age(getattr(ctx, "last_state_request_time", 0.0)),
+                        "last_state_request_id": getattr(ctx, "last_state_request_id", 0),
+                        "last_state_request_len": getattr(ctx, "last_state_request_len", 0),
+                        "last_state_sync_reply_age_s": _age(
+                            getattr(ctx, "last_state_sync_reply_time", 0.0)
+                        ),
+                        "last_state_sync_tick": getattr(ctx, "last_state_sync_reply_tick", 0),
+                        "last_state_sync_replay_timestamp": getattr(
+                            ctx,
+                            "last_state_sync_replay_timestamp",
+                            0,
+                        ),
+                        "last_state_sync_snapshot_source": getattr(
+                            ctx,
+                            "last_state_sync_snapshot_source",
+                            "",
+                        ),
+                    },
                 }
                 clients.append(entry)
 
@@ -1516,10 +1566,26 @@ Examples:
             vel_str = f" vel=({vx:.1f}, {vy:.1f}, {vz:.1f}) speed={speed:.1f}" if speed > 0.1 else ""
             hp = c["health_pct"]
             hp_str = f" HP={hp}%" if hp < 100 else ""
+            telemetry = c.get("telemetry", {})
+            last_input = telemetry.get("last_input") or {}
+            input_str = ""
+            if last_input:
+                input_str = (
+                    f" input=({float(last_input.get('fwd', 0.0)):.2f},"
+                    f"{float(last_input.get('strafe', 0.0)):.2f})"
+                )
+            sync_str = (
+                f" action_age={telemetry.get('last_action_age_s')}s"
+                f" nonzero_age={telemetry.get('last_nonzero_move_input_age_s')}s"
+                f" state_req={telemetry.get('state_requests')}"
+                f" sync={telemetry.get('state_sync_replies')}/"
+                f"{telemetry.get('state_sync_view_replies')}"
+            )
             lines.append(
                 f"Client {c['client_id']} (entity {c['entity_id']}) [{c['phase']}]: "
                 f"pos=({x:.1f}, {y:.1f}, {z:.1f}) "
-                f"heading={c['heading_deg']}° aim={c['aim_yaw_deg']}°{vel_str}{hp_str}"
+                f"heading={c['heading_deg']}° aim={c['aim_yaw_deg']}°"
+                f"{vel_str}{hp_str}{input_str}{sync_str}"
             )
         return "\n".join(lines)
 
@@ -2238,6 +2304,80 @@ Examples:
         team_name = {1: "Red", 2: "Blue"}.get(team, str(team)) if team else "same"
         return f"Respawned client {ctx.client_id} (team={team_name}) at {result}"
 
+    def _cmd_enter_game(self, args: list) -> str:
+        """Force a connected client into game through the normal TankPacket spawn path.
+
+        This is intended for automation: it bypasses fragile team/flag clicking
+        but still uses the same server spawn path as manual map flag selection.
+        Usage:
+          enter_game [c<id>] [t<team>] [x y z]
+          spawn_now [c<id>] [t<team>] [x y z]
+        """
+        if not self.server:
+            return "Error: No server reference"
+
+        ctx = None
+        if args and args[0].lower().startswith("c") and args[0][1:].isdigit():
+            target_id = int(args[0][1:])
+            ctx, _ = self._get_client_by_id(target_id)
+            if not ctx:
+                return f"Error: No client with id {target_id}"
+            args = args[1:]
+        else:
+            ctx, _ = self._get_active_client()
+        if not ctx:
+            return "Error: No connected client"
+        if not ctx.tcp_handler or not ctx.session:
+            return f"Error: Client {ctx.client_id} has no active TCP/session"
+
+        team_id = ctx.session.team_id or 1
+        if args and args[0].lower().startswith("t") and args[0][1:].isdigit():
+            team_id = int(args[0][1:])
+            args = args[1:]
+
+        pos = None
+        try:
+            if len(args) >= 3:
+                pos = (float(args[0]), float(args[1]), float(args[2]))
+            elif args:
+                return "enter_game usage: enter_game [c<id>] [t<team>] [x y z]"
+        except ValueError as e:
+            return f"enter_game arg parse error: {e}"
+
+        entity_id = ctx.session.player_id or ctx.session.entity_id or ctx.entity_id
+        if not entity_id:
+            entity_id = int(getattr(self.server, "next_entity_id", 1337) or 1337)
+            self.server.next_entity_id = max(int(getattr(self.server, "next_entity_id", 1337) or 1337), entity_id + 1)
+
+        ctx.session.player_id = entity_id
+        ctx.session.team_id = team_id
+        ctx.entity_id = entity_id
+        ctx.known_entity_ids.add(entity_id)
+        if hasattr(ctx, "authoritative_state_history"):
+            ctx.authoritative_state_history.clear()
+
+        self.ctx = ctx
+        self.session = ctx.session
+        self.tcp_handler = ctx.tcp_handler
+
+        self.server._spawn_wf_style(
+            ctx,
+            team_id=team_id,
+            net_id=entity_id,
+            unit_type=getattr(ctx, "entity_type", 0) or 0,
+            pos=pos,
+            announce=False,
+        )
+        self._sync_to_active_client()
+
+        spawn_pos = ctx.player_pos
+        udp = ctx.session.udp_addr if ctx.session else None
+        return (
+            f"Entered game: client={ctx.client_id} entity={entity_id} team={team_id} "
+            f"pos=({spawn_pos[0]:.1f},{spawn_pos[1]:.1f},{spawn_pos[2]:.1f}) "
+            f"udp={'yes' if udp else 'no'}"
+        )
+
     def _cmd_spawn_full(self, args: list) -> str:
         """
         Force a full spawn sequence for the current client.
@@ -2339,6 +2479,11 @@ Examples:
             return f"spawn_full option parse error: {e}"
 
         name = self.session.username if self.session and self.session.username else "Player"
+        active_ctx = self.ctx
+        if active_ctx is None:
+            active_ctx, _ = self._get_active_client()
+            if active_ctx is not None:
+                self.ctx = active_ctx
 
         send_translation = True
         if send_world_stats and translation_override is None:
@@ -2447,8 +2592,40 @@ Examples:
         self.tcp_handler.send(build_reincarnate(0x11, "Spawn success"))
         self.tcp_handler.send(build_birth_notice(entity_id))
 
+        if active_ctx:
+            active_ctx.entity_id = entity_id
+            active_ctx.entity_type = vehicle_type
+            active_ctx.player_pos = (x, y, z)
+            active_ctx.player_vel = (0.0, 0.0, 0.0)
+            active_ctx.player_health = 1.0
+            active_ctx.player_energy = 1.0
+            active_ctx.known_entity_ids.add(entity_id)
+            active_ctx.world_collision_ref_pos = active_ctx.player_pos
+            active_ctx.world_collision_bounds_dirty = True
+            if active_ctx.weapon_system:
+                active_ctx.weapon_system.player_id = entity_id
+                active_ctx.weapon_system.team_id = team_id
+                active_ctx.weapon_system.player_pos = (x, y, z)
+
         if self.session:
             self.session.suppress_want_updates_payload = prior_suppress
+            self.session.player_id = entity_id
+            self.session.enter_game(entity_id, team_id)
+            self.session.last_spawn_time = time.monotonic()
+
+        if (
+            self.server
+            and active_ctx
+            and FEATURES.tick_loop_enabled
+            and (active_ctx.tick_thread is None or not active_ctx.tick_thread.is_alive())
+        ):
+            active_ctx.last_action_dump_time = time.monotonic()
+            active_ctx.tick_thread = threading.Thread(
+                target=self.server._tick_loop,
+                args=(active_ctx,),
+                daemon=True,
+            )
+            active_ctx.tick_thread.start()
 
         return ("Spawn sequence sent: team=%d entity=%d vehicle=%d behavior=%d pos=(%.1f,%.1f,%.1f) delay_ms=%d"
                 % (team_id, entity_id, vehicle_type, behavior_type, x, y, z, delay_ms))
@@ -3404,5 +3581,4 @@ Examples:
             int(time_ms),
             running.lower() in ('true', '1', 'yes'),
             int(round_time_ms),
-            int(extra),
         )
