@@ -187,6 +187,72 @@ def test_spawn_at_point_honors_clicked_pad_when_default_configured():
             os.environ["WULFRAM_SPAWN_POS"] = old_spawn_pos
 
 
+def test_map_entity_z_aligns_buried_entities_to_terrain():
+    """Map-state buildings/spawn points below terrain should be lifted to ground."""
+    server = WulframServer.__new__(WulframServer)
+    server.up_axis = "z"
+    server.terrain_height_offset = 5.0
+    server.terrain = SimpleNamespace(get_height=lambda x, y: 60.0)
+
+    z, ground_z, aligned = server._align_map_entity_z_to_terrain(2578.7, 3040.0, 63.72)
+
+    assert aligned is True
+    assert ground_z == 65.0
+    assert z == 65.0
+    print("test_map_entity_z_aligns_buried_entities_to_terrain: PASSED")
+    return True
+
+
+def test_map_entity_z_preserves_elevated_entities():
+    """Terrain alignment should not pull already-elevated map entries down."""
+    server = WulframServer.__new__(WulframServer)
+    server.up_axis = "z"
+    server.terrain_height_offset = 5.0
+    server.terrain = SimpleNamespace(get_height=lambda x, y: 0.0)
+
+    z, ground_z, aligned = server._align_map_entity_z_to_terrain(5150.1, 5241.3, 7.7)
+
+    assert aligned is False
+    assert ground_z == 5.0
+    assert z == 7.7
+    print("test_map_entity_z_preserves_elevated_entities: PASSED")
+    return True
+
+
+def test_pulse_shell_default_spawn_uses_recovered_muzzle_offset():
+    """Default pulse origin should stay near the tank, not raw shape-hardpoint scale."""
+    keys = [
+        "WULFRAM_PROJECTILE_SPAWN_MODE",
+        "WULFRAM_PROJECTILE_SPAWN_OFFSET",
+        "WULFRAM_PROJECTILE_BARREL_RIGHT",
+        "WULFRAM_PROJECTILE_BARREL_UP",
+    ]
+    old_env = {key: os.environ.get(key) for key in keys}
+    try:
+        for key in keys:
+            os.environ.pop(key, None)
+
+        ws = WeaponSystem()
+        ws.player_pos = (100.0, 200.0, 10.0)
+        ws.player_rot = (0.0, 0.0, 0.0)
+        ws.player_team = 2
+        ws.player_id = 1337
+
+        proj = ws._fire_pulse_cannon()
+
+        assert proj is not None
+        assert proj.pos == (105.5, 199.75, 11.25), proj.pos
+        assert proj.vel == (75.0, 0.0, -0.0), proj.vel
+        print("test_pulse_shell_default_spawn_uses_recovered_muzzle_offset: PASSED")
+        return True
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def test_remote_spawn_points_use_udp_not_tcp():
     """Remote spawn-point UPDATE_ARRAY should avoid the TCP stream."""
     old_transport = os.environ.get("WULFRAM_SPAWN_POINTS_TRANSPORT")
@@ -5471,6 +5537,12 @@ def main():
         test_decode_lp_string_empty,
         test_decode_lp_string_truncated,
         test_handlers_import,
+        test_spawn_override_wins_over_map_spawn_points,
+        test_spawn_at_point_honors_clicked_pad_when_default_configured,
+        test_map_entity_z_aligns_buried_entities_to_terrain,
+        test_map_entity_z_preserves_elevated_entities,
+        test_pulse_shell_default_spawn_uses_recovered_muzzle_offset,
+        test_remote_spawn_points_use_udp_not_tcp,
         test_send_initial_game_data_og_bootstrap_order,
         test_remote_want_updates_suppresses_empty_tcp_update_array,
         test_build_chat_message_comm_layout,

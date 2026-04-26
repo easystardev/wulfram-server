@@ -165,23 +165,22 @@ class WeaponSystem:
         except ValueError:
             self.heading_offset = 0.0
 
-        # Projectile spawn tuning via hardpoints (shape data).
-        # Hardpoint data is useful for tuning but not yet stable across maps/models.
-        # Default to simple forward offset from authoritative server pose.
-        self.projectile_spawn_mode = os.environ.get("WULFRAM_PROJECTILE_SPAWN_MODE", "auto").lower()
+        # Projectile spawn tuning.  Raw shape hardpoints are still opt-in: the
+        # recovered tank-local pulse muzzle is the safer default for OG parity.
+        self.projectile_spawn_mode = os.environ.get("WULFRAM_PROJECTILE_SPAWN_MODE", "offset").lower()
         self.projectile_hardpoint_name = os.environ.get("WULFRAM_PROJECTILE_HARDPOINT", "gun").strip()
         try:
-            self.projectile_spawn_offset = float(os.environ.get("WULFRAM_PROJECTILE_SPAWN_OFFSET", "2.0"))
+            self.projectile_spawn_offset = float(os.environ.get("WULFRAM_PROJECTILE_SPAWN_OFFSET", "5.5"))
         except ValueError:
-            self.projectile_spawn_offset = 2.0
+            self.projectile_spawn_offset = 5.5
         try:
-            self.projectile_barrel_right = float(os.environ.get("WULFRAM_PROJECTILE_BARREL_RIGHT", "0.0"))
+            self.projectile_barrel_right = float(os.environ.get("WULFRAM_PROJECTILE_BARREL_RIGHT", "-0.25"))
         except ValueError:
-            self.projectile_barrel_right = 0.0
+            self.projectile_barrel_right = -0.25
         try:
-            self.projectile_barrel_up = float(os.environ.get("WULFRAM_PROJECTILE_BARREL_UP", "0.2"))
+            self.projectile_barrel_up = float(os.environ.get("WULFRAM_PROJECTILE_BARREL_UP", "1.25"))
         except ValueError:
-            self.projectile_barrel_up = 0.2
+            self.projectile_barrel_up = 1.25
         try:
             self.shape_coord_scale = float(os.environ.get("WULFRAM_SHAPE_COORD_SCALE", "65536.0"))
         except ValueError:
@@ -819,10 +818,12 @@ class WeaponSystem:
             spawn_mode = self.projectile_spawn_mode
             if spawn_mode == "auto":
                 spawn_mode = "hardpoint"
+            used_hardpoint = False
             if spawn_mode == "hardpoint":
                 shape_name = self.player_shape_override or (f"tank_{self.player_team}" if self.player_team in (1, 2) else "tank_1")
                 hp = self._get_shape_hardpoint(shape_name, self.projectile_hardpoint_name)
                 if hp is not None:
+                    used_hardpoint = True
                     _, hardpoint_local = hp
                     model_x, model_y, model_z = hardpoint_local
                     if self.hardpoint_origin_mode in ("base", "min_y"):
@@ -857,6 +858,19 @@ class WeaponSystem:
                     spawn_x += spawn_offset * fwd_x
                     spawn_y += spawn_offset * fwd_y
                     spawn_z += spawn_offset * fwd_z
+            if not used_hardpoint:
+                barrel_right = self.projectile_barrel_right
+                barrel_up = self.projectile_barrel_up
+                if barrel_right != 0.0 or barrel_up != 0.0:
+                    cy, sy = math.cos(yaw), math.sin(yaw)
+                    if self.up_axis == "z":
+                        spawn_x += barrel_right * (-sy)
+                        spawn_y += barrel_right * cy
+                        spawn_z += barrel_up
+                    else:
+                        spawn_x += barrel_right * (-sy)
+                        spawn_y += barrel_up
+                        spawn_z += barrel_right * cy
 
         entity_id = self.next_entity_id
         self.next_entity_id += 1

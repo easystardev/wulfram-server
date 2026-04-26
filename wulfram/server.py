@@ -543,7 +543,6 @@ class WulframServer:
                 "[COLLISION] Mesh building collision unavailable: "
                 f"{self._building_collision.last_error}"
             )
-        self._load_map_buildings()
         gravity_env = os.environ.get("WULFRAM_GRAVITY")
         try:
             self.gravity = float(gravity_env) if gravity_env is not None else -50.0
@@ -575,6 +574,7 @@ class WulframServer:
                 "[COLLISION] Terrain grid collision initialized "
                 f"with {self._terrain_grid_collision.sector_count} sectors"
             )
+        self._load_map_buildings()
         world_bound_env = os.environ.get("WULFRAM_WORLD_BOUND")
         try:
             # Clamp world X/Y to the protocol position domain by default (VEC_POS max=8192).
@@ -4030,6 +4030,26 @@ class WulframServer:
 
         return rows, cols, size_x, size_y
 
+    def _terrain_ground_z_at(self, x: float, y: float) -> Optional[float]:
+        """Return the tank/building ground Z for map X/Y when terrain is loaded."""
+        if getattr(self, "up_axis", "z") != "z":
+            return None
+        terrain = getattr(self, "terrain", None)
+        if terrain is None:
+            return None
+        return float(terrain.get_height(x, y)) + float(getattr(self, "terrain_height_offset", 0.0))
+
+    def _align_map_entity_z_to_terrain(
+        self,
+        x: float,
+        y: float,
+        z: float,
+    ) -> tuple[float, Optional[float], bool]:
+        ground_z = self._terrain_ground_z_at(x, y)
+        if ground_z is None or z >= ground_z - 0.01:
+            return z, ground_z, False
+        return ground_z, ground_z, True
+
     def _load_map_spawn_points(self) -> Optional[list]:
         """Load repair pad spawn points from the current map state file."""
         if self.map_spawn_points:
@@ -4053,6 +4073,7 @@ class WulframServer:
             return None
 
         points = []
+        aligned_count = 0
         try:
             lines = state_path.read_text(encoding="utf-8", errors="ignore").splitlines()
         except OSError:
@@ -4083,9 +4104,12 @@ class WulframServer:
                 team = int(parts[data_start])
                 x = float(parts[data_start + 1])
                 y = float(parts[data_start + 2])
-                z = float(parts[data_start + 3])
+                raw_z = float(parts[data_start + 3])
             except (ValueError, IndexError):
                 continue
+            z, terrain_z, aligned = self._align_map_entity_z_to_terrain(x, y, raw_z)
+            if aligned:
+                aligned_count += 1
 
             variant = 1
             rot = (0.0, 0.0, 0.0)
@@ -4104,7 +4128,7 @@ class WulframServer:
                 except ValueError:
                     variant = 1
 
-            points.append({
+            point = {
                 "oid": oid,
                 "team": team,
                 "variant": variant,
@@ -4112,11 +4136,16 @@ class WulframServer:
                 "y": y,
                 "z": z,
                 "rot": rot,
-            })
+            }
+            if aligned:
+                point["raw_z"] = raw_z
+                point["terrain_z"] = terrain_z
+            points.append(point)
             oid += 1
 
         if points:
-            print(f"[MAP] Loaded {len(points)} spawn points from {state_path}")
+            suffix = f" ({aligned_count} terrain-aligned)" if aligned_count else ""
+            print(f"[MAP] Loaded {len(points)} spawn points from {state_path}{suffix}")
             self.map_spawn_points = points
 
         return self.map_spawn_points
@@ -4167,6 +4196,7 @@ class WulframServer:
             return
 
         buildings = {}
+        aligned_count = 0
         oid = 10001  # Offset from spawn point OIDs (5001+)
         for line in lines:
             line = line.strip()
@@ -4193,9 +4223,12 @@ class WulframServer:
                 team = int(parts[data_start])
                 x = float(parts[data_start + 1])
                 y = float(parts[data_start + 2])
-                z = float(parts[data_start + 3])
+                raw_z = float(parts[data_start + 3])
             except (ValueError, IndexError):
                 continue
+            z, _terrain_z, aligned = self._align_map_entity_z_to_terrain(x, y, raw_z)
+            if aligned:
+                aligned_count += 1
 
             heading = 0.0
             if len(parts) > data_start + 6:
@@ -4238,7 +4271,8 @@ class WulframServer:
 
         self._rebuild_static_world_raycast_index()
         if buildings:
-            print(f"[MAP] Loaded {len(buildings)} building entities for collision from {state_path}")
+            suffix = f" ({aligned_count} terrain-aligned)" if aligned_count else ""
+            print(f"[MAP] Loaded {len(buildings)} building entities for collision from {state_path}{suffix}")
 
     def get_spawn_points(self) -> list:
         """Return spawn point list for current map/config."""
