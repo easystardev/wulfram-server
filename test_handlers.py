@@ -23,7 +23,7 @@ from wulfram.handlers import (
     _send_spawn_points_for_client,
 )
 from wulfram.client import ClientContext
-from wulfram.control import ControlServer
+from wulfram.control import ControlServer, build_input_sync_diagnosis
 from wulfram.session import Session, Phase, FEATURES
 from wulfram.server import WulframServer, _StaticWorldRayNode
 from wulfram.building_collision import BuildingCollisionAssets
@@ -114,6 +114,51 @@ def test_handlers_import():
         send_udp_ack,
     )
     print("test_handlers_import: PASSED")
+    return True
+
+
+def test_input_sync_diagnosis_distinguishes_idle_snapback_from_correction_failure():
+    """Live telemetry should call out idle controls while corrections are active."""
+    diagnosis = build_input_sync_diagnosis(
+        phase="IN_GAME",
+        last_input={"fwd": 0.0, "strafe": 0.0, "turn": 0.0, "thrust": 0.824},
+        last_action_age_s=0.1,
+        last_nonzero_move_input_age_s=90.0,
+        last_position_change_age_s=80.0,
+        last_state_request_age_s=0.2,
+        last_state_sync_reply_age_s=0.3,
+        state_requests=100,
+        state_sync_replies=99,
+        state_sync_view_replies=99,
+    )
+
+    assert diagnosis["status"] == "idle_input_authoritative_snapback"
+    assert diagnosis["corrections_active"] is True
+    assert diagnosis["drive_idle"] is True
+    assert diagnosis["movement_input_recent"] is False
+    print("test_input_sync_diagnosis_distinguishes_idle_snapback_from_correction_failure: PASSED")
+    return True
+
+
+def test_input_sync_diagnosis_reports_movement_without_targeted_corrections():
+    """Movement packets without reply traffic should stay visible as sync debt."""
+    diagnosis = build_input_sync_diagnosis(
+        phase="IN_GAME",
+        last_input={"fwd": 1.0, "strafe": 0.0, "turn": 0.0},
+        last_action_age_s=0.1,
+        last_nonzero_move_input_age_s=0.1,
+        last_position_change_age_s=0.2,
+        last_state_request_age_s=30.0,
+        last_state_sync_reply_age_s=None,
+        state_requests=0,
+        state_sync_replies=0,
+        state_sync_view_replies=0,
+    )
+
+    assert diagnosis["status"] == "movement_without_targeted_corrections"
+    assert diagnosis["corrections_active"] is False
+    assert diagnosis["movement_input_recent"] is True
+    print("test_input_sync_diagnosis_reports_movement_without_targeted_corrections: PASSED")
     return True
 
 
@@ -5537,6 +5582,8 @@ def main():
         test_decode_lp_string_empty,
         test_decode_lp_string_truncated,
         test_handlers_import,
+        test_input_sync_diagnosis_distinguishes_idle_snapback_from_correction_failure,
+        test_input_sync_diagnosis_reports_movement_without_targeted_corrections,
         test_spawn_override_wins_over_map_spawn_points,
         test_spawn_at_point_honors_clicked_pad_when_default_configured,
         test_map_entity_z_aligns_buried_entities_to_terrain,

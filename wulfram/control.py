@@ -41,6 +41,71 @@ from .packets import (
 )
 
 
+def build_input_sync_diagnosis(
+    *,
+    phase: str,
+    last_input: dict,
+    last_action_age_s: Optional[float],
+    last_nonzero_move_input_age_s: Optional[float],
+    last_position_change_age_s: Optional[float],
+    last_state_request_age_s: Optional[float],
+    last_state_sync_reply_age_s: Optional[float],
+    state_requests: int,
+    state_sync_replies: int,
+    state_sync_view_replies: int,
+) -> dict:
+    """Summarize whether a live OG sync issue is packet-side or input-side."""
+
+    def _recent(age: Optional[float], limit: float) -> bool:
+        return age is not None and age <= limit
+
+    def _abs_input(name: str) -> float:
+        try:
+            return abs(float(last_input.get(name, 0.0)))
+        except (TypeError, ValueError):
+            return 0.0
+
+    action_stream_active = _recent(last_action_age_s, 2.0)
+    corrections_active = (
+        state_requests > 0
+        and state_sync_replies > 0
+        and state_sync_view_replies > 0
+        and _recent(last_state_request_age_s, 3.0)
+        and _recent(last_state_sync_reply_age_s, 3.0)
+    )
+    movement_input_recent = _recent(last_nonzero_move_input_age_s, 6.0)
+    position_recent = _recent(last_position_change_age_s, 6.0)
+    drive_idle = (
+        _abs_input("fwd") <= 0.05
+        and _abs_input("strafe") <= 0.05
+        and _abs_input("turn") <= 0.05
+    )
+
+    if phase != "IN_GAME":
+        status = "not_in_game"
+    elif not action_stream_active:
+        status = "no_recent_action_packets"
+    elif corrections_active and movement_input_recent:
+        status = "moving_with_corrections"
+    elif corrections_active and drive_idle:
+        status = "idle_input_authoritative_snapback"
+    elif action_stream_active and movement_input_recent and not corrections_active:
+        status = "movement_without_targeted_corrections"
+    elif action_stream_active and drive_idle:
+        status = "idle_input_no_targeted_corrections"
+    else:
+        status = "undetermined"
+
+    return {
+        "status": status,
+        "action_stream_active": action_stream_active,
+        "corrections_active": corrections_active,
+        "movement_input_recent": movement_input_recent,
+        "position_recent": position_recent,
+        "drive_idle": drive_idle,
+    }
+
+
 class ControlServer:
     """
     Control plane server for packet injection.
@@ -1506,6 +1571,54 @@ Examples:
                 if not ctx or not ctx.running:
                     continue
                 phase = ctx.session.phase.name if ctx.session else "NONE"
+                telemetry = {
+                    "action_packets": getattr(ctx, "action_packet_count", 0),
+                    "action_updates": getattr(ctx, "action_update_count", 0),
+                    "action_dumps": getattr(ctx, "action_dump_count", 0),
+                    "input_feedback": getattr(ctx, "input_feedback_count", 0),
+                    "nonzero_move_inputs": getattr(ctx, "nonzero_move_input_count", 0),
+                    "last_action_type": getattr(ctx, "last_action_packet_type", ""),
+                    "last_action_age_s": _age(getattr(ctx, "last_action_packet_time", 0.0)),
+                    "last_nonzero_move_input_age_s": _age(
+                        getattr(ctx, "last_nonzero_move_input_time", 0.0)
+                    ),
+                    "last_input_feedback_age_s": _age(getattr(ctx, "last_input_feedback_time", 0.0)),
+                    "last_position_change_age_s": _age(getattr(ctx, "last_position_update", 0.0)),
+                    "position_changes": getattr(ctx, "position_change_count", 0),
+                    "last_input": getattr(ctx, "last_decoded_input", {}) or {},
+                    "state_requests": getattr(ctx, "state_request_count", 0),
+                    "state_sync_replies": getattr(ctx, "state_sync_reply_count", 0),
+                    "state_sync_view_replies": getattr(ctx, "state_sync_view_reply_count", 0),
+                    "last_state_request_age_s": _age(getattr(ctx, "last_state_request_time", 0.0)),
+                    "last_state_request_id": getattr(ctx, "last_state_request_id", 0),
+                    "last_state_request_len": getattr(ctx, "last_state_request_len", 0),
+                    "last_state_sync_reply_age_s": _age(
+                        getattr(ctx, "last_state_sync_reply_time", 0.0)
+                    ),
+                    "last_state_sync_tick": getattr(ctx, "last_state_sync_reply_tick", 0),
+                    "last_state_sync_replay_timestamp": getattr(
+                        ctx,
+                        "last_state_sync_replay_timestamp",
+                        0,
+                    ),
+                    "last_state_sync_snapshot_source": getattr(
+                        ctx,
+                        "last_state_sync_snapshot_source",
+                        "",
+                    ),
+                }
+                telemetry["diagnosis"] = build_input_sync_diagnosis(
+                    phase=phase,
+                    last_input=telemetry["last_input"],
+                    last_action_age_s=telemetry["last_action_age_s"],
+                    last_nonzero_move_input_age_s=telemetry["last_nonzero_move_input_age_s"],
+                    last_position_change_age_s=telemetry["last_position_change_age_s"],
+                    last_state_request_age_s=telemetry["last_state_request_age_s"],
+                    last_state_sync_reply_age_s=telemetry["last_state_sync_reply_age_s"],
+                    state_requests=telemetry["state_requests"],
+                    state_sync_replies=telemetry["state_sync_replies"],
+                    state_sync_view_replies=telemetry["state_sync_view_replies"],
+                )
                 entry = {
                     "client_id": ctx.client_id,
                     "entity_id": ctx.session.entity_id if ctx.session else None,
@@ -1521,42 +1634,7 @@ Examples:
                     "aim_yaw_deg": round(math.degrees(ctx.player_aim_yaw), 1),
                     "aim_pitch_deg": round(math.degrees(ctx.player_aim_pitch), 1),
                     "health_pct": round(ctx.player_health * 100),
-                    "telemetry": {
-                        "action_packets": getattr(ctx, "action_packet_count", 0),
-                        "action_updates": getattr(ctx, "action_update_count", 0),
-                        "action_dumps": getattr(ctx, "action_dump_count", 0),
-                        "input_feedback": getattr(ctx, "input_feedback_count", 0),
-                        "nonzero_move_inputs": getattr(ctx, "nonzero_move_input_count", 0),
-                        "last_action_type": getattr(ctx, "last_action_packet_type", ""),
-                        "last_action_age_s": _age(getattr(ctx, "last_action_packet_time", 0.0)),
-                        "last_nonzero_move_input_age_s": _age(
-                            getattr(ctx, "last_nonzero_move_input_time", 0.0)
-                        ),
-                        "last_input_feedback_age_s": _age(getattr(ctx, "last_input_feedback_time", 0.0)),
-                        "last_position_change_age_s": _age(getattr(ctx, "last_position_update", 0.0)),
-                        "position_changes": getattr(ctx, "position_change_count", 0),
-                        "last_input": getattr(ctx, "last_decoded_input", {}) or {},
-                        "state_requests": getattr(ctx, "state_request_count", 0),
-                        "state_sync_replies": getattr(ctx, "state_sync_reply_count", 0),
-                        "state_sync_view_replies": getattr(ctx, "state_sync_view_reply_count", 0),
-                        "last_state_request_age_s": _age(getattr(ctx, "last_state_request_time", 0.0)),
-                        "last_state_request_id": getattr(ctx, "last_state_request_id", 0),
-                        "last_state_request_len": getattr(ctx, "last_state_request_len", 0),
-                        "last_state_sync_reply_age_s": _age(
-                            getattr(ctx, "last_state_sync_reply_time", 0.0)
-                        ),
-                        "last_state_sync_tick": getattr(ctx, "last_state_sync_reply_tick", 0),
-                        "last_state_sync_replay_timestamp": getattr(
-                            ctx,
-                            "last_state_sync_replay_timestamp",
-                            0,
-                        ),
-                        "last_state_sync_snapshot_source": getattr(
-                            ctx,
-                            "last_state_sync_snapshot_source",
-                            "",
-                        ),
-                    },
+                    "telemetry": telemetry,
                 }
                 clients.append(entry)
 
@@ -1589,11 +1667,13 @@ Examples:
                 f" sync={telemetry.get('state_sync_replies')}/"
                 f"{telemetry.get('state_sync_view_replies')}"
             )
+            diagnosis = telemetry.get("diagnosis") or {}
+            diagnosis_str = f" diag={diagnosis.get('status')}" if diagnosis.get("status") else ""
             lines.append(
                 f"Client {c['client_id']} (entity {c['entity_id']}) [{c['phase']}]: "
                 f"pos=({x:.1f}, {y:.1f}, {z:.1f}) "
                 f"heading={c['heading_deg']}° aim={c['aim_yaw_deg']}°"
-                f"{vel_str}{hp_str}{input_str}{sync_str}"
+                f"{vel_str}{hp_str}{input_str}{sync_str}{diagnosis_str}"
             )
         return "\n".join(lines)
 
