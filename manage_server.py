@@ -22,6 +22,26 @@ CLIENT_ERROR_LOG = Path(__file__).parent.parent / "slurpysoft-wulfram" / "errorl
 PORT = 2627
 
 
+def _windows_pid_exists(pid):
+    """Return whether a Windows process exists without relying on tasklist."""
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    handle = ctypes.windll.kernel32.OpenProcess(
+        PROCESS_QUERY_LIMITED_INFORMATION,
+        False,
+        int(pid),
+    )
+    if not handle:
+        return False
+    try:
+        exit_code = wintypes.DWORD()
+        if not ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return True
+        return exit_code.value == STILL_ACTIVE
+    finally:
+        ctypes.windll.kernel32.CloseHandle(handle)
+
+
 def kill_processes_on_port(port):
     """Kill any processes using the specified port."""
     if sys.platform == 'win32':
@@ -74,11 +94,7 @@ def get_running_pid():
             pid = int(PID_FILE.read_text().strip())
             # Check if process exists
             if sys.platform == 'win32':
-                result = subprocess.run(
-                    ['tasklist', '/FI', f'PID eq {pid}'],
-                    capture_output=True, text=True
-                )
-                if str(pid) in result.stdout:
+                if _windows_pid_exists(pid):
                     return pid
             else:
                 os.kill(pid, 0)
@@ -187,16 +203,21 @@ def start_server(foreground=False):
 
         with _open_shared_log_file(LOG_FILE) as log:
             if sys.platform == 'win32':
+                creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+                if hasattr(subprocess, "DETACHED_PROCESS"):
+                    creationflags |= subprocess.DETACHED_PROCESS
                 proc = subprocess.Popen(
                     [sys.executable, '-u', str(SERVER_SCRIPT)],
+                    stdin=subprocess.DEVNULL,
                     stdout=log,
                     stderr=subprocess.STDOUT,
-                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
-                    close_fds=False
+                    creationflags=creationflags,
+                    close_fds=True
                 )
             else:
                 proc = subprocess.Popen(
                     [sys.executable, '-u', str(SERVER_SCRIPT)],
+                    stdin=subprocess.DEVNULL,
                     stdout=log,
                     stderr=subprocess.STDOUT,
                     start_new_session=True

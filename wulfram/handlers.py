@@ -236,45 +236,23 @@ def _send_minimal_login_bootstrap(server: "WulframServer", ctx: "ClientContext")
 
 
 def _send_og_login_bootstrap(server: "WulframServer", ctx: "ClientContext") -> None:
-    """Send the empirical/decompile-aligned OG login bootstrap."""
+    """Send the OG login bootstrap up to the team-select screen.
+
+    Keep this deliberately narrow.  The original client needs the spectator
+    PLAYER identity to finish the "processing player map" step, but it runs
+    disconnect/map cleanup paths from later gameplay bootstrap packets.
+    Sending GAME_CLOCK, roster, translation, or WORLD_STATS before team
+    selection can leave it half-spawned or bounce it back to the address
+    screen when the user clicks a team.
+    """
     session = ctx.session
     tcp = ctx.tcp_handler
     if session.player_id == 0:
         session.player_id = ctx.entity_id
 
-    player_id = session.player_id or ctx.entity_id
-    name = session.username or f"Player{ctx.client_id}"
-    team_hint = session.team_id if session.team_id else 1
-
     tcp.send(build_team_info())
     tcp.send(build_login_status(8, is_donor=True))
-    tcp.send(build_player(entity_id=player_id, spectator=False))
-    tcp.send(build_game_clock())
-    tcp.send(build_motd("Welcome to Wulfram!"))
-
-    if FEATURES.send_behavior_packet and not session.behavior_sent:
-        tcp.send(build_behavior_packet())
-        session.behavior_sent = True
-
-    if FEATURES.send_translation_packet and not session.translation_sent:
-        tcp.send(build_translation_packet())
-        session.translation_sent = True
-
-    if not session.roster_sent:
-        tcp.send(build_add_to_roster(
-            player_id=player_id,
-            entity_id=player_id,
-            name=name,
-            team=team_hint,
-        ))
-        session.roster_sent = True
-
-    # The OG client expects WORLD_STATS during the login/bootstrap edge. Sending
-    # it again immediately after a team click re-runs the client's map cleanup
-    # path and can dump back to the protocol-mismatch screen.
-    if not session.world_stats_sent:
-        tcp.send(server.build_world_stats_packet())
-        session.world_stats_sent = True
+    tcp.send(build_player(entity_id=session.player_id, spectator=True))
 
 
 # ============ TCP Handlers ============

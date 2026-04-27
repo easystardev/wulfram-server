@@ -264,6 +264,32 @@ def test_map_entity_z_preserves_elevated_entities():
     return True
 
 
+def test_control_pose_reset_updates_ground_override():
+    """Control-plane exact pose resets should move the local ground clamp too."""
+    control = ControlServer.__new__(ControlServer)
+    server = SimpleNamespace(
+        spawn_sets_ground_level=True,
+        up_axis="z",
+        _get_network_tick=lambda ctx: 123,
+    )
+    control.server = server
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("127.0.0.1", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    ctx.ground_level_override = 65.0
+
+    control._apply_exact_client_pose(ctx, (2578.7, 3040.0, 63.7244))
+
+    assert ctx.player_pos == (2578.7, 3040.0, 63.7244)
+    assert ctx.ground_level_override == 63.7244
+    assert ctx.player_vel == (0.0, 0.0, 0.0)
+    print("test_control_pose_reset_updates_ground_override: PASSED")
+    return True
+
+
 def test_pulse_shell_default_spawn_uses_recovered_muzzle_offset():
     """Default pulse origin should stay near the tank, not raw shape-hardpoint scale."""
     keys = [
@@ -436,7 +462,7 @@ def test_remote_spawn_create_update_array_avoids_tcp():
 
 
 def test_send_initial_game_data_og_bootstrap_order():
-    """Remote OG bootstrap should match the verified packet order."""
+    """Remote OG bootstrap should stop at the team-select-safe packet set."""
     old_mode = os.environ.get("WULFRAM_LOGIN_BOOTSTRAP")
     os.environ["WULFRAM_LOGIN_BOOTSTRAP"] = "og"
 
@@ -464,11 +490,13 @@ def test_send_initial_game_data_og_bootstrap_order():
         send_initial_game_data(server, ctx)
 
         opcodes = [payload[0] for payload in ctx.tcp_handler.sent]
-        assert opcodes == [0x28, 0x22, 0x17, 0x2F, 0x23, 0x24, 0x32, 0x1A, 0x16], opcodes
-        assert session.behavior_sent is True
-        assert session.translation_sent is True
-        assert session.roster_sent is True
-        assert session.world_stats_sent is True
+        assert opcodes == [0x28, 0x22, 0x17], opcodes
+        assert session.player_id == 1337
+        assert ctx.tcp_handler.sent[-1][-1] == 0x01  # spectator
+        assert session.behavior_sent is False
+        assert session.translation_sent is False
+        assert session.roster_sent is False
+        assert session.world_stats_sent is False
         print("test_send_initial_game_data_og_bootstrap_order: PASSED")
         return True
     finally:
@@ -939,7 +967,7 @@ def test_remote_state_sync_reply_stays_safe_without_post_spawn_input_after_delay
 
 
 def test_remote_state_sync_reply_emits_view_update_with_request_timestamp():
-    """Remote STATE_REQUEST replies should include a replay VIEW_UPDATE companion."""
+    """Remote OG STATE_REQUEST replies should preserve the replay/request timestamp."""
     server = WulframServer.__new__(WulframServer)
     server.update_local_state_mode = "wf"
     server.update_entity_vitals = False
@@ -1024,7 +1052,86 @@ def test_remote_state_sync_reply_emits_view_update_with_request_timestamp():
     assert view_entities[0].velocity is not None
     assert view_entities[0].rotation is not None
     assert view_entities[0].rotation == entities[0].rotation
+    assert ctx.last_state_sync_update_len == len(update_payload)
+    assert ctx.last_state_sync_view_len == len(view_payload)
+    assert ctx.last_state_sync_update_has_local_state is True
+    assert ctx.last_state_sync_view_has_local_state is True
+    assert ctx.last_state_sync_view_timestamp == 0x89ABCDEF
+    assert ctx.last_state_sync_reason == "test"
+    assert ctx.last_state_sync_update_hex == update_payload[:32].hex()
+    assert ctx.last_state_sync_view_hex == view_payload[:32].hex()
     print("test_remote_state_sync_reply_emits_view_update_with_request_timestamp: PASSED")
+    return True
+
+
+def test_loopback_state_sync_reply_keeps_request_timestamp():
+    """Loopback/Python STATE_REQUEST replies keep request-id timestamps for latency correlation."""
+    server = WulframServer.__new__(WulframServer)
+    server.update_local_state_mode = "wf"
+    server.update_entity_vitals = False
+    server.view_update_local_stats = False
+    server.view_update_entity_vitals = False
+    server.remote_full_local_state_delay = 2.0
+    server.local_state_weapon_type = 0
+    server.spawn_tank_weapon_type = 2
+    server.local_state_ammo_override = False
+    server.local_state_ammo_from_behavior = True
+    server.local_state_primary_override = ""
+    server.local_state_secondary_override = ""
+    server.local_state_turret_bits = 16
+    server.local_state_turret_max = 6.3
+    server.local_state_turret_range = 12.6
+    server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
+    server._get_health_value = lambda ctx: 1.0
+    server._get_energy_value = lambda ctx: 1.0
+    server._to_client_pos = lambda pos: pos
+    server._get_network_tick = lambda ctx: 0x12345678
+    server.debug_viewpoint = False
+    server.debug_udp_raw = False
+    server.pktlog = SimpleNamespace(enabled=False)
+    captured = []
+    server.udp_handler = SimpleNamespace(send_to=lambda payload, addr: captured.append((payload, addr)))
+
+    session = Session()
+    session.translation_ack_received = True
+    session.in_game = True
+    session.entity_id = 0x14EA
+    session.udp_addr = ("127.0.0.1", 50000)
+    session.last_spawn_time = time.monotonic() - 5.0
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("127.0.0.1", 50000),
+        session=session,
+        entity_id=0x14EA,
+    )
+    ctx.player_pos = (4950.0, 5100.0, 5.0)
+    ctx.player_vel = (0.0, 0.0, 0.0)
+    ctx.player_pose = {"roll": 0.0, "pitch": 0.0}
+    ctx.player_heading = 0.0
+    ctx.player_yaw = 0.125
+    ctx.last_state_sync_send = 0.0
+
+    server._send_state_sync_snapshot(
+        ctx,
+        include_view_update=True,
+        replay_timestamp=0x89ABCDEF,
+        reason="test",
+    )
+
+    assert len(captured) == 2, captured
+    view_payload, view_addr = captured[1]
+    assert view_addr == ("127.0.0.1", 50000)
+    assert view_payload[0] == 0x0F
+    timestamp, view_tick, _view_local_state, view_entities = decode_view_update(
+        view_payload,
+        behavior_config=parse_behavior(build_behavior_packet()),
+    )
+    assert timestamp == 0x89ABCDEF
+    assert view_tick == 0x12345678
+    assert len(view_entities) == 1
+    assert view_entities[0].entity_id == 0x14EA
+    assert view_entities[0].position is not None
+    print("test_loopback_state_sync_reply_keeps_request_timestamp: PASSED")
     return True
 
 
@@ -4029,6 +4136,57 @@ def test_building_collision_skips_aabb_for_mesh_backed_building():
     return True
 
 
+def test_repair_pad_collision_does_not_block_vehicle_movement():
+    """Repair pads are service/spawn pads, not solid vehicle blockers."""
+    old_env = os.environ.pop("WULFRAM_REPAIR_PAD_BLOCKS_VEHICLES", None)
+    try:
+        server = WulframServer.__new__(WulframServer)
+        server._building_entities = {
+            10001: SimpleNamespace(
+                x=100.0,
+                y=100.0,
+                z=5.0,
+                entity_type=EntityType.REPAIR_BUILDING,
+                team_id=1,
+                heading=0.0,
+            )
+        }
+        server._building_collision = SimpleNamespace(
+            available=True,
+            has_collision_model=lambda entity_type, team_id: True,
+            test_sphere_collision=lambda building, sphere_pos, sphere_radius: (
+                10.0,
+                (1.0, 0.0, 0.0),
+            ),
+        )
+        server._snapshot_in_game_clients = lambda: []
+
+        ctx = ClientContext(
+            client_id=1,
+            client_addr=("10.10.10.2", 50000),
+            session=Session(),
+            entity_id=0x14EA,
+        )
+
+        px, py, vx, vy = server._check_building_collisions(
+            ctx,
+            100.0,
+            100.0,
+            5.0,
+            3.0,
+            4.0,
+        )
+
+        assert (px, py, vx, vy) == (100.0, 100.0, 3.0, 4.0), (px, py, vx, vy)
+        assert ctx.debug_last_collision == {}, ctx.debug_last_collision
+    finally:
+        if old_env is not None:
+            os.environ["WULFRAM_REPAIR_PAD_BLOCKS_VEHICLES"] = old_env
+
+    print("test_repair_pad_collision_does_not_block_vehicle_movement: PASSED")
+    return True
+
+
 def test_building_collision_team_variant_matches_client_helper():
     """Server building collision must resolve the same team variant as the client."""
     assert BuildingCollisionAssets.get_model_name(EntityType.PAD, 1) == "skypump_2"
@@ -5621,6 +5779,7 @@ def main():
         test_spawn_at_point_honors_clicked_pad_when_default_configured,
         test_map_entity_z_aligns_buried_entities_to_terrain,
         test_map_entity_z_preserves_elevated_entities,
+        test_control_pose_reset_updates_ground_override,
         test_pulse_shell_default_spawn_uses_recovered_muzzle_offset,
         test_remote_spawn_points_use_udp_not_tcp,
         test_send_initial_game_data_og_bootstrap_order,
@@ -5634,6 +5793,7 @@ def main():
         test_remote_state_sync_reply_stays_spawn_safe_after_spawn_delay,
         test_remote_state_sync_reply_stays_safe_without_post_spawn_input_after_delay,
         test_remote_state_sync_reply_emits_view_update_with_request_timestamp,
+        test_loopback_state_sync_reply_keeps_request_timestamp,
         test_remote_state_sync_reply_uses_request_aligned_authoritative_pose,
         test_remote_promoted_heartbeat_stays_short_form_safe,
         test_remote_state_sync_reply_keeps_full_motion_when_stable,
@@ -5697,6 +5857,7 @@ def main():
         test_model_collision_returns_first_contact_in_grid_order,
         test_triangle_cbsp_contact_returns_first_leaf_hit,
         test_building_collision_skips_aabb_for_mesh_backed_building,
+        test_repair_pad_collision_does_not_block_vehicle_movement,
         test_building_collision_team_variant_matches_client_helper,
         test_server_team_model_name_matches_client_helper,
         test_effective_inactivity_timeout_extends_remote_ingame_clients,

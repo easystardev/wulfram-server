@@ -218,6 +218,13 @@ class ControlServer:
         ctx.player_pose["pitch"] = 0.0
         ctx.player_pose["yaw"] = -heading
         ctx.player_pose["last_tick"] = self.server._get_network_tick(ctx) if self.server else 0
+        if self.server and getattr(self.server, "spawn_sets_ground_level", False):
+            if getattr(self.server, "up_axis", "z") == "z":
+                ctx.ground_level_override = pz
+            else:
+                ctx.ground_level_override = py
+        else:
+            ctx.ground_level_override = None
 
         if ctx.weapon_system:
             ctx.weapon_system.player_pos = ctx.player_pos
@@ -1575,6 +1582,26 @@ Examples:
                     "action_packets": getattr(ctx, "action_packet_count", 0),
                     "action_updates": getattr(ctx, "action_update_count", 0),
                     "action_dumps": getattr(ctx, "action_dump_count", 0),
+                    "action_update_decode_fails": getattr(
+                        ctx,
+                        "action_update_decode_fail_count",
+                        0,
+                    ),
+                    "action_dump_decode_fails": getattr(
+                        ctx,
+                        "action_dump_decode_fail_count",
+                        0,
+                    ),
+                    "last_action_update_decode_fail_hex": getattr(
+                        ctx,
+                        "last_action_update_decode_fail_hex",
+                        "",
+                    ),
+                    "last_action_dump_decode_fail_hex": getattr(
+                        ctx,
+                        "last_action_dump_decode_fail_hex",
+                        "",
+                    ),
                     "input_feedback": getattr(ctx, "input_feedback_count", 0),
                     "nonzero_move_inputs": getattr(ctx, "nonzero_move_input_count", 0),
                     "last_action_type": getattr(ctx, "last_action_packet_type", ""),
@@ -1606,6 +1633,34 @@ Examples:
                         "last_state_sync_snapshot_source",
                         "",
                     ),
+                    "last_state_sync_reason": getattr(ctx, "last_state_sync_reason", ""),
+                    "last_state_sync_update_len": getattr(ctx, "last_state_sync_update_len", 0),
+                    "last_state_sync_view_len": getattr(ctx, "last_state_sync_view_len", 0),
+                    "last_state_sync_update_has_local_state": getattr(
+                        ctx,
+                        "last_state_sync_update_has_local_state",
+                        False,
+                    ),
+                    "last_state_sync_view_has_local_state": getattr(
+                        ctx,
+                        "last_state_sync_view_has_local_state",
+                        False,
+                    ),
+                    "last_state_sync_view_timestamp": getattr(
+                        ctx,
+                        "last_state_sync_view_timestamp",
+                        0,
+                    ),
+                    "last_state_sync_update_hex": getattr(ctx, "last_state_sync_update_hex", ""),
+                    "last_state_sync_view_hex": getattr(ctx, "last_state_sync_view_hex", ""),
+                    "last_damage_age_s": _age(getattr(ctx, "last_damage_time", 0.0)),
+                    "last_damage_source": getattr(ctx, "last_damage_source", ""),
+                    "last_damage_amount": getattr(ctx, "last_damage_amount", 0.0),
+                    "last_damage_old_health": getattr(ctx, "last_damage_old_health", 0.0),
+                    "last_damage_new_health": getattr(ctx, "last_damage_new_health", 0.0),
+                    "last_controller": getattr(ctx, "debug_last_controller_step", {}) or {},
+                    "last_collision": getattr(ctx, "debug_last_collision", {}) or {},
+                    "last_motion_collision": getattr(ctx, "debug_last_motion_collision", {}) or {},
                 }
                 telemetry["diagnosis"] = build_input_sync_diagnosis(
                     phase=phase,
@@ -1943,12 +1998,19 @@ Examples:
 
         Sends DELETE_OBJECT with explosion effects, waits for client to
         process deletion, then spawns a fresh entity with full health.
-        If pos is None, _spawn_wf_style picks from WULFRAM_SPAWN_POS / map.
+        If pos is None, the control respawn uses the team's real map spawn
+        point when available; older flat fallback positions are only for
+        non-explicit server/test spawns.
         """
         entity_id = ctx.entity_id or 1337
         team_id = team if team is not None else (ctx.session.team_id if ctx.session else 1)
         if ctx.session:
             ctx.session.team_id = team_id
+
+        if pos is None:
+            spawn = self.server._pick_spawn_point(team_id)
+            if spawn:
+                pos = (spawn["x"], spawn["y"], spawn["z"])
 
         # Build spawn pos for the status message (actual spawn uses _spawn_wf_style logic)
         spawn_pos = pos

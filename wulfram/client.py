@@ -94,6 +94,10 @@ class ClientContext:
     action_packet_count: int = 0
     action_update_count: int = 0
     action_dump_count: int = 0
+    action_update_decode_fail_count: int = 0
+    action_dump_decode_fail_count: int = 0
+    last_action_update_decode_fail_hex: str = ""
+    last_action_dump_decode_fail_hex: str = ""
     last_action_packet_time: float = 0.0
     last_action_packet_type: str = ""
     last_action_packet_client_tick: int = 0
@@ -113,6 +117,14 @@ class ClientContext:
     last_state_sync_reply_tick: int = 0
     last_state_sync_replay_timestamp: int = 0
     last_state_sync_snapshot_source: str = ""
+    last_state_sync_reason: str = ""
+    last_state_sync_update_len: int = 0
+    last_state_sync_view_len: int = 0
+    last_state_sync_update_has_local_state: bool = False
+    last_state_sync_view_has_local_state: bool = False
+    last_state_sync_view_timestamp: int = 0
+    last_state_sync_update_hex: str = ""
+    last_state_sync_view_hex: str = ""
     position_change_count: int = 0
 
     last_sent_tick: int = 0
@@ -162,6 +174,11 @@ class ClientContext:
     # Combat stats
     kills: int = 0
     deaths: int = 0
+    last_damage_time: float = 0.0
+    last_damage_source: str = ""
+    last_damage_amount: float = 0.0
+    last_damage_old_health: float = 0.0
+    last_damage_new_health: float = 0.0
 
     # Pending respawn position (set by respawn command, consumed by auto_join_team)
     pending_respawn_pos: Optional[tuple] = None

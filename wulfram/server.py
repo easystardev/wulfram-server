@@ -521,6 +521,12 @@ class WulframServer:
         self.map_spawn_points = self._parse_spawn_points_env(os.environ.get("WULFRAM_SPAWN_POINTS", ""))
         default_use_map_spawn = "1" if self.map_name.lower() == "crossroads" else "0"
         self.use_map_spawn_points = os.environ.get("WULFRAM_USE_MAP_SPAWN", default_use_map_spawn) == "1"
+        self.align_spawn_points_to_terrain = (
+            os.environ.get("WULFRAM_ALIGN_SPAWN_POINTS_TO_TERRAIN", "0") == "1"
+        )
+        self.align_spawn_pos_to_terrain = (
+            os.environ.get("WULFRAM_ALIGN_SPAWN_POS_TO_TERRAIN", "0") == "1"
+        )
         self.default_flat_spawn_pos = self._parse_spawn_pos_env(
             os.environ.get("WULFRAM_DEFAULT_FLAT_SPAWN", "")
         )
@@ -556,6 +562,9 @@ class WulframServer:
         # Terrain heightmap for dynamic ground level and slope-aware physics.
         self.terrain: Optional[Terrain] = None
         self.terrain_pitch_enabled = os.environ.get("WULFRAM_TERRAIN_PITCH", "1") == "1"
+        self.terrain_collision_with_ground_override = (
+            os.environ.get("WULFRAM_TERRAIN_COLLISION_WITH_GROUND_OVERRIDE", "0") == "1"
+        )
         try:
             self.terrain_height_offset = float(os.environ.get("WULFRAM_TERRAIN_HEIGHT_OFFSET", "5.0"))
         except ValueError:
@@ -685,10 +694,14 @@ class WulframServer:
             f"{self.team_switch_update_stats_transport}/{self.team_switch_update_stats_variant} "
             f"gravity={self.gravity:.1f} tick_hz={self.tick_rate_hz:.1f} "
             f"update_on_change={int(self.update_on_change)} heartbeat={self.update_heartbeat_interval:.2f}s "
-            f"map_spawns={int(self.use_map_spawn_points)} update_packet={self.update_packet_type} "
+            f"map_spawns={int(self.use_map_spawn_points)} "
+            f"spawn_align_terrain={int(self.align_spawn_points_to_terrain)} "
+            f"spawn_pos_align_terrain={int(self.align_spawn_pos_to_terrain)} "
+            f"update_packet={self.update_packet_type} "
             f"force_default_spawn={int(self.force_default_spawn_pos)} "
             f"default_spawn={self.default_flat_spawn_pos} "
             f"heartbeat_view={int(self.heartbeat_view_update)} jump_jets={int(self.jump_jets_enabled)} "
+            f"terrain_collision_override={int(self.terrain_collision_with_ground_override)} "
             f"inactivity_timeout={self.inactivity_timeout:.1f}s"
         )
 
@@ -3374,9 +3387,21 @@ class WulframServer:
                         f"team={team_id} pos={spawn_pos}"
                     )
 
-        # Offset spawn to avoid overlapping tanks in multi-client tests.
-        # Use 0-based index among active clients (not client_id, which grows unboundedly).
-        if self.multi_spawn_offset:
+        # Offset spawn to avoid overlapping tanks in multi-client tests. Do not
+        # move explicit map-flag spawns by default: the offset can put a clicked
+        # repair pad spawn onto unrelated steep terrain, which turns later
+        # targeted corrections into bogus authoritative snaps.
+        offset_explicit_spawns = (
+            os.environ.get("WULFRAM_MULTI_SPAWN_OFFSET_EXPLICIT", "0")
+            .strip()
+            .lower()
+            in ("1", "true", "on", "yes")
+        )
+        apply_spawn_offset = bool(self.multi_spawn_offset) and (
+            pos is None or offset_explicit_spawns
+        )
+        if apply_spawn_offset:
+            # Use 0-based index among active clients (not client_id, which grows unboundedly).
             with self.clients_lock:
                 active_ids = sorted(c.client_id for c in self.clients.values() if c and c.running)
             try:
@@ -3385,8 +3410,10 @@ class WulframServer:
                 idx = 0
             spawn_pos = (spawn_pos[0] + idx * self.multi_spawn_offset, spawn_pos[1], spawn_pos[2])
 
-        # Adjust spawn Z to terrain height when terrain is loaded.
-        if self.terrain and self.up_axis == "z":
+        # Optional legacy/debug path: force the spawn anchor onto the decoded
+        # heightmap. Default off because OG live memory matches raw map-state
+        # repair-pad Z more closely than the currently decoded terrain height.
+        if self.terrain and self.up_axis == "z" and self.align_spawn_pos_to_terrain:
             terrain_z = (
                 self.terrain.get_height(spawn_pos[0], spawn_pos[1])
                 + self.terrain_height_offset
@@ -4112,9 +4139,12 @@ class WulframServer:
                 raw_z = float(parts[data_start + 3])
             except (ValueError, IndexError):
                 continue
-            z, terrain_z, aligned = self._align_map_entity_z_to_terrain(x, y, raw_z)
-            if aligned:
-                aligned_count += 1
+            if getattr(self, "align_spawn_points_to_terrain", False):
+                z, terrain_z, aligned = self._align_map_entity_z_to_terrain(x, y, raw_z)
+                if aligned:
+                    aligned_count += 1
+            else:
+                z, terrain_z, aligned = raw_z, self._terrain_ground_z_at(x, y), False
 
             variant = 1
             rot = (0.0, 0.0, 0.0)
@@ -5079,6 +5109,12 @@ class WulframServer:
         view_include_local_state = False
         view_payload = b""
         if include_view_update:
+            # VIEW_UPDATE is replay-mode input to the client's prediction path.
+            # The wrapper timestamp must be the STATE_REQUEST/replay id when
+            # present; the decompile stores it in the interpolation record used
+            # by prediction verification. A fresh packet timestamp can make the
+            # OG client receive the correction but reject it as unpaired.
+            view_timestamp = replay_timestamp
             view_weapon_type = weapon_type
             view_ammo_bits = 0
             view_ammo_mask = 0
@@ -5140,10 +5176,19 @@ class WulframServer:
                 turret_range=self.local_state_turret_range,
                 is_manned=True,
                 speed_scale=1.0,
-                timestamp=replay_timestamp,
+                timestamp=view_timestamp,
             )
             self.udp_handler.send_to(view_payload, ctx.session.udp_addr)
             ctx.state_sync_view_reply_count += 1
+
+        ctx.last_state_sync_reason = reason
+        ctx.last_state_sync_update_len = len(update_payload)
+        ctx.last_state_sync_view_len = len(view_payload)
+        ctx.last_state_sync_update_has_local_state = bool(update_include_local_state)
+        ctx.last_state_sync_view_has_local_state = bool(view_include_local_state)
+        ctx.last_state_sync_view_timestamp = int(view_timestamp or 0) if include_view_update else 0
+        ctx.last_state_sync_update_hex = update_payload[:32].hex()
+        ctx.last_state_sync_view_hex = view_payload[:32].hex()
 
         if self.pktlog.enabled:
             self.pktlog.log(
@@ -5157,6 +5202,10 @@ class WulframServer:
                 mask_bits=(0b1110,),
                 has_local_state=update_include_local_state,
                 health=health_val,
+                extra=(
+                    f"reason={reason} replay=0x{int(replay_timestamp or 0):08x} "
+                    f"source={snapshot_source}"
+                ),
             )
             if include_view_update:
                 self.pktlog.log(
@@ -5170,6 +5219,10 @@ class WulframServer:
                     mask_bits=(0b1110,),
                     has_local_state=view_include_local_state,
                     health=health_val,
+                    extra=(
+                        f"reason={reason} replay=0x{int(replay_timestamp or 0):08x} "
+                        f"view_ts=0x{int(view_timestamp or 0):08x} source={snapshot_source}"
+                    ),
                 )
 
         if self.debug_viewpoint or self.debug_udp_raw:
@@ -5291,6 +5344,14 @@ class WulframServer:
 
             # Process jump jets (slot 5 = upward thrust)
             self._process_jump_jets(ctx, addr)
+        else:
+            ctx.action_dump_decode_fail_count += 1
+            ctx.last_action_dump_decode_fail_hex = data[:48].hex()
+            if self.debug_sync:
+                print(
+                    f"[UDP] ACTION_DUMP decode failed c{ctx.client_id}: "
+                    f"len={len(data)} data={ctx.last_action_dump_decode_fail_hex}"
+                )
 
     def _handle_action_update(self, ctx: Optional[ClientContext], data: bytes, addr: tuple):
         """
@@ -5373,6 +5434,14 @@ class WulframServer:
 
             # Process jump jets (slot 5 = upward thrust)
             self._process_jump_jets(ctx, addr)
+        else:
+            ctx.action_update_decode_fail_count += 1
+            ctx.last_action_update_decode_fail_hex = data[:48].hex()
+            if self.debug_sync:
+                print(
+                    f"[UDP] ACTION_UPDATE decode failed c{ctx.client_id}: "
+                    f"len={len(data)} data={ctx.last_action_update_decode_fail_hex}"
+                )
 
     def _handle_weapon_demand(self, ctx: Optional[ClientContext], data: bytes, addr: tuple):
         """
@@ -6058,15 +6127,16 @@ class WulframServer:
 
         # Add gravity to vertical impulse (matches GUESS3_Transform_accelerate_z)
         gravity = self.gravity
-        if self.terrain and self.up_axis == "z":
+        use_ground_override = ctx.ground_level_override is not None
+        if use_ground_override:
+            ground_level = ctx.ground_level_override
+        elif self.terrain and self.up_axis == "z":
             ground_level = (
                 self.terrain.get_height(ctx.player_pos[0], ctx.player_pos[1])
                 + self.terrain_height_offset
             )
         else:
             ground_level = self.ground_level
-            if ctx.ground_level_override is not None:
-                ground_level = ctx.ground_level_override
 
         # Gravity and ground collision use terrain-aware ground_level (computed above).
         if vertical_idx == 2:
@@ -6123,7 +6193,7 @@ class WulframServer:
             new_x = max(-self.world_bound, min(self.world_bound, new_x))
             new_y = max(-self.world_bound, min(self.world_bound, new_y))
             # Clamp Z to terrain height at NEW position (not pre-integration)
-            if self.terrain:
+            if self.terrain and not use_ground_override:
                 terrain_z = (
                     self.terrain.get_height(new_x, new_y)
                     + self.terrain_height_offset
@@ -6158,7 +6228,7 @@ class WulframServer:
         # terrain plane after the initial post-integrate clamp. Keep the final
         # authoritative pose on or above terrain before replication.
         if self.up_axis == "z":
-            if self.terrain:
+            if self.terrain and not use_ground_override:
                 terrain_z = self.terrain.get_height(new_x, new_y) + self.terrain_height_offset
             else:
                 terrain_z = ground_level
@@ -6378,6 +6448,11 @@ class WulframServer:
 
     def _resolve_entity_world_collision(self, ctx, px, py, pz, vx, vy, vz):
         if self._terrain_grid_collision is None:
+            return px, py, pz, vx, vy, vz
+        if (
+            ctx.ground_level_override is not None
+            and not getattr(self, "terrain_collision_with_ground_override", False)
+        ):
             return px, py, pz, vx, vy, vz
 
         half_extents = self._get_entity_world_half_extents(ctx)
@@ -6815,6 +6890,22 @@ class WulframServer:
             int(building.entity_type),
             int(getattr(building, "team_id", 1)),
         )
+
+    def _building_blocks_vehicle_collision(self, building) -> bool:
+        """Return whether a map building should block vehicle movement.
+
+        Repair pads are spawn/service pads. Treating their mesh/AABB as a
+        solid blocker makes the authoritative tank shove sideways immediately
+        after a map-flag spawn, while the OG client drives across the pad.
+        """
+        if int(getattr(building, "entity_type", -1)) == int(EntityType.REPAIR_BUILDING):
+            return (
+                os.environ.get("WULFRAM_REPAIR_PAD_BLOCKS_VEHICLES", "0")
+                .strip()
+                .lower()
+                in ("1", "true", "on", "yes")
+            )
+        return True
 
     def _get_building_world_half_extents(self, building) -> tuple[float, float, float]:
         hx, hy = self._BUILDING_HALF_EXTENTS.get(building.entity_type, (8.0, 8.0))
@@ -7374,6 +7465,8 @@ class WulframServer:
         # Check buildings loaded from map state file
         building_entities = self._building_entities
         for eid, building in building_entities.items():
+            if not self._building_blocks_vehicle_collision(building):
+                continue
             has_mesh_model = self._building_has_mesh_collision(building)
             mesh_hit = False
             if has_mesh_model:
@@ -7913,6 +8006,11 @@ class WulframServer:
         old_health = target.player_health
         target.player_health = round(max(0.0, old_health - damage), 6)
         new_health = target.player_health
+        target.last_damage_time = time.monotonic()
+        target.last_damage_source = f"projectile:{getattr(proj.entity_type, 'name', proj.entity_type)}"
+        target.last_damage_amount = damage
+        target.last_damage_old_health = old_health
+        target.last_damage_new_health = new_health
 
         attacker_name = attacker.session.username or f"Player{attacker.client_id}"
         target_name = target.session.username or f"Player{target.client_id}"
@@ -8259,6 +8357,16 @@ class WulframServer:
             best_target.player_health = max(0.0, old_health - damage)
             target_name = best_target.session.username or f"Player{best_target.client_id}"
             btype_name = getattr(b.entity_type, 'name', str(b.entity_type))
+            best_target.last_damage_time = now
+            best_target.last_damage_source = f"turret:{btype_name}:oid={oid}"
+            best_target.last_damage_amount = damage
+            best_target.last_damage_old_health = old_health
+            best_target.last_damage_new_health = best_target.player_health
+            print(
+                f"[TURRET] {btype_name} oid={oid} hit {target_name} "
+                f"for {damage*100:.0f}% "
+                f"({old_health*100:.0f}% -> {best_target.player_health*100:.0f}%)"
+            )
 
             if best_target.player_health <= 0.0 and old_health > 0.0:
                 # Turret killed the player
