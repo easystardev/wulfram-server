@@ -211,12 +211,10 @@ class WulframServer:
             # default, but send PLAYER_INFO to remote OG clients unless explicitly
             # disabled.
             self.spawn_send_player_info = False
-        # Pre-create entity via UPDATE_ARRAY before TankPacket so OIDTable has the
-        # correct OID when PLAYER_INFO processes it.  Without this,
-        # Entity_create_from_network in PLAYER_INFO stores a garbage OID (unaff_EBX)
-        # â†’ OIDTable_lookup fails on retransmit â†’ LocalPlayer_initialize never fires
-        # â†’ g_local_player_entity stays 0 â†’ sync_local_player skips all health writes.
-        self.spawn_send_update_array = os.environ.get("WULFRAM_SPAWN_UPDATE_ARRAY", "1") == "1"
+        # Keep UPDATE_ARRAY pre-create opt-in until it preserves the OG
+        # local sync/camera bootstrap. Proven correction sessions can use the
+        # local sync state plus server_expected, even when the camera global is 0.
+        self.spawn_send_update_array = os.environ.get("WULFRAM_SPAWN_UPDATE_ARRAY", "0") == "1"
         self.spawn_send_game_clock = os.environ.get("WULFRAM_SPAWN_GAME_CLOCK", "1") == "1"
         self.spawn_send_comm_message = (
             os.environ.get("WULFRAM_SPAWN_COMM_MESSAGE", "0").strip().lower()
@@ -704,6 +702,25 @@ class WulframServer:
             f"terrain_collision_override={int(self.terrain_collision_with_ground_override)} "
             f"inactivity_timeout={self.inactivity_timeout:.1f}s"
         )
+        if self.spawn_send_player_info_explicit and not self.spawn_send_player_info:
+            print(
+                "[CONFIG-WARN] WULFRAM_SPAWN_PLAYER_INFO=0 disables canonical "
+                "remote OG local-player initialization; manual flag spawns can "
+                "leave camera/sync_state unset and corrections invisible."
+            )
+        if self.spawn_send_update_array:
+            print(
+                "[CONFIG-WARN] WULFRAM_SPAWN_UPDATE_ARRAY=1 is experimental for "
+                "remote OG correction: current probes require a live local "
+                "sync/server_expected sink, and pre-create sessions can strand "
+                "that bootstrap."
+            )
+        if self.spawn_send_player_info and not self.spawn_send_update_array:
+            print(
+                "[CONFIG-WARN] PLAYER_INFO without spawn UPDATE_ARRAY can leave "
+                "the OG entity without network sync state; targeted corrections "
+                "may stay invisible."
+            )
 
         # PLAYER_INFO triggers local-state sync on the client. For remote/OG
         # clients, default to canonical local-state so hull/fuel/ammo/turret
