@@ -913,9 +913,14 @@ class WulframServer:
         # already emits its own ping/state timing packets, and extra server
         # pings have proven to be destabilizing during compatibility testing.
         self.server_ping_loop_enabled = os.environ.get("WULFRAM_SERVER_PING_LOOP", "0") == "1"
-        # UDP 0x0B -> 0x0C ping replies are part of the live OG timing path.
-        # Keep the allowlist configurable, but default to all clients.
-        udp_ping_reply_hosts = os.environ.get("WULFRAM_UDP_PING_REPLY_HOSTS", "*").strip()
+        # UDP 0x0B -> 0x0C ping replies share the client's timing opcode
+        # neighborhood with STATE_REQUEST. Keep replies available for local
+        # tools, but make remote OG timing traffic opt-in so correction tests
+        # cannot be perturbed by server-originated ping echoes.
+        udp_ping_reply_hosts = os.environ.get(
+            "WULFRAM_UDP_PING_REPLY_HOSTS",
+            "127.0.0.1,::1,loopback",
+        ).strip()
         self.udp_ping_reply_allow_all = udp_ping_reply_hosts.lower() in ("*", "all", "any")
         self.udp_ping_reply_hosts = {
             self._normalize_debug_host(entry)

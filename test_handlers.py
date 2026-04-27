@@ -1722,6 +1722,39 @@ def test_remote_udp_ping_request_gets_og_safe_reply():
     return True
 
 
+def test_udp_ping_reply_default_policy_is_loopback_only():
+    """Remote OG ping replies should be opt-in; local tools still get replies."""
+    previous = os.environ.pop("WULFRAM_UDP_PING_REPLY_HOSTS", None)
+    try:
+        server = WulframServer(host="127.0.0.1", port=0)
+    finally:
+        if previous is not None:
+            os.environ["WULFRAM_UDP_PING_REPLY_HOSTS"] = previous
+
+    assert server.udp_ping_reply_allow_all is False
+    assert {"127.0.0.1", "::1", "loopback"}.issubset(server.udp_ping_reply_hosts)
+
+    remote = ClientContext(
+        client_id=8,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    remote.session.udp_addr = ("10.10.10.2", 51126)
+    local = ClientContext(
+        client_id=9,
+        client_addr=("127.0.0.1", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    local.session.udp_addr = ("127.0.0.1", 51126)
+
+    assert server._udp_ping_reply_allowed_for_client(remote) is False
+    assert server._udp_ping_reply_allowed_for_client(local) is True
+    print("test_udp_ping_reply_default_policy_is_loopback_only: PASSED")
+    return True
+
+
 def test_jump_velocity_update_packet_uses_spawn_safe_local_state_for_remote_og():
     """Jump velocity updates must keep the OG-safe local-state shape."""
     server = WulframServer.__new__(WulframServer)
@@ -5612,6 +5645,7 @@ def main():
         test_remote_spawn_bootstrap_heartbeat_uses_safe_rot_only_shape,
         test_state_request_does_not_overwrite_client_tick_offset,
         test_remote_udp_ping_request_gets_og_safe_reply,
+        test_udp_ping_reply_default_policy_is_loopback_only,
         test_jump_velocity_update_packet_uses_spawn_safe_local_state_for_remote_og,
         test_translation_velocity_quantizer_matches_decompile_defaults,
         test_server_remote_local_state_kwargs_use_full_tank_shape,
