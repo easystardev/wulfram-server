@@ -218,13 +218,17 @@ class ControlServer:
         ctx.player_pose["pitch"] = 0.0
         ctx.player_pose["yaw"] = -heading
         ctx.player_pose["last_tick"] = self.server._get_network_tick(ctx) if self.server else 0
-        if self.server and getattr(self.server, "spawn_sets_ground_level", False):
+        if self.server and hasattr(self.server, "_set_ground_level_override_for_pose"):
+            self.server._set_ground_level_override_for_pose(ctx, ctx.player_pos)
+        elif self.server and getattr(self.server, "spawn_sets_ground_level", False):
             if getattr(self.server, "up_axis", "z") == "z":
                 ctx.ground_level_override = pz
             else:
                 ctx.ground_level_override = py
+            ctx.ground_override_ref_terrain_level = None
         else:
             ctx.ground_level_override = None
+            ctx.ground_override_ref_terrain_level = None
 
         if ctx.weapon_system:
             ctx.weapon_system.player_pos = ctx.player_pos
@@ -2271,15 +2275,24 @@ Examples:
         t = self.server.terrain
         if t is None:
             return "No terrain loaded"
-        offset = self.server.terrain_height_offset
-        lines = [f"Terrain: {t.num_x}x{t.num_z} grid, offset={offset}"]
+        map_offset = self.server.terrain_height_offset
+        physics_offset = getattr(self.server, "terrain_physics_height_offset", map_offset)
+        lines = [
+            f"Terrain: {t.num_x}x{t.num_z} grid, "
+            f"map_offset={map_offset} physics_offset={physics_offset}"
+        ]
 
         if args and len(args) >= 2:
             try:
                 wx, wy = float(args[0]), float(args[1])
                 h = t.get_height(wx, wy)
                 pitch = t.get_pitch_at_heading(wx, wy, 0.0)
-                lines.append(f"  ({wx:.1f}, {wy:.1f}): h={h:.2f}, ground_z={h + offset:.2f}, pitch={math.degrees(pitch):.1f} deg (north)")
+                lines.append(
+                    f"  ({wx:.1f}, {wy:.1f}): h={h:.2f} "
+                    f"map_ground_z={h + map_offset:.2f} "
+                    f"physics_ground_z={h + physics_offset:.2f} "
+                    f"pitch={math.degrees(pitch):.1f} deg (north)"
+                )
             except Exception as e:
                 lines.append(f"  Error: {e}")
         else:
@@ -2292,8 +2305,9 @@ Examples:
                     pitch = t.get_pitch_at_heading(x, y, ctx.player_heading)
                     lines.append(
                         f"  c{ctx.client_id} pos=({x:.1f},{y:.1f},{z:.2f}) "
-                        f"terrain_h={h:.2f} ground_z={h + offset:.2f} "
-                        f"pitch={math.degrees(pitch):.1f}deg delta_z={z - (h + offset):.2f}"
+                        f"terrain_h={h:.2f} physics_ground_z={h + physics_offset:.2f} "
+                        f"pitch={math.degrees(pitch):.1f}deg "
+                        f"delta_z={z - (h + physics_offset):.2f}"
                     )
         return "\n".join(lines)
 

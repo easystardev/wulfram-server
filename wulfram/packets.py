@@ -1080,7 +1080,8 @@ def build_behavior_packet() -> bytes:
     behavior_log = os.environ.get("WULFRAM_BEHAVIOR_LOG", "0") == "1"
 
     # Section 1: Header (95 bytes)
-    payload.append(0x00)
+    spawn_enabled = os.environ.get("WULFRAM_BEHAVIOR_SPAWN_ENABLED", "1").strip().lower()
+    payload.append(0x00 if spawn_enabled in ("0", "false", "off", "no") else 0x01)
     payload += pack_fixed16(5.0)
     payload += pack_fixed16(10.0)
     payload += pack_fixed16(10.0)

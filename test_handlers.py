@@ -50,6 +50,7 @@ from wulfram2_protocol.codec import BitReader
 from client.wulfram_client.network.behavior import parse_behavior
 from client.wulfram_client.network.decoder import decode_update_array, decode_view_update, decode_tank_packet
 from client.wulfram_client.network.quantizer import parse_translation
+from wulfram2_protocol.entities import tank_suspension_lift_accel
 from client.wulfram_client.data.models import CBSPTree, CBSPTreeNode, Vec3
 from client.wulfram_client.simulation.collision import (
     segment_hits_cbsp_tree,
@@ -115,6 +116,14 @@ def test_handlers_import():
         send_udp_ack,
     )
     print("test_handlers_import: PASSED")
+    return True
+
+
+def test_behavior_spawn_enabled_defaults_on_for_entry_map_spawn():
+    """OG map clicks only emit default spawn REINCARNATE when BEHAVIOR enables spawning."""
+    cfg = parse_behavior(build_behavior_packet())
+    assert cfg.spawn_enabled is True
+    print("test_behavior_spawn_enabled_defaults_on_for_entry_map_spawn: PASSED")
     return True
 
 
@@ -254,7 +263,10 @@ def test_map_entity_z_preserves_elevated_entities():
     server = WulframServer.__new__(WulframServer)
     server.up_axis = "z"
     server.terrain_height_offset = 5.0
-    server.terrain = SimpleNamespace(get_height=lambda x, y: 0.0)
+    server.terrain = SimpleNamespace(
+        get_height=lambda x, y: 0.0,
+        get_slope=lambda x, y: (0.0, 0.0),
+    )
 
     z, ground_z, aligned = server._align_map_entity_z_to_terrain(5150.1, 5241.3, 7.7)
 
@@ -3348,6 +3360,7 @@ def test_server_motion_reclamps_below_ground_after_collision_response():
     server.up_axis = "z"
     server.terrain = SimpleNamespace(get_height=lambda x, y: 0.0)
     server.terrain_height_offset = 5.0
+    server.terrain_physics_height_offset = 5.0
     server.terrain_pitch_enabled = False
     server.gravity = 0.0
     server.ground_level = 0.0
@@ -3382,6 +3395,55 @@ def test_server_motion_reclamps_below_ground_after_collision_response():
     return True
 
 
+def test_server_motion_uses_physics_terrain_offset_for_vehicle_ground():
+    """Vehicle collision should use physics terrain offset, not map-entity Z offset."""
+    server = WulframServer.__new__(WulframServer)
+    server.tick_rate_hz = 30.0
+    server.linear_damp_driving = 0.0
+    server.linear_damp_coasting = 0.0
+    server.up_axis = "z"
+    server.terrain = SimpleNamespace(
+        get_height=lambda x, y: 10.0,
+        get_slope=lambda x, y: (0.0, 0.0),
+    )
+    server.terrain_height_offset = 5.0
+    server.terrain_physics_height_offset = 0.0
+    server.terrain_pitch_enabled = False
+    server.tank_suspension_enabled = False
+    server.gravity = 0.0
+    server.ground_level = 0.0
+    server.world_bound = 100000.0
+    server.f32_physics = False
+    server._resolve_entity_world_collision = (
+        lambda ctx, px, py, pz, vx, vy, vz: (px, py, pz, vx, vy, vz)
+    )
+    server._check_building_collisions = (
+        lambda ctx, px, py, pz, vx, vy: (px, py, vx, vy)
+    )
+
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    ctx.injected_input = (0.0, 0.0)
+    ctx.entity_type = EntityType.TANK
+    ctx.player_pos = (0.0, 0.0, 9.0)
+    ctx.player_vel = (0.0, 0.0, 0.0)
+    ctx.player_heading = 0.0
+    ctx.ground_level_override = None
+    ctx.player_pose = {}
+
+    server._update_player_position(ctx, dt_override=1.0 / 30.0)
+
+    assert ctx.player_pos[2] == 10.0, ctx.player_pos
+    assert ctx.debug_last_controller_step["ground_level"] == 10.0
+    assert ctx.debug_last_controller_step["terrain_ground_level"] == 10.0
+    print("test_server_motion_uses_physics_terrain_offset_for_vehicle_ground: PASSED")
+    return True
+
+
 def test_server_motion_releases_spawn_ground_override_on_terrain_departure():
     """Spawn-pad ground pins should not become a permanent flat plane on sloped terrain."""
     server = WulframServer.__new__(WulframServer)
@@ -3394,6 +3456,7 @@ def test_server_motion_releases_spawn_ground_override_on_terrain_departure():
         get_slope=lambda x, y: (0.0, 0.0),
     )
     server.terrain_height_offset = 5.0
+    server.terrain_physics_height_offset = 5.0
     server.terrain_pitch_enabled = False
     server.gravity = -50.0
     server.ground_level = 0.0
@@ -3434,6 +3497,62 @@ def test_server_motion_releases_spawn_ground_override_on_terrain_departure():
     return True
 
 
+def test_server_motion_releases_ground_override_when_terrain_changes_under_tank():
+    """Exact-pose ground pins should release once the tank drives onto changing terrain."""
+    server = WulframServer.__new__(WulframServer)
+    server.tick_rate_hz = 45.0
+    server.linear_damp_driving = 0.0
+    server.linear_damp_coasting = 0.0
+    server.up_axis = "z"
+    server.terrain = SimpleNamespace(
+        get_height=lambda x, y: 42.0 + x * 0.25,
+        get_slope=lambda x, y: (0.25, 0.0),
+    )
+    server.terrain_height_offset = 5.0
+    server.terrain_physics_height_offset = 5.0
+    server.terrain_pitch_enabled = False
+    server.gravity = -50.0
+    server.ground_level = 0.0
+    server.world_bound = 100000.0
+    server.f32_physics = False
+    server.ground_override_release_distance = 24.0
+    server.ground_override_release_height = 4.0
+    server.ground_override_release_terrain_distance = 4.0
+    server.ground_override_release_terrain_height = 0.75
+    server._resolve_entity_world_collision = (
+        lambda ctx, px, py, pz, vx, vy, vz: (px, py, pz, vx, vy, vz)
+    )
+    server._check_building_collisions = (
+        lambda ctx, px, py, pz, vx, vy: (px, py, vx, vy)
+    )
+
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    ctx.injected_input = (0.0, 0.0)
+    ctx.entity_type = EntityType.TANK
+    ctx.player_pos = (6.0, 0.0, 47.0)
+    ctx.player_vel = (0.0, 0.0, 0.0)
+    ctx.player_heading = 0.0
+    ctx.ground_level_override = 47.0
+    ctx.ground_override_ref_terrain_level = 47.0
+    ctx.world_collision_ref_pos = (0.0, 0.0, 47.0)
+    ctx.player_pose = {}
+
+    server._update_player_position(ctx, dt_override=0.1)
+
+    assert ctx.ground_level_override is None
+    assert ctx.debug_last_controller_step["ground_override_released"] is True
+    assert ctx.debug_last_controller_step["ground_override_release_reason"] == "terrain_change"
+    assert ctx.debug_last_controller_step["ground_level_source"] == "terrain"
+    assert abs(ctx.player_pos[2] - 48.5) < 1e-6, ctx.player_pos
+    print("test_server_motion_releases_ground_override_when_terrain_changes_under_tank: PASSED")
+    return True
+
+
 def test_remote_team_select_uses_remote_idle_timeout():
     """Remote OG clients can sit on entry-map UI while the harness probes spawn clicks."""
     server = WulframServer.__new__(WulframServer)
@@ -3456,14 +3575,16 @@ def test_remote_team_select_uses_remote_idle_timeout():
     return True
 
 
-def test_tank_surface_state_uses_max_altitude_clearance_target():
-    """Tank altitude ratio should normalize against terrain offset plus max_altitude."""
+def test_tank_surface_state_uses_spring_base_clearance_target():
+    """Tank altitude ratio should normalize against spring base plus max_altitude."""
     server = WulframServer.__new__(WulframServer)
     server.terrain = SimpleNamespace(
         get_height=lambda x, y: 10.0,
         get_slope=lambda x, y: (0.0, 0.0),
     )
     server.terrain_height_offset = 5.0
+    server.terrain_physics_height_offset = 0.0
+    server.tank_spring_base_offset = 2.0
 
     ctx = ClientContext(
         client_id=1,
@@ -3472,13 +3593,13 @@ def test_tank_surface_state_uses_max_altitude_clearance_target():
         entity_id=0x14EA,
     )
     ctx.entity_type = EntityType.TANK
-    ctx.player_pos = (0.0, 0.0, 18.25)
+    ctx.player_pos = (0.0, 0.0, 15.25)
     ctx.player_heading = 0.0
 
     _up, clearance_ratio = server._sample_tank_surface_state(ctx)
 
     assert abs(clearance_ratio - 1.0) < 1e-6, clearance_ratio
-    print("test_tank_surface_state_uses_max_altitude_clearance_target: PASSED")
+    print("test_tank_surface_state_uses_spring_base_clearance_target: PASSED")
     return True
 
 
@@ -3494,9 +3615,11 @@ def test_tank_suspension_lift_supports_floor_clearance():
         get_slope=lambda x, y: (0.0, 0.0),
     )
     server.terrain_height_offset = 5.0
+    server.terrain_physics_height_offset = 0.0
+    server.tank_spring_base_offset = 2.0
     server.terrain_pitch_enabled = False
     server.tank_suspension_enabled = True
-    server.tank_suspension_stiffness = 60.0
+    server.tank_suspension_stiffness = 40.0
     server.tank_suspension_damping = 1.5
     server.tank_suspension_lift_cap = 120.0
     server.gravity = -50.0
@@ -3518,7 +3641,7 @@ def test_tank_suspension_lift_supports_floor_clearance():
     )
     ctx.injected_input = (0.0, 0.0)
     ctx.entity_type = EntityType.TANK
-    ctx.player_pos = (0.0, 0.0, 15.0)
+    ctx.player_pos = (0.0, 0.0, 12.0)
     ctx.player_vel = (0.0, 0.0, 0.0)
     ctx.player_heading = 0.0
     ctx.ground_level_override = None
@@ -3528,8 +3651,17 @@ def test_tank_suspension_lift_supports_floor_clearance():
 
     assert ctx.player_vel[2] > 0.0, ctx.player_vel
     assert ctx.debug_last_controller_step["suspension_lift"] > 50.0
-    assert abs(ctx.debug_last_controller_step["suspension_target_clearance"] - 8.25) < 1e-6
+    assert abs(ctx.debug_last_controller_step["suspension_target_clearance"] - 5.25) < 1e-6
     print("test_tank_suspension_lift_supports_floor_clearance: PASSED")
+    return True
+
+
+def test_tank_suspension_default_stiffness_matches_decompile_equilibrium():
+    """Default compact spring stiffness should settle near target minus gravity/stiffness."""
+    lift = tank_suspension_lift_accel(4.0, 5.25, 0.0)
+
+    assert abs(lift - 50.0) < 1e-6, lift
+    print("test_tank_suspension_default_stiffness_matches_decompile_equilibrium: PASSED")
     return True
 
 
@@ -6054,6 +6186,7 @@ def main():
         test_decode_lp_string_empty,
         test_decode_lp_string_truncated,
         test_handlers_import,
+        test_behavior_spawn_enabled_defaults_on_for_entry_map_spawn,
         test_input_sync_diagnosis_distinguishes_idle_snapback_from_correction_failure,
         test_input_sync_diagnosis_reports_movement_without_targeted_corrections,
         test_spawn_override_wins_over_map_spawn_points,
@@ -6119,10 +6252,13 @@ def main():
         test_server_tank_motion_uses_low_speed_mobility_factor,
         test_server_motion_clamps_to_move_adjust,
         test_server_motion_reclamps_below_ground_after_collision_response,
+        test_server_motion_uses_physics_terrain_offset_for_vehicle_ground,
         test_server_motion_releases_spawn_ground_override_on_terrain_departure,
+        test_server_motion_releases_ground_override_when_terrain_changes_under_tank,
         test_remote_team_select_uses_remote_idle_timeout,
-        test_tank_surface_state_uses_max_altitude_clearance_target,
+        test_tank_surface_state_uses_spring_base_clearance_target,
         test_tank_suspension_lift_supports_floor_clearance,
+        test_tank_suspension_default_stiffness_matches_decompile_equilibrium,
         test_ghost_rejoin_skips_loopback_clients,
         test_projectile_world_hit_skips_aabb_for_mesh_backed_building,
         test_projectile_world_hit_prefers_closest_building_before_terrain,
