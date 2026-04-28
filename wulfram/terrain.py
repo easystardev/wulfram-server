@@ -1,8 +1,8 @@
 """Terrain heightmap loader for Wulfram server.
 
 Loads the game's 'land' file format and provides height/slope queries
-for terrain-aware physics. Matches the client's bilinear interpolation
-(HeightmapGrid_sample_bilinear in World.c:8744).
+for terrain-aware physics. Matches the client's alternating triangle-plane
+height query (GUESS3_Terrain_interpolate_grid_height in World.c).
 
 File format (from GUESS3_Terrain_load_heightmap_file, World.c:9002):
   Line 1: "129x129" (grid dimensions: num_x x num_z)
@@ -21,7 +21,7 @@ import math
 
 
 class Terrain:
-    """Heightmap terrain with bilinear height interpolation and slope queries."""
+    """Heightmap terrain with decompile-matched triangle height queries."""
 
     def __init__(self, land_file_path: str):
         with open(land_file_path, "r") as f:
@@ -81,57 +81,85 @@ class Terrain:
         gz = max(0, min(gz, self.num_z - 1))
         return self._cell_types[gx * self.num_z + gz]
 
-    def get_height(self, wx: float, wy: float) -> float:
-        """Get terrain height at server coords (wx=X, wy=Y) via bilinear interpolation.
+    @staticmethod
+    def _height_on_triangle(
+        wx: float,
+        wy: float,
+        a: tuple[float, float, float],
+        b: tuple[float, float, float],
+        c: tuple[float, float, float],
+    ) -> tuple[float, tuple[float, float, float]]:
+        """Return the plane height and positive-Z normal for one terrain triangle."""
+        ab = (b[0] - a[0], b[1] - a[1], b[2] - a[2])
+        ac = (c[0] - a[0], c[1] - a[1], c[2] - a[2])
+        nx = ab[1] * ac[2] - ab[2] * ac[1]
+        ny = ab[2] * ac[0] - ab[0] * ac[2]
+        nz = ab[0] * ac[1] - ab[1] * ac[0]
+        if nz < 0.0:
+            nx, ny, nz = -nx, -ny, -nz
+        mag_sq = nx * nx + ny * ny + nz * nz
+        if mag_sq <= 1e-12 or abs(nz) <= 1e-12:
+            return a[2], (0.0, 0.0, 1.0)
 
-        Matches client's HeightmapGrid_sample_bilinear (World.c:8744).
-        Returns raw heightmap value (add offset externally for server Z).
+        # Plane equation through a: n dot ((x, y, z) - a) = 0.
+        height = a[2] - (nx * (wx - a[0]) + ny * (wy - a[1])) / nz
+        inv_mag = 1.0 / math.sqrt(mag_sq)
+        return height, (nx * inv_mag, ny * inv_mag, nz * inv_mag)
+
+    def sample_height_normal(self, wx: float, wy: float) -> tuple[float, tuple[float, float, float]]:
+        """Get raw terrain height and normal at server coords (wx=X, wy=Y).
+
+        `GUESS3_Terrain_interpolate_grid_height` picks one of two triangles per
+        cell using `((~col ^ row) & 1)`, then computes height from that triangle
+        plane. This intentionally differs from bilinear interpolation on rough
+        cells and keeps spring/clamp sampling aligned with terrain collision.
         """
-        # Convert world coords to fractional grid indices
-        fx = wx * self.inv_cell_x
-        fy = wy * self.inv_cell_z
-
-        # Integer grid cell
-        gx = int(math.floor(fx))
-        gz = int(math.floor(fy))
-
-        # Fractional part within cell
-        tx = fx - gx
-        tz = fy - gz
-
-        # Clamp grid indices
+        gx = int(math.floor(wx * self.inv_cell_x))
+        gz = int(math.floor(wy * self.inv_cell_z))
         gx = max(0, min(gx, self.num_x - 2))
         gz = max(0, min(gz, self.num_z - 2))
 
-        # Four corner heights
+        x0 = gx * self.cell_x
+        x1 = (gx + 1) * self.cell_x
+        y0 = gz * self.cell_z
+        y1 = (gz + 1) * self.cell_z
+
         h00 = self._heights[gx * self.num_z + gz]
         h10 = self._heights[(gx + 1) * self.num_z + gz]
         h01 = self._heights[gx * self.num_z + gz + 1]
         h11 = self._heights[(gx + 1) * self.num_z + gz + 1]
 
-        # Bilinear interpolation (matching client order: lerp X first, then Z)
-        h_bottom = h00 + tx * (h10 - h00)  # lerp along X at z=gz
-        h_top = h01 + tx * (h11 - h01)     # lerp along X at z=gz+1
-        return h_bottom + tz * (h_top - h_bottom)  # lerp along Z
+        v00 = (x0, y0, h00)
+        v10 = (x1, y0, h10)
+        v01 = (x0, y1, h01)
+        v11 = (x1, y1, h11)
+
+        if ((~gx ^ gz) & 1) == 0:
+            diagonal_test = (wy - y0) - (x1 - wx)
+            if diagonal_test < 0.0:
+                return self._height_on_triangle(wx, wy, v01, v00, v10)
+            return self._height_on_triangle(wx, wy, v10, v11, v01)
+
+        diagonal_test = (wy - y0) - (wx - x0)
+        if diagonal_test < 0.0:
+            return self._height_on_triangle(wx, wy, v00, v10, v11)
+        return self._height_on_triangle(wx, wy, v01, v00, v11)
+
+    def get_height(self, wx: float, wy: float) -> float:
+        """Get raw terrain height at server coords (wx=X, wy=Y)."""
+        height, _normal = self.sample_height_normal(wx, wy)
+        return height
 
     def get_slope(self, wx: float, wy: float) -> tuple:
-        """Get terrain slope at server coords via central differences.
+        """Get terrain slope at server coords from the active terrain triangle.
 
         Returns (dh_dx, dh_dy): height gradient in server X and Y directions.
         Units: rise per unit of run (dimensionless).
         """
-        # Use half-cell offsets for central differences
-        dx = self.cell_x * 0.5
-        dy = self.cell_z * 0.5
-
-        h_xp = self.get_height(wx + dx, wy)
-        h_xn = self.get_height(wx - dx, wy)
-        h_yp = self.get_height(wx, wy + dy)
-        h_yn = self.get_height(wx, wy - dy)
-
-        dh_dx = (h_xp - h_xn) / (2.0 * dx)
-        dh_dy = (h_yp - h_yn) / (2.0 * dy)
-        return (dh_dx, dh_dy)
+        _height, normal = self.sample_height_normal(wx, wy)
+        if abs(normal[2]) <= 1e-12:
+            return (0.0, 0.0)
+        return (-normal[0] / normal[2], -normal[1] / normal[2])
 
     def get_pitch_at_heading(self, wx: float, wy: float, heading: float) -> float:
         """Get terrain pitch angle (radians) along a heading direction.

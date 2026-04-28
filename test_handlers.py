@@ -26,6 +26,7 @@ from wulfram.client import ClientContext
 from wulfram.control import ControlServer, build_input_sync_diagnosis
 from wulfram.session import Session, Phase, FEATURES
 from wulfram.server import WulframServer, _StaticWorldRayNode
+from wulfram.terrain import Terrain
 from wulfram.building_collision import BuildingCollisionAssets
 from wulfram.world_collision import TerrainContact, TerrainGridCollision, TerrainRaycastHit
 from wulfram.weapons import (
@@ -3381,6 +3382,157 @@ def test_server_motion_reclamps_below_ground_after_collision_response():
     return True
 
 
+def test_server_motion_releases_spawn_ground_override_on_terrain_departure():
+    """Spawn-pad ground pins should not become a permanent flat plane on sloped terrain."""
+    server = WulframServer.__new__(WulframServer)
+    server.tick_rate_hz = 45.0
+    server.linear_damp_driving = 0.0
+    server.linear_damp_coasting = 0.0
+    server.up_axis = "z"
+    server.terrain = SimpleNamespace(
+        get_height=lambda x, y: 42.0,
+        get_slope=lambda x, y: (0.0, 0.0),
+    )
+    server.terrain_height_offset = 5.0
+    server.terrain_pitch_enabled = False
+    server.gravity = -50.0
+    server.ground_level = 0.0
+    server.world_bound = 100000.0
+    server.f32_physics = False
+    server.ground_override_release_distance = 24.0
+    server.ground_override_release_height = 4.0
+    server._resolve_entity_world_collision = (
+        lambda ctx, px, py, pz, vx, vy, vz: (px, py, pz, vx, vy, vz)
+    )
+    server._check_building_collisions = (
+        lambda ctx, px, py, pz, vx, vy: (px, py, vx, vy)
+    )
+
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    ctx.injected_input = (0.0, 0.0)
+    ctx.entity_type = EntityType.TANK
+    ctx.player_pos = (130.0, 0.0, 63.7)
+    ctx.player_vel = (0.0, 0.0, 0.0)
+    ctx.player_heading = 0.0
+    ctx.ground_level_override = 63.7
+    ctx.world_collision_ref_pos = (0.0, 0.0, 63.7)
+    ctx.player_pose = {}
+
+    server._update_player_position(ctx, dt_override=1.0)
+
+    assert ctx.ground_level_override is None
+    assert ctx.debug_last_controller_step["ground_level_source"] == "terrain"
+    assert ctx.debug_last_controller_step["ground_override_released"] is True
+    assert ctx.player_pos[2] == 47.0, ctx.player_pos
+    assert ctx.player_vel[2] == 0.0, ctx.player_vel
+    print("test_server_motion_releases_spawn_ground_override_on_terrain_departure: PASSED")
+    return True
+
+
+def test_remote_team_select_uses_remote_idle_timeout():
+    """Remote OG clients can sit on entry-map UI while the harness probes spawn clicks."""
+    server = WulframServer.__new__(WulframServer)
+    server.inactivity_timeout = 120.0
+    server.remote_idle_timeout = 900.0
+
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    ctx.session.phase = Phase.TEAM_SELECT
+
+    assert server._effective_inactivity_timeout(ctx) == 900.0
+
+    ctx.client_addr = ("127.0.0.1", 50000)
+    assert server._effective_inactivity_timeout(ctx) == 120.0
+    print("test_remote_team_select_uses_remote_idle_timeout: PASSED")
+    return True
+
+
+def test_tank_surface_state_uses_max_altitude_clearance_target():
+    """Tank altitude ratio should normalize against terrain offset plus max_altitude."""
+    server = WulframServer.__new__(WulframServer)
+    server.terrain = SimpleNamespace(
+        get_height=lambda x, y: 10.0,
+        get_slope=lambda x, y: (0.0, 0.0),
+    )
+    server.terrain_height_offset = 5.0
+
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    ctx.entity_type = EntityType.TANK
+    ctx.player_pos = (0.0, 0.0, 18.25)
+    ctx.player_heading = 0.0
+
+    _up, clearance_ratio = server._sample_tank_surface_state(ctx)
+
+    assert abs(clearance_ratio - 1.0) < 1e-6, clearance_ratio
+    print("test_tank_surface_state_uses_max_altitude_clearance_target: PASSED")
+    return True
+
+
+def test_tank_suspension_lift_supports_floor_clearance():
+    """The compact tank spring approximation should lift from terrain floor toward hover clearance."""
+    server = WulframServer.__new__(WulframServer)
+    server.tick_rate_hz = 30.0
+    server.linear_damp_driving = 0.0
+    server.linear_damp_coasting = 0.0
+    server.up_axis = "z"
+    server.terrain = SimpleNamespace(
+        get_height=lambda x, y: 10.0,
+        get_slope=lambda x, y: (0.0, 0.0),
+    )
+    server.terrain_height_offset = 5.0
+    server.terrain_pitch_enabled = False
+    server.tank_suspension_enabled = True
+    server.tank_suspension_stiffness = 60.0
+    server.tank_suspension_damping = 1.5
+    server.tank_suspension_lift_cap = 120.0
+    server.gravity = -50.0
+    server.ground_level = 0.0
+    server.world_bound = 100000.0
+    server.f32_physics = False
+    server._resolve_entity_world_collision = (
+        lambda ctx, px, py, pz, vx, vy, vz: (px, py, pz, vx, vy, vz)
+    )
+    server._check_building_collisions = (
+        lambda ctx, px, py, pz, vx, vy: (px, py, vx, vy)
+    )
+
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    ctx.injected_input = (0.0, 0.0)
+    ctx.entity_type = EntityType.TANK
+    ctx.player_pos = (0.0, 0.0, 15.0)
+    ctx.player_vel = (0.0, 0.0, 0.0)
+    ctx.player_heading = 0.0
+    ctx.ground_level_override = None
+    ctx.player_pose = {}
+
+    server._update_player_position(ctx, dt_override=1.0 / 30.0)
+
+    assert ctx.player_vel[2] > 0.0, ctx.player_vel
+    assert ctx.debug_last_controller_step["suspension_lift"] > 50.0
+    assert abs(ctx.debug_last_controller_step["suspension_target_clearance"] - 8.25) < 1e-6
+    print("test_tank_suspension_lift_supports_floor_clearance: PASSED")
+    return True
+
+
 def test_ghost_rejoin_skips_loopback_clients():
     """Loopback/Python clients should not use ghost rejoin, which can poison local sync with stale localhost ghosts."""
     server = WulframServer.__new__(WulframServer)
@@ -4758,6 +4910,77 @@ def test_entity_world_collision_pathological_dirty_bounds_contact_falls_back_to_
     return True
 
 
+def test_entity_world_collision_downward_dirty_bounds_contact_falls_back_to_raycast():
+    """Dirty terrain contacts with downward normals should not push idle tanks under rough terrain."""
+    raycast_calls = 0
+
+    def fake_model_bounds_contact(*args, **kwargs):
+        return TerrainContact(
+            position=(10.0, 0.0, 4.0),
+            normal=(0.2, 0.0, -0.98),
+            penetration=2.0,
+            sector_index=0,
+            cell=(0, 0),
+        )
+
+    def fake_raycast(start, end):
+        nonlocal raycast_calls
+        raycast_calls += 1
+        return TerrainRaycastHit(
+            position=(9.0, 0.0, 4.0),
+            normal=(0.0, 0.0, 1.0),
+            distance=1.0,
+            sector_index=0,
+            cell=(0, 0),
+        )
+
+    server = WulframServer.__new__(WulframServer)
+    server._terrain_grid_collision = SimpleNamespace(
+        test_model_bounds_contact=fake_model_bounds_contact,
+        raycast=fake_raycast,
+        test_box_collision=lambda *args, **kwargs: None,
+        test_model_collision=lambda *args, **kwargs: None,
+    )
+    server._get_entity_world_half_extents = lambda ctx: (4.0, 4.0, 4.0)
+    server._get_entity_world_collision_model = lambda ctx: (
+        [],
+        SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=5.0)),
+        5.0,
+        0.0,
+    )
+
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    ctx.player_heading = 0.0
+    ctx.player_pos = (0.0, 0.0, 4.0)
+    ctx.world_collision_ref_pos = (0.0, 0.0, 4.0)
+
+    px, py, pz, vx, vy, vz = server._resolve_entity_world_collision(
+        ctx,
+        10.0,
+        0.0,
+        4.0,
+        1.0,
+        0.0,
+        -5.0,
+    )
+
+    assert raycast_calls == 1, raycast_calls
+    assert ctx.debug_last_collision["kind"] == "terrain_dirty_raycast", ctx.debug_last_collision
+    assert abs(px - 4.0) < 1e-6, px
+    assert abs(py) < 1e-6, py
+    assert 4.0 < pz < 5.0, pz
+    assert abs(vx - 1.0) < 1e-6, vx
+    assert abs(vy) < 1e-6, vy
+    assert abs(vz) < 1e-6, vz
+    print("test_entity_world_collision_downward_dirty_bounds_contact_falls_back_to_raycast: PASSED")
+    return True
+
+
 def test_entity_world_collision_far_dirty_bounds_contact_falls_back_to_raycast():
     """Dirty-bounds contacts with far-away stored contact points should defer to raycast instead of teleporting."""
     raycast_calls = 0
@@ -4971,6 +5194,64 @@ def test_dirty_bounds_contact_helpers_skip_triangle_prefilter():
     )
     assert model_contact is not None
     print("test_dirty_bounds_contact_helpers_skip_triangle_prefilter: PASSED")
+    return True
+
+
+def _make_test_terrain(size_x: int, size_z: int, heights: list[float]) -> Terrain:
+    terrain = Terrain.__new__(Terrain)
+    terrain.num_x = size_x
+    terrain.num_z = size_z
+    terrain.world_w = float(size_x - 1)
+    terrain.world_h = float(size_z - 1)
+    terrain.cell_x = 1.0
+    terrain.cell_z = 1.0
+    terrain.inv_cell_x = 1.0
+    terrain.inv_cell_z = 1.0
+    terrain._heights = list(heights)
+    terrain._cell_types = [0] * (size_x * size_z)
+    return terrain
+
+
+def test_terrain_height_uses_decompile_triangle_plane_not_bilinear():
+    """Rough-cell height sampling should use the same triangle split as the client spring query."""
+    # Heights are stored [x * num_z + z]. On odd cell (1, 0), the upper-left
+    # triangle excludes h11, so this point should remain at zero. Bilinear
+    # sampling would incorrectly blend h11 in and return 6.25.
+    terrain = _make_test_terrain(
+        3,
+        2,
+        [
+            0.0, 0.0,
+            0.0, 0.0,
+            0.0, 100.0,
+        ],
+    )
+
+    assert terrain.get_height(1.25, 0.25) == 0.0
+    assert terrain.get_height(1.75, 0.75) == 50.0
+    print("test_terrain_height_uses_decompile_triangle_plane_not_bilinear: PASSED")
+    return True
+
+
+def test_terrain_slope_uses_active_triangle_plane_normal():
+    """Terrain slope should come from the active triangle plane, not central bilinear smoothing."""
+    terrain = _make_test_terrain(
+        2,
+        2,
+        [
+            0.0, 3.0,
+            2.0, 5.0,
+        ],
+    )
+
+    height, normal = terrain.sample_height_normal(0.25, 0.75)
+    dh_dx, dh_dy = terrain.get_slope(0.25, 0.75)
+
+    assert abs(height - 2.75) < 1e-6, height
+    assert abs(dh_dx - 2.0) < 1e-6, dh_dx
+    assert abs(dh_dy - 3.0) < 1e-6, dh_dy
+    assert normal[2] > 0.0, normal
+    print("test_terrain_slope_uses_active_triangle_plane_normal: PASSED")
     return True
 
 
@@ -5838,6 +6119,10 @@ def main():
         test_server_tank_motion_uses_low_speed_mobility_factor,
         test_server_motion_clamps_to_move_adjust,
         test_server_motion_reclamps_below_ground_after_collision_response,
+        test_server_motion_releases_spawn_ground_override_on_terrain_departure,
+        test_remote_team_select_uses_remote_idle_timeout,
+        test_tank_surface_state_uses_max_altitude_clearance_target,
+        test_tank_suspension_lift_supports_floor_clearance,
         test_ghost_rejoin_skips_loopback_clients,
         test_projectile_world_hit_skips_aabb_for_mesh_backed_building,
         test_projectile_world_hit_prefers_closest_building_before_terrain,
@@ -5869,10 +6154,13 @@ def main():
         test_entity_world_collision_dirty_bounds_store_accepts_tiny_contact,
         test_entity_world_collision_dirty_bounds_store_uses_contact_point_radius_resolution,
         test_entity_world_collision_pathological_dirty_bounds_contact_falls_back_to_raycast,
+        test_entity_world_collision_downward_dirty_bounds_contact_falls_back_to_raycast,
         test_entity_world_collision_far_dirty_bounds_contact_falls_back_to_raycast,
         test_entity_world_collision_horizontal_dirty_bounds_contact_falls_back_to_raycast,
         test_entity_world_collision_dirty_bounds_phase_uses_xy_broadphase,
         test_dirty_bounds_contact_helpers_skip_triangle_prefilter,
+        test_terrain_height_uses_decompile_triangle_plane_not_bilinear,
+        test_terrain_slope_uses_active_triangle_plane_normal,
         test_terrain_cell_triangles_match_decompile_order,
         test_terrain_raycast_patch_traverse_uses_start_to_end_sector_sweep,
         test_terrain_patch_raycast_cells_uses_decompile_dda_order,

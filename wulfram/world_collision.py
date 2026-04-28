@@ -173,6 +173,13 @@ class TerrainGridCollision:
     def sector_count(self) -> int:
         return len(self.sectors)
 
+    @staticmethod
+    def _orient_terrain_normal(normal: tuple[float, float, float]) -> tuple[float, float, float]:
+        """Terrain is a height field, so contact normals should not push entities downward."""
+        if normal[2] < 0.0:
+            return (-normal[0], -normal[1], -normal[2])
+        return normal
+
     def coords_to_index(self, row: int, col: int) -> int:
         return row * self.sector_cols + col
 
@@ -275,7 +282,7 @@ class TerrainGridCollision:
                     closest_world = self._local_to_world_point(closest_local, center, cos_h, sin_h)
                     contact = TerrainContact(
                         position=closest_world,
-                        normal=axis_world,
+                        normal=self._orient_terrain_normal(axis_world),
                         penetration=penetration,
                         sector_index=sector.index,
                         cell=(cell_x, cell_y),
@@ -329,7 +336,7 @@ class TerrainGridCollision:
                     closest_world = self._local_to_world_point(closest_local, collision_center, cos_h, sin_h)
                     return TerrainContact(
                         position=closest_world,
-                        normal=axis_world,
+                        normal=self._orient_terrain_normal(axis_world),
                         penetration=penetration,
                         sector_index=sector.index,
                         cell=(cell_x, cell_y),
@@ -384,7 +391,7 @@ class TerrainGridCollision:
                     contact_world = self._local_to_world_point(contact_point_local, center, cos_h, sin_h)
                     contact = TerrainContact(
                         position=contact_world,
-                        normal=normal_world,
+                        normal=self._orient_terrain_normal(normal_world),
                         penetration=penetration,
                         sector_index=sector.index,
                         cell=(cell_x, cell_y),
@@ -436,7 +443,7 @@ class TerrainGridCollision:
                     contact_world = self._local_to_world_point(contact_point_local, collision_center, cos_h, sin_h)
                     return TerrainContact(
                         position=contact_world,
-                        normal=normal_world,
+                        normal=self._orient_terrain_normal(normal_world),
                         penetration=penetration,
                         sector_index=sector.index,
                         cell=(cell_x, cell_y),
@@ -587,6 +594,7 @@ class TerrainGridCollision:
             normal = _normalize3(_cross3(_sub3(tri[1], tri[0]), _sub3(tri[2], tri[0])))
             if normal is None:
                 continue
+            normal = self._orient_terrain_normal(normal)
             delta = _sub3(hit_point, start)
             return TerrainRaycastHit(
                 position=hit_point,

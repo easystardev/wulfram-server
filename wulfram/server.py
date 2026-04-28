@@ -42,8 +42,10 @@ from wulfram2_protocol.entities import (
     LOCAL_STATE_SECONDARY_TURRET_WEAPON_TYPES,
     WEAPON_NAMES,
     tank_altitude_mobility_factor,
+    tank_hover_clearance_target,
     tank_slope_mobility_factor,
     tank_suspension_sample_offsets,
+    tank_suspension_lift_accel,
     tank_terrain_contact_coupling,
     terrain_aligned_basis,
     vehicle_runtime_speed,
@@ -198,6 +200,18 @@ class WulframServer:
             self.remote_idle_timeout = 900.0
         # Keep spawns pinned to ground unless explicitly disabled.
         self.spawn_sets_ground_level = os.environ.get("WULFRAM_SPAWN_SET_GROUND", "1") == "1"
+        try:
+            self.ground_override_release_distance = float(
+                os.environ.get("WULFRAM_GROUND_OVERRIDE_RELEASE_DISTANCE", "24.0")
+            )
+        except ValueError:
+            self.ground_override_release_distance = 24.0
+        try:
+            self.ground_override_release_height = float(
+                os.environ.get("WULFRAM_GROUND_OVERRIDE_RELEASE_HEIGHT", "4.0")
+            )
+        except ValueError:
+            self.ground_override_release_height = 4.0
         # Spawn packet toggles (useful for crash isolation).
         # Spawn sequence toggles (default to Wulf-Forge minimal behavior).
         self.spawn_send_udp_tank = os.environ.get("WULFRAM_SPAWN_UDP_TANK", "1") == "1"
@@ -567,6 +581,23 @@ class WulframServer:
             self.terrain_height_offset = float(os.environ.get("WULFRAM_TERRAIN_HEIGHT_OFFSET", "5.0"))
         except ValueError:
             self.terrain_height_offset = 5.0
+        # Experimental compact spring support. The OG client applies the full
+        # BEHAVIOR-provided softbody/piecewise spring model; a center-height
+        # lift approximation overcorrects live OG Z on spawn pads, so keep it
+        # opt-in until the per-point softbody path is cloned.
+        self.tank_suspension_enabled = os.environ.get("WULFRAM_TANK_SUSPENSION", "0") == "1"
+        try:
+            self.tank_suspension_stiffness = float(os.environ.get("WULFRAM_TANK_SUSPENSION_STIFFNESS", "60.0"))
+        except ValueError:
+            self.tank_suspension_stiffness = 60.0
+        try:
+            self.tank_suspension_damping = float(os.environ.get("WULFRAM_TANK_SUSPENSION_DAMPING", "1.5"))
+        except ValueError:
+            self.tank_suspension_damping = 1.5
+        try:
+            self.tank_suspension_lift_cap = float(os.environ.get("WULFRAM_TANK_SUSPENSION_LIFT_CAP", "120.0"))
+        except ValueError:
+            self.tank_suspension_lift_cap = 120.0
         self._load_terrain()
         self._terrain_grid_collision: Optional[TerrainGridCollision] = None
         self._entity_collision_extents_cache: Dict[tuple[int, int], tuple[float, float, float]] = {}
@@ -667,8 +698,9 @@ class WulframServer:
         # Experimental auxiliary heartbeat/correction path. UPDATE_ARRAY remains
         # the canonical gameplay stream for vitals and entity replication.
         self.heartbeat_view_update = os.environ.get("WULFRAM_HEARTBEAT_VIEW_UPDATE", "0") == "1"
-        # Jump jets — custom extension (not in OG decompile). Always enabled.
-        self.jump_jets_enabled = True
+        # Jump jets are a custom extension, not part of the OG Tank controller.
+        # Keep them opt-in so default server motion stays clone-focused.
+        self.jump_jets_enabled = os.environ.get("WULFRAM_JUMP_JETS", "0") == "1"
 
         print(
             "[CONFIG] spawn_udp_tank="
@@ -4627,7 +4659,7 @@ class WulframServer:
         timeout = self.inactivity_timeout
         addr = ctx.client_addr[0] if ctx.client_addr else ""
         is_remote = addr not in ("127.0.0.1", "::1", "localhost")
-        if is_remote and ctx.session.phase == Phase.IN_GAME:
+        if is_remote:
             timeout = max(timeout, self.remote_idle_timeout)
         return timeout
 
@@ -5749,6 +5781,11 @@ class WulframServer:
         _avg_up, clearance_ratio = self._sample_tank_surface_state(ctx)
         return tank_altitude_mobility_factor(clearance_ratio)
 
+    def _tank_hover_clearance_target(self, ctx: ClientContext) -> float:
+        veh_config = VEHICLE_PHYSICS_CONFIGS.get(ctx.entity_type)
+        max_altitude = veh_config.max_altitude if veh_config else 3.25
+        return tank_hover_clearance_target(self.terrain_height_offset, max_altitude)
+
     def _tank_terrain_contact_vector(self, ctx: ClientContext) -> tuple[float, float]:
         """Approximate the OG spring contact direction from sampled terrain normals."""
         if ctx.entity_type != EntityType.TANK or self.terrain is None:
@@ -5781,14 +5818,18 @@ class WulframServer:
         for dx, dy in offsets:
             sx = ctx.player_pos[0] + dx
             sy = ctx.player_pos[1] + dy
-            raw_ground_z = self.terrain.get_height(sx, sy)
-            dh_dx, dh_dy = self.terrain.get_slope(sx, sy)
-            mag_sq = dh_dx * dh_dx + dh_dy * dh_dy + 1.0
-            if mag_sq <= 1e-10:
-                sample_up = (0.0, 0.0, 1.0)
+            sample_height_normal = getattr(self.terrain, "sample_height_normal", None)
+            if callable(sample_height_normal):
+                raw_ground_z, sample_up = sample_height_normal(sx, sy)
             else:
-                inv_mag = 1.0 / math.sqrt(mag_sq)
-                sample_up = (-dh_dx * inv_mag, -dh_dy * inv_mag, inv_mag)
+                raw_ground_z = self.terrain.get_height(sx, sy)
+                dh_dx, dh_dy = self.terrain.get_slope(sx, sy)
+                mag_sq = dh_dx * dh_dx + dh_dy * dh_dy + 1.0
+                if mag_sq <= 1e-10:
+                    sample_up = (0.0, 0.0, 1.0)
+                else:
+                    inv_mag = 1.0 / math.sqrt(mag_sq)
+                    sample_up = (-dh_dx * inv_mag, -dh_dy * inv_mag, inv_mag)
             sum_up_x += sample_up[0]
             sum_up_y += sample_up[1]
             sum_up_z += sample_up[2]
@@ -5805,10 +5846,8 @@ class WulframServer:
             inv_avg_mag = 1.0 / math.sqrt(avg_mag_sq)
             avg_up = (avg_up_x * inv_avg_mag, avg_up_y * inv_avg_mag, avg_up_z * inv_avg_mag)
 
-        if self.terrain_height_offset <= 0.0:
-            clearance_ratio = 1.0
-        else:
-            clearance_ratio = (sum_clearance * inv_count) / self.terrain_height_offset
+        target_clearance = self._tank_hover_clearance_target(ctx)
+        clearance_ratio = (sum_clearance * inv_count) / target_clearance
         return avg_up, clearance_ratio
 
     def _normalize_turn_input_value(self, ctx: ClientContext, turn_val: float) -> float:
@@ -6091,6 +6130,10 @@ class WulframServer:
         yaw = heading_override if heading_override is not None else ctx.player_heading
         cos_yaw = math.cos(yaw)
         sin_yaw = math.sin(yaw)
+        avg_up = (0.0, 0.0, 1.0)
+        _clearance_ratio = 1.0
+        dh_dx = 0.0
+        dh_dy = 0.0
 
         if self.up_axis == "z":
             if self.terrain and self.terrain_pitch_enabled:
@@ -6144,21 +6187,68 @@ class WulframServer:
 
         # Add gravity to vertical impulse (matches GUESS3_Transform_accelerate_z)
         gravity = self.gravity
-        use_ground_override = ctx.ground_level_override is not None
-        if use_ground_override:
-            ground_level = ctx.ground_level_override
-        elif self.terrain and self.up_axis == "z":
-            ground_level = (
+        terrain_ground_level = None
+        if self.terrain and self.up_axis == "z":
+            terrain_ground_level = (
                 self.terrain.get_height(ctx.player_pos[0], ctx.player_pos[1])
                 + self.terrain_height_offset
             )
+        ground_override_ref_pos = getattr(ctx, "world_collision_ref_pos", None)
+        ground_override_released = False
+        if ctx.ground_level_override is not None and terrain_ground_level is not None:
+            release_distance = max(0.0, getattr(self, "ground_override_release_distance", 24.0))
+            release_height = max(0.0, getattr(self, "ground_override_release_height", 4.0))
+            moved_far = False
+            if ground_override_ref_pos is not None:
+                dx_ref = ctx.player_pos[0] - ground_override_ref_pos[0]
+                dy_ref = ctx.player_pos[1] - ground_override_ref_pos[1]
+                moved_far = (
+                    release_distance > 0.0
+                    and (dx_ref * dx_ref + dy_ref * dy_ref) >= release_distance * release_distance
+                )
+            terrain_delta = abs(float(ctx.ground_level_override) - terrain_ground_level)
+            if moved_far or (release_height > 0.0 and terrain_delta >= release_height):
+                ctx.ground_level_override = None
+                ground_override_released = True
+        use_ground_override = ctx.ground_level_override is not None
+        if use_ground_override:
+            ground_level = ctx.ground_level_override
+            ground_level_source = "override"
+        elif terrain_ground_level is not None:
+            ground_level = terrain_ground_level
+            ground_level_source = "terrain"
         else:
             ground_level = self.ground_level
+            ground_level_source = "default"
+
+        suspension_lift = 0.0
+        suspension_clearance = None
+        suspension_target_clearance = None
+        if (
+            getattr(self, "tank_suspension_enabled", False)
+            and ctx.entity_type == EntityType.TANK
+            and self.terrain is not None
+            and self.up_axis == "z"
+            and not use_ground_override
+        ):
+            if not self.terrain_pitch_enabled:
+                avg_up, _clearance_ratio = self._sample_tank_surface_state(ctx, yaw)
+            suspension_target_clearance = self._tank_hover_clearance_target(ctx)
+            suspension_clearance = _clearance_ratio * suspension_target_clearance
+            suspension_lift = tank_suspension_lift_accel(
+                suspension_clearance,
+                suspension_target_clearance,
+                vel_z,
+                stiffness=getattr(self, "tank_suspension_stiffness", 60.0),
+                damping=getattr(self, "tank_suspension_damping", 1.5),
+                lift_cap=getattr(self, "tank_suspension_lift_cap", 120.0),
+            )
 
         # Gravity and ground collision use terrain-aware ground_level (computed above).
         if vertical_idx == 2:
             impulse_z += gravity  # gravity is negative
-            if ctx.player_pos[2] <= ground_level and ctx.player_vel[2] + gravity * dt < 0:
+            impulse_z += suspension_lift
+            if ctx.player_pos[2] <= ground_level and ctx.player_vel[2] + impulse_z * dt < 0:
                 impulse_z = 0.0
         else:
             impulse_y += gravity
@@ -6244,6 +6334,7 @@ class WulframServer:
         # Terrain/world contact response can still push the tank back below the
         # terrain plane after the initial post-integrate clamp. Keep the final
         # authoritative pose on or above terrain before replication.
+        final_ground_clamped = False
         if self.up_axis == "z":
             if self.terrain and not use_ground_override:
                 terrain_z = self.terrain.get_height(new_x, new_y) + self.terrain_height_offset
@@ -6251,13 +6342,17 @@ class WulframServer:
                 terrain_z = ground_level
             if new_z < terrain_z:
                 new_z = terrain_z
+                final_ground_clamped = True
                 if new_vel_z < 0.0:
                     new_vel_z = 0.0
         else:
             if new_y < ground_level:
                 new_y = ground_level
+                final_ground_clamped = True
                 if new_vel_y < 0.0:
                     new_vel_y = 0.0
+        if final_ground_clamped:
+            ctx.world_collision_ref_pos = (new_x, new_y, new_z)
 
         old_pos = ctx.player_pos
         ctx.player_pos = (new_x, new_y, new_z)
@@ -6301,6 +6396,14 @@ class WulframServer:
             "raw_impulse": (fwd_impulse, strafe_impulse),
             "move_impulse": (impulse_x, impulse_y, impulse_z),
             "ground_level": ground_level,
+            "ground_level_source": ground_level_source,
+            "terrain_ground_level": terrain_ground_level,
+            "suspension_lift": suspension_lift,
+            "suspension_clearance": suspension_clearance,
+            "suspension_target_clearance": suspension_target_clearance,
+            "ground_level_override": ctx.ground_level_override,
+            "ground_override_ref_pos": ground_override_ref_pos,
+            "ground_override_released": ground_override_released,
             "linear_damp": linear_damp,
             "acceleration": (acc_x, acc_y, acc_z),
             "world_collision_ref_pos": getattr(ctx, "world_collision_ref_pos", None),
@@ -6459,7 +6562,9 @@ class WulframServer:
         )
         if contact_distance > max(bounding_radius * 1.5, 8.0):
             return True
-        normal_z = abs(contact.normal[2])
+        if contact.normal[2] <= 0.0:
+            return True
+        normal_z = contact.normal[2]
         penetration_limit = max(bounding_radius * 1.25, 8.0)
         return normal_z < 0.1 and contact.penetration > penetration_limit
 
