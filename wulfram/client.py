@@ -64,6 +64,7 @@ class ClientContext:
     player_angular_vel: float = 0.0
     # Angular velocity from steering response, integrated in tick loop (rad/s)
     angular_vel_yaw: float = 0.0
+    player_fuel: float = 33000.0
     player_energy: float = 100.0
     player_health: float = 1.0  # Normalized 0.0-1.0, used for HUD health display
 
@@ -84,6 +85,9 @@ class ClientContext:
 
     # Jump jet system (per-client)
     jump_jet_system: "JumpJetSystem" = None
+    jump_prev_thrust_input: float = 0.0
+    jump_cooldown_remaining: float = 0.0
+    jump_spawn_lockout: float = 2.0
 
     # Input tracking
     last_action_dump_time: float = field(default_factory=time.monotonic)
@@ -186,6 +190,8 @@ class ClientContext:
     injected_input: Optional[tuple] = None
     # Server-injected turn input override - persists until cleared
     injected_turn: Optional[float] = None
+    # Server-injected upward thrust override - persists until cleared
+    injected_thrust: Optional[float] = None
     # Previous tick's raw turn input — for detecting input transitions (key press/release)
     prev_raw_turn_input: float = 0.0
     last_sent_pos: tuple = field(default_factory=lambda: (0.0, 0.0, 0.0))

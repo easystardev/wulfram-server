@@ -38,6 +38,8 @@ from .client import ClientContext
 from wulfram2_protocol.entities import (
     ACTION_ANALOG_SLOTS,
     ACTION_DUMP_CONTROL_SLOTS,
+    JUMP_JET_CONFIGS,
+    JUMP_JET_SPAWN_LOCKOUT,
     LOCAL_STATE_PRIMARY_TURRET_WEAPON_TYPES,
     LOCAL_STATE_SECONDARY_TURRET_WEAPON_TYPES,
     WEAPON_NAMES,
@@ -46,6 +48,7 @@ from wulfram2_protocol.entities import (
     tank_slope_mobility_factor,
     tank_suspension_sample_offsets,
     tank_suspension_lift_accel,
+    tank_fuel_mobility_factor,
     tank_terrain_contact_coupling,
     terrain_aligned_basis,
     vehicle_runtime_speed,
@@ -73,6 +76,7 @@ from .packets import (
     build_chat_message, build_add_to_roster, build_update_stats, build_player, build_player_info,
     build_birth_notice, build_game_clock, build_reincarnate,
     build_update_array_create_tank, build_update_array_player_update,
+    build_view_update_create_tank,
     build_update_array_multi, build_view_update_multi, build_view_update_player_update,
     get_behavior_weapon_capability_counts, build_world_stats,
     build_delete_object,
@@ -588,6 +592,9 @@ class WulframServer:
         self.terrain_pitch_enabled = os.environ.get("WULFRAM_TERRAIN_PITCH", "1") == "1"
         self.terrain_collision_with_ground_override = (
             os.environ.get("WULFRAM_TERRAIN_COLLISION_WITH_GROUND_OVERRIDE", "0") == "1"
+        )
+        self.entity_terrain_collision_enabled = (
+            os.environ.get("WULFRAM_ENTITY_TERRAIN_COLLISION", "0") == "1"
         )
         try:
             self.terrain_height_offset = float(os.environ.get("WULFRAM_TERRAIN_HEIGHT_OFFSET", "5.0"))
@@ -1121,7 +1128,7 @@ class WulframServer:
         except ValueError:
             self.correction_interval = 0.0
         self.correction_mode = os.environ.get("WULFRAM_CORRECTION_MODE", "view_update").strip().lower()
-        if self.correction_mode not in ("full", "rot_only", "pos_only", "dual_entity", "view_update"):
+        if self.correction_mode not in ("full", "rot_only", "pos_only", "dual_entity", "view_update", "view_update_define"):
             self.correction_mode = "view_update"
 
         print(
@@ -1678,9 +1685,15 @@ class WulframServer:
         corr_pos = self._to_client_pos(ctx.player_pos)
         corr_rot = self._local_player_sync_rotation(ctx)
         cmode = self.correction_mode
-        inc_pos = cmode in ("full", "pos_only", "dual_entity", "view_update")
+        inc_pos = cmode in ("full", "pos_only", "dual_entity", "view_update", "view_update_define")
         inc_vel = cmode in ("full", "pos_only", "dual_entity", "view_update")
-        inc_rot = cmode in ("full", "rot_only", "dual_entity", "view_update")
+        inc_rot = cmode in ("full", "rot_only", "dual_entity", "view_update", "view_update_define")
+        correction_timestamp = None
+        if cmode in ("view_update", "view_update_define"):
+            last_request_id = int(getattr(ctx, "last_state_request_id", 0) or 0)
+            last_request_time = float(getattr(ctx, "last_state_request_time", 0.0) or 0.0)
+            if last_request_id and last_request_time > 0.0 and (time.monotonic() - last_request_time) <= 1.5:
+                correction_timestamp = last_request_id
 
         if not handlers._is_loopback_client(ctx):
             # OG clients reject the promoted/full local-state form on targeted
@@ -1710,7 +1723,35 @@ class WulframServer:
             turret_range=self.local_state_turret_range,
         )
 
-        if cmode == "view_update":
+        if cmode == "view_update_define":
+            team_id = int(getattr(ctx.session, "team_id", 0) or 1)
+            entity_type = int(getattr(ctx, "entity_type", EntityType.TANK) or EntityType.TANK)
+            payload = build_view_update_create_tank(
+                tick=tick,
+                entity_id=ctx.session.entity_id,
+                entity_type=entity_type,
+                team=team_id,
+                pos=corr_pos,
+                behavior_type=team_id,
+                include_health=include_local_state,
+                include_entity_vitals=False,
+                health=health,
+                fuel=fuel,
+                is_manned=True,
+                weapon_id=weapon_type,
+                rot=corr_rot,
+                ammo_count_bits=ammo_bits,
+                ammo_count=ammo_mask,
+                primary_turret_bits=pt_bits,
+                primary_turret_angle=pt_angle,
+                secondary_turret_bits=st_bits,
+                secondary_turret_angle=st_angle,
+                turret_max=self.local_state_turret_max,
+                turret_range=self.local_state_turret_range,
+                timestamp=correction_timestamp,
+            )
+            label = "CORRECTION(view_update_define)"
+        elif cmode == "view_update":
             payload = build_view_update_player_update(
                 tick=tick,
                 entity_id=ctx.session.entity_id,
@@ -1720,6 +1761,7 @@ class WulframServer:
                 include_pos=inc_pos,
                 include_vel=inc_vel,
                 include_rot=inc_rot,
+                timestamp=correction_timestamp,
                 **common_kw,
             )
             label = "CORRECTION(view_update)"
@@ -1790,11 +1832,34 @@ class WulframServer:
     ) -> bytes:
         """Build a safe promoted remote heartbeat/correction update.
 
-        Ordinary heartbeats should respect the caller's requested transform
-        fields instead of always expanding into a full pos+vel+rot packet.
-        Targeted correction snapshots still pass explicit position/velocity/
-        rotation and therefore keep the existing full-motion shape.
+        Loopback/Python heartbeats respect the caller's requested transform
+        fields. Remote OG local-player updates must not send partial transform
+        records: the decompiled transform applier can consume unpopulated
+        position fields when rotation is present, poisoning the local entity
+        with NaNs. For OG, any transform-bearing heartbeat is expanded to
+        position + velocity + rotation.
         """
+        if not handlers._is_loopback_client(ctx):
+            wants_transform = pos is not None or vel is not None or rot is not None or include_vel or include_rot
+            if wants_transform:
+                if pos is None and getattr(ctx, "player_pos", None) is not None:
+                    pos = self._to_client_pos(ctx.player_pos)
+                if pos is not None:
+                    if vel is None:
+                        vel = ctx.player_vel
+                    if rot is None:
+                        rot = self._local_player_sync_rotation(ctx)
+                    include_vel = True
+                    include_rot = True
+                else:
+                    # The OG local-player transform applier is not safe with a
+                    # partial interpolation record. If no finite position is
+                    # available, fall back to a local-state heartbeat only.
+                    vel = None
+                    rot = None
+                    include_vel = False
+                    include_rot = False
+
         entity_id = ctx.session.entity_id or ctx.entity_id
         has_pos = pos is not None
         has_vel = include_vel and vel is not None
@@ -1846,14 +1911,14 @@ class WulframServer:
         health: float,
         fuel: float,
     ) -> bytes:
-        """Build the one-off post-spawn OG heartbeat on the safe rot-only shape.
+        """Build the one-off post-spawn OG heartbeat on the full-transform shape.
 
         Fresh remote OG spawns still benefit from a single local-state sync
         packet immediately after Tank/PLAYER_INFO, but the old minimal
         no-entity heartbeat is fragile in that bootstrap window. Reuse the
-        promoted remote heartbeat layout with only body rotation enabled so the
-        client gets authoritative local-state without an immediate position
-        snap.
+        promoted remote heartbeat layout; the remote OG guard expands the body
+        rotation request into a complete position + velocity + rotation update
+        so the client's interpolation record is fully populated.
         """
         if entity_id is None:
             entity_id = ctx.session.entity_id or ctx.entity_id
@@ -2477,6 +2542,7 @@ class WulframServer:
         ctx.jump_jet_system.enabled = self.jump_jets_enabled
         ctx.jump_jet_system.debug = False
         ctx.jump_jet_system.on_jump = lambda pid, imp, vel: self._on_jump_jet_triggered(ctx, pid, imp, vel)
+        self._reset_jump_jet_state(ctx)
 
         return ctx
 
@@ -3241,6 +3307,7 @@ class WulframServer:
         ctx.jump_jet_system.enabled = self.jump_jets_enabled
         ctx.jump_jet_system.debug = False
         ctx.jump_jet_system.on_jump = lambda pid, imp, vel: self._on_jump_jet_triggered(ctx, pid, imp, vel)
+        self._reset_jump_jet_state(ctx)
 
         # Register.
         with self.clients_lock:
@@ -3519,6 +3586,7 @@ class WulframServer:
         ctx.player_heading = spawn_yaw
         ctx.player_energy = self.player_energy_max
         ctx.vehicle_physics.heading = spawn_yaw
+        self._reset_jump_jet_state(ctx)
         ctx.last_action_dump_time = time.monotonic()  # Reset timer for position tracking
         self._set_ground_level_override_for_pose(ctx, spawn_pos)
 
@@ -3712,7 +3780,7 @@ class WulframServer:
                             fuel=1.0,
                         )
                         self.udp_handler.send_to(hb_packet, ctx.session.udp_addr)
-                        print("[SPAWN] Sent remote bootstrap heartbeat UPDATE_ARRAY (rot-only safe shape)")
+                        print("[SPAWN] Sent remote bootstrap heartbeat UPDATE_ARRAY (full transform safe shape)")
                     else:
                         print("[SPAWN] Suppressing immediate remote bootstrap heartbeat UPDATE_ARRAY")
                 else:
@@ -3928,6 +3996,7 @@ class WulframServer:
         send_pos = self._to_client_pos(spawn_pos)
         self._set_ground_level_override_for_pose(ctx, spawn_pos)
         ctx.player_energy = self.player_energy_max
+        self._reset_jump_jet_state(ctx)
         tank_packet = build_udp_tank_packet_wf(
             net_id=net_id,
             unit_type=0,
@@ -4160,7 +4229,12 @@ class WulframServer:
         y: float,
         z: float,
     ) -> tuple[float, Optional[float], bool]:
-        ground_z = self._terrain_ground_z_at(x, y)
+        # Collision and vehicle physics run against the physics terrain plane,
+        # not the +5 visual/map offset used by some replicated map entities.
+        # Preserve raw map-state Z unless it is genuinely below that physics
+        # plane; otherwise server-side building collision diverges from the OG
+        # and Python clients, which load local map-state blockers at raw Z.
+        ground_z = self._terrain_physics_ground_z_at(x, y)
         if ground_z is None or z >= ground_z - 0.01:
             return z, ground_z, False
         return ground_z, ground_z, True
@@ -5425,7 +5499,7 @@ class WulframServer:
                 for proj in new_projectiles:
                     self._spawn_moving_projectile(ctx, proj, addr)
 
-            # Process jump jets (slot 5 = upward thrust)
+            # Legacy packet-arrival hook; fixed-step jumpjets run in motion tick.
             self._process_jump_jets(ctx, addr)
         else:
             ctx.action_dump_decode_fail_count += 1
@@ -5515,7 +5589,7 @@ class WulframServer:
                 for proj in new_projectiles:
                     self._spawn_moving_projectile(ctx, proj, addr)
 
-            # Process jump jets (slot 5 = upward thrust)
+            # Legacy packet-arrival hook; fixed-step jumpjets run in motion tick.
             self._process_jump_jets(ctx, addr)
         else:
             ctx.action_update_decode_fail_count += 1
@@ -5794,19 +5868,8 @@ class WulframServer:
 
     @staticmethod
     def _tank_low_speed_mobility_factor(current_speed: float, speed_threshold: float) -> float:
-        """Decompile-backed tank forward-mobility cap from current speed."""
-        if speed_threshold <= 0.0:
-            return 1.0
-        if current_speed < 0.0:
-            current_speed = 0.0
-        if current_speed < speed_threshold:
-            factor = (current_speed / speed_threshold) * 0.6 + 0.4
-            if factor < 0.4:
-                return 0.4
-            if factor > 1.0:
-                return 1.0
-            return factor
-        return 1.0
+        """Compatibility wrapper for the earlier speed-based interpretation."""
+        return tank_fuel_mobility_factor(current_speed, speed_threshold)
 
     def _tank_altitude_mobility(self, ctx: ClientContext) -> float:
         """Approximate the OG tank altitude penalty from current terrain clearance."""
@@ -5949,6 +6012,68 @@ class WulframServer:
         """
         return self.strafe_sign * self._normalize_behavior_axis_value(ctx, strafe_val)
 
+    def _get_jumpjet_input(self, ctx: ClientContext) -> float:
+        """Get digital jumpjet action input from OG behavior slot 4."""
+        injected = getattr(ctx, "injected_thrust", None)
+        if injected is not None:
+            return 1.0 if float(injected) >= 0.5 else 0.0
+        if getattr(ctx, "weapon_system", None) is None:
+            return 0.0
+        return 1.0 if ctx.weapon_system.behavior_slots[BehaviorSlot.JUMPJET] >= 0.5 else 0.0
+
+    def _reset_jump_jet_state(self, ctx: ClientContext) -> None:
+        """Reset fixed-step jump-jet prediction state on spawn/respawn."""
+        ctx.jump_prev_thrust_input = 0.0
+        ctx.jump_cooldown_remaining = 0.0
+        ctx.jump_spawn_lockout = JUMP_JET_SPAWN_LOCKOUT
+        if getattr(ctx, "jump_jet_system", None) is not None:
+            try:
+                ctx.jump_jet_system.reset_player(ctx.session.player_id or ctx.entity_id)
+            except Exception:
+                pass
+
+    def _apply_jump_jets_fixed_step(
+        self,
+        ctx: ClientContext,
+        *,
+        dt: float,
+        jumpjet_input: float,
+        current_altitude: float,
+        current_vel_up: float,
+    ) -> tuple[float, bool, float]:
+        """Apply opt-in custom jump jets in the deterministic movement frame."""
+        ctx.jump_cooldown_remaining = max(
+            0.0,
+            float(getattr(ctx, "jump_cooldown_remaining", 0.0)) - dt,
+        )
+        ctx.jump_spawn_lockout = max(
+            0.0,
+            float(getattr(ctx, "jump_spawn_lockout", 0.0)) - dt,
+        )
+
+        impulse = 0.0
+        fired = False
+        cfg = JUMP_JET_CONFIGS.get(ctx.entity_type) if getattr(self, "jump_jets_enabled", False) else None
+        if cfg is not None and ctx.jump_spawn_lockout <= 0.0:
+            rising_edge = ctx.jump_prev_thrust_input < 0.5 and jumpjet_input >= 0.5
+            if (
+                rising_edge
+                and ctx.jump_cooldown_remaining <= 0.0
+                and current_altitude < cfg.max_altitude
+                and ctx.player_energy >= cfg.fuel_cost
+            ):
+                impulse = cfg.impulse
+                current_vel_up += impulse
+                ctx.jump_cooldown_remaining = cfg.cooldown
+                fired = True
+                if cfg.fuel_cost > 0.0:
+                    self._consume_player_energy(ctx, cfg.fuel_cost)
+                player_id = ctx.session.player_id or ctx.entity_id
+                self._on_jump_jet_triggered(ctx, player_id, impulse, current_vel_up)
+
+        ctx.jump_prev_thrust_input = jumpjet_input
+        return current_vel_up, fired, impulse
+
     def _record_client_action_telemetry(
         self,
         ctx: ClientContext,
@@ -5972,6 +6097,12 @@ class WulframServer:
         )
         fire_input = ws.behavior_slots[BehaviorSlot.FIRE]
         thrust_input = ws.behavior_slots[BehaviorSlot.UPWARD_THRUST]
+        jumpjet_input = ws.behavior_slots[BehaviorSlot.JUMPJET]
+        active_slots = {
+            str(idx): float(value)
+            for idx, value in enumerate(ws.behavior_slots)
+            if abs(float(value)) > 0.001
+        }
 
         ctx.action_packet_count += 1
         if packet_type == "ACTION_UPDATE":
@@ -5987,6 +6118,8 @@ class WulframServer:
             "strafe": float(strafe_input),
             "fire": float(fire_input),
             "thrust": float(thrust_input),
+            "jumpjet": float(jumpjet_input),
+            "active_slots": active_slots,
         }
         if abs(fwd_input) > 0.05 or abs(strafe_input) > 0.05:
             ctx.nonzero_move_input_count += 1
@@ -6112,7 +6245,8 @@ class WulframServer:
         veh_config = VEHICLE_PHYSICS_CONFIGS.get(ctx.entity_type)
         move_adjust = veh_config.move_adjust if veh_config else 85.0
         strafe_adjust = veh_config.strafe_adjust if veh_config else 69.7
-        low_speed_threshold = veh_config.low_fuel_level if veh_config else 2000.0
+        low_fuel_level = veh_config.low_fuel_level if veh_config else 2000.0
+        max_fuel = veh_config.max_fuel if veh_config else 33000.0
         # Dual-damp: client uses 0.8 when driving, 2.0 when coasting
         # (from Tank_read_throttle_input and Tank_compute_mobility_factors in Vehicles.c)
         has_input = abs(throttle_input) > 0.0 or abs(strafe_input) > 0.0
@@ -6130,9 +6264,10 @@ class WulframServer:
                     vel_z,
                     up_axis=self.up_axis,
                 )
-            forward_mobility = self._tank_low_speed_mobility_factor(
-                current_speed,
-                low_speed_threshold,
+            current_fuel = float(getattr(ctx, "player_fuel", max_fuel))
+            forward_mobility = tank_fuel_mobility_factor(
+                current_fuel,
+                low_fuel_level,
             )
             turn_mobility = self._tank_altitude_mobility(ctx)
             forward_mobility *= turn_mobility
@@ -6293,6 +6428,26 @@ class WulframServer:
             ground_level = self.ground_level
             ground_level_source = "default"
 
+        jumpjet_input = self._get_jumpjet_input(ctx)
+        if vertical_idx == 2:
+            jump_altitude = ctx.player_pos[2] - ground_level if ground_level is not None else ctx.player_pos[2]
+            vel_z, jump_jet_fired, jump_jet_impulse = self._apply_jump_jets_fixed_step(
+                ctx,
+                dt=dt,
+                jumpjet_input=jumpjet_input,
+                current_altitude=jump_altitude,
+                current_vel_up=vel_z,
+            )
+        else:
+            jump_altitude = ctx.player_pos[1] - ground_level if ground_level is not None else ctx.player_pos[1]
+            vel_y, jump_jet_fired, jump_jet_impulse = self._apply_jump_jets_fixed_step(
+                ctx,
+                dt=dt,
+                jumpjet_input=jumpjet_input,
+                current_altitude=jump_altitude,
+                current_vel_up=vel_y,
+            )
+
         suspension_lift = 0.0
         suspension_clearance = None
         suspension_target_clearance = None
@@ -6342,7 +6497,7 @@ class WulframServer:
                 acc_y = -vel_y / dt if dt > 0 else 0.0
 
         pre_pos = ctx.player_pos
-        pre_vel = ctx.player_vel
+        pre_vel = (vel_x, vel_y, vel_z)
 
         # Verlet integration: pos += vel * dt + 0.5 * acc * dtÂ²
         # (from Vec3_integrate_motion, Physics.c:4396-4410)
@@ -6449,11 +6604,17 @@ class WulframServer:
             ),
             "forward_input": throttle_input,
             "strafe_input": strafe_input,
+            "thrust_input": self._normalize_behavior_axis_value(
+                ctx,
+                ctx.weapon_system.behavior_slots[BehaviorSlot.UPWARD_THRUST],
+            ) if getattr(ctx, "weapon_system", None) is not None else 0.0,
+            "jumpjet_input": jumpjet_input,
             "pre_pos": pre_pos,
             "pre_vel": pre_vel,
             "old_heading": yaw,
             "new_heading": ctx.player_heading,
             "current_speed": current_speed,
+            "current_fuel": current_fuel if ctx.entity_type == EntityType.TANK else None,
             "forward_mobility": forward_mobility,
             "turn_mobility": turn_mobility,
             "terrain_up": avg_up if self.terrain and self.up_axis == "z" and self.terrain_pitch_enabled else (0.0, 0.0, 1.0),
@@ -6467,6 +6628,11 @@ class WulframServer:
             "ground_level": ground_level,
             "ground_level_source": ground_level_source,
             "terrain_ground_level": terrain_ground_level,
+            "jump_jet_fired": jump_jet_fired,
+            "jump_jet_impulse": jump_jet_impulse,
+            "jump_jet_altitude": jump_altitude,
+            "jump_cooldown_remaining": ctx.jump_cooldown_remaining,
+            "jump_spawn_lockout": ctx.jump_spawn_lockout,
             "suspension_lift": suspension_lift,
             "suspension_clearance": suspension_clearance,
             "suspension_target_clearance": suspension_target_clearance,
@@ -6642,6 +6808,9 @@ class WulframServer:
 
     def _resolve_entity_world_collision(self, ctx, px, py, pz, vx, vy, vz):
         if self._terrain_grid_collision is None:
+            return px, py, pz, vx, vy, vz
+        if not getattr(self, "entity_terrain_collision_enabled", True):
+            ctx.world_collision_bounds_dirty = False
             return px, py, pz, vx, vy, vz
         if (
             ctx.ground_level_override is not None
@@ -8733,63 +8902,13 @@ class WulframServer:
 
     def _process_jump_jets(self, ctx: ClientContext, addr: tuple):
         """
-        Process jump jet input from behavior slot 5.
+        Process jump jet input.
         Called after decoding ACTION_DUMP or ACTION_UPDATE.
         """
-        if not self.jump_jets_enabled:
-            return
-
-        # Suppress jump jets for the first 2 seconds after spawn to avoid
-        # interfering with the client's spawn state machine.
-        if hasattr(ctx.session, 'last_spawn_time') and (time.monotonic() - ctx.session.last_spawn_time) < 2.0:
-            return
-
-        # Get slot 5 value (upward thrust / Q/Z key)
-        slot5_value = ctx.weapon_system.behavior_slots[BehaviorSlot.UPWARD_THRUST]
-
-        # Get player/entity info
-        player_id = ctx.session.player_id or ctx.entity_id
-        entity_type = 0  # Tank (could track per-player vehicle type)
-
-        if self.up_axis == "z":
-            current_pos_up = ctx.player_pos[2]
-            current_vel_up = ctx.player_vel[2]
-        else:
-            current_pos_up = ctx.player_pos[1]
-            current_vel_up = ctx.player_vel[1]
-
-        # Process jump jet input
-        impulse, cooldown_ready = ctx.jump_jet_system.process_input(
-            player_id=player_id,
-            slot5_value=slot5_value,
-            entity_type=entity_type,
-            current_pos_z=current_pos_up,
-            current_vel_z=current_vel_up,
-            current_energy=ctx.player_energy
-        )
-
-        if impulse > 0:
-            # Apply vertical impulse to player velocity
-            if self.up_axis == "z":
-                ctx.player_vel = (
-                    ctx.player_vel[0],
-                    ctx.player_vel[1],
-                    ctx.player_vel[2] + impulse
-                )
-            else:
-                ctx.player_vel = (
-                    ctx.player_vel[0],
-                    ctx.player_vel[1] + impulse,
-                    ctx.player_vel[2]
-                )
-
-            # Consume fuel (if using energy system)
-            fuel_cost = ctx.jump_jet_system.get_fuel_cost(entity_type)
-            if fuel_cost > 0:
-                self._consume_player_energy(ctx, fuel_cost)
-
-            # Send position/velocity update to client
-            self._send_jump_velocity_update(ctx, addr)
+        # Jump jets are now applied in _update_player_position() so the server
+        # and Python prediction use the same fixed-step rising-edge model.
+        # Keep this packet-arrival hook as a no-op compatibility shim.
+        return
 
     def _on_jump_jet_triggered(self, ctx: ClientContext, player_id: int, impulse: float, new_vel_z: float):
         """Callback when a jump jet is triggered."""

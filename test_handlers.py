@@ -43,6 +43,7 @@ from wulfram.packets import (
     build_player_info,
     build_translation_packet,
     build_update_array_create_tank,
+    build_view_update_create_tank,
     build_update_array_heartbeat,
     build_world_stats,
 )
@@ -243,18 +244,36 @@ def test_spawn_at_point_honors_clicked_pad_when_default_configured():
 
 
 def test_map_entity_z_aligns_buried_entities_to_terrain():
-    """Map-state buildings/spawn points below terrain should be lifted to ground."""
+    """Map-state buildings/spawn points below physics terrain should be lifted."""
     server = WulframServer.__new__(WulframServer)
     server.up_axis = "z"
     server.terrain_height_offset = 5.0
+    server.terrain_physics_height_offset = 0.0
     server.terrain = SimpleNamespace(get_height=lambda x, y: 60.0)
 
-    z, ground_z, aligned = server._align_map_entity_z_to_terrain(2578.7, 3040.0, 63.72)
+    z, ground_z, aligned = server._align_map_entity_z_to_terrain(2578.7, 3040.0, 58.0)
 
     assert aligned is True
-    assert ground_z == 65.0
-    assert z == 65.0
+    assert ground_z == 60.0
+    assert z == 60.0
     print("test_map_entity_z_aligns_buried_entities_to_terrain: PASSED")
+    return True
+
+
+def test_map_entity_z_preserves_raw_z_above_physics_terrain():
+    """The +5 map display offset must not lift physics collision blockers."""
+    server = WulframServer.__new__(WulframServer)
+    server.up_axis = "z"
+    server.terrain_height_offset = 5.0
+    server.terrain_physics_height_offset = 0.0
+    server.terrain = SimpleNamespace(get_height=lambda x, y: 0.0)
+
+    z, ground_z, aligned = server._align_map_entity_z_to_terrain(5064.28, 5103.49, 3.65)
+
+    assert aligned is False
+    assert ground_z == 0.0
+    assert z == 3.65
+    print("test_map_entity_z_preserves_raw_z_above_physics_terrain: PASSED")
     return True
 
 
@@ -263,6 +282,7 @@ def test_map_entity_z_preserves_elevated_entities():
     server = WulframServer.__new__(WulframServer)
     server.up_axis = "z"
     server.terrain_height_offset = 5.0
+    server.terrain_physics_height_offset = 0.0
     server.terrain = SimpleNamespace(
         get_height=lambda x, y: 0.0,
         get_slope=lambda x, y: (0.0, 0.0),
@@ -271,7 +291,7 @@ def test_map_entity_z_preserves_elevated_entities():
     z, ground_z, aligned = server._align_map_entity_z_to_terrain(5150.1, 5241.3, 7.7)
 
     assert aligned is False
-    assert ground_z == 5.0
+    assert ground_z == 0.0
     assert z == 7.7
     print("test_map_entity_z_preserves_elevated_entities: PASSED")
     return True
@@ -564,7 +584,7 @@ def test_build_update_array_remote_heartbeat_shape():
 
 
 def test_server_remote_heartbeat_helper_keeps_full_local_state():
-    """Promoted remote OG heartbeats should keep local-state but avoid forced position snaps."""
+    """Promoted remote OG heartbeats should keep local-state and a complete transform."""
     server = WulframServer.__new__(WulframServer)
     server.update_local_state_mode = "wf"
     server.local_state_weapon_type = 0
@@ -616,8 +636,8 @@ def test_server_remote_heartbeat_helper_keeps_full_local_state():
     assert local_state.weapon_id == 2
     assert len(entities) == 1
     assert entities[0].entity_id == 0x14EA
-    assert entities[0].position is None
-    assert entities[0].velocity is None
+    assert entities[0].position is not None
+    assert entities[0].velocity is not None
     assert entities[0].rotation is not None
     assert entities[0].angular_velocity is not None
     print("test_server_remote_heartbeat_helper_keeps_full_local_state: PASSED")
@@ -1148,6 +1168,181 @@ def test_loopback_state_sync_reply_keeps_request_timestamp():
     return True
 
 
+def test_remote_empirical_view_update_correction_uses_fresh_state_request_timestamp():
+    """Explicit OG correction bursts should stay tied to the latest fresh STATE_REQUEST id."""
+    server = WulframServer.__new__(WulframServer)
+    server.correction_mode = "view_update"
+    server.local_state_turret_max = 6.3
+    server.local_state_turret_range = 12.6
+    server.spawn_tank_weapon_type = 2
+    server._get_health_value = lambda ctx: 1.0
+    server._get_energy_value = lambda ctx: 1.0
+    server._to_client_pos = lambda pos: pos
+
+    session = Session()
+    session.translation_ack_received = True
+    session.in_game = True
+    session.entity_id = 0x14EA
+    session.udp_addr = ("10.10.10.2", 50000)
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=session,
+        entity_id=0x14EA,
+    )
+    ctx.player_pos = (4950.0, 5100.0, 5.0)
+    ctx.player_vel = (1.0, 2.0, 3.0)
+    ctx.player_pose = {"roll": 0.125, "pitch": -0.25}
+    ctx.player_heading = 0.5
+    ctx.last_state_request_id = 0x00ABCDEF
+    ctx.last_state_request_time = time.monotonic()
+
+    payload, label, corr_pos, corr_rot, inc_pos, inc_rot = server._build_empirical_correction_payload(
+        ctx,
+        tick=0x00123456,
+        include_local_state=True,
+        health=1.0,
+        fuel=1.0,
+        weapon_type=0,
+        ammo_bits=6,
+        ammo_mask=0x3F,
+        pt_bits=16,
+        pt_angle=1.0,
+        st_bits=16,
+        st_angle=-1.0,
+    )
+
+    timestamp, tick, local_state, entities = decode_view_update(
+        payload,
+        behavior_config=parse_behavior(build_behavior_packet()),
+    )
+    assert label == "CORRECTION(view_update)"
+    assert inc_pos is True
+    assert inc_rot is True
+    assert timestamp == 0x00ABCDEF
+    assert tick == 0x00123456
+    assert local_state is not None
+    assert local_state.weapon_id == 2
+    assert local_state.ammo_mask == 0
+    assert len(entities) == 1
+    assert entities[0].entity_id == 0x14EA
+    assert entities[0].position is not None
+    assert entities[0].velocity is not None
+    assert entities[0].rotation is not None
+    assert all(abs(a - b) < 0.3 for a, b in zip(entities[0].position, corr_pos))
+    assert all(abs(a - b) < 0.01 for a, b in zip(entities[0].rotation, corr_rot))
+    print("test_remote_empirical_view_update_correction_uses_fresh_state_request_timestamp: PASSED")
+    return True
+
+
+def test_view_update_create_tank_decodes_definition_shape():
+    """Definition-bearing VIEW_UPDATE should roundtrip with bit 0 plus pos/rot."""
+    payload = build_view_update_create_tank(
+        tick=0x00123456,
+        timestamp=0x00ABCDEF,
+        entity_id=0x14EA,
+        entity_type=EntityType.TANK,
+        team=2,
+        pos=(4950.0, 5100.0, 5.0),
+        behavior_type=2,
+        include_health=True,
+        health=0.875,
+        fuel=0.625,
+        weapon_id=2,
+        rot=(0.125, -0.25, 0.5),
+    )
+
+    timestamp, tick, local_state, entities = decode_view_update(
+        payload,
+        behavior_config=parse_behavior(build_behavior_packet()),
+    )
+    assert timestamp == 0x00ABCDEF
+    assert tick == 0x00123456
+    assert local_state is not None
+    assert local_state.weapon_id == 2
+    assert len(entities) == 1
+    assert entities[0].entity_id == 0x14EA
+    assert entities[0].is_manned is True
+    assert entities[0].entity_type == EntityType.TANK
+    assert entities[0].team_id == 2
+    assert entities[0].position is not None
+    assert entities[0].velocity is None
+    assert entities[0].rotation is not None
+    print("test_view_update_create_tank_decodes_definition_shape: PASSED")
+    return True
+
+
+def test_remote_empirical_view_update_define_correction_uses_definition_shape():
+    """The experimental OG correction mode should set definition, pos, and rot under VIEW_UPDATE."""
+    server = WulframServer.__new__(WulframServer)
+    server.correction_mode = "view_update_define"
+    server.local_state_turret_max = 6.3
+    server.local_state_turret_range = 12.6
+    server.spawn_tank_weapon_type = 2
+    server._get_health_value = lambda ctx: 1.0
+    server._get_energy_value = lambda ctx: 1.0
+    server._to_client_pos = lambda pos: pos
+
+    session = Session()
+    session.translation_ack_received = True
+    session.in_game = True
+    session.entity_id = 0x14EA
+    session.team_id = 2
+    session.udp_addr = ("10.10.10.2", 50000)
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=session,
+        entity_id=0x14EA,
+    )
+    ctx.entity_type = EntityType.TANK
+    ctx.player_pos = (4950.0, 5100.0, 5.0)
+    ctx.player_vel = (1.0, 2.0, 3.0)
+    ctx.player_pose = {"roll": 0.125, "pitch": -0.25}
+    ctx.player_heading = 0.5
+    ctx.last_state_request_id = 0x00ABCDEF
+    ctx.last_state_request_time = time.monotonic()
+
+    payload, label, corr_pos, corr_rot, inc_pos, inc_rot = server._build_empirical_correction_payload(
+        ctx,
+        tick=0x00123456,
+        include_local_state=True,
+        health=1.0,
+        fuel=1.0,
+        weapon_type=0,
+        ammo_bits=6,
+        ammo_mask=0x3F,
+        pt_bits=16,
+        pt_angle=1.0,
+        st_bits=16,
+        st_angle=-1.0,
+    )
+
+    timestamp, tick, local_state, entities = decode_view_update(
+        payload,
+        behavior_config=parse_behavior(build_behavior_packet()),
+    )
+    assert label == "CORRECTION(view_update_define)"
+    assert inc_pos is True
+    assert inc_rot is True
+    assert timestamp == 0x00ABCDEF
+    assert tick == 0x00123456
+    assert local_state is not None
+    assert local_state.weapon_id == 2
+    assert local_state.ammo_mask == 0
+    assert len(entities) == 1
+    assert entities[0].entity_id == 0x14EA
+    assert entities[0].entity_type == EntityType.TANK
+    assert entities[0].team_id == 2
+    assert entities[0].position is not None
+    assert entities[0].velocity is None
+    assert entities[0].rotation is not None
+    assert all(abs(a - b) < 0.3 for a, b in zip(entities[0].position, corr_pos))
+    assert all(abs(a - b) < 0.01 for a, b in zip(entities[0].rotation, corr_rot))
+    print("test_remote_empirical_view_update_define_correction_uses_definition_shape: PASSED")
+    return True
+
+
 def test_remote_state_sync_reply_uses_request_aligned_authoritative_pose():
     """STATE_REQUEST replies should use the cached authoritative pose nearest the replay tick."""
     server = WulframServer.__new__(WulframServer)
@@ -1376,7 +1571,7 @@ def test_remote_state_sync_reuses_cached_sample_when_replay_window_misses():
 
 
 def test_remote_promoted_heartbeat_stays_short_form_safe():
-    """Ordinary promoted remote heartbeats should stay on the short-form-safe local-state."""
+    """Ordinary promoted remote heartbeats should keep short local-state and full transform."""
     server = WulframServer.__new__(WulframServer)
     server.update_local_state_mode = "wf"
     server.local_state_weapon_type = 0
@@ -1429,8 +1624,8 @@ def test_remote_promoted_heartbeat_stays_short_form_safe():
     assert local_state is not None
     assert local_state.weapon_id == 2
     assert len(entities) == 1
-    assert entities[0].position is None
-    assert entities[0].velocity is None
+    assert entities[0].position is not None
+    assert entities[0].velocity is not None
     assert entities[0].rotation is not None
     print("test_remote_promoted_heartbeat_stays_short_form_safe: PASSED")
     return True
@@ -1729,8 +1924,8 @@ def test_remote_sync_heartbeat_helper_uses_heading_not_player_yaw():
     assert tick == 0x12345678
     assert local_state is not None
     assert len(entities) == 1
-    assert entities[0].position is None
-    assert entities[0].velocity is None
+    assert entities[0].position is not None
+    assert entities[0].velocity is not None
     assert entities[0].rotation is not None
     assert abs(entities[0].rotation[0] - 0.125) < 1e-3
     assert abs(entities[0].rotation[1] + 0.375) < 1e-3
@@ -1739,8 +1934,8 @@ def test_remote_sync_heartbeat_helper_uses_heading_not_player_yaw():
     return True
 
 
-def test_remote_spawn_bootstrap_heartbeat_uses_safe_rot_only_shape():
-    """Fresh remote OG spawn bootstrap should get a rot-only safe heartbeat."""
+def test_remote_spawn_bootstrap_heartbeat_uses_safe_full_transform_shape():
+    """Fresh remote OG spawn bootstrap should get a complete transform heartbeat."""
     server = WulframServer.__new__(WulframServer)
     server.local_state_turret_max = 6.3
     server.local_state_turret_range = 12.6
@@ -1777,14 +1972,14 @@ def test_remote_spawn_bootstrap_heartbeat_uses_safe_rot_only_shape():
     assert local_state.weapon_id == 2
     assert len(entities) == 1
     assert entities[0].entity_id == 0x14EA
-    assert entities[0].position is None
-    assert entities[0].velocity is None
+    assert entities[0].position is not None
+    assert entities[0].velocity is not None
     assert entities[0].rotation is not None
     assert entities[0].angular_velocity is not None
     assert abs(entities[0].rotation[0] - 0.125) < 1e-3
     assert abs(entities[0].rotation[1] + 0.375) < 1e-3
     assert abs(entities[0].rotation[2] - 0.25) < 1e-3
-    print("test_remote_spawn_bootstrap_heartbeat_uses_safe_rot_only_shape: PASSED")
+    print("test_remote_spawn_bootstrap_heartbeat_uses_safe_full_transform_shape: PASSED")
     return True
 
 
@@ -3262,8 +3457,8 @@ def test_remote_initial_spawn_keeps_minimal_path_when_never_promoted():
     return True
 
 
-def test_server_tank_motion_uses_low_speed_mobility_factor():
-    """Tank forward movement should ramp from the OG 0.4 mobility floor at rest."""
+def test_server_tank_motion_uses_fuel_mobility_factor():
+    """Full-fuel tanks should not get the low-fuel 0.4 mobility floor."""
     server = WulframServer.__new__(WulframServer)
     server.tick_rate_hz = 45.0
     server.linear_damp_driving = 0.0
@@ -3292,6 +3487,52 @@ def test_server_tank_motion_uses_low_speed_mobility_factor():
     ctx.entity_type = EntityType.TANK
     ctx.player_pos = (0.0, 0.0, 10.0)
     ctx.player_vel = (0.0, 0.0, 0.0)
+    ctx.player_fuel = 33000.0
+    ctx.player_heading = 0.0
+    ctx.ground_level_override = None
+    ctx.player_pose = {}
+
+    server._update_player_position(ctx, dt_override=1.0)
+
+    vx, vy, vz = ctx.player_vel
+    assert abs(vx - 85.0) < 1e-4, vx
+    assert abs(vy) < 1e-4, vy
+    assert abs(vz) < 1e-4, vz
+    print("test_server_tank_motion_uses_fuel_mobility_factor: PASSED")
+    return True
+
+
+def test_server_tank_motion_reduces_mobility_when_low_fuel():
+    """Only low raw fuel should activate the OG 0.4-1.0 mobility ramp."""
+    server = WulframServer.__new__(WulframServer)
+    server.tick_rate_hz = 45.0
+    server.linear_damp_driving = 0.0
+    server.linear_damp_coasting = 0.0
+    server.up_axis = "z"
+    server.terrain = None
+    server.terrain_pitch_enabled = False
+    server.gravity = 0.0
+    server.ground_level = 0.0
+    server.world_bound = 100000.0
+    server.f32_physics = False
+    server._resolve_entity_world_collision = (
+        lambda ctx, px, py, pz, vx, vy, vz: (px, py, pz, vx, vy, vz)
+    )
+    server._check_building_collisions = (
+        lambda ctx, px, py, pz, vx, vy: (px, py, vx, vy)
+    )
+
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    ctx.injected_input = (1.0, 0.0)
+    ctx.entity_type = EntityType.TANK
+    ctx.player_pos = (0.0, 0.0, 10.0)
+    ctx.player_vel = (0.0, 0.0, 0.0)
+    ctx.player_fuel = 0.0
     ctx.player_heading = 0.0
     ctx.ground_level_override = None
     ctx.player_pose = {}
@@ -3302,7 +3543,64 @@ def test_server_tank_motion_uses_low_speed_mobility_factor():
     assert abs(vx - 34.0) < 1e-4, vx
     assert abs(vy) < 1e-4, vy
     assert abs(vz) < 1e-4, vz
-    print("test_server_tank_motion_uses_low_speed_mobility_factor: PASSED")
+    print("test_server_tank_motion_reduces_mobility_when_low_fuel: PASSED")
+    return True
+
+
+def test_server_jump_jets_apply_fixed_step_rising_edge():
+    """Opt-in jump jets should fire once on thrust rising edge inside motion step."""
+    server = WulframServer.__new__(WulframServer)
+    server.tick_rate_hz = 30.0
+    server.linear_damp_driving = 0.0
+    server.linear_damp_coasting = 0.0
+    server.up_axis = "z"
+    server.terrain = None
+    server.terrain_pitch_enabled = False
+    server.gravity = 0.0
+    server.ground_level = 0.0
+    server.world_bound = 100000.0
+    server.f32_physics = False
+    server.jump_jets_enabled = True
+    server.weapon_energy_enabled = True
+    server.player_energy_max = 100.0
+    server._resolve_entity_world_collision = (
+        lambda ctx, px, py, pz, vx, vy, vz: (px, py, pz, vx, vy, vz)
+    )
+    server._check_building_collisions = (
+        lambda ctx, px, py, pz, vx, vy: (px, py, vx, vy)
+    )
+
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    ctx.injected_input = (0.0, 0.0)
+    ctx.injected_thrust = 1.0
+    ctx.entity_type = EntityType.TANK
+    ctx.player_pos = (0.0, 0.0, 10.0)
+    ctx.player_vel = (0.0, 0.0, 0.0)
+    ctx.player_fuel = 33000.0
+    ctx.player_energy = 100.0
+    ctx.player_heading = 0.0
+    ctx.ground_level_override = None
+    ctx.player_pose = {}
+    ctx.jump_spawn_lockout = 0.0
+    ctx.jump_cooldown_remaining = 0.0
+    ctx.jump_prev_thrust_input = 0.0
+
+    server._update_player_position(ctx, dt_override=1.0 / 30.0)
+
+    assert ctx.debug_last_controller_step["jump_jet_fired"] is True
+    assert abs(ctx.player_vel[2] - 15.0) < 1e-4, ctx.player_vel
+    assert abs(ctx.player_energy - 90.0) < 1e-4, ctx.player_energy
+
+    server._update_player_position(ctx, dt_override=1.0 / 30.0)
+
+    assert ctx.debug_last_controller_step["jump_jet_fired"] is False
+    assert abs(ctx.player_vel[2] - 15.0) < 1e-4, ctx.player_vel
+    print("test_server_jump_jets_apply_fixed_step_rising_edge: PASSED")
     return True
 
 
@@ -4509,6 +4807,51 @@ def test_effective_inactivity_timeout_extends_remote_ingame_clients():
     assert server._effective_inactivity_timeout(remote_ctx) == 900.0
     assert server._effective_inactivity_timeout(local_ctx) == 120.0
     print("test_effective_inactivity_timeout_extends_remote_ingame_clients: PASSED")
+    return True
+
+
+def test_entity_world_collision_can_be_disabled_for_player_sync():
+    """Server can leave terrain shape collision out of player motion while keeping other terrain users."""
+    collision_calls = 0
+
+    def fake_box_collision(*args, **kwargs):
+        nonlocal collision_calls
+        collision_calls += 1
+        return TerrainContact(
+            position=(50.0, 75.0, 6.0),
+            normal=(-1.0, 0.0, 0.0),
+            penetration=8.0,
+            sector_index=0,
+            cell=(0, 0),
+        )
+
+    server = WulframServer.__new__(WulframServer)
+    server._terrain_grid_collision = SimpleNamespace(test_box_collision=fake_box_collision)
+    server.entity_terrain_collision_enabled = False
+
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    ctx.player_heading = 0.0
+    ctx.world_collision_bounds_dirty = True
+
+    result = server._resolve_entity_world_collision(
+        ctx,
+        100.0,
+        200.0,
+        10.0,
+        3.0,
+        4.0,
+        -6.0,
+    )
+
+    assert result == (100.0, 200.0, 10.0, 3.0, 4.0, -6.0), result
+    assert collision_calls == 0, collision_calls
+    assert ctx.world_collision_bounds_dirty is False, ctx.world_collision_bounds_dirty
+    print("test_entity_world_collision_can_be_disabled_for_player_sync: PASSED")
     return True
 
 
@@ -6192,6 +6535,7 @@ def main():
         test_spawn_override_wins_over_map_spawn_points,
         test_spawn_at_point_honors_clicked_pad_when_default_configured,
         test_map_entity_z_aligns_buried_entities_to_terrain,
+        test_map_entity_z_preserves_raw_z_above_physics_terrain,
         test_map_entity_z_preserves_elevated_entities,
         test_control_pose_reset_updates_ground_override,
         test_pulse_shell_default_spawn_uses_recovered_muzzle_offset,
@@ -6208,6 +6552,9 @@ def main():
         test_remote_state_sync_reply_stays_safe_without_post_spawn_input_after_delay,
         test_remote_state_sync_reply_emits_view_update_with_request_timestamp,
         test_loopback_state_sync_reply_keeps_request_timestamp,
+        test_remote_empirical_view_update_correction_uses_fresh_state_request_timestamp,
+        test_view_update_create_tank_decodes_definition_shape,
+        test_remote_empirical_view_update_define_correction_uses_definition_shape,
         test_remote_state_sync_reply_uses_request_aligned_authoritative_pose,
         test_remote_promoted_heartbeat_stays_short_form_safe,
         test_remote_state_sync_reply_keeps_full_motion_when_stable,
@@ -6216,7 +6563,7 @@ def main():
         test_spawn_wf_minimal_uses_local_player_sync_rotation,
         test_player_body_rotation_preserves_pitch_for_remote_entities,
         test_remote_sync_heartbeat_helper_uses_heading_not_player_yaw,
-        test_remote_spawn_bootstrap_heartbeat_uses_safe_rot_only_shape,
+        test_remote_spawn_bootstrap_heartbeat_uses_safe_full_transform_shape,
         test_state_request_does_not_overwrite_client_tick_offset,
         test_remote_udp_ping_request_gets_og_safe_reply,
         test_udp_ping_reply_default_policy_is_loopback_only,
@@ -6249,7 +6596,9 @@ def main():
         test_remote_client_does_not_promote_full_local_state_on_heartbeat_reason,
         test_remote_respawn_restores_promoted_local_state_after_spawn,
         test_remote_initial_spawn_keeps_minimal_path_when_never_promoted,
-        test_server_tank_motion_uses_low_speed_mobility_factor,
+        test_server_tank_motion_uses_fuel_mobility_factor,
+        test_server_tank_motion_reduces_mobility_when_low_fuel,
+        test_server_jump_jets_apply_fixed_step_rising_edge,
         test_server_motion_clamps_to_move_adjust,
         test_server_motion_reclamps_below_ground_after_collision_response,
         test_server_motion_uses_physics_terrain_offset_for_vehicle_ground,
@@ -6282,6 +6631,7 @@ def main():
         test_building_collision_team_variant_matches_client_helper,
         test_server_team_model_name_matches_client_helper,
         test_effective_inactivity_timeout_extends_remote_ingame_clients,
+        test_entity_world_collision_can_be_disabled_for_player_sync,
         test_entity_world_collision_prefers_mesh_contact_when_collision_model_exists,
         test_entity_world_collision_falls_back_to_box_without_collision_model,
         test_entity_world_collision_uses_dirty_terrain_raycast_branch,

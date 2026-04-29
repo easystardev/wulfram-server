@@ -976,7 +976,7 @@ Examples:
         if not self.server:
             return "Error: No server reference"
 
-        valid_modes = ("full", "rot_only", "pos_only", "dual_entity", "view_update")
+        valid_modes = ("full", "rot_only", "pos_only", "dual_entity", "view_update", "view_update_define")
         if not hasattr(self.server, "correction_mode"):
             self.server.correction_mode = "dual_entity"
         if not hasattr(self.server, "correction_interval"):
@@ -998,7 +998,7 @@ Examples:
                     lines.append(f"  client {ctx.client_id}: no corrections sent yet{queued}")
             lines.append("")
             lines.append("Usage: correction <seconds|on|off|now|mode <name>|send [c<id>]>")
-            lines.append("Modes: full, rot_only, pos_only, dual_entity, view_update")
+            lines.append("Modes: full, rot_only, pos_only, dual_entity, view_update, view_update_define")
             return "\n".join(lines)
 
         subcmd = args[0].lower()
@@ -1458,6 +1458,7 @@ Examples:
 
             if not quick:
                 # Full reload: all modules in dependency order
+                from wulfram2_protocol import entities as entities_mod
                 from . import codec as codec_mod
                 from . import session as session_mod
                 from . import client as client_mod
@@ -1477,6 +1478,7 @@ Examples:
                 # (handlers, control, server). Otherwise those modules bind to
                 # the discarded new Features() instance.
                 for mod, name in [
+                    (entities_mod, "shared.entities"),
                     (codec_mod, "codec"),
                     (session_mod, "session"),
                     (physics_mod, "physics"),
@@ -1823,13 +1825,19 @@ Examples:
                     thrust = ws.behavior_slots[BehaviorSlot.UPWARD_THRUST]
                     s6 = ws.behavior_slots[BehaviorSlot.SLOT6]
                     s7 = ws.behavior_slots[BehaviorSlot.SLOT7]
+                    active_slots = ",".join(
+                        f"{idx}:{float(value):.4f}"
+                        for idx, value in enumerate(ws.behavior_slots)
+                        if abs(float(value)) > 0.001
+                    ) or "none"
                     raw_input = self.server._get_raw_turn_input(ctx)
                     physics = ctx.vehicle_physics
                     ang_vel = physics.angular_velocity if physics else 0.0
                     lines.append(
                         f"C{ctx.client_id}: turn={turn:.4f} fwd={fwd:.4f} side={side:.4f} "
                         f"fire={fire:.0f} thrust={thrust:.4f} s6={s6:.4f} s7={s7:.4f} | "
-                        f"raw={raw_input:.4f} av={ang_vel:.4f} hdg={_math.degrees(-ctx.player_heading):.1f}"
+                        f"raw={raw_input:.4f} av={ang_vel:.4f} hdg={_math.degrees(-ctx.player_heading):.1f} | "
+                        f"active={active_slots}"
                     )
             return "\n".join(lines) if lines else "No connected clients"
         except Exception as e:

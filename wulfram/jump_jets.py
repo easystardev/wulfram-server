@@ -1,40 +1,23 @@
 """
 Jump Jets system for Wulfram 2 server.
 
-Implements a custom jump jet mechanic since the original game doesn't have one.
-Uses behavior slot 5 (upward thrust / Q/Z keys) with rising edge detection.
+Implements the opt-in server-side jump jet extension.
+Empirical OG input probing shows action_key "jumpjet" is behavior slot 4;
+Q/Z upward_thrust remains slot 5 and should not trigger this path.
 """
 
 import time
-from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple, Callable
 
-
-@dataclass
-class JumpJetConfig:
-    """Configuration for jump jets per vehicle type."""
-    impulse: float = 15.0        # Upward velocity impulse (units/second)
-    cooldown: float = 3.0        # Seconds before can jump again
-    fuel_cost: float = 10.0      # Energy consumed (0 = free)
-    max_altitude: float = 50.0   # Maximum height limit
-    air_control: float = 0.3     # Movement control while airborne (0-1)
-
-
-# Per vehicle type configurations
-# Vehicle types: 0=Tank, 1=Scout/Medic, 2=Assault, 3=Bomber
-JUMP_JET_CONFIGS: Dict[int, JumpJetConfig] = {
-    0: JumpJetConfig(impulse=15.0, cooldown=3.0, fuel_cost=10.0),   # Tank - standard
-    1: JumpJetConfig(impulse=20.0, cooldown=2.0, fuel_cost=8.0),    # Scout - high, fast
-    2: JumpJetConfig(impulse=10.0, cooldown=5.0, fuel_cost=15.0),   # Assault - low, slow
-    # Bomber (3+) - no jump jets, they already fly
-}
+from dataclasses import dataclass
+from wulfram2_protocol.entities import JUMP_JET_CONFIGS, JumpJetConfig
 
 
 @dataclass
 class JumpJetState:
     """Per-player jump jet state."""
     last_jump_time: float = 0.0       # Monotonic time of last jump
-    prev_slot5_value: float = 0.0     # For rising edge detection
+    prev_jumpjet_value: float = 0.0   # For rising edge detection
     is_airborne: bool = False         # Currently in jump
     air_time: float = 0.0             # Time since leaving ground
 
@@ -43,8 +26,8 @@ class JumpJetSystem:
     """
     Handles jump jet mechanics for all players.
 
-    Detects when behavior slot 5 (Q/Z keys / upward thrust) transitions
-    from low to high (rising edge) and applies a vertical impulse if
+    Detects when jumpjet action input transitions from low to high
+    (rising edge) and applies a vertical impulse if
     cooldown has elapsed and altitude allows.
     """
 
@@ -68,7 +51,7 @@ class JumpJetSystem:
     def process_input(
         self,
         player_id: int,
-        slot5_value: float,
+        jumpjet_value: float,
         entity_type: int,
         current_pos_z: float,
         current_vel_z: float = 0.0,
@@ -79,7 +62,7 @@ class JumpJetSystem:
 
         Args:
             player_id: Player identifier
-            slot5_value: Current value of behavior slot 5 (0.0-1.0)
+            jumpjet_value: Current jumpjet action value (0.0-1.0)
             entity_type: Vehicle type (0=Tank, 1=Scout, etc.)
             current_pos_z: Current altitude
             current_vel_z: Current vertical velocity
@@ -100,8 +83,8 @@ class JumpJetSystem:
             return (0.0, True)
 
         # Rising edge detection: slot goes from < 0.5 to >= 0.5
-        rising_edge = state.prev_slot5_value < 0.5 and slot5_value >= 0.5
-        state.prev_slot5_value = slot5_value
+        rising_edge = state.prev_jumpjet_value < 0.5 and jumpjet_value >= 0.5
+        state.prev_jumpjet_value = jumpjet_value
 
         # Check cooldown status (for UI feedback even if not jumping)
         now = time.monotonic()

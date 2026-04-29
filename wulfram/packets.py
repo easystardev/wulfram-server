@@ -869,6 +869,7 @@ def build_update_array_create_tank(tick: int, entity_id: int, entity_type: int, 
                                     health: float = 1.0,
                                     fuel: float = 1.0,
                                     is_manned: bool = True,
+                                    is_static: bool = False,
                                     weapon_id: int = 2,
                                     rot: Tuple[float, float, float] = (0.0, 0.0, 0.0),
                                     ammo_count_bits: int = 0,
@@ -904,7 +905,7 @@ def build_update_array_create_tank(tick: int, entity_id: int, entity_type: int, 
     config_val = behavior_type if behavior_type else team
     bw.write_bits(8, config_val & 0xFF)
     bw.write_bits(8, team & 0xFF)
-    bw.write_bits(1, 0)
+    bw.write_bits(1, 1 if is_static else 0)
 
     bw.write_bits(4, 15)
     for coord in pos:
@@ -921,6 +922,63 @@ def build_update_array_create_tank(tick: int, entity_id: int, entity_type: int, 
         bw.write_bits(10, _encode_health_bits(fuel, total_bits=10, max_val=ENERGY_MAX, range_val=ENERGY_RANGE))
 
     return b'\x0E' + tick_bytes + bw.get_bytes()
+
+
+def build_view_update_create_tank(tick: int, entity_id: int, entity_type: int, team: int,
+                                  pos: Tuple[float, float, float], behavior_type: int = 0,
+                                  include_interp: bool = False, interp_bits: int = 16,
+                                  include_health: bool = True,
+                                  include_entity_vitals: bool = False,
+                                  health: float = 1.0,
+                                  fuel: float = 1.0,
+                                  is_manned: bool = True,
+                                  is_static: bool = False,
+                                  weapon_id: int = 2,
+                                  rot: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+                                  ammo_count_bits: int = 0,
+                                  ammo_count: int = 0,
+                                  primary_turret_bits: int = 0,
+                                  primary_turret_angle: float = 0.0,
+                                  secondary_turret_bits: int = 0,
+                                  secondary_turret_angle: float = 0.0,
+                                  turret_max: float = 6.3,
+                                  turret_range: float = 12.6,
+                                  timestamp: Optional[int] = None) -> bytes:
+    """Build VIEW_UPDATE carrying the same definition-bearing tank shape.
+
+    OG's local correction path appears to gate transform application on the
+    entity-definition bit in the same UPDATE_ARRAY payload. Keep this wrapper
+    byte-identical to build_update_array_create_tank after the replay timestamp.
+    """
+    if timestamp is None:
+        timestamp = get_ticks()
+    update = build_update_array_create_tank(
+        tick=tick,
+        entity_id=entity_id,
+        entity_type=entity_type,
+        team=team,
+        pos=pos,
+        behavior_type=behavior_type,
+        include_interp=include_interp,
+        interp_bits=interp_bits,
+        include_health=include_health,
+        include_entity_vitals=include_entity_vitals,
+        health=health,
+        fuel=fuel,
+        is_manned=is_manned,
+        is_static=is_static,
+        weapon_id=weapon_id,
+        rot=rot,
+        ammo_count_bits=ammo_count_bits,
+        ammo_count=ammo_count,
+        primary_turret_bits=primary_turret_bits,
+        primary_turret_angle=primary_turret_angle,
+        secondary_turret_bits=secondary_turret_bits,
+        secondary_turret_angle=secondary_turret_angle,
+        turret_max=turret_max,
+        turret_range=turret_range,
+    )
+    return b'\x0F' + struct.pack(">I", timestamp) + update[1:]
 
 
 def build_update_array_teleport(tick: int, entity_id: int,

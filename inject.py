@@ -13,7 +13,11 @@ Control plane runs on port 2628 (game server port + 1).
 import socket
 import sys
 import argparse
-import readline  # Enables arrow keys, history in interactive mode
+
+try:
+    import readline  # Enables arrow keys, history in interactive mode
+except ImportError:
+    readline = None
 
 
 def connect(host: str = "127.0.0.1", port: int = 2628) -> socket.socket:
