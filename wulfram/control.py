@@ -106,6 +106,74 @@ def build_input_sync_diagnosis(
     }
 
 
+def build_player_terrain_probe(server: Any, pos: tuple[float, float, float], heading_rad: float) -> dict:
+    """Return decompile-grounded terrain probe data for live player telemetry.
+
+    The probe mirrors the fields we care about for the current rough-terrain
+    target: the active triangle-plane height/normal from
+    `GUESS3_Terrain_interpolate_grid_height`, the physics ground Z used by the
+    server movement path, and the tank's current clearance over that plane.
+    """
+    if server is None:
+        return {}
+    terrain = getattr(server, "terrain", None)
+    if terrain is None:
+        return {}
+
+    import math
+
+    x, y, z = (float(pos[0]), float(pos[1]), float(pos[2]))
+    physics_offset = float(
+        getattr(server, "terrain_physics_height_offset", getattr(server, "terrain_height_offset", 0.0))
+    )
+    sample_height_normal = getattr(terrain, "sample_height_normal", None)
+    if callable(sample_height_normal):
+        raw_height, normal = sample_height_normal(x, y)
+    else:
+        raw_height = terrain.get_height(x, y)
+        dh_dx, dh_dy = terrain.get_slope(x, y)
+        mag_sq = dh_dx * dh_dx + dh_dy * dh_dy + 1.0
+        if mag_sq <= 1e-12:
+            normal = (0.0, 0.0, 1.0)
+        else:
+            inv_mag = 1.0 / math.sqrt(mag_sq)
+            normal = (-dh_dx * inv_mag, -dh_dy * inv_mag, inv_mag)
+
+    if abs(float(normal[2])) <= 1e-12:
+        slope = (0.0, 0.0)
+    else:
+        slope = (-float(normal[0]) / float(normal[2]), -float(normal[1]) / float(normal[2]))
+
+    cell = None
+    cell_type = None
+    try:
+        gx = int(math.floor(x * float(terrain.inv_cell_x)))
+        gy = int(math.floor(y * float(terrain.inv_cell_z)))
+        gx = max(0, min(gx, int(terrain.num_x) - 2))
+        gy = max(0, min(gy, int(terrain.num_z) - 2))
+        cell = [gx, gy]
+        get_cell_type = getattr(terrain, "get_cell_type", None)
+        if callable(get_cell_type):
+            cell_type = int(get_cell_type(gx, gy))
+    except Exception:
+        cell = None
+
+    ground_z = float(raw_height) + physics_offset
+    slope_heading = slope[0] * math.cos(heading_rad) + slope[1] * math.sin(heading_rad)
+    return {
+        "source": "GUESS3_Terrain_interpolate_grid_height",
+        "cell": cell,
+        "cell_type": cell_type,
+        "raw_height": round(float(raw_height), 5),
+        "physics_ground_z": round(ground_z, 5),
+        "clearance_z": round(z - ground_z, 5),
+        "normal": [round(float(v), 6) for v in normal],
+        "slope": [round(float(v), 6) for v in slope],
+        "slope_at_heading": round(float(slope_heading), 6),
+        "pitch_at_heading_deg": round(math.degrees(math.atan(slope_heading)), 3),
+    }
+
+
 class ControlServer:
     """
     Control plane server for packet injection.
@@ -208,6 +276,7 @@ class ControlServer:
         ctx.pending_respawn_pos = None
         ctx.injected_input = None
         ctx.injected_turn = None
+        ctx.injected_jumpjet = None
         ctx.prev_raw_turn_input = 0.0
         if hasattr(ctx, "authoritative_state_history"):
             ctx.authoritative_state_history.clear()
@@ -426,6 +495,8 @@ class ControlServer:
             return self._cmd_input(args)
         elif cmd == 'move' or cmd == 'mv':
             return self._cmd_move(args)
+        elif cmd == 'jump' or cmd == 'jj':
+            return self._cmd_jump(args)
         elif cmd == 'damage' or cmd == 'dmg':
             return self._cmd_damage(args)
         elif cmd == 'resend':
@@ -478,6 +549,7 @@ class ControlServer:
   health set <val> [c<id>] - Set health directly (0.0-1.0)
   players / pl [json]    - Show all connected players' positions and headings
   projectiles / proj [json] - Dump live in-flight projectile state for divergence probes
+  jump / jj [secs] [c<id>] - Pulse opt-in server-side jumpjet action
   help                   - Show this help
   quit                   - Disconnect
 
@@ -1695,6 +1767,11 @@ Examples:
                     "aim_yaw_deg": round(math.degrees(ctx.player_aim_yaw), 1),
                     "aim_pitch_deg": round(math.degrees(ctx.player_aim_pitch), 1),
                     "health_pct": round(ctx.player_health * 100),
+                    "terrain": build_player_terrain_probe(
+                        self.server,
+                        ctx.player_pos,
+                        ctx.player_heading,
+                    ),
                     "telemetry": telemetry,
                 }
                 clients.append(entry)
@@ -1822,6 +1899,7 @@ Examples:
                     fwd = ws.behavior_slots[BehaviorSlot.MOVING_FORWARD]
                     side = ws.behavior_slots[BehaviorSlot.MOVING_SIDEWAYS]
                     fire = ws.behavior_slots[BehaviorSlot.FIRE]
+                    jumpjet = ws.behavior_slots[BehaviorSlot.JUMPJET]
                     thrust = ws.behavior_slots[BehaviorSlot.UPWARD_THRUST]
                     s6 = ws.behavior_slots[BehaviorSlot.SLOT6]
                     s7 = ws.behavior_slots[BehaviorSlot.SLOT7]
@@ -1835,7 +1913,7 @@ Examples:
                     ang_vel = physics.angular_velocity if physics else 0.0
                     lines.append(
                         f"C{ctx.client_id}: turn={turn:.4f} fwd={fwd:.4f} side={side:.4f} "
-                        f"fire={fire:.0f} thrust={thrust:.4f} s6={s6:.4f} s7={s7:.4f} | "
+                        f"jump={jumpjet:.0f} fire={fire:.0f} thrust={thrust:.4f} s6={s6:.4f} s7={s7:.4f} | "
                         f"raw={raw_input:.4f} av={ang_vel:.4f} hdg={_math.degrees(-ctx.player_heading):.1f} | "
                         f"active={active_slots}"
                     )
@@ -1927,6 +2005,55 @@ Examples:
         t = threading.Thread(target=_do_move, daemon=True)
         t.start()
         return f"Moving {direction} for {duration:.1f}s ({len(targets)} client(s))"
+
+    def _cmd_jump(self, args: list) -> str:
+        """Pulse the opt-in server-side jumpjet input for a client.
+
+        Usage:
+          jump [secs] [c<id>]  - Pulse jumpjet action (default 0.30s)
+        """
+        if not self.server:
+            return "Error: No server reference"
+        import threading
+
+        duration = 0.30
+        client_filter = None
+        for a in args:
+            if a.lower().startswith("c") and a[1:].isdigit():
+                client_filter = int(a[1:])
+            else:
+                try:
+                    duration = float(a)
+                except ValueError:
+                    pass
+        duration = max(1.0 / max(float(getattr(self.server, "tick_rate_hz", 30.0)), 1.0), duration)
+
+        targets = []
+        with self.server.clients_lock:
+            for ctx in self.server.clients.values():
+                if not ctx or not ctx.running:
+                    continue
+                if client_filter is not None and ctx.client_id != client_filter:
+                    continue
+                targets.append(ctx)
+
+        if not targets:
+            return "No matching clients"
+
+        def _do_jump():
+            for ctx in targets:
+                ctx.jump_prev_thrust_input = 0.0
+                ctx.injected_jumpjet = 1.0
+            time.sleep(duration)
+            for ctx in targets:
+                ctx.injected_jumpjet = None
+            print(f"[JUMP] control pulse complete ({duration:.2f}s)")
+
+        t = threading.Thread(target=_do_jump, daemon=True)
+        t.start()
+        enabled = bool(getattr(self.server, "jump_jets_enabled", False))
+        status = "enabled" if enabled else "disabled"
+        return f"Pulsed jumpjet for {duration:.2f}s ({len(targets)} client(s), server jump_jets={status})"
 
     def _cmd_damage(self, args: list) -> str:
         """Apply damage to a player for testing.
@@ -2293,13 +2420,18 @@ Examples:
         if args and len(args) >= 2:
             try:
                 wx, wy = float(args[0]), float(args[1])
-                h = t.get_height(wx, wy)
-                pitch = t.get_pitch_at_heading(wx, wy, 0.0)
+                wz = float(args[2]) if len(args) >= 3 else 0.0
+                probe = build_player_terrain_probe(
+                    self.server,
+                    (wx, wy, wz),
+                    0.0,
+                )
                 lines.append(
-                    f"  ({wx:.1f}, {wy:.1f}): h={h:.2f} "
-                    f"map_ground_z={h + map_offset:.2f} "
-                    f"physics_ground_z={h + physics_offset:.2f} "
-                    f"pitch={math.degrees(pitch):.1f} deg (north)"
+                    f"  ({wx:.1f}, {wy:.1f}): h={probe.get('raw_height', 0.0):.2f} "
+                    f"map_ground_z={probe.get('raw_height', 0.0) + map_offset:.2f} "
+                    f"physics_ground_z={probe.get('physics_ground_z', 0.0):.2f} "
+                    f"cell={probe.get('cell')} normal={probe.get('normal')} "
+                    f"slope={probe.get('slope')} pitch={probe.get('pitch_at_heading_deg', 0.0):.1f} deg (north)"
                 )
             except Exception as e:
                 lines.append(f"  Error: {e}")
@@ -2309,13 +2441,14 @@ Examples:
                     if not ctx or not ctx.running:
                         continue
                     x, y, z = ctx.player_pos
-                    h = t.get_height(x, y)
-                    pitch = t.get_pitch_at_heading(x, y, ctx.player_heading)
+                    probe = build_player_terrain_probe(self.server, ctx.player_pos, ctx.player_heading)
                     lines.append(
                         f"  c{ctx.client_id} pos=({x:.1f},{y:.1f},{z:.2f}) "
-                        f"terrain_h={h:.2f} physics_ground_z={h + physics_offset:.2f} "
-                        f"pitch={math.degrees(pitch):.1f}deg "
-                        f"delta_z={z - (h + physics_offset):.2f}"
+                        f"terrain_h={probe.get('raw_height', 0.0):.2f} "
+                        f"physics_ground_z={probe.get('physics_ground_z', 0.0):.2f} "
+                        f"cell={probe.get('cell')} normal={probe.get('normal')} "
+                        f"pitch={probe.get('pitch_at_heading_deg', 0.0):.1f}deg "
+                        f"delta_z={probe.get('clearance_z', 0.0):.2f}"
                     )
         return "\n".join(lines)
 

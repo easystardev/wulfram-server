@@ -732,6 +732,14 @@ class WulframServer:
         # Jump jets are a custom extension, not part of the OG Tank controller.
         # Keep them opt-in so default server motion stays clone-focused.
         self.jump_jets_enabled = os.environ.get("WULFRAM_JUMP_JETS", "0") == "1"
+        self.jump_jet_correction_burst_count = max(
+            0,
+            int(os.environ.get("WULFRAM_JUMP_JET_CORRECTION_BURST", "12")),
+        )
+        self.jump_jet_correction_burst_interval = max(
+            0.01,
+            float(os.environ.get("WULFRAM_JUMP_JET_CORRECTION_INTERVAL", "0.05")),
+        )
 
         print(
             "[CONFIG] spawn_udp_tank="
@@ -762,6 +770,7 @@ class WulframServer:
             f"force_default_spawn={int(self.force_default_spawn_pos)} "
             f"default_spawn={self.default_flat_spawn_pos} "
             f"heartbeat_view={int(self.heartbeat_view_update)} jump_jets={int(self.jump_jets_enabled)} "
+            f"jump_corr={self.jump_jet_correction_burst_count}@{self.jump_jet_correction_burst_interval:.2f}s "
             f"terrain_collision_override={int(self.terrain_collision_with_ground_override)} "
             f"inactivity_timeout={self.inactivity_timeout:.1f}s"
         )
@@ -6014,6 +6023,11 @@ class WulframServer:
 
     def _get_jumpjet_input(self, ctx: ClientContext) -> float:
         """Get digital jumpjet action input from OG behavior slot 4."""
+        injected = getattr(ctx, "injected_jumpjet", None)
+        if injected is not None:
+            return 1.0 if float(injected) >= 0.5 else 0.0
+        # Backward compatibility for older tests/control scripts that used the
+        # upward-thrust override before slot 4 was split out as jumpjet.
         injected = getattr(ctx, "injected_thrust", None)
         if injected is not None:
             return 1.0 if float(injected) >= 0.5 else 0.0
@@ -8913,6 +8927,25 @@ class WulframServer:
     def _on_jump_jet_triggered(self, ctx: ClientContext, player_id: int, impulse: float, new_vel_z: float):
         """Callback when a jump jet is triggered."""
         print(f"[JUMP] Jump triggered for player {player_id}: impulse={impulse}, vel_z={new_vel_z:.1f}")
+        burst_count = int(getattr(self, "jump_jet_correction_burst_count", 0) or 0)
+        if burst_count > 0 and not handlers._is_loopback_client(ctx):
+            # The original Tank controller has no local jumpjet impulse, so OG
+            # clients need a short authoritative burst to make the custom
+            # server-side hop visible instead of waiting for sparse organic
+            # STATE_REQUEST replies.
+            ctx.force_correction_once = True
+            ctx.correction_burst_remaining = max(
+                int(getattr(ctx, "correction_burst_remaining", 0) or 0),
+                burst_count - 1,
+            )
+            ctx.correction_burst_interval_s = float(
+                getattr(self, "jump_jet_correction_burst_interval", 0.05) or 0.05
+            )
+            ctx.last_correction_send = 0.0
+            print(
+                f"[JUMP] Queued correction burst x{burst_count} "
+                f"@ {ctx.correction_burst_interval_s:.2f}s for client {ctx.client_id}"
+            )
 
         # Send visual/audio feedback via chat — debug clients only.
         # OG client crashes on unexpected COMM_MESSAGE during spawn.

@@ -23,7 +23,7 @@ from wulfram.handlers import (
     _send_spawn_points_for_client,
 )
 from wulfram.client import ClientContext
-from wulfram.control import ControlServer, build_input_sync_diagnosis
+from wulfram.control import ControlServer, build_input_sync_diagnosis, build_player_terrain_probe
 from wulfram.session import Session, Phase, FEATURES
 from wulfram.server import WulframServer, _StaticWorldRayNode
 from wulfram.terrain import Terrain
@@ -51,7 +51,7 @@ from wulfram2_protocol.codec import BitReader
 from client.wulfram_client.network.behavior import parse_behavior
 from client.wulfram_client.network.decoder import decode_update_array, decode_view_update, decode_tank_packet
 from client.wulfram_client.network.quantizer import parse_translation
-from wulfram2_protocol.entities import tank_suspension_lift_accel
+from wulfram2_protocol.entities import JUMP_JET_CONFIGS, tank_suspension_lift_accel
 from client.wulfram_client.data.models import CBSPTree, CBSPTreeNode, Vec3
 from client.wulfram_client.simulation.collision import (
     segment_hits_cbsp_tree,
@@ -3577,7 +3577,7 @@ def test_server_jump_jets_apply_fixed_step_rising_edge():
         entity_id=0x14EA,
     )
     ctx.injected_input = (0.0, 0.0)
-    ctx.injected_thrust = 1.0
+    ctx.injected_jumpjet = 1.0
     ctx.entity_type = EntityType.TANK
     ctx.player_pos = (0.0, 0.0, 10.0)
     ctx.player_vel = (0.0, 0.0, 0.0)
@@ -3592,15 +3592,110 @@ def test_server_jump_jets_apply_fixed_step_rising_edge():
 
     server._update_player_position(ctx, dt_override=1.0 / 30.0)
 
+    tank_jump = JUMP_JET_CONFIGS[EntityType.TANK]
     assert ctx.debug_last_controller_step["jump_jet_fired"] is True
-    assert abs(ctx.player_vel[2] - 15.0) < 1e-4, ctx.player_vel
-    assert abs(ctx.player_energy - 90.0) < 1e-4, ctx.player_energy
+    assert abs(ctx.player_vel[2] - tank_jump.impulse) < 1e-4, ctx.player_vel
+    assert abs(ctx.player_energy - (100.0 - tank_jump.fuel_cost)) < 1e-4, ctx.player_energy
 
     server._update_player_position(ctx, dt_override=1.0 / 30.0)
 
     assert ctx.debug_last_controller_step["jump_jet_fired"] is False
-    assert abs(ctx.player_vel[2] - 15.0) < 1e-4, ctx.player_vel
+    assert abs(ctx.player_vel[2] - tank_jump.impulse) < 1e-4, ctx.player_vel
     print("test_server_jump_jets_apply_fixed_step_rising_edge: PASSED")
+    return True
+
+
+def test_server_jump_jets_have_visible_peak_under_default_gravity():
+    """Opt-in tank jumpjets should produce a visible altitude change, not a tiny hop."""
+    server = WulframServer.__new__(WulframServer)
+    server.tick_rate_hz = 30.0
+    server.linear_damp_driving = 0.8
+    server.linear_damp_coasting = 2.0
+    server.up_axis = "z"
+    server.terrain = None
+    server.terrain_pitch_enabled = False
+    server.gravity = -50.0
+    server.ground_level = 0.0
+    server.world_bound = 100000.0
+    server.f32_physics = False
+    server.jump_jets_enabled = True
+    server.weapon_energy_enabled = True
+    server.player_energy_max = 100.0
+    server._resolve_entity_world_collision = (
+        lambda ctx, px, py, pz, vx, vy, vz: (px, py, pz, vx, vy, vz)
+    )
+    server._check_building_collisions = (
+        lambda ctx, px, py, pz, vx, vy: (px, py, vx, vy)
+    )
+
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    ctx.injected_input = (0.0, 0.0)
+    ctx.injected_jumpjet = 1.0
+    ctx.entity_type = EntityType.TANK
+    ctx.player_pos = (0.0, 0.0, 0.0)
+    ctx.player_vel = (0.0, 0.0, 0.0)
+    ctx.player_fuel = 33000.0
+    ctx.player_energy = 100.0
+    ctx.player_heading = 0.0
+    ctx.ground_level_override = None
+    ctx.player_pose = {}
+    ctx.jump_spawn_lockout = 0.0
+    ctx.jump_cooldown_remaining = 0.0
+    ctx.jump_prev_thrust_input = 0.0
+
+    peak_z = 0.0
+    for step in range(45):
+        if step == 1:
+            ctx.injected_jumpjet = None
+        server._update_player_position(ctx, dt_override=1.0 / 30.0)
+        peak_z = max(peak_z, ctx.player_pos[2])
+
+    assert peak_z >= 8.0, peak_z
+    print("test_server_jump_jets_have_visible_peak_under_default_gravity: PASSED")
+    return True
+
+
+def test_server_jump_jets_queue_remote_og_correction_burst():
+    """Remote OG clients need correction bursts because OG has no local jump impulse."""
+    server = WulframServer.__new__(WulframServer)
+    server.jump_jet_correction_burst_count = 12
+    server.jump_jet_correction_burst_interval = 0.05
+
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+
+    server._on_jump_jet_triggered(ctx, player_id=ctx.entity_id, impulse=45.0, new_vel_z=45.0)
+
+    assert ctx.force_correction_once is True
+    assert ctx.correction_burst_remaining == 11
+    assert abs(ctx.correction_burst_interval_s - 0.05) < 1e-6
+    assert ctx.last_correction_send == 0.0
+
+    loopback_ctx = ClientContext(
+        client_id=2,
+        client_addr=("127.0.0.1", 50001),
+        session=Session(),
+        entity_id=0x14EB,
+    )
+    server._on_jump_jet_triggered(
+        loopback_ctx,
+        player_id=loopback_ctx.entity_id,
+        impulse=45.0,
+        new_vel_z=45.0,
+    )
+
+    assert loopback_ctx.force_correction_once is False
+    assert loopback_ctx.correction_burst_remaining == 0
+    print("test_server_jump_jets_queue_remote_og_correction_burst: PASSED")
     return True
 
 
@@ -5730,6 +5825,37 @@ def test_terrain_slope_uses_active_triangle_plane_normal():
     return True
 
 
+def test_player_terrain_probe_reports_decompile_triangle_state():
+    """Live player telemetry should preserve the terrain data needed for rough-terrain diagnosis."""
+    terrain = _make_test_terrain(
+        2,
+        2,
+        [
+            0.0, 3.0,
+            2.0, 5.0,
+        ],
+    )
+    terrain._cell_types = [7, 8, 9, 10]
+    server = SimpleNamespace(
+        terrain=terrain,
+        terrain_height_offset=5.0,
+        terrain_physics_height_offset=0.5,
+    )
+
+    probe = build_player_terrain_probe(server, (0.25, 0.75, 4.0), 0.0)
+
+    assert probe["source"] == "GUESS3_Terrain_interpolate_grid_height"
+    assert probe["cell"] == [0, 0]
+    assert probe["cell_type"] == 7
+    assert abs(probe["raw_height"] - 2.75) < 1e-5
+    assert abs(probe["physics_ground_z"] - 3.25) < 1e-5
+    assert abs(probe["clearance_z"] - 0.75) < 1e-5
+    assert probe["normal"][2] > 0.0
+    assert probe["slope"] == [2.0, 3.0]
+    print("test_player_terrain_probe_reports_decompile_triangle_state: PASSED")
+    return True
+
+
 def test_terrain_cell_triangles_match_decompile_order():
     """Terrain cell triangle splitting should match the original quad-triangle order, not just the diagonal parity."""
     terrain = SimpleNamespace(
@@ -6599,6 +6725,8 @@ def main():
         test_server_tank_motion_uses_fuel_mobility_factor,
         test_server_tank_motion_reduces_mobility_when_low_fuel,
         test_server_jump_jets_apply_fixed_step_rising_edge,
+        test_server_jump_jets_have_visible_peak_under_default_gravity,
+        test_server_jump_jets_queue_remote_og_correction_burst,
         test_server_motion_clamps_to_move_adjust,
         test_server_motion_reclamps_below_ground_after_collision_response,
         test_server_motion_uses_physics_terrain_offset_for_vehicle_ground,
@@ -6647,6 +6775,7 @@ def main():
         test_dirty_bounds_contact_helpers_skip_triangle_prefilter,
         test_terrain_height_uses_decompile_triangle_plane_not_bilinear,
         test_terrain_slope_uses_active_triangle_plane_normal,
+        test_player_terrain_probe_reports_decompile_triangle_state,
         test_terrain_cell_triangles_match_decompile_order,
         test_terrain_raycast_patch_traverse_uses_start_to_end_sector_sweep,
         test_terrain_patch_raycast_cells_uses_decompile_dda_order,

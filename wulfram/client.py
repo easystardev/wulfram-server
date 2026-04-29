@@ -192,6 +192,8 @@ class ClientContext:
     injected_turn: Optional[float] = None
     # Server-injected upward thrust override - persists until cleared
     injected_thrust: Optional[float] = None
+    # Server-injected jumpjet action override - persists until cleared
+    injected_jumpjet: Optional[float] = None
     # Previous tick's raw turn input — for detecting input transitions (key press/release)
     prev_raw_turn_input: float = 0.0
     last_sent_pos: tuple = field(default_factory=lambda: (0.0, 0.0, 0.0))
