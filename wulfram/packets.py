@@ -54,8 +54,7 @@ _write_update_array_entity = write_update_array_entity
 # Server tick clock - ticks relative to server start (matches wulf-forge)
 _SERVER_START = time.monotonic()
 
-# Behavior packet feature toggles (wulf-forge-inspired).
-BEHAVIOR_THRUSTERS = os.environ.get("WULFRAM_BEHAVIOR_THRUSTERS", "1") == "1"
+# Behavior packet feature toggles.
 BEHAVIOR_ACTIVE_EXTRAS = os.environ.get("WULFRAM_BEHAVIOR_ACTIVE_EXTRAS", "1") == "1"
 
 # Behavior packet physics defaults.
@@ -64,6 +63,24 @@ BEHAVIOR_TURN_RATE = _read_float_env("WULFRAM_BEHAVIOR_TURN_RATE", 0.05)
 BEHAVIOR_SUSPENSION_DAMPENING = _read_float_env("WULFRAM_BEHAVIOR_SUSP_DAMPENING", 1.3)
 BEHAVIOR_MAX_ALTITUDE = _read_float_env("WULFRAM_BEHAVIOR_MAX_ALTITUDE", 3.25)
 BEHAVIOR_GRAVITY_PCT = _read_float_env("WULFRAM_BEHAVIOR_GRAVITY_PCT", 1.0)
+BEHAVIOR_SPRING_STATES = (
+    os.environ.get(
+        "WULFRAM_BEHAVIOR_SPRING_STATES",
+        os.environ.get("WULFRAM_BEHAVIOR_THRUSTERS", "1"),
+    ) == "1"
+)
+BEHAVIOR_TANK_SPRING_LONGITUDINAL = _read_float_env("WULFRAM_BEHAVIOR_TANK_SPRING_LONGITUDINAL", 3.4)
+BEHAVIOR_TANK_SPRING_LATERAL = _read_float_env("WULFRAM_BEHAVIOR_TANK_SPRING_LATERAL", 2.2)
+
+
+def get_behavior_tank_spring_local_offsets() -> Tuple[Tuple[float, float], ...]:
+    """Return the tank-local XY offsets emitted in BEHAVIOR Section 5."""
+    return (
+        (BEHAVIOR_TANK_SPRING_LONGITUDINAL, BEHAVIOR_TANK_SPRING_LATERAL),
+        (BEHAVIOR_TANK_SPRING_LONGITUDINAL, -BEHAVIOR_TANK_SPRING_LATERAL),
+        (-BEHAVIOR_TANK_SPRING_LONGITUDINAL, BEHAVIOR_TANK_SPRING_LATERAL),
+        (-BEHAVIOR_TANK_SPRING_LONGITUDINAL, -BEHAVIOR_TANK_SPRING_LATERAL),
+    )
 
 
 def get_ticks() -> int:
@@ -1240,51 +1257,32 @@ def build_behavior_packet() -> bytes:
 
     assert len(payload) == 95 + 2340 + 468 + 72, f"After Section 4: expected 2975, got {len(payload)}"
 
-    # Section 5: Hardpoints
+    # Section 5: Spring states
     section5_start = len(payload)
 
-    def _write_hardpoint_block(count: int, is_thruster: bool) -> None:
-        payload.extend(struct.pack(">I", count))
-        if count > 0:
-            for i in range(count):
-                if is_thruster:
-                    wing_width = 2.0
-                    lateral_bias = 0.0
-                    forward_bias = 0.0
-                    if i % 2 == 1:
-                        x_pos = wing_width + lateral_bias
-                    else:
-                        x_pos = -wing_width + lateral_bias
-                    y_pos = forward_bias
-                    z_pos = -0.5
-                    nx, ny, nz = 0.0, 0.0, -0.75
-                else:
-                    x_pos = 1.5 if (i % 2 == 1) else -1.5
-                    y_pos = 2.0
-                    z_pos = 0.5
-                    nx, ny, nz = 0.0, 1.0, 0.0
-
-                payload.extend(pack_fixed16(float(x_pos)))
-                payload.extend(pack_fixed16(float(y_pos)))
-                payload.extend(pack_fixed16(float(z_pos)))
-                payload.extend(pack_fixed16(float(nx)))
-                payload.extend(pack_fixed16(float(ny)))
-                payload.extend(pack_fixed16(float(nz)))
-                payload.extend(struct.pack(">I", 0))
-
-        if is_thruster:
-            payload.extend(pack_fixed16(-5.0))
-        else:
+    def _write_spring_state(local_offsets: Tuple[Tuple[float, float], ...]) -> None:
+        # Spring_read_from_stream reads u32 count, then position Vec3,
+        # velocity Vec3, pinned flag per point, followed by one fixed16 scalar.
+        payload.extend(struct.pack(">I", len(local_offsets)))
+        for x_pos, y_pos in local_offsets:
+            payload.extend(pack_fixed16(float(x_pos)))
+            payload.extend(pack_fixed16(float(y_pos)))
             payload.extend(pack_fixed16(0.0))
+            payload.extend(pack_fixed16(0.0))
+            payload.extend(pack_fixed16(0.0))
+            payload.extend(pack_fixed16(0.0))
+            payload.extend(struct.pack(">I", 0))
+        payload.extend(pack_fixed16(0.0))
 
-    if BEHAVIOR_THRUSTERS:
-        _write_hardpoint_block(2, True)
-        _write_hardpoint_block(2, True)
-        _write_hardpoint_block(2, True)
-        _write_hardpoint_block(2, True)
+    if BEHAVIOR_SPRING_STATES:
+        tank_offsets = get_behavior_tank_spring_local_offsets()
+        _write_spring_state(tank_offsets)
+        _write_spring_state(tank_offsets)
+        _write_spring_state(tank_offsets)
+        _write_spring_state(tank_offsets)
     else:
         for _ in range(4):
-            _write_hardpoint_block(0, False)
+            _write_spring_state(())
 
     section5_size = len(payload) - section5_start
     assert len(payload) == 2975 + section5_size, f"After Section 5: expected {2975 + section5_size}, got {len(payload)}"
@@ -1351,7 +1349,7 @@ def build_behavior_packet() -> bytes:
     if behavior_log:
         print(
             "[BEHAVIOR] "
-            f"thrusters={int(BEHAVIOR_THRUSTERS)} extras={int(BEHAVIOR_ACTIVE_EXTRAS)} "
+            f"spring_states={int(BEHAVIOR_SPRING_STATES)} extras={int(BEHAVIOR_ACTIVE_EXTRAS)} "
             f"section5={section5_size} section6={section6_size} "
             f"payload_len={len(payload)} packet_len={len(packet)}"
         )

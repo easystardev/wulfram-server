@@ -35,7 +35,7 @@ would be lost.
 
 | Module | Global(s) | Notes |
 |--------|-----------|-------|
-| `packets.py:18-19` | `BEHAVIOR_THRUSTERS`, `BEHAVIOR_ACTIVE_EXTRAS` | Boolean flags from env |
+| `packets.py:18-19` | `BEHAVIOR_SPRING_STATES`, `BEHAVIOR_ACTIVE_EXTRAS` | Boolean flags from env |
 | `packets.py:20-30` | `_RAW_HEALTH_MODE`, `_ALLOW_LINEAR_HEALTH`, `HEALTH_RAW_MODE` | Health encoding mode; conditional logic runs at module scope |
 | `packets.py:39-44` | `HEALTH_MAX`, `HEALTH_RANGE`, `ENERGY_MAX`, `ENERGY_RANGE`, `HEALTH_NORMALIZED`, `ENTITY_VITALS_MODE` | Quantizer scaling from env |
 | `packets.py:48-52` | `BEHAVIOR_GROUND_FRICTION`, `BEHAVIOR_TURN_RATE`, `BEHAVIOR_SUSPENSION_DAMPENING`, `BEHAVIOR_MAX_ALTITUDE`, `BEHAVIOR_GRAVITY_PCT` | Behavior packet physics |

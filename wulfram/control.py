@@ -324,6 +324,8 @@ class ControlServer:
 
         if hasattr(ctx, "debug_last_controller_step"):
             ctx.debug_last_controller_step.clear()
+        if hasattr(ctx, "debug_last_spring_state"):
+            ctx.debug_last_spring_state.clear()
         if hasattr(ctx, "debug_last_collision"):
             ctx.debug_last_collision.clear()
 

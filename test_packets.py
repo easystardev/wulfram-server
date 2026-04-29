@@ -261,8 +261,15 @@ def test_behavior_packet():
     print(f"BEHAVIOR_PACKET:")
     print(f"  Length: {len(payload)}")
     print(f"  Opcode: 0x{payload[0]:02X}")
-    match = payload[0] == 0x24 and len(payload) >= 3116 and len(parsed.weapon_units) == 4
+    spring_counts = [len(s.points) for s in parsed.spring_states]
+    match = (
+        payload[0] == 0x24
+        and len(payload) >= 3116
+        and len(parsed.weapon_units) == 4
+        and spring_counts == [4, 4, 4, 4]
+    )
     print(f"  Parsed weapon units: {len(parsed.weapon_units)}")
+    print(f"  Spring states: {spring_counts}")
     print(f"  Match: {match}")
     return match
 

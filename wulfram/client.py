@@ -203,6 +203,7 @@ class ClientContext:
     last_state_sync_rot: Optional[tuple] = None
     authoritative_state_history: Any = field(default_factory=lambda: deque(maxlen=180))
     debug_last_controller_step: dict = field(default_factory=dict)
+    debug_last_spring_state: dict = field(default_factory=dict)
     debug_last_collision: dict = field(default_factory=dict)
 
     def __post_init__(self):

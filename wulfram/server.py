@@ -46,6 +46,8 @@ from wulfram2_protocol.entities import (
     tank_altitude_mobility_factor,
     tank_hover_clearance_target,
     tank_slope_mobility_factor,
+    tank_spring_average_clearance,
+    tank_suspension_local_sample_offsets,
     tank_suspension_sample_offsets,
     tank_suspension_lift_accel,
     tank_fuel_mobility_factor,
@@ -84,6 +86,7 @@ from .packets import (
     build_transient_array, FX_CHAIN_GUN_FIRE, FX_PULSE_FIRE,
     FX_FLAK_FIRE, FX_MISSILE_FIRE, FX_IMPACT_VEHICLE,
     FX_IMPACT_BUILDING, FX_IMPACT_TERRAIN,
+    get_behavior_tank_spring_local_offsets,
 )
 from . import handlers
 from .pktlog import PacketLog
@@ -612,6 +615,7 @@ class WulframServer:
             )
         except ValueError:
             self.tank_spring_base_offset = 2.0
+        self.tank_spring_sample_local_offsets = get_behavior_tank_spring_local_offsets()
         # Compact spring support for tanks. The OG client applies the full
         # BEHAVIOR softbody/piecewise spring model; this lower-baseline center
         # lift keeps authoritative Z near observed OG rough-terrain motion while
@@ -5909,22 +5913,30 @@ class WulframServer:
     ) -> tuple[tuple[float, float, float], float]:
         """Approximate spring world-state from four tank-footprint terrain samples."""
         if ctx.entity_type != EntityType.TANK or self.terrain is None:
+            ctx.debug_last_spring_state = {}
             return (0.0, 0.0, 1.0), 1.0
 
         if heading is None:
             heading = ctx.player_heading
 
+        local_offsets = tank_suspension_local_sample_offsets(
+            longitudinal=self._TANK_RADIUS * 0.85,
+            lateral=self._TANK_RADIUS * 0.55,
+            local_offsets=getattr(self, "tank_spring_sample_local_offsets", None),
+        )
         offsets = tank_suspension_sample_offsets(
             heading,
             longitudinal=self._TANK_RADIUS * 0.85,
             lateral=self._TANK_RADIUS * 0.55,
+            local_offsets=local_offsets,
         )
         sum_up_x = 0.0
         sum_up_y = 0.0
         sum_up_z = 0.0
         sum_clearance = 0.0
+        samples = []
 
-        for dx, dy in offsets:
+        for (local_x, local_y), (dx, dy) in zip(local_offsets, offsets):
             sx = ctx.player_pos[0] + dx
             sy = ctx.player_pos[1] + dy
             sample_height_normal = getattr(self.terrain, "sample_height_normal", None)
@@ -5939,10 +5951,21 @@ class WulframServer:
                 else:
                     inv_mag = 1.0 / math.sqrt(mag_sq)
                     sample_up = (-dh_dx * inv_mag, -dh_dy * inv_mag, inv_mag)
+            clearance = ctx.player_pos[2] - raw_ground_z
             sum_up_x += sample_up[0]
             sum_up_y += sample_up[1]
             sum_up_z += sample_up[2]
-            sum_clearance += ctx.player_pos[2] - raw_ground_z
+            sum_clearance += clearance
+            samples.append(
+                {
+                    "local_offset": [round(float(local_x), 5), round(float(local_y), 5)],
+                    "world_offset": [round(float(dx), 5), round(float(dy), 5)],
+                    "sample_xy": [round(float(sx), 5), round(float(sy), 5)],
+                    "raw_ground_z": round(float(raw_ground_z), 5),
+                    "clearance": round(float(clearance), 5),
+                    "normal": [round(float(v), 6) for v in sample_up],
+                }
+            )
 
         inv_count = 1.0 / float(len(offsets))
         avg_up_x = sum_up_x * inv_count
@@ -5956,7 +5979,19 @@ class WulframServer:
             avg_up = (avg_up_x * inv_avg_mag, avg_up_y * inv_avg_mag, avg_up_z * inv_avg_mag)
 
         target_clearance = self._tank_hover_clearance_target(ctx)
-        clearance_ratio = (sum_clearance * inv_count) / target_clearance
+        average_clearance = tank_spring_average_clearance(sum_clearance, len(offsets))
+        clearance_ratio = average_clearance / target_clearance
+        ctx.debug_last_spring_state = {
+            "source": "Spring_update_world_state",
+            "point_count": len(offsets),
+            "clearance_denominator": max(1, len(offsets) - 1),
+            "height_sum": round(float(sum_clearance), 5),
+            "average_clearance": round(float(average_clearance), 5),
+            "target_clearance": round(float(target_clearance), 5),
+            "clearance_ratio": round(float(clearance_ratio), 6),
+            "avg_normal": [round(float(v), 6) for v in avg_up],
+            "samples": samples,
+        }
         return avg_up, clearance_ratio
 
     def _normalize_turn_input_value(self, ctx: ClientContext, turn_val: float) -> float:
@@ -6633,6 +6668,7 @@ class WulframServer:
             "turn_mobility": turn_mobility,
             "terrain_up": avg_up if self.terrain and self.up_axis == "z" and self.terrain_pitch_enabled else (0.0, 0.0, 1.0),
             "terrain_clearance_ratio": _clearance_ratio if self.terrain and self.up_axis == "z" and self.terrain_pitch_enabled else 1.0,
+            "spring_state": dict(getattr(ctx, "debug_last_spring_state", {}) or {}),
             "terrain_gradient": (dh_dx, dh_dy) if self.terrain and self.up_axis == "z" and self.terrain_pitch_enabled else (0.0, 0.0),
             "terrain_contact": (contact_x, contact_y) if ctx.entity_type == EntityType.TANK else (0.0, 0.0),
             "basis_forward": forward,

@@ -33,6 +33,7 @@ from wulfram.weapons import (
     WeaponSystem,
     WeaponType,
     EntityType,
+    VEHICLE_PHYSICS_CONFIGS,
     Projectile,
     build_projectile_spawn_packet,
     build_projectile_update_packet,
@@ -3969,7 +3970,7 @@ def test_remote_team_select_uses_remote_idle_timeout():
 
 
 def test_tank_surface_state_uses_spring_base_clearance_target():
-    """Tank altitude ratio should normalize against spring base plus max_altitude."""
+    """Tank altitude ratio should use the decompile spring height denominator."""
     server = WulframServer.__new__(WulframServer)
     server.terrain = SimpleNamespace(
         get_height=lambda x, y: 10.0,
@@ -3986,13 +3987,62 @@ def test_tank_surface_state_uses_spring_base_clearance_target():
         entity_id=0x14EA,
     )
     ctx.entity_type = EntityType.TANK
-    ctx.player_pos = (0.0, 0.0, 15.25)
+    target_clearance = 2.0 + VEHICLE_PHYSICS_CONFIGS[EntityType.TANK].max_altitude
+    ctx.player_pos = (0.0, 0.0, 10.0 + target_clearance)
     ctx.player_heading = 0.0
 
     _up, clearance_ratio = server._sample_tank_surface_state(ctx)
 
-    assert abs(clearance_ratio - 1.0) < 1e-6, clearance_ratio
+    # Spring_update_world_state stores height_sum / (point_count - 1), so a
+    # 4-point spring at nominal per-point clearance reports 4/3.
+    assert abs(clearance_ratio - (4.0 / 3.0)) < 1e-6, clearance_ratio
     print("test_tank_surface_state_uses_spring_base_clearance_target: PASSED")
+    return True
+
+
+def test_tank_surface_state_uses_behavior_spring_offsets():
+    """Terrain samples should follow BEHAVIOR Section-5 local spring points."""
+    server = WulframServer.__new__(WulframServer)
+    sampled = []
+
+    def sample_height_normal(x, y):
+        sampled.append((x, y))
+        return 10.0, (0.0, 0.0, 1.0)
+
+    server.terrain = SimpleNamespace(sample_height_normal=sample_height_normal)
+    server.terrain_height_offset = 5.0
+    server.terrain_physics_height_offset = 0.0
+    server.tank_spring_base_offset = 2.0
+    server.tank_spring_sample_local_offsets = (
+        (5.0, 1.0),
+        (5.0, -1.0),
+        (-5.0, 1.0),
+        (-5.0, -1.0),
+    )
+
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    ctx.entity_type = EntityType.TANK
+    ctx.player_pos = (100.0, 200.0, 15.25)
+    ctx.player_heading = 0.0
+
+    server._sample_tank_surface_state(ctx)
+
+    expected = [(105.0, 201.0), (105.0, 199.0), (95.0, 201.0), (95.0, 199.0)]
+    assert sampled == expected, sampled
+    spring_debug = ctx.debug_last_spring_state
+    assert spring_debug["source"] == "Spring_update_world_state"
+    assert spring_debug["point_count"] == 4
+    assert spring_debug["clearance_denominator"] == 3
+    assert spring_debug["height_sum"] == 21.0
+    assert spring_debug["average_clearance"] == 7.0
+    assert spring_debug["samples"][0]["local_offset"] == [5.0, 1.0]
+    assert spring_debug["samples"][0]["sample_xy"] == [105.0, 201.0]
+    print("test_tank_surface_state_uses_behavior_spring_offsets: PASSED")
     return True
 
 
@@ -6734,6 +6784,7 @@ def main():
         test_server_motion_releases_ground_override_when_terrain_changes_under_tank,
         test_remote_team_select_uses_remote_idle_timeout,
         test_tank_surface_state_uses_spring_base_clearance_target,
+        test_tank_surface_state_uses_behavior_spring_offsets,
         test_tank_suspension_lift_supports_floor_clearance,
         test_tank_suspension_default_stiffness_matches_decompile_equilibrium,
         test_ghost_rejoin_skips_loopback_clients,
