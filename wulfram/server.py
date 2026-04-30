@@ -1102,19 +1102,19 @@ class WulframServer:
         # Entity velocity at 0x18 is PERSISTENT (not zeroed each frame).
         # Impulse at 0x24 IS zeroed each frame (from vehicle controller).
         #
-        # Client uses TWO different damp values (from Tank_read_throttle_input
-        # and Tank_compute_mobility_factors in Vehicles.c):
-        #   DRIVING (throttle != 0): damp = ground_friction * terrain_scale + world_damp
-        #     On flat ground: 0.8 * 1.0 + 0.0 = 0.8
-        #   COASTING (throttle == 0): damp = 2.0 (hardcoded at Vehicles.c:932, 0x40000000)
+        # Live OG memory probe, grounded in Physics.c:6036-6073:
+        #   entity+0xC0+3 = 1 (linear damping enabled)
+        #   entity+0xBC->+4+0x78 = 1.5 (Tank physics config linear damping)
+        # Keep separate env knobs for experiments, but default both drive and
+        # coast paths to the measured physics-config coefficient.
         try:
-            self.linear_damp_driving = float(os.environ.get("WULFRAM_LINEAR_DAMP_DRIVING", "0.8"))
+            self.linear_damp_driving = float(os.environ.get("WULFRAM_LINEAR_DAMP_DRIVING", "1.5"))
         except ValueError:
-            self.linear_damp_driving = 0.8
+            self.linear_damp_driving = 1.5
         try:
-            self.linear_damp_coasting = float(os.environ.get("WULFRAM_LINEAR_DAMP_COASTING", "2.0"))
+            self.linear_damp_coasting = float(os.environ.get("WULFRAM_LINEAR_DAMP_COASTING", "1.5"))
         except ValueError:
-            self.linear_damp_coasting = 2.0
+            self.linear_damp_coasting = 1.5
 
         # Local-player correction mode. UPDATE_ARRAY-based modes
         # (`dual_entity`, `full`, `pos_only`, `rot_only`) do NOT
@@ -6268,9 +6268,9 @@ class WulframServer:
 
         Steady state: vel = impulse / linear_damp
 
-        Dual-damp model (from Tank_read_throttle_input / Tank_compute_mobility_factors):
-          DRIVING (throttle != 0): linear_damp = ground_friction (0.8 on flat ground)
-          COASTING (throttle == 0): linear_damp = 2.0 (hardcoded, Vehicles.c:932)
+        Current OG tank memory shows the active PhysicsConfig linear damping
+        coefficient is 1.5 with linear damping enabled. The server still keeps
+        drive/coast env overrides so we can A/B older empirical assumptions.
         """
         import math
 
@@ -6296,8 +6296,6 @@ class WulframServer:
         strafe_adjust = veh_config.strafe_adjust if veh_config else 69.7
         low_fuel_level = veh_config.low_fuel_level if veh_config else 2000.0
         max_fuel = veh_config.max_fuel if veh_config else 33000.0
-        # Dual-damp: client uses 0.8 when driving, 2.0 when coasting
-        # (from Tank_read_throttle_input and Tank_compute_mobility_factors in Vehicles.c)
         has_input = abs(throttle_input) > 0.0 or abs(strafe_input) > 0.0
         linear_damp = self.linear_damp_driving if has_input else self.linear_damp_coasting
         vel_x, vel_y, vel_z = ctx.player_vel
