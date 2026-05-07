@@ -23,12 +23,15 @@ from wulfram2_protocol.entities import (  # noqa: F401 — re-export for existin
     ACTION_DUMP_CONTROL_SLOTS,
     BehaviorSlot,
     EntityType,
+    OG_TANK_SOFTBODY_IDLE_SLOT5,
+    TANK_SOFTBODY_CONTROL_SLOT,
     WeaponType,
     WEAPON_NAMES,
     TANK_WEAPON_SLOTS,
     VehiclePhysicsConfig,
     VEHICLE_PHYSICS_CONFIGS,
     Projectile,
+    tank_softbody_control_slot_value,
 )
 
 # Module-level debug flag — gated by WULFRAM_DEBUG_SYNC env var
@@ -66,6 +69,7 @@ class WeaponSystem:
 
     def __init__(self):
         self.behavior_slots: List[float] = [0.0] * 22  # Current behavior values
+        self.behavior_slots[TANK_SOFTBODY_CONTROL_SLOT] = OG_TANK_SOFTBODY_IDLE_SLOT5
         self.client_frame_counter: int = 0  # frame counter from ACTION_UPDATE
         # Sub-tick input timing: records when the TURNING slot last changed
         # so the tick loop can split the physics step at the transition point.
@@ -270,6 +274,12 @@ class WeaponSystem:
                 value, raw_val = self._read_behavior_value_debug(slot_idx, reader)
                 raw_values[slot_idx] = raw_val
                 if 0 <= slot_idx < len(decoded_slots):
+                    if slot_idx == BehaviorSlot.UPWARD_THRUST and abs(value) <= 0.001:
+                        # Same persistent-slider rule as ACTION_UPDATE: live OG
+                        # can emit a zero-ish full dump while its local Q/Z
+                        # softbody value remains latched. Preserve the last
+                        # decoded value instead of snapping the server to idle.
+                        continue
                     decoded_slots[slot_idx] = value
 
             # Apply atomically so malformed dumps cannot partially corrupt state.
@@ -279,7 +289,7 @@ class WeaponSystem:
             turn = self.behavior_slots[BehaviorSlot.TURNING]
             fwd = self.behavior_slots[BehaviorSlot.MOVING_FORWARD]
             strafe = self.behavior_slots[BehaviorSlot.MOVING_SIDEWAYS]
-            thrust = self.behavior_slots[BehaviorSlot.UPWARD_THRUST]
+            thrust = tank_softbody_control_slot_value(self.behavior_slots)
             fire = self.behavior_slots[BehaviorSlot.FIRE]
 
             # Show raw bits for movement slots (1=turn, 2=fwd, 3=strafe)
@@ -347,8 +357,11 @@ class WeaponSystem:
             return False
 
         self.client_frame_counter = frame
+        if count == 0:
+            if tick > 0:
+                self.prev_action_client_tick = tick
+            return True
 
-        updated_any = False
         changed = []
         decoded_updates = []
         max_updates = min(count, 64)
@@ -364,8 +377,17 @@ class WeaponSystem:
             return False
 
         # Apply updates only after full packet decode succeeds.
+        updated_any = False
+        decoded_any = bool(decoded_updates)
         now_mono = time.monotonic()
         for slot_idx, value in decoded_updates:
+            if slot_idx == BehaviorSlot.UPWARD_THRUST and abs(value) <= 0.001:
+                # Live OG Q/Z behaves like a persistent softbody slider. The
+                # ACTION_UPDATE release packet can carry zero even though the
+                # current slider value is retained and later restated by
+                # ACTION_DUMP. Preserve the previous value here so server
+                # prediction does not snap back to idle between dumps.
+                continue
             old_val = self.behavior_slots[slot_idx]
             self.behavior_slots[slot_idx] = value
             updated_any = True
@@ -390,7 +412,7 @@ class WeaponSystem:
                 print(f"[ACTION_UPDATE] tick={tick} frame={frame} changes={changed}")
             return True
 
-        return False
+        return decoded_any
 
     def _decode_quantized(self, raw: int, bits: int, max_val: float, range_val: float) -> float:
         """Decode quantized integer to float using ValueQuantizer formula."""

@@ -48,16 +48,33 @@ from wulfram.packets import (
     build_update_array_heartbeat,
     build_world_stats,
 )
-from wulfram2_protocol.codec import BitReader
+from wulfram2_protocol.codec import BitReader, BitWriter, quantize_float
 from client.wulfram_client.network.behavior import parse_behavior
 from client.wulfram_client.network.decoder import decode_update_array, decode_view_update, decode_tank_packet
 from client.wulfram_client.network.quantizer import parse_translation
-from wulfram2_protocol.entities import JUMP_JET_CONFIGS, tank_suspension_lift_accel
+from wulfram2_protocol.entities import (
+    ACTION_ANALOG_SLOTS,
+    ACTION_DUMP_CONTROL_SLOTS,
+    BehaviorSlot,
+    JUMP_JET_CONFIGS,
+    OG_TANK_SOFTBODY_FLAT_AVERAGE_HEIGHT,
+    OG_TANK_SOFTBODY_IDLE_SLOT5,
+    OG_TANK_SOFTBODY_Q_SLOT5,
+    OG_TANK_SOFTBODY_Z_SLOT5,
+    TANK_SOFTBODY_CONTROL_SLOT,
+    tank_softbody_control_slot_value,
+    tank_softbody_suspension_force,
+    tank_suspension_lift_accel,
+)
 from client.wulfram_client.data.models import CBSPTree, CBSPTreeNode, Vec3
 from client.wulfram_client.simulation.collision import (
     segment_hits_cbsp_tree,
     segment_raycast_cbsp_tree,
 )
+
+
+def _remote_view_timestamp(tick: int) -> int:
+    return (int(tick) + 1000) & 0xFFFFFFFF
 
 
 def test_decode_lp_string_basic():
@@ -130,7 +147,7 @@ def test_behavior_spawn_enabled_defaults_on_for_entry_map_spawn():
 
 
 def test_input_sync_diagnosis_distinguishes_idle_snapback_from_correction_failure():
-    """Live telemetry should call out idle controls while corrections are active."""
+    """Live telemetry should call out idle controls while correction packets are active."""
     diagnosis = build_input_sync_diagnosis(
         phase="IN_GAME",
         last_input={"fwd": 0.0, "strafe": 0.0, "turn": 0.0, "thrust": 0.824},
@@ -144,8 +161,10 @@ def test_input_sync_diagnosis_distinguishes_idle_snapback_from_correction_failur
         state_sync_view_replies=99,
     )
 
-    assert diagnosis["status"] == "idle_input_authoritative_snapback"
+    assert diagnosis["status"] == "idle_input_correction_packets_active"
     assert diagnosis["corrections_active"] is True
+    assert diagnosis["correction_packets_active"] is True
+    assert diagnosis["correction_application_verified"] is False
     assert diagnosis["drive_idle"] is True
     assert diagnosis["movement_input_recent"] is False
     print("test_input_sync_diagnosis_distinguishes_idle_snapback_from_correction_failure: PASSED")
@@ -171,6 +190,34 @@ def test_input_sync_diagnosis_reports_movement_without_targeted_corrections():
     assert diagnosis["corrections_active"] is False
     assert diagnosis["movement_input_recent"] is True
     print("test_input_sync_diagnosis_reports_movement_without_targeted_corrections: PASSED")
+    return True
+
+
+def test_input_sync_diagnosis_counts_unsolicited_correction_stream():
+    """Live movement correction packets should not be reported as no packet stream."""
+    diagnosis = build_input_sync_diagnosis(
+        phase="IN_GAME",
+        last_input={"fwd": 1.0, "strafe": 0.0, "turn": 0.0},
+        last_action_age_s=0.1,
+        last_nonzero_move_input_age_s=0.1,
+        last_position_change_age_s=0.2,
+        last_state_request_age_s=30.0,
+        last_state_sync_reply_age_s=None,
+        state_requests=0,
+        state_sync_replies=0,
+        state_sync_view_replies=0,
+        last_correction_age_s=0.05,
+        last_movement_correction_age_s=0.05,
+        movement_corrections=3,
+    )
+
+    assert diagnosis["status"] == "moving_with_correction_packets"
+    assert diagnosis["corrections_active"] is True
+    assert diagnosis["correction_packets_active"] is True
+    assert diagnosis["correction_application_verified"] is False
+    assert diagnosis["state_request_corrections_active"] is False
+    assert diagnosis["correction_stream_active"] is True
+    print("test_input_sync_diagnosis_counts_unsolicited_correction_stream: PASSED")
     return True
 
 
@@ -267,7 +314,10 @@ def test_map_entity_z_preserves_raw_z_above_physics_terrain():
     server.up_axis = "z"
     server.terrain_height_offset = 5.0
     server.terrain_physics_height_offset = 0.0
-    server.terrain = SimpleNamespace(get_height=lambda x, y: 0.0)
+    server.terrain = SimpleNamespace(
+        get_height=lambda x, y: 0.0,
+        get_slope=lambda x, y: (0.0, 0.0),
+    )
 
     z, ground_z, aligned = server._align_map_entity_z_to_terrain(5064.28, 5103.49, 3.65)
 
@@ -324,6 +374,36 @@ def test_control_pose_reset_updates_ground_override():
     return True
 
 
+def test_tank_softbody_spawn_pose_does_not_pin_ground_override():
+    """Softbody tanks should settle on terrain suspension, not a spawn Z clamp."""
+    server = WulframServer.__new__(WulframServer)
+    server.spawn_sets_ground_level = True
+    server.up_axis = "z"
+    server.terrain = SimpleNamespace(
+        get_height=lambda x, y: 0.0,
+        get_slope=lambda x, y: (0.0, 0.0),
+    )
+    server.terrain_physics_height_offset = 0.0
+    server.tank_suspension_enabled = True
+    server.tank_suspension_model = "softbody"
+
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    ctx.entity_type = EntityType.TANK
+    ctx.ground_level_override = 65.0
+
+    server._set_ground_level_override_for_pose(ctx, (100.0, 200.0, 2.5))
+
+    assert ctx.ground_level_override is None
+    assert ctx.ground_override_ref_terrain_level is None
+    print("test_tank_softbody_spawn_pose_does_not_pin_ground_override: PASSED")
+    return True
+
+
 def test_pulse_shell_default_spawn_uses_recovered_muzzle_offset():
     """Default pulse origin should stay near the tank, not raw shape-hardpoint scale."""
     keys = [
@@ -356,6 +436,46 @@ def test_pulse_shell_default_spawn_uses_recovered_muzzle_offset():
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+
+
+def test_projectile_fire_pose_uses_replay_history_when_available():
+    """Moving fire should use the pose aligned to the input packet tick."""
+    server = WulframServer.__new__(WulframServer)
+    server.up_axis = "z"
+    server.pos_offset = 0.0
+    server.projectile_aim_source = "body"
+    server.use_client_ticks = False
+    server.viewpoint_timeout = 0.5
+    server.aim_hold_time = 0.5
+
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("127.0.0.1", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    ctx.player_pos = (50.0, 60.0, 7.0)
+    ctx.player_heading = 2.0
+    ctx.player_pose["roll"] = 0.4
+    ctx.player_pose["pitch"] = 0.2
+    ctx.player_aim_source = "init"
+    ctx.player_aim_time = 0.0
+    ctx.authoritative_state_history.append({
+        "tick": 1000,
+        "time": time.monotonic(),
+        "pos": (10.0, 20.0, 3.0),
+        "vel": (1.0, 0.0, 0.0),
+        "rot": (0.1, 0.2, 1.25),
+    })
+
+    pos, rot, aim_src, pose_src = server._select_weapon_fire_pose(ctx, 1000)
+
+    assert pos == (10.0, 20.0, 3.0), pos
+    assert rot == (0.1, 0.0, 1.25), rot
+    assert aim_src == "body"
+    assert pose_src == "history"
+    print("test_projectile_fire_pose_uses_replay_history_when_available: PASSED")
+    return True
 
 
 def test_remote_spawn_points_use_udp_not_tcp():
@@ -834,7 +954,7 @@ def test_remote_state_sync_reply_stays_spawn_safe_immediately_after_spawn():
     assert view_local_state is not None and view_local_state.weapon_id == 2
     assert entities[0].position is not None
     assert view_entities[0].position is not None
-    assert timestamp == 0x89ABCDEF
+    assert timestamp == _remote_view_timestamp(0x12345678)
     assert view_tick == 0x12345678
     print("test_remote_state_sync_reply_stays_spawn_safe_immediately_after_spawn: PASSED")
     return True
@@ -918,7 +1038,7 @@ def test_remote_state_sync_reply_stays_spawn_safe_after_spawn_delay():
     assert view_entities[0].position is not None
     assert view_entities[0].velocity is not None
     assert view_entities[0].rotation is not None
-    assert timestamp == 0x89ABCDEF
+    assert timestamp == _remote_view_timestamp(0x12345678)
     assert view_tick == 0x12345678
     print("test_remote_state_sync_reply_stays_spawn_safe_after_spawn_delay: PASSED")
     return True
@@ -1000,8 +1120,8 @@ def test_remote_state_sync_reply_stays_safe_without_post_spawn_input_after_delay
     return True
 
 
-def test_remote_state_sync_reply_emits_view_update_with_request_timestamp():
-    """Remote OG STATE_REQUEST replies should preserve the replay/request timestamp."""
+def test_remote_state_sync_reply_emits_view_update_with_fresh_remote_timestamp():
+    """Remote OG STATE_REQUEST replies keep replay wrappers fresh for client admission."""
     server = WulframServer.__new__(WulframServer)
     server.update_local_state_mode = "wf"
     server.update_entity_vitals = False
@@ -1076,7 +1196,7 @@ def test_remote_state_sync_reply_emits_view_update_with_request_timestamp():
         view_payload,
         behavior_config=parse_behavior(build_behavior_packet()),
     )
-    assert timestamp == 0x89ABCDEF
+    assert timestamp == _remote_view_timestamp(0x12345678)
     assert view_tick == 0x12345678
     assert view_local_state is not None
     assert view_local_state.weapon_id == 2
@@ -1090,11 +1210,11 @@ def test_remote_state_sync_reply_emits_view_update_with_request_timestamp():
     assert ctx.last_state_sync_view_len == len(view_payload)
     assert ctx.last_state_sync_update_has_local_state is True
     assert ctx.last_state_sync_view_has_local_state is True
-    assert ctx.last_state_sync_view_timestamp == 0x89ABCDEF
+    assert ctx.last_state_sync_view_timestamp == _remote_view_timestamp(0x12345678)
     assert ctx.last_state_sync_reason == "test"
     assert ctx.last_state_sync_update_hex == update_payload[:32].hex()
     assert ctx.last_state_sync_view_hex == view_payload[:32].hex()
-    print("test_remote_state_sync_reply_emits_view_update_with_request_timestamp: PASSED")
+    print("test_remote_state_sync_reply_emits_view_update_with_fresh_remote_timestamp: PASSED")
     return True
 
 
@@ -1169,8 +1289,163 @@ def test_loopback_state_sync_reply_keeps_request_timestamp():
     return True
 
 
-def test_remote_empirical_view_update_correction_uses_fresh_state_request_timestamp():
-    """Explicit OG correction bursts should stay tied to the latest fresh STATE_REQUEST id."""
+def test_remote_state_request_queues_visible_correction_burst():
+    """Remote OG STATE_REQUEST replies should be followed by a short settle stream."""
+    server = WulframServer.__new__(WulframServer)
+    server.state_sync_correction_burst_count = 6
+    server.state_sync_correction_burst_interval = 0.10
+
+    remote = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    remote.correction_burst_remaining = 2
+    assert server._queue_state_sync_correction_burst(remote) is True
+    assert remote.correction_burst_remaining == 6
+    assert remote.correction_burst_interval_s == 0.10
+
+    loopback = ClientContext(
+        client_id=2,
+        client_addr=("127.0.0.1", 50000),
+        session=Session(),
+        entity_id=0x14EB,
+    )
+    assert server._queue_state_sync_correction_burst(loopback) is False
+    assert getattr(loopback, "correction_burst_remaining", 0) == 0
+    print("test_remote_state_request_queues_visible_correction_burst: PASSED")
+    return True
+
+
+def test_remote_active_movement_suppresses_visible_correction_burst():
+    """Do not queue hard replay corrections while OG is actively driving."""
+    server = WulframServer.__new__(WulframServer)
+    server.state_sync_correction_burst_count = 6
+    server.state_sync_correction_burst_interval = 0.10
+    server.active_input_correction_suppress_window = 0.35
+
+    remote = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    now = time.monotonic()
+    remote.last_action_packet_time = now
+    remote.last_decoded_input = {"fwd": 0.61, "strafe": 0.0}
+    assert server._remote_movement_input_active(remote, now=now) is True
+    assert server._queue_state_sync_correction_burst(remote) is False
+    assert remote.correction_burst_remaining == 0
+
+    remote.last_decoded_input = {"fwd": 0.0, "strafe": 0.0}
+    assert server._remote_movement_input_active(remote, now=now) is False
+    assert server._queue_state_sync_correction_burst(remote) is True
+    assert remote.correction_burst_remaining == 6
+
+    remote.correction_burst_remaining = 0
+    remote.last_decoded_input = {"fwd": 0.61, "strafe": 0.0}
+    remote.last_action_packet_time = now - 1.0
+    assert server._remote_movement_input_active(remote, now=now) is False
+    assert server._queue_state_sync_correction_burst(remote) is True
+    assert remote.correction_burst_remaining == 6
+    print("test_remote_active_movement_suppresses_visible_correction_burst: PASSED")
+    return True
+
+
+def test_state_request_active_movement_skips_view_update_correction():
+    """STATE_REQUEST during active drive should not inject local sync packets."""
+    captured = []
+    server = WulframServer.__new__(WulframServer)
+    server.update_local_state_mode = "off"
+    server.update_entity_vitals = False
+    server.view_update_local_stats = False
+    server.view_update_entity_vitals = False
+    server.state_sync_reply_allow_all = True
+    server.state_sync_reply_hosts = set()
+    server._state_sync_blocked_clients = set()
+    server.state_sync_view_mode = "all"
+    server.state_sync_snapshot_mode = "remote_live"
+    server.state_sync_correction_burst_count = 6
+    server.state_sync_correction_burst_interval = 0.10
+    server.active_input_correction_suppress_window = 0.35
+    server.remote_full_local_state_delay = 2.0
+    server.spawn_tank_weapon_type = 2
+    server.local_state_turret_max = 6.3
+    server.local_state_turret_range = 12.6
+    server._get_health_value = lambda ctx: 1.0
+    server._get_energy_value = lambda ctx: 1.0
+    server._to_client_pos = lambda pos: pos
+    server._get_network_tick = lambda ctx: 0x12345678
+    server.debug_viewpoint = False
+    server.debug_udp_raw = False
+    server.pktlog = SimpleNamespace(enabled=False)
+    server.udp_handler = SimpleNamespace(send_to=lambda payload, addr: captured.append((payload, addr)))
+
+    session = Session()
+    session.translation_ack_received = True
+    session.in_game = True
+    session.entity_id = 0x14EA
+    session.udp_addr = ("10.10.10.2", 50000)
+    session.last_spawn_time = time.monotonic() - 5.0
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=session,
+        entity_id=0x14EA,
+    )
+    ctx.player_pos = (4950.0, 5100.0, 5.0)
+    ctx.player_vel = (7.0, 1.0, 0.0)
+    ctx.player_pose = {"roll": 0.0, "pitch": 0.0}
+    ctx.player_heading = 0.25
+    ctx.player_yaw = -0.25
+    ctx.last_state_sync_send = 0.0
+    ctx.last_action_packet_time = time.monotonic()
+    ctx.last_decoded_input = {"fwd": 0.61, "strafe": 0.0}
+
+    payload = struct.pack(">BII", 0x0C, 0x00ABCDEF, 0)
+    server._handle_state_request(ctx, payload, ctx.client_addr)
+
+    assert len(captured) == 0, captured
+    assert ctx.state_sync_reply_count == 0
+    assert ctx.state_sync_view_reply_count == 0
+    assert ctx.correction_burst_remaining == 0
+    assert ctx.state_request_count == 1
+    print("test_state_request_active_movement_skips_view_update_correction: PASSED")
+    return True
+
+
+def test_batched_state_request_sees_later_action_update_movement():
+    """Datagram pre-scan should suppress sync before a later batched ACTION_UPDATE is handled."""
+    server = WulframServer.__new__(WulframServer)
+    server.active_input_correction_suppress_window = 0.35
+
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    ctx.weapon_system = WeaponSystem()
+    state_request = struct.pack(">BII", 0x0C, 0x00ABCDEF, 0)
+    action_update = _build_single_slot_action_update(
+        ctx.weapon_system,
+        BehaviorSlot.MOVING_FORWARD,
+        0.61,
+    )
+
+    assert server._udp_packets_have_active_movement_input(
+        ctx,
+        [state_request, action_update],
+    ) is True
+    ctx._datagram_active_movement_input = True
+    assert server._remote_movement_input_active(ctx, now=time.monotonic()) is True
+    print("test_batched_state_request_sees_later_action_update_movement: PASSED")
+    return True
+
+
+def test_remote_empirical_view_update_correction_uses_fresh_remote_timestamp():
+    """Explicit OG correction bursts should use a fresh remote replay wrapper."""
     server = WulframServer.__new__(WulframServer)
     server.correction_mode = "view_update"
     server.local_state_turret_max = 6.3
@@ -1220,7 +1495,7 @@ def test_remote_empirical_view_update_correction_uses_fresh_state_request_timest
     assert label == "CORRECTION(view_update)"
     assert inc_pos is True
     assert inc_rot is True
-    assert timestamp == 0x00ABCDEF
+    assert timestamp == _remote_view_timestamp(0x00123456)
     assert tick == 0x00123456
     assert local_state is not None
     assert local_state.weapon_id == 2
@@ -1232,7 +1507,7 @@ def test_remote_empirical_view_update_correction_uses_fresh_state_request_timest
     assert entities[0].rotation is not None
     assert all(abs(a - b) < 0.3 for a, b in zip(entities[0].position, corr_pos))
     assert all(abs(a - b) < 0.01 for a, b in zip(entities[0].rotation, corr_rot))
-    print("test_remote_empirical_view_update_correction_uses_fresh_state_request_timestamp: PASSED")
+    print("test_remote_empirical_view_update_correction_uses_fresh_remote_timestamp: PASSED")
     return True
 
 
@@ -1326,7 +1601,7 @@ def test_remote_empirical_view_update_define_correction_uses_definition_shape():
     assert label == "CORRECTION(view_update_define)"
     assert inc_pos is True
     assert inc_rot is True
-    assert timestamp == 0x00ABCDEF
+    assert timestamp == _remote_view_timestamp(0x00123456)
     assert tick == 0x00123456
     assert local_state is not None
     assert local_state.weapon_id == 2
@@ -1344,6 +1619,90 @@ def test_remote_empirical_view_update_define_correction_uses_definition_shape():
     return True
 
 
+def test_remote_state_sync_defaults_to_live_snapshot_for_remote_og():
+    """Remote OG STATE_REQUEST replies should not drag live movement to stale history."""
+    server = WulframServer.__new__(WulframServer)
+    server.update_local_state_mode = "wf"
+    server.update_entity_vitals = False
+    server.view_update_local_stats = False
+    server.view_update_entity_vitals = False
+    server.state_sync_snapshot_mode = "remote_live"
+    server.remote_full_local_state_delay = 2.0
+    server.local_state_weapon_type = 0
+    server.spawn_tank_weapon_type = 2
+    server.local_state_ammo_override = False
+    server.local_state_ammo_from_behavior = True
+    server.local_state_primary_override = ""
+    server.local_state_secondary_override = ""
+    server.local_state_turret_bits = 16
+    server.local_state_turret_max = 6.3
+    server.local_state_turret_range = 12.6
+    server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
+    server._get_health_value = lambda ctx: 1.0
+    server._get_energy_value = lambda ctx: 1.0
+    server._to_client_pos = lambda pos: pos
+    server._get_network_tick = lambda ctx: 0x12345678
+    server.debug_viewpoint = False
+    server.debug_udp_raw = False
+    server.pktlog = SimpleNamespace(enabled=False)
+    captured = []
+    server.udp_handler = SimpleNamespace(send_to=lambda payload, addr: captured.append((payload, addr)))
+
+    session = Session()
+    session.translation_ack_received = True
+    session.in_game = True
+    session.entity_id = 0x14EA
+    session.udp_addr = ("10.10.10.2", 50000)
+    session.last_spawn_time = time.monotonic() - 5.0
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=session,
+        entity_id=0x14EA,
+    )
+    ctx.remote_full_local_state_ready = False
+    ctx.player_pos = (4950.0, 5100.0, 5.0)
+    ctx.player_vel = (9.0, 9.0, 0.0)
+    ctx.player_pose = {"roll": 0.0, "pitch": 0.0}
+    ctx.player_heading = 1.25
+    ctx.player_yaw = -1.25
+    ctx.last_state_sync_send = 0.0
+    ctx.authoritative_state_history.append({
+        "tick": 0x89ABCDE0,
+        "time": time.monotonic(),
+        "pos": (4900.0, 5000.0, 5.0),
+        "vel": (3.0, 0.0, 0.0),
+        "rot": (0.0, 0.0, 0.5),
+    })
+
+    server._send_state_sync_snapshot(
+        ctx,
+        include_view_update=True,
+        replay_timestamp=0x89ABCDEF,
+        reason="state_request",
+    )
+
+    assert len(captured) == 2, captured
+    update_payload = captured[0][0]
+    view_payload = captured[1][0]
+    _, _, update_entities = decode_update_array(
+        update_payload,
+        behavior_config=parse_behavior(build_behavior_packet()),
+    )
+    _, _, _, view_entities = decode_view_update(
+        view_payload,
+        behavior_config=parse_behavior(build_behavior_packet()),
+    )
+
+    assert ctx.last_state_sync_snapshot_source == "live"
+    assert all(abs(a - b) < 0.25 for a, b in zip(update_entities[0].position, (4950.0, 5100.0, 5.0)))
+    assert all(abs(a - b) < 0.25 for a, b in zip(view_entities[0].position, (4950.0, 5100.0, 5.0)))
+    assert all(abs(a - b) < 0.05 for a, b in zip(update_entities[0].velocity, (9.0, 9.0, 0.0)))
+    assert update_entities[0].position == view_entities[0].position
+    print("test_remote_state_sync_defaults_to_live_snapshot_for_remote_og: PASSED")
+    return True
+
+
 def test_remote_state_sync_reply_uses_request_aligned_authoritative_pose():
     """STATE_REQUEST replies should use the cached authoritative pose nearest the replay tick."""
     server = WulframServer.__new__(WulframServer)
@@ -1351,6 +1710,7 @@ def test_remote_state_sync_reply_uses_request_aligned_authoritative_pose():
     server.update_entity_vitals = False
     server.view_update_local_stats = False
     server.view_update_entity_vitals = False
+    server.state_sync_snapshot_mode = "history"
     server.remote_full_local_state_delay = 2.0
     server.local_state_weapon_type = 0
     server.spawn_tank_weapon_type = 2
@@ -1420,7 +1780,7 @@ def test_remote_state_sync_reply_uses_request_aligned_authoritative_pose():
     )
 
     assert tick == 0x12345678
-    assert timestamp == 0x89ABCDEF
+    assert timestamp == _remote_view_timestamp(0x12345678)
     assert view_tick == 0x12345678
     assert update_local_state is not None and update_local_state.weapon_id == 2
     assert view_local_state is not None and view_local_state.weapon_id == 2
@@ -1444,6 +1804,7 @@ def test_remote_state_sync_reply_remaps_client_tick_to_server_history():
     server.update_entity_vitals = False
     server.view_update_local_stats = False
     server.view_update_entity_vitals = False
+    server.state_sync_snapshot_mode = "history"
     server.remote_full_local_state_delay = 2.0
     server.local_state_weapon_type = 0
     server.spawn_tank_weapon_type = 2
@@ -1516,7 +1877,7 @@ def test_remote_state_sync_reply_remaps_client_tick_to_server_history():
     )
 
     assert tick == 0x12345678
-    assert timestamp == 0x002B61E0
+    assert timestamp == _remote_view_timestamp(0x12345678)
     assert view_tick == 0x12345678
     assert update_local_state is not None and update_local_state.weapon_id == 2
     assert view_local_state is not None and view_local_state.weapon_id == 2
@@ -2816,6 +3177,108 @@ def test_weapon_system_held_fire_repeats_on_cooldown():
     return True
 
 
+def test_weapon_system_accepts_empty_action_update_keepalive():
+    """Count=0 ACTION_UPDATE packets still carry a valid tick/frame keepalive."""
+    ws = WeaponSystem()
+    packet = b"\x0A\x00" + struct.pack(">II", 0x12345678, 77)
+
+    assert ws.decode_action_update(packet) is True
+    assert ws.client_frame_counter == 77
+    assert ws.prev_action_client_tick == 0x12345678
+    assert abs(ws.behavior_slots[TANK_SOFTBODY_CONTROL_SLOT] - OG_TANK_SOFTBODY_IDLE_SLOT5) < 1e-6
+    print("test_weapon_system_accepts_empty_action_update_keepalive: PASSED")
+    return True
+
+
+def _build_single_slot_action_update(ws: WeaponSystem, slot_idx: int, value: float) -> bytes:
+    bw = BitWriter()
+    bw.write_bits(8, 1)
+    bw.write_bits(32, 0x12345679)
+    bw.write_bits(32, 78)
+    bw.write_bits(ws.slot_index_bits, int(slot_idx))
+    if slot_idx == BehaviorSlot.UPWARD_THRUST:
+        raw = quantize_float(value, ws.zoom_max, ws.zoom_range, ws.zoom_bits)
+        bw.write_bits(ws.zoom_bits, raw)
+    elif slot_idx in ACTION_ANALOG_SLOTS:
+        raw = quantize_float(value, ws.control_max, ws.control_range, ws.control_bits)
+        bw.write_bits(ws.control_bits, raw)
+    else:
+        bw.write_bits(1, 1 if value >= 0.5 else 0)
+    return b"\x0A" + bw.get_bytes()
+
+
+def _build_action_dump(ws: WeaponSystem, slots: dict[int, float]) -> bytes:
+    bw = BitWriter()
+    bw.write_bits(32, 0x1234567A)
+    bw.write_bits(32, 79)
+    for slot_idx in range(1, 22):
+        value = float(slots.get(slot_idx, 0.0))
+        if slot_idx == BehaviorSlot.UPWARD_THRUST:
+            raw = quantize_float(value, ws.zoom_max, ws.zoom_range, ws.zoom_bits)
+            bw.write_bits(ws.zoom_bits, raw)
+        elif slot_idx in ACTION_DUMP_CONTROL_SLOTS:
+            raw = quantize_float(value, ws.control_max, ws.control_range, ws.control_bits)
+            bw.write_bits(ws.control_bits, raw)
+        else:
+            bw.write_bits(1, 1 if value >= 0.5 else 0)
+    return b"\x09" + bw.get_bytes()
+
+
+def test_weapon_system_slot5_release_preserves_og_slider_value():
+    """ACTION_UPDATE slot-5 zero is a key release, not an OG softbody reset."""
+    ws = WeaponSystem()
+    ws.behavior_slots[TANK_SOFTBODY_CONTROL_SLOT] = OG_TANK_SOFTBODY_Z_SLOT5
+
+    packet = _build_single_slot_action_update(ws, BehaviorSlot.UPWARD_THRUST, 0.0)
+
+    assert ws.decode_action_update(packet) is True
+    assert abs(ws.behavior_slots[TANK_SOFTBODY_CONTROL_SLOT] - OG_TANK_SOFTBODY_Z_SLOT5) < 1e-6
+    assert abs(tank_softbody_control_slot_value(ws.behavior_slots) - OG_TANK_SOFTBODY_Z_SLOT5) < 1e-6
+    print("test_weapon_system_slot5_release_preserves_og_slider_value: PASSED")
+    return True
+
+
+def test_weapon_system_action_dump_slot5_zero_preserves_og_slider_value():
+    """ACTION_DUMP slot-5 zero should not erase the persistent OG Q/Z slider."""
+    ws = WeaponSystem()
+    ws.behavior_slots[TANK_SOFTBODY_CONTROL_SLOT] = OG_TANK_SOFTBODY_Z_SLOT5
+
+    packet = _build_action_dump(ws, {BehaviorSlot.UPWARD_THRUST: 0.0})
+
+    assert ws.decode_action_dump(packet) is True
+    assert abs(ws.behavior_slots[TANK_SOFTBODY_CONTROL_SLOT] - OG_TANK_SOFTBODY_Z_SLOT5) < 1e-6
+    assert abs(tank_softbody_control_slot_value(ws.behavior_slots) - OG_TANK_SOFTBODY_Z_SLOT5) < 1e-6
+    print("test_weapon_system_action_dump_slot5_zero_preserves_og_slider_value: PASSED")
+    return True
+
+
+def test_weapon_system_action_dump_slot5_nonzero_updates_og_slider_value():
+    """ACTION_DUMP should still accept explicit nonzero slot-5 Q/Z values."""
+    ws = WeaponSystem()
+    ws.behavior_slots[TANK_SOFTBODY_CONTROL_SLOT] = OG_TANK_SOFTBODY_IDLE_SLOT5
+
+    packet = _build_action_dump(ws, {BehaviorSlot.UPWARD_THRUST: OG_TANK_SOFTBODY_Q_SLOT5})
+
+    assert ws.decode_action_dump(packet) is True
+    assert abs(ws.behavior_slots[TANK_SOFTBODY_CONTROL_SLOT] - OG_TANK_SOFTBODY_Q_SLOT5) < 0.01
+    assert tank_softbody_control_slot_value(ws.behavior_slots) > OG_TANK_SOFTBODY_IDLE_SLOT5
+    print("test_weapon_system_action_dump_slot5_nonzero_updates_og_slider_value: PASSED")
+    return True
+
+
+def test_tank_softbody_control_ignores_live_slot6_lean_by_default():
+    """Slot 6 is live OG lean data; it is only a legacy opt-in fallback."""
+    slots = [0.0] * 22
+    slots[BehaviorSlot.SLOT6] = -0.7324
+
+    assert abs(tank_softbody_control_slot_value(slots) - OG_TANK_SOFTBODY_IDLE_SLOT5) < 1e-6
+    assert abs(
+        tank_softbody_control_slot_value(slots, allow_legacy_slot6=True) + 0.7324
+    ) < 1e-6
+    print("test_tank_softbody_control_ignores_live_slot6_lean_by_default: PASSED")
+    return True
+
+
 def test_send_entity_create_uses_udp_only():
     """Remote entity-create UPDATE_ARRAY should avoid TCP for OG safety."""
     server = WulframServer.__new__(WulframServer)
@@ -3464,6 +3927,8 @@ def test_server_tank_motion_uses_fuel_mobility_factor():
     server.tick_rate_hz = 45.0
     server.linear_damp_driving = 0.0
     server.linear_damp_coasting = 0.0
+    server.turn_deadzone = 0.05
+    server.turn_sign = -1.0
     server.up_axis = "z"
     server.terrain = None
     server.terrain_pitch_enabled = False
@@ -3548,12 +4013,179 @@ def test_server_tank_motion_reduces_mobility_when_low_fuel():
     return True
 
 
+def test_tank_ground_contact_damping_limits_low_hover_speed():
+    """Low Z hover should keep the extra terrain-contact horizontal loss."""
+    server = WulframServer.__new__(WulframServer)
+    server.tick_rate_hz = 30.0
+    server.linear_damp_driving = 1.5
+    server.linear_damp_coasting = 1.5
+    server.tank_ground_contact_damp = 6.0
+    server.turn_deadzone = 0.05
+    server.turn_sign = -1.0
+    server.up_axis = "z"
+    server.terrain = SimpleNamespace(
+        get_height=lambda x, y: 0.0,
+        get_slope=lambda x, y: (0.0, 0.0),
+    )
+    server.terrain_height_offset = 0.0
+    server.terrain_physics_height_offset = 0.0
+    server.terrain_pitch_enabled = False
+    server.tank_suspension_enabled = True
+    server.tank_suspension_model = "softbody"
+    server.tank_suspension_damping = 6.0
+    server.tank_spring_base_offset = 2.0
+    server.gravity = 0.0
+    server.ground_level = 0.0
+    server.world_bound = 100000.0
+    server.f32_physics = False
+    server.jump_jets_enabled = False
+    server._resolve_entity_world_collision = (
+        lambda ctx, px, py, pz, vx, vy, vz: (px, py, pz, vx, vy, vz)
+    )
+    server._check_building_collisions = (
+        lambda ctx, px, py, pz, vx, vy: (px, py, vx, vy)
+    )
+
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    ctx.injected_input = (0.5188, 0.0)
+    ctx.weapon_system = WeaponSystem()
+    ctx.weapon_system.behavior_slots[5] = OG_TANK_SOFTBODY_Z_SLOT5
+    ctx.entity_type = EntityType.TANK
+    ctx.player_pos = (0.0, 0.0, 1.628)
+    ctx.player_vel = (0.0, 0.0, 0.0)
+    ctx.player_fuel = 33000.0
+    ctx.player_energy = 100.0
+    ctx.player_heading = 0.0
+    ctx.ground_level_override = None
+    ctx.player_pose = {}
+
+    for _ in range(60):
+        server._update_player_position(ctx, dt_override=1.0 / 30.0)
+
+    vx, vy, vz = ctx.player_vel
+    controller = ctx.debug_last_controller_step
+    assert abs(controller["linear_damp"] - 1.5) < 1e-6, controller
+    assert abs(controller["horizontal_damp"] - 6.0) < 1e-6, controller
+    assert abs(controller["tank_ground_contact_damp"] - 6.0) < 1e-6, controller
+    assert 7.0 <= vx <= 9.0, vx
+    assert abs(vy) < 1e-4, vy
+    assert abs(vz) < 1e-4, vz
+    print("test_tank_ground_contact_damping_limits_low_hover_speed: PASSED")
+    return True
+
+
+def test_tank_high_hover_uses_linear_damping_for_w_motion():
+    """High Q hover should move like OG with the measured 1.5 linear damping."""
+    server = WulframServer.__new__(WulframServer)
+    server.tick_rate_hz = 30.0
+    server.linear_damp_driving = 1.5
+    server.linear_damp_coasting = 1.5
+    server.tank_ground_contact_damp = 6.0
+    server.turn_deadzone = 0.05
+    server.turn_sign = -1.0
+    server.up_axis = "z"
+    server.terrain = SimpleNamespace(
+        get_height=lambda x, y: 0.0,
+        get_slope=lambda x, y: (0.0, 0.0),
+    )
+    server.terrain_height_offset = 0.0
+    server.terrain_physics_height_offset = 0.0
+    server.terrain_pitch_enabled = False
+    server.tank_suspension_enabled = True
+    server.tank_suspension_model = "softbody"
+    server.tank_suspension_damping = 6.0
+    server.tank_spring_base_offset = 2.0
+    server.gravity = 0.0
+    server.ground_level = 0.0
+    server.world_bound = 100000.0
+    server.f32_physics = False
+    server.jump_jets_enabled = False
+    server._resolve_entity_world_collision = (
+        lambda ctx, px, py, pz, vx, vy, vz: (px, py, pz, vx, vy, vz)
+    )
+    server._check_building_collisions = (
+        lambda ctx, px, py, pz, vx, vy: (px, py, vx, vy)
+    )
+
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    ctx.injected_input = (0.5188, 0.0)
+    ctx.weapon_system = WeaponSystem()
+    ctx.weapon_system.behavior_slots[5] = OG_TANK_SOFTBODY_Q_SLOT5
+    ctx.entity_type = EntityType.TANK
+    ctx.player_pos = (0.0, 0.0, 3.952)
+    ctx.player_vel = (0.0, 0.0, 0.0)
+    ctx.player_fuel = 33000.0
+    ctx.player_energy = 100.0
+    ctx.player_heading = 0.0
+    ctx.ground_level_override = None
+    ctx.player_pose = {}
+
+    for _ in range(60):
+        server._update_player_position(ctx, dt_override=1.0 / 30.0)
+
+    vx, vy, vz = ctx.player_vel
+    controller = ctx.debug_last_controller_step
+    assert abs(controller["linear_damp"] - 1.5) < 1e-6, controller
+    assert abs(controller["horizontal_damp"] - 1.5) < 1e-6, controller
+    assert abs(controller["tank_ground_contact_damp"]) < 1e-6, controller
+    assert 26.0 <= vx <= 30.0, vx
+    assert abs(vy) < 1e-4, vy
+    assert abs(vz) < 1e-4, vz
+    print("test_tank_high_hover_uses_linear_damping_for_w_motion: PASSED")
+    return True
+
+
+def test_remote_og_movement_input_delay_replays_prior_axis_sample():
+    """Remote OG movement should use delayed action history, not immediate slots."""
+    server = WulframServer.__new__(WulframServer)
+    server.remote_og_movement_input_delay = 0.20
+
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    now = time.monotonic()
+    ctx.movement_input_history.append({"time": now - 0.40, "fwd": 0.0, "strafe": 0.0})
+    ctx.movement_input_history.append({"time": now - 0.05, "fwd": 0.5188, "strafe": 0.0})
+
+    delay = server._remote_og_movement_input_delay_for_ctx(ctx)
+    fwd, strafe, source = server._select_delayed_movement_input(
+        ctx,
+        current_fwd=0.5188,
+        current_strafe=0.0,
+        delay_s=delay,
+    )
+    assert abs(delay - 0.20) < 1e-6, delay
+    assert fwd == 0.0, (fwd, source)
+    assert strafe == 0.0, strafe
+    assert source == "delayed_remote_og_action_history", source
+
+    ctx.client_addr = ("127.0.0.1", 50000)
+    assert server._remote_og_movement_input_delay_for_ctx(ctx) == 0.0
+    print("test_remote_og_movement_input_delay_replays_prior_axis_sample: PASSED")
+    return True
+
+
 def test_server_jump_jets_apply_fixed_step_rising_edge():
     """Opt-in jump jets should fire once on thrust rising edge inside motion step."""
     server = WulframServer.__new__(WulframServer)
     server.tick_rate_hz = 30.0
     server.linear_damp_driving = 0.0
     server.linear_damp_coasting = 0.0
+    server.turn_deadzone = 0.05
+    server.turn_sign = -1.0
     server.up_axis = "z"
     server.terrain = None
     server.terrain_pitch_enabled = False
@@ -4046,12 +4678,14 @@ def test_tank_surface_state_uses_behavior_spring_offsets():
     return True
 
 
-def test_tank_suspension_lift_supports_floor_clearance():
-    """The compact tank spring approximation should lift from terrain floor toward hover clearance."""
+def test_tank_softbody_support_pulls_down_from_compact_equilibrium():
+    """Default tank support should not hold the old compact 5.25-target Z."""
     server = WulframServer.__new__(WulframServer)
     server.tick_rate_hz = 30.0
     server.linear_damp_driving = 0.0
     server.linear_damp_coasting = 0.0
+    server.turn_deadzone = 0.05
+    server.turn_sign = -1.0
     server.up_axis = "z"
     server.terrain = SimpleNamespace(
         get_height=lambda x, y: 10.0,
@@ -4062,6 +4696,7 @@ def test_tank_suspension_lift_supports_floor_clearance():
     server.tank_spring_base_offset = 2.0
     server.terrain_pitch_enabled = False
     server.tank_suspension_enabled = True
+    server.tank_suspension_model = "softbody"
     server.tank_suspension_stiffness = 40.0
     server.tank_suspension_damping = 1.5
     server.tank_suspension_lift_cap = 120.0
@@ -4083,8 +4718,10 @@ def test_tank_suspension_lift_supports_floor_clearance():
         entity_id=0x14EA,
     )
     ctx.injected_input = (0.0, 0.0)
+    ctx.weapon_system = WeaponSystem()
+    ctx.weapon_system.behavior_slots[5] = OG_TANK_SOFTBODY_IDLE_SLOT5
     ctx.entity_type = EntityType.TANK
-    ctx.player_pos = (0.0, 0.0, 12.0)
+    ctx.player_pos = (0.0, 0.0, 13.9375)
     ctx.player_vel = (0.0, 0.0, 0.0)
     ctx.player_heading = 0.0
     ctx.ground_level_override = None
@@ -4092,19 +4729,96 @@ def test_tank_suspension_lift_supports_floor_clearance():
 
     server._update_player_position(ctx, dt_override=1.0 / 30.0)
 
-    assert ctx.player_vel[2] > 0.0, ctx.player_vel
-    assert ctx.debug_last_controller_step["suspension_lift"] > 50.0
-    assert abs(ctx.debug_last_controller_step["suspension_target_clearance"] - 5.25) < 1e-6
-    print("test_tank_suspension_lift_supports_floor_clearance: PASSED")
+    assert ctx.player_vel[2] < 0.0, ctx.player_vel
+    assert ctx.debug_last_controller_step["suspension_model"] == "softbody_empirical_flat"
+    assert ctx.debug_last_controller_step["suspension_lift"] < 50.0
+    assert abs(
+        ctx.debug_last_controller_step["suspension_target_clearance"]
+        - OG_TANK_SOFTBODY_FLAT_AVERAGE_HEIGHT
+    ) < 1e-6
+    assert ctx.debug_last_controller_step["suspension_target_clearance"] != 5.25
+    print("test_tank_softbody_support_pulls_down_from_compact_equilibrium: PASSED")
     return True
 
 
-def test_tank_suspension_default_stiffness_matches_decompile_equilibrium():
-    """Default compact spring stiffness should settle near target minus gravity/stiffness."""
+def test_tank_softbody_supports_gravity_at_og_flat_height():
+    """The softbody stand-in should support gravity at the live OG flat height."""
+    result = tank_softbody_suspension_force(
+        OG_TANK_SOFTBODY_FLAT_AVERAGE_HEIGHT,
+        0.0,
+        OG_TANK_SOFTBODY_IDLE_SLOT5,
+        gravity=-50.0,
+    )
+
+    assert result.model == "softbody_empirical_flat"
+    assert abs(result.lift_accel - 50.0) < 1e-6, result
+    assert abs(result.force_bias_accel) < 1e-6, result
+    assert abs(result.height_ratio - 0.3324) < 0.001, result.height_ratio
+    print("test_tank_softbody_supports_gravity_at_og_flat_height: PASSED")
+    return True
+
+
+def test_tank_softbody_slot5_changes_response_without_jumpjet():
+    """Q/Z slot 5 should change the softbody force path, not jumpjet input."""
+    low = tank_softbody_suspension_force(
+        OG_TANK_SOFTBODY_FLAT_AVERAGE_HEIGHT,
+        0.0,
+        OG_TANK_SOFTBODY_Z_SLOT5,
+    )
+    idle = tank_softbody_suspension_force(
+        OG_TANK_SOFTBODY_FLAT_AVERAGE_HEIGHT,
+        0.0,
+        OG_TANK_SOFTBODY_IDLE_SLOT5,
+    )
+    high = tank_softbody_suspension_force(
+        OG_TANK_SOFTBODY_FLAT_AVERAGE_HEIGHT,
+        0.0,
+        OG_TANK_SOFTBODY_Q_SLOT5,
+    )
+
+    assert low.response_scale < idle.response_scale < high.response_scale
+    assert low.softbody_stiffness < idle.softbody_stiffness < high.softbody_stiffness
+    assert low.force_curve_input < idle.force_curve_input < high.force_curve_input
+    assert low.force_bias_accel < idle.force_bias_accel < high.force_bias_accel
+    assert low.target_average_height < idle.target_average_height < high.target_average_height
+    assert high.target_average_height - low.target_average_height > 1.0
+    assert low.lift_accel < idle.lift_accel < high.lift_accel
+    assert high.lift_accel - idle.lift_accel < 20.0, high
+    assert idle.lift_accel - low.lift_accel < 20.0, low
+    print("test_tank_softbody_slot5_changes_response_without_jumpjet: PASSED")
+    return True
+
+
+def test_tank_softbody_control_prefers_live_og_slot5():
+    """Live OG Q/Z telemetry uses behavior slot 5; slot 6 is only fallback lean data."""
+    slots = [0.0] * 22
+    slots[BehaviorSlot.UPWARD_THRUST] = OG_TANK_SOFTBODY_Q_SLOT5
+    slots[BehaviorSlot.SLOT6] = -0.0916
+
+    assert abs(tank_softbody_control_slot_value(slots) - OG_TANK_SOFTBODY_Q_SLOT5) < 1e-6
+    slots[BehaviorSlot.UPWARD_THRUST] = 0.0
+    slots[BehaviorSlot.SLOT6] = 0.1831
+    assert abs(
+        tank_softbody_control_slot_value(slots, allow_legacy_slot6=True) - 0.1831
+    ) < 1e-6
+    print("test_tank_softbody_control_prefers_live_og_slot5: PASSED")
+    return True
+
+
+def test_weapon_system_upward_thrust_defaults_to_og_idle_slot5():
+    """Slot 5 is a positive OG softbody control with an idle baseline."""
+    ws = WeaponSystem()
+    assert abs(ws.behavior_slots[TANK_SOFTBODY_CONTROL_SLOT] - OG_TANK_SOFTBODY_IDLE_SLOT5) < 1e-6
+    print("test_weapon_system_upward_thrust_defaults_to_og_idle_slot5: PASSED")
+    return True
+
+
+def test_tank_suspension_legacy_compact_stiffness_matches_old_equilibrium():
+    """Legacy compact spring behavior remains available for blocker probes."""
     lift = tank_suspension_lift_accel(4.0, 5.25, 0.0)
 
     assert abs(lift - 50.0) < 1e-6, lift
-    print("test_tank_suspension_default_stiffness_matches_decompile_equilibrium: PASSED")
+    print("test_tank_suspension_legacy_compact_stiffness_matches_old_equilibrium: PASSED")
     return True
 
 
@@ -6514,10 +7228,49 @@ def test_control_pos_exact_reset_targets_specific_client():
     assert ctx.player_pose["pos"] == (100.0, 200.0, 300.0), ctx.player_pose["pos"]
     assert ctx.player_pose["vel"] == (0.0, 0.0, 0.0), ctx.player_pose["vel"]
     assert abs(ctx.player_pose["yaw"] + math.radians(45.0)) < 1e-6, ctx.player_pose["yaw"]
-    assert max(abs(v) for v in ctx.weapon_system.behavior_slots) == 0.0, ctx.weapon_system.behavior_slots
+    softbody_slots = {int(BehaviorSlot.UPWARD_THRUST), int(TANK_SOFTBODY_CONTROL_SLOT)}
+    assert abs(tank_softbody_control_slot_value(ctx.weapon_system.behavior_slots) - OG_TANK_SOFTBODY_IDLE_SLOT5) < 1e-6
+    for idx, value in enumerate(ctx.weapon_system.behavior_slots):
+        if idx in softbody_slots:
+            assert abs(value - OG_TANK_SOFTBODY_IDLE_SLOT5) < 1e-6, ctx.weapon_system.behavior_slots
+        else:
+            assert value == 0.0, ctx.weapon_system.behavior_slots
     assert ctx.weapon_system.prev_fire_state == 0.0, ctx.weapon_system.prev_fire_state
     assert ctx.weapon_system.fire_cooldown == 0.0, ctx.weapon_system.fire_cooldown
     print("test_control_pos_exact_reset_targets_specific_client: PASSED")
+    return True
+
+
+def test_control_pos_can_apply_live_tap_velocity():
+    """Control `pos ... vel vx vy vz` should preserve live tap velocity."""
+    server = SimpleNamespace(
+        clients_lock=threading.Lock(),
+        clients={},
+        _get_network_tick=lambda _ctx: 778,
+    )
+
+    session = Session()
+    session.udp_addr = ("127.0.0.1", 30000)
+    ctx = ClientContext(
+        client_id=8,
+        client_addr=("127.0.0.1", 30000),
+        session=session,
+        entity_id=0x1235,
+    )
+    server.clients[ctx.client_id] = ctx
+
+    control = ControlServer(port=0)
+    control.server = server
+
+    result = control._cmd_player_pos(["c8", "10", "20", "30", "vel", "1.5", "-2.0", "0.25"])
+
+    assert "vel=(1.50, -2.00, 0.25)" in result, result
+    assert ctx.player_pos == (10.0, 20.0, 30.0), ctx.player_pos
+    assert ctx.player_vel == (1.5, -2.0, 0.25), ctx.player_vel
+    assert ctx.player_pose["vel"] == (1.5, -2.0, 0.25), ctx.player_pose["vel"]
+    assert ctx.last_sent_vel == (1.5, -2.0, 0.25), ctx.last_sent_vel
+    assert abs(ctx.player_speed - math.sqrt(1.5 * 1.5 + 2.0 * 2.0 + 0.25 * 0.25)) < 1e-6
+    print("test_control_pos_can_apply_live_tap_velocity: PASSED")
     return True
 
 
@@ -6708,13 +7461,16 @@ def main():
         test_behavior_spawn_enabled_defaults_on_for_entry_map_spawn,
         test_input_sync_diagnosis_distinguishes_idle_snapback_from_correction_failure,
         test_input_sync_diagnosis_reports_movement_without_targeted_corrections,
+        test_input_sync_diagnosis_counts_unsolicited_correction_stream,
         test_spawn_override_wins_over_map_spawn_points,
         test_spawn_at_point_honors_clicked_pad_when_default_configured,
         test_map_entity_z_aligns_buried_entities_to_terrain,
         test_map_entity_z_preserves_raw_z_above_physics_terrain,
         test_map_entity_z_preserves_elevated_entities,
         test_control_pose_reset_updates_ground_override,
+        test_tank_softbody_spawn_pose_does_not_pin_ground_override,
         test_pulse_shell_default_spawn_uses_recovered_muzzle_offset,
+        test_projectile_fire_pose_uses_replay_history_when_available,
         test_remote_spawn_points_use_udp_not_tcp,
         test_send_initial_game_data_og_bootstrap_order,
         test_remote_want_updates_suppresses_empty_tcp_update_array,
@@ -6726,11 +7482,16 @@ def main():
         test_remote_state_sync_reply_stays_spawn_safe_immediately_after_spawn,
         test_remote_state_sync_reply_stays_spawn_safe_after_spawn_delay,
         test_remote_state_sync_reply_stays_safe_without_post_spawn_input_after_delay,
-        test_remote_state_sync_reply_emits_view_update_with_request_timestamp,
+        test_remote_state_sync_reply_emits_view_update_with_fresh_remote_timestamp,
         test_loopback_state_sync_reply_keeps_request_timestamp,
-        test_remote_empirical_view_update_correction_uses_fresh_state_request_timestamp,
+        test_remote_state_request_queues_visible_correction_burst,
+        test_remote_active_movement_suppresses_visible_correction_burst,
+        test_state_request_active_movement_skips_view_update_correction,
+        test_batched_state_request_sees_later_action_update_movement,
+        test_remote_empirical_view_update_correction_uses_fresh_remote_timestamp,
         test_view_update_create_tank_decodes_definition_shape,
         test_remote_empirical_view_update_define_correction_uses_definition_shape,
+        test_remote_state_sync_defaults_to_live_snapshot_for_remote_og,
         test_remote_state_sync_reply_uses_request_aligned_authoritative_pose,
         test_remote_promoted_heartbeat_stays_short_form_safe,
         test_remote_state_sync_reply_keeps_full_motion_when_stable,
@@ -6757,6 +7518,11 @@ def main():
         test_control_game_clock_builder_matches_packet_signature,
         test_weapon_system_og_direct_trigger_slot_fires_pulse_shell,
         test_weapon_system_held_fire_repeats_on_cooldown,
+        test_weapon_system_accepts_empty_action_update_keepalive,
+        test_weapon_system_slot5_release_preserves_og_slider_value,
+        test_weapon_system_action_dump_slot5_zero_preserves_og_slider_value,
+        test_weapon_system_action_dump_slot5_nonzero_updates_og_slider_value,
+        test_tank_softbody_control_ignores_live_slot6_lean_by_default,
         test_send_entity_create_uses_udp_only,
         test_transient_fx_stays_off_for_remote_og_by_default,
         test_transient_fx_can_be_enabled_for_remote_clients,
@@ -6774,6 +7540,9 @@ def main():
         test_remote_initial_spawn_keeps_minimal_path_when_never_promoted,
         test_server_tank_motion_uses_fuel_mobility_factor,
         test_server_tank_motion_reduces_mobility_when_low_fuel,
+        test_tank_ground_contact_damping_limits_low_hover_speed,
+        test_tank_high_hover_uses_linear_damping_for_w_motion,
+        test_remote_og_movement_input_delay_replays_prior_axis_sample,
         test_server_jump_jets_apply_fixed_step_rising_edge,
         test_server_jump_jets_have_visible_peak_under_default_gravity,
         test_server_jump_jets_queue_remote_og_correction_burst,
@@ -6785,8 +7554,12 @@ def main():
         test_remote_team_select_uses_remote_idle_timeout,
         test_tank_surface_state_uses_spring_base_clearance_target,
         test_tank_surface_state_uses_behavior_spring_offsets,
-        test_tank_suspension_lift_supports_floor_clearance,
-        test_tank_suspension_default_stiffness_matches_decompile_equilibrium,
+        test_tank_softbody_support_pulls_down_from_compact_equilibrium,
+        test_tank_softbody_supports_gravity_at_og_flat_height,
+        test_tank_softbody_slot5_changes_response_without_jumpjet,
+        test_tank_softbody_control_prefers_live_og_slot5,
+        test_weapon_system_upward_thrust_defaults_to_og_idle_slot5,
+        test_tank_suspension_legacy_compact_stiffness_matches_old_equilibrium,
         test_ghost_rejoin_skips_loopback_clients,
         test_projectile_world_hit_skips_aabb_for_mesh_backed_building,
         test_projectile_world_hit_prefers_closest_building_before_terrain,
@@ -6841,6 +7614,7 @@ def main():
         test_roster_entry_stays_tcp_only,
         test_broadcast_player_stats_stays_tcp_only,
         test_control_pos_exact_reset_targets_specific_client,
+        test_control_pos_can_apply_live_tap_velocity,
         test_control_heading_set_preserves_yaw_sign_convention,
         test_solo_local_player_keepalive_shape_triggers_og_state_request_gate,
         test_view_update_pos_without_rot_clamps_to_safe_shape,

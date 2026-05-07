@@ -50,6 +50,9 @@ from wulfram2_protocol.entities import (
     tank_suspension_local_sample_offsets,
     tank_suspension_sample_offsets,
     tank_suspension_lift_accel,
+    tank_softbody_control_slot_value,
+    tank_softbody_horizontal_damping,
+    tank_softbody_suspension_force,
     tank_fuel_mobility_factor,
     tank_terrain_contact_coupling,
     terrain_aligned_basis,
@@ -615,12 +618,21 @@ class WulframServer:
             )
         except ValueError:
             self.tank_spring_base_offset = 2.0
+        self.tank_drive_terrain_aligned = (
+            os.environ.get("WULFRAM_TANK_DRIVE_TERRAIN_ALIGNED", "0") == "1"
+        )
+        self.tank_terrain_contact_coupling_enabled = (
+            os.environ.get("WULFRAM_TANK_TERRAIN_CONTACT_COUPLING", "0") == "1"
+        )
         self.tank_spring_sample_local_offsets = get_behavior_tank_spring_local_offsets()
-        # Compact spring support for tanks. The OG client applies the full
-        # BEHAVIOR softbody/piecewise spring model; this lower-baseline center
-        # lift keeps authoritative Z near observed OG rough-terrain motion while
-        # the per-point spring path is still being cloned.
+        # Tank vertical support. Default to the decompile-shaped softbody
+        # stand-in; keep the old compact center-lift model available only for
+        # explicit comparison/debugging.
         self.tank_suspension_enabled = os.environ.get("WULFRAM_TANK_SUSPENSION", "1") == "1"
+        self.tank_suspension_model = os.environ.get(
+            "WULFRAM_TANK_SUSPENSION_MODEL",
+            "softbody",
+        ).strip().lower()
         try:
             self.tank_suspension_stiffness = float(os.environ.get("WULFRAM_TANK_SUSPENSION_STIFFNESS", "40.0"))
         except ValueError:
@@ -940,6 +952,15 @@ class WulframServer:
         # Tick selection: default to server tick for stability across multiple clients.
         self.use_client_ticks = os.environ.get("WULFRAM_USE_CLIENT_TICKS", "0") == "1"
         print(f"[CONFIG] use_client_ticks={int(self.use_client_ticks)}")
+        try:
+            self.remote_og_movement_input_delay = float(
+                os.environ.get("WULFRAM_REMOTE_OG_MOVEMENT_INPUT_DELAY", "0.20")
+            )
+        except ValueError:
+            self.remote_og_movement_input_delay = 0.20
+        if self.remote_og_movement_input_delay < 0.0:
+            self.remote_og_movement_input_delay = 0.0
+        print(f"[CONFIG] remote_og_movement_input_delay={self.remote_og_movement_input_delay:.2f}s")
         # Aim/movement configuration (shared across clients)
         # Slot-integrated aim is sensitive to noisy axis samples; keep opt-in.
         self.use_slot_aim = os.environ.get("WULFRAM_USE_SLOT_AIM", "0") == "1"
@@ -1052,6 +1073,36 @@ class WulframServer:
         ).strip().lower()
         if self.state_sync_view_mode not in ("off", "loopback", "remote", "all"):
             self.state_sync_view_mode = "all"
+        self.state_sync_snapshot_mode = os.environ.get(
+            "WULFRAM_STATE_SYNC_SNAPSHOT_MODE",
+            "remote_live",
+        ).strip().lower()
+        if self.state_sync_snapshot_mode not in ("remote_live", "live", "history"):
+            self.state_sync_snapshot_mode = "remote_live"
+        try:
+            self.state_sync_correction_burst_count = int(
+                os.environ.get("WULFRAM_STATE_SYNC_CORRECTION_BURST", "6")
+            )
+        except ValueError:
+            self.state_sync_correction_burst_count = 6
+        if self.state_sync_correction_burst_count < 0:
+            self.state_sync_correction_burst_count = 0
+        try:
+            self.state_sync_correction_burst_interval = float(
+                os.environ.get("WULFRAM_STATE_SYNC_CORRECTION_INTERVAL", "0.10")
+            )
+        except ValueError:
+            self.state_sync_correction_burst_interval = 0.10
+        if self.state_sync_correction_burst_interval < 0.0:
+            self.state_sync_correction_burst_interval = 0.0
+        try:
+            self.remote_view_update_timestamp_ahead_ms = int(
+                os.environ.get("WULFRAM_REMOTE_VIEW_TIMESTAMP_AHEAD_MS", "1000")
+            )
+        except ValueError:
+            self.remote_view_update_timestamp_ahead_ms = 1000
+        if self.remote_view_update_timestamp_ahead_ms < 0:
+            self.remote_view_update_timestamp_ahead_ms = 0
         # Non-canonical debug/status chat is useful for the Python client, but
         # it should not leak to OG clients while protocol compatibility work is
         # in flight.
@@ -1077,6 +1128,10 @@ class WulframServer:
             f"state_sync_reply_hosts="
             f"{'*' if self.state_sync_reply_allow_all else ','.join(sorted(self.state_sync_reply_hosts))} "
             f"state_sync_view_mode={self.state_sync_view_mode} "
+            f"state_sync_snapshot_mode={self.state_sync_snapshot_mode} "
+            f"state_sync_correction_burst={self.state_sync_correction_burst_count}@"
+            f"{self.state_sync_correction_burst_interval}s "
+            f"remote_view_ts_ahead={self.remote_view_update_timestamp_ahead_ms}ms "
             f"debug_comm_hosts="
             f"{'*' if self.debug_comm_allow_all else ','.join(sorted(self.debug_comm_hosts))}"
         )
@@ -1115,6 +1170,14 @@ class WulframServer:
             self.linear_damp_coasting = float(os.environ.get("WULFRAM_LINEAR_DAMP_COASTING", "1.5"))
         except ValueError:
             self.linear_damp_coasting = 1.5
+        try:
+            self.tank_ground_contact_damp = float(
+                os.environ.get("WULFRAM_TANK_GROUND_CONTACT_DAMP", "6.0")
+            )
+        except ValueError:
+            self.tank_ground_contact_damp = 6.0
+        if self.tank_ground_contact_damp < 0.0:
+            self.tank_ground_contact_damp = 0.0
 
         # Local-player correction mode. UPDATE_ARRAY-based modes
         # (`dual_entity`, `full`, `pos_only`, `rot_only`) do NOT
@@ -1140,6 +1203,29 @@ class WulframServer:
             self.correction_interval = float(os.environ.get("WULFRAM_CORRECTION_INTERVAL", "0"))
         except ValueError:
             self.correction_interval = 0.0
+        try:
+            # Remote OG still needs fresh VIEW_UPDATE wrappers after movement
+            # settles, but live traces show position-bearing replay updates
+            # reset the local physics path while forward/strafe input is held.
+            self.movement_correction_interval = float(
+                os.environ.get("WULFRAM_MOVEMENT_CORRECTION_INTERVAL", "0.10")
+            )
+        except ValueError:
+            self.movement_correction_interval = 0.10
+        try:
+            self.movement_correction_window = float(
+                os.environ.get("WULFRAM_MOVEMENT_CORRECTION_WINDOW", "4.0")
+            )
+        except ValueError:
+            self.movement_correction_window = 4.0
+        try:
+            self.active_input_correction_suppress_window = float(
+                os.environ.get("WULFRAM_ACTIVE_INPUT_CORRECTION_SUPPRESS_WINDOW", "1.25")
+            )
+        except ValueError:
+            self.active_input_correction_suppress_window = 1.25
+        if self.active_input_correction_suppress_window < 0.0:
+            self.active_input_correction_suppress_window = 0.0
         self.correction_mode = os.environ.get("WULFRAM_CORRECTION_MODE", "view_update").strip().lower()
         if self.correction_mode not in ("full", "rot_only", "pos_only", "dual_entity", "view_update", "view_update_define"):
             self.correction_mode = "view_update"
@@ -1148,7 +1234,11 @@ class WulframServer:
             f"[CONFIG-HEADING] turn_adjust={self.turn_adjust} turn_sign={self.turn_sign} "
             f"deadzone={self.turn_deadzone} damp_coeff={self.damp_coeff} "
             f"linear_damp=driving:{self.linear_damp_driving}/coast:{self.linear_damp_coasting} "
+            f"tank_ground_contact_damp={self.tank_ground_contact_damp} "
             f"tick_rate={self.tick_rate_hz}Hz correction_interval={self.correction_interval}s "
+            f"movement_correction={self.movement_correction_interval}s/"
+            f"{self.movement_correction_window}s "
+            f"active_suppress={self.active_input_correction_suppress_window}s "
             f"correction_mode={self.correction_mode}"
         )
 
@@ -1185,6 +1275,25 @@ class WulframServer:
             tick = ctx.last_sent_tick + 1
         ctx.last_sent_tick = tick & 0xFFFFFFFF
         return ctx.last_sent_tick
+
+    def _fresh_remote_view_update_timestamp(self, ctx: ClientContext, tick: int) -> int:
+        """Return a remote OG VIEW_UPDATE timestamp that the client will clamp fresh.
+
+        The OG replay handler clamps future VIEW_UPDATE timestamps down to its
+        current tick before storing interp_record+0x08. Live wulftap shows stale
+        STATE_REQUEST ids are rejected by UpdateArray_check_eligible before
+        NetworkSync_receive_entity_update can store server_expected, so remote
+        OG replay wrappers must be current/future while snapshot selection can
+        still use the original request id.
+        """
+        base_tick = int(tick) & 0xFFFFFFFF
+        client_tick = int(getattr(ctx, "last_client_tick", 0) or 0) & 0xFFFFFFFF
+        if client_tick and self._tick_delta_signed(client_tick, base_tick) > 0:
+            base_tick = client_tick
+        ahead_ms = int(getattr(self, "remote_view_update_timestamp_ahead_ms", 1000) or 0)
+        if ahead_ms < 0:
+            ahead_ms = 0
+        return (base_tick + ahead_ms) & 0xFFFFFFFF
 
     @staticmethod
     def _tick_delta_signed(newer: int, older: int) -> int:
@@ -1703,10 +1812,13 @@ class WulframServer:
         inc_rot = cmode in ("full", "rot_only", "dual_entity", "view_update", "view_update_define")
         correction_timestamp = None
         if cmode in ("view_update", "view_update_define"):
-            last_request_id = int(getattr(ctx, "last_state_request_id", 0) or 0)
-            last_request_time = float(getattr(ctx, "last_state_request_time", 0.0) or 0.0)
-            if last_request_id and last_request_time > 0.0 and (time.monotonic() - last_request_time) <= 1.5:
-                correction_timestamp = last_request_id
+            if handlers._is_loopback_client(ctx):
+                last_request_id = int(getattr(ctx, "last_state_request_id", 0) or 0)
+                last_request_time = float(getattr(ctx, "last_state_request_time", 0.0) or 0.0)
+                if last_request_id and last_request_time > 0.0 and (time.monotonic() - last_request_time) <= 1.5:
+                    correction_timestamp = last_request_id
+            else:
+                correction_timestamp = self._fresh_remote_view_update_timestamp(ctx, tick)
 
         if not handlers._is_loopback_client(ctx):
             # OG clients reject the promoted/full local-state form on targeted
@@ -2654,9 +2766,76 @@ class WulframServer:
             if self.debug_udp_raw and data[0] == 0x10 and 0x35 in data:
                 print(f"[UDP-RAW] 0x10 wrapper: len={len(data)} hex={data.hex()}")
 
-            # Parse multiple packets from a single UDP datagram
-            for packet in self._parse_udp_datagram(data, ctx):
-                self._handle_single_udp_packet(ctx, packet, addr)
+            # Parse multiple packets from a single UDP datagram. OG can batch a
+            # STATE_REQUEST before the ACTION_UPDATE/ACTION_DUMP that makes W/A/D
+            # active; pre-scan the whole datagram so correction suppression sees
+            # that input before the first state-sync packet is handled.
+            packets = list(self._parse_udp_datagram(data, ctx))
+            if ctx is not None:
+                ctx._datagram_active_movement_input = (
+                    self._udp_packets_have_active_movement_input(ctx, packets)
+                )
+            try:
+                for packet in packets:
+                    self._handle_single_udp_packet(ctx, packet, addr)
+            finally:
+                if ctx is not None:
+                    ctx._datagram_active_movement_input = False
+
+    def _udp_packets_have_active_movement_input(
+        self,
+        ctx: ClientContext,
+        packets: list[bytes],
+    ) -> bool:
+        """Return true if a batched UDP datagram carries active fwd/strafe input."""
+        if handlers._is_loopback_client(ctx):
+            return False
+        if not getattr(ctx, "weapon_system", None):
+            return False
+
+        def _clone_weapon_system_for_decode() -> WeaponSystem:
+            source = ctx.weapon_system
+            clone = WeaponSystem()
+            clone.behavior_slots = source.behavior_slots.copy()
+            for attr in (
+                "control_bits",
+                "control_max",
+                "control_range",
+                "zoom_bits",
+                "zoom_max",
+                "zoom_range",
+                "slot_index_bits",
+                "weapon_from_slot4",
+            ):
+                setattr(clone, attr, getattr(source, attr))
+            return clone
+
+        for packet in packets:
+            if not packet:
+                continue
+            pkt_type = packet[0]
+            if pkt_type not in (0x09, 0x0A):
+                continue
+            probe = _clone_weapon_system_for_decode()
+            if pkt_type == 0x09:
+                decoded = probe.decode_action_dump(packet)
+            else:
+                decoded = probe.decode_action_update(packet)
+            if not decoded:
+                continue
+            fwd = self._normalize_behavior_axis_value(
+                ctx,
+                probe.behavior_slots[BehaviorSlot.MOVING_FORWARD],
+            )
+            if abs(fwd) > 0.05:
+                return True
+            strafe = self._decode_network_strafe_input(
+                ctx,
+                probe.behavior_slots[BehaviorSlot.MOVING_SIDEWAYS],
+            )
+            if abs(strafe) > 0.05:
+                return True
+        return False
 
     def _ping_loop(self, ctx: ClientContext):
         """Send periodic ping requests to keep connection alive (like wulf-forge)."""
@@ -4143,7 +4322,9 @@ class WulframServer:
                     "[TERRAIN] Height offsets: "
                     f"map={self.terrain_height_offset} "
                     f"physics={self.terrain_physics_height_offset} "
-                    f"tank_spring_base={self.tank_spring_base_offset}"
+                    f"tank_spring_base={self.tank_spring_base_offset} "
+                    f"tank_drive_terrain_aligned={int(self.tank_drive_terrain_aligned)} "
+                    f"tank_contact_coupling={int(self.tank_terrain_contact_coupling_enabled)}"
                 )
             except Exception as e:
                 print(f"[TERRAIN] Failed to load {land_path}: {e}")
@@ -4226,6 +4407,16 @@ class WulframServer:
     def _set_ground_level_override_for_pose(self, ctx: ClientContext, pos: tuple[float, float, float]) -> None:
         """Pin exact spawn/control Z while recording the terrain anchor under it."""
         if not getattr(self, "spawn_sets_ground_level", False):
+            ctx.ground_level_override = None
+            ctx.ground_override_ref_terrain_level = None
+            return
+        if (
+            getattr(ctx, "entity_type", None) == EntityType.TANK
+            and getattr(self, "up_axis", "z") == "z"
+            and getattr(self, "terrain", None) is not None
+            and getattr(self, "tank_suspension_enabled", False)
+            and getattr(self, "tank_suspension_model", "softbody") != "compact"
+        ):
             ctx.ground_level_override = None
             ctx.ground_override_ref_terrain_level = None
             return
@@ -5108,12 +5299,35 @@ class WulframServer:
         # expanded ammo/turret local-state on the correction packet itself.
         self._maybe_promote_remote_full_local_state(ctx, reason="state_request")
 
+        if self._remote_movement_input_active(ctx, now=now):
+            return
+
+        include_view_update = self._should_send_state_sync_view_update(ctx)
         self._send_state_sync_snapshot(
             ctx,
             reason="state_request",
-            include_view_update=self._should_send_state_sync_view_update(ctx),
+            include_view_update=include_view_update,
             replay_timestamp=request_id if request_id else None,
         )
+        if include_view_update:
+            self._queue_state_sync_correction_burst(ctx)
+
+    def _queue_state_sync_correction_burst(self, ctx: ClientContext) -> bool:
+        """Queue enough replay updates for OG's local correction to visibly settle."""
+        if handlers._is_loopback_client(ctx):
+            return False
+        if self._remote_movement_input_active(ctx):
+            return False
+        count = int(getattr(self, "state_sync_correction_burst_count", 0) or 0)
+        if count <= 0:
+            return False
+        interval = float(getattr(self, "state_sync_correction_burst_interval", 0.10) or 0.0)
+        if interval < 0.0:
+            interval = 0.0
+        current_remaining = int(getattr(ctx, "correction_burst_remaining", 0) or 0)
+        ctx.correction_burst_remaining = max(current_remaining, count)
+        ctx.correction_burst_interval_s = interval
+        return True
 
     def _send_state_sync_snapshot(
         self,
@@ -5161,7 +5375,19 @@ class WulframServer:
             return angle
 
         tick = self._get_network_tick(ctx)
-        snapshot = self._select_authoritative_state_snapshot(ctx, replay_timestamp)
+        snapshot_mode = getattr(self, "state_sync_snapshot_mode", "remote_live")
+        use_history_snapshot = snapshot_mode == "history" or (
+            snapshot_mode == "remote_live" and handlers._is_loopback_client(ctx)
+        )
+        # Live OG telemetry shows stale replay-history poses can be accepted
+        # under a fresh VIEW_UPDATE timestamp and drag local prediction behind
+        # the server during real movement. Keep history available for loopback
+        # tooling/A-B runs, but default remote OG correction to current state.
+        snapshot = (
+            self._select_authoritative_state_snapshot(ctx, replay_timestamp)
+            if use_history_snapshot
+            else None
+        )
         if snapshot is None:
             snapshot_source = "live"
             send_pos = self._to_client_pos(ctx.player_pos)
@@ -5280,11 +5506,13 @@ class WulframServer:
         view_payload = b""
         if include_view_update:
             # VIEW_UPDATE is replay-mode input to the client's prediction path.
-            # The wrapper timestamp must be the STATE_REQUEST/replay id when
-            # present; the decompile stores it in the interpolation record used
-            # by prediction verification. A fresh packet timestamp can make the
-            # OG client receive the correction but reject it as unpaired.
+            # Loopback/Python clients keep the STATE_REQUEST/replay id for
+            # latency correlation. Remote OG clients need a current/future
+            # wrapper timestamp because UpdateArray_check_eligible rejects
+            # stale interp_record+0x08 values before prediction storage.
             view_timestamp = replay_timestamp
+            if not handlers._is_loopback_client(ctx):
+                view_timestamp = self._fresh_remote_view_update_timestamp(ctx, tick)
             view_weapon_type = weapon_type
             view_ammo_bits = 0
             view_ammo_mask = 0
@@ -5438,6 +5666,55 @@ class WulframServer:
             f"hist_pos=({_fmt_vec(hist_pos)})"
         )
 
+    def _select_weapon_fire_pose(
+        self,
+        ctx: ClientContext,
+        client_tick: int,
+    ) -> tuple[tuple, tuple, str, str]:
+        """Return the packet-aligned pose used to spawn a projectile.
+
+        Fire packets arrive after the client has already simulated the input
+        frame that produced them. Using the live server pose makes moving shots
+        spawn a few units ahead of the client's local muzzle. Reuse the same
+        replay/history mapping as STATE_REQUEST so projectile origin and local
+        correction agree on the input tick.
+        """
+        pose_source = "live"
+        fire_pos = ctx.player_pos
+        body_roll = float(ctx.player_pose.get("roll", 0.0) or 0.0)
+        body_pitch = float(ctx.player_pose.get("pitch", 0.0) or 0.0)
+        body_yaw = float(ctx.player_heading)
+
+        hist = self._select_authoritative_state_snapshot(ctx, client_tick) if client_tick else None
+        if hist is not None:
+            hist_pos = hist.get("pos")
+            hist_rot = hist.get("rot") or ()
+            if hist_pos is not None:
+                fire_pos = self._from_client_pos(hist_pos)
+                pose_source = "history"
+            if len(hist_rot) >= 1:
+                body_roll = float(hist_rot[0])
+            if len(hist_rot) >= 2:
+                body_pitch = float(hist_rot[1])
+            if len(hist_rot) >= 3:
+                body_yaw = float(hist_rot[2])
+
+        aim_pitch, aim_yaw, aim_src = self._get_aim_rotation(ctx)
+        aim_label = aim_src
+        if self.projectile_aim_source == "body":
+            aim_pitch = 0.0
+            aim_yaw = body_yaw
+            aim_label = "body"
+        elif self.projectile_aim_source == "viewpoint":
+            aim_pitch = ctx.player_aim_pitch
+            aim_yaw = ctx.player_aim_yaw
+            aim_label = "viewpoint"
+        elif self.projectile_aim_source == "auto" and aim_src != "viewpoint":
+            aim_pitch = body_pitch
+            aim_yaw = body_yaw
+
+        return fire_pos, (body_roll, aim_pitch, aim_yaw), aim_label, pose_source
+
     def _handle_action_dump(self, ctx: Optional[ClientContext], data: bytes, addr: tuple):
         """
         Handle ACTION_DUMP packet (0x09).
@@ -5466,28 +5743,10 @@ class WulframServer:
             # Update weapon system with current pose
             ctx.weapon_system.player_id = ctx.session.player_id or ctx.entity_id
             ctx.weapon_system.player_team = ctx.session.team_id or 2
-            # Use server-tracked position for projectile spawns.
-            ctx.weapon_system.player_pos = ctx.player_pos
-            # Aim rotation (viewpoint when available) order: (roll, pitch, yaw)
-            aim_pitch, aim_yaw, aim_src = self._get_aim_rotation(ctx)
-            aim_override = "auto"
-            if self.projectile_aim_source == "body":
-                aim_pitch = 0.0
-                aim_yaw = ctx.player_heading
-                aim_override = "body"
-            elif self.projectile_aim_source == "viewpoint":
-                aim_pitch = ctx.player_aim_pitch
-                aim_yaw = ctx.player_aim_yaw
-                aim_override = "viewpoint"
-            elif self.projectile_aim_source == "auto":
-                # Keep dynamic source from _get_aim_rotation().
-                aim_override = aim_src
-            ctx.weapon_system.player_rot = (
-                ctx.player_pose.get("roll", 0.0),
-                aim_pitch,
-                aim_yaw,
-            )
-            ctx.weapon_system.projectile_aim_source = aim_override if aim_override != "auto" else aim_src
+            fire_pos, fire_rot, aim_src, pose_src = self._select_weapon_fire_pose(ctx, client_tick)
+            ctx.weapon_system.player_pos = fire_pos
+            ctx.weapon_system.player_rot = fire_rot
+            ctx.weapon_system.projectile_aim_source = aim_src
 
             # Weapon spawning with wulf-forge encoding
             if self.projectiles_enabled:
@@ -5505,8 +5764,10 @@ class WulframServer:
                     print(
                         f"[WEAPON-FIRE] Firing {len(new_projectiles)} proj "
                         f"heading={math.degrees(ctx.player_heading):.1f} "
-                        f"aim_yaw={math.degrees(aim_yaw):.1f} vp_yaw={vp_yaw:.1f} "
-                        f"src={aim_src} turn_slot={turn_val:.3f} pos={ctx.player_pos}"
+                        f"aim_yaw={math.degrees(fire_rot[2]):.1f} vp_yaw={vp_yaw:.1f} "
+                        f"src={aim_src} pose_src={pose_src} "
+                        f"turn_slot={turn_val:.3f} pos={ctx.player_pos} "
+                        f"fire_pos={fire_pos}"
                     )
                     self._log_fire_pose_context(ctx, client_tick, "ACTION_DUMP")
                 for proj in new_projectiles:
@@ -5557,28 +5818,10 @@ class WulframServer:
             # Update weapon system with current pose
             ctx.weapon_system.player_id = ctx.session.player_id or ctx.entity_id
             ctx.weapon_system.player_team = ctx.session.team_id or 2
-            # Use server-tracked position for projectile spawns.
-            ctx.weapon_system.player_pos = ctx.player_pos
-            # Aim rotation (viewpoint when available) order: (roll, pitch, yaw)
-            aim_pitch, aim_yaw, aim_src = self._get_aim_rotation(ctx)
-            aim_override = "auto"
-            if self.projectile_aim_source == "body":
-                aim_pitch = 0.0
-                aim_yaw = ctx.player_heading
-                aim_override = "body"
-            elif self.projectile_aim_source == "viewpoint":
-                aim_pitch = ctx.player_aim_pitch
-                aim_yaw = ctx.player_aim_yaw
-                aim_override = "viewpoint"
-            elif self.projectile_aim_source == "auto":
-                # Keep dynamic source from _get_aim_rotation().
-                aim_override = aim_src
-            ctx.weapon_system.player_rot = (
-                ctx.player_pose.get("roll", 0.0),
-                aim_pitch,
-                aim_yaw,
-            )
-            ctx.weapon_system.projectile_aim_source = aim_override if aim_override != "auto" else aim_src
+            fire_pos, fire_rot, aim_src, pose_src = self._select_weapon_fire_pose(ctx, client_tick)
+            ctx.weapon_system.player_pos = fire_pos
+            ctx.weapon_system.player_rot = fire_rot
+            ctx.weapon_system.projectile_aim_source = aim_src
 
             # Weapon spawning with wulf-forge encoding
             if self.projectiles_enabled:
@@ -5594,9 +5837,10 @@ class WulframServer:
                     print(
                         f"[WEAPON-FIRE] Firing {len(new_projectiles)} proj "
                         f"heading={math.degrees(ctx.player_heading):.1f} "
-                        f"aim_yaw={math.degrees(aim_yaw):.1f} vp_yaw={vp_yaw:.1f} "
-                        f"src={aim_override if aim_override != 'auto' else aim_src} "
-                        f"turn_slot={turn_val:.3f} pos={ctx.player_pos}"
+                        f"aim_yaw={math.degrees(fire_rot[2]):.1f} vp_yaw={vp_yaw:.1f} "
+                        f"src={aim_src} pose_src={pose_src} "
+                        f"turn_slot={turn_val:.3f} pos={ctx.player_pos} "
+                        f"fire_pos={fire_pos}"
                     )
                     self._log_fire_pose_context(ctx, client_tick, "ACTION_UPDATE")
                 for proj in new_projectiles:
@@ -6145,7 +6389,7 @@ class WulframServer:
             ws.behavior_slots[BehaviorSlot.MOVING_SIDEWAYS],
         )
         fire_input = ws.behavior_slots[BehaviorSlot.FIRE]
-        thrust_input = ws.behavior_slots[BehaviorSlot.UPWARD_THRUST]
+        thrust_input = tank_softbody_control_slot_value(ws.behavior_slots)
         jumpjet_input = ws.behavior_slots[BehaviorSlot.JUMPJET]
         active_slots = {
             str(idx): float(value)
@@ -6161,6 +6405,17 @@ class WulframServer:
         ctx.last_action_packet_time = now
         ctx.last_action_packet_type = packet_type
         ctx.last_action_packet_client_tick = client_tick
+        history = getattr(ctx, "movement_input_history", None)
+        if history is not None:
+            history.append(
+                {
+                    "time": now,
+                    "fwd": float(fwd_input),
+                    "strafe": float(strafe_input),
+                    "packet_type": packet_type,
+                    "client_tick": int(client_tick or 0),
+                }
+            )
         ctx.last_decoded_input = {
             "turn": float(turn_input),
             "fwd": float(fwd_input),
@@ -6173,6 +6428,57 @@ class WulframServer:
         if abs(fwd_input) > 0.05 or abs(strafe_input) > 0.05:
             ctx.nonzero_move_input_count += 1
             ctx.last_nonzero_move_input_time = now
+
+    def _remote_og_movement_input_delay_for_ctx(self, ctx: ClientContext) -> float:
+        """Return the empirically observed remote OG input replay delay."""
+        if ctx is None or ctx.injected_input is not None:
+            return 0.0
+        if handlers._is_loopback_client(ctx):
+            return 0.0
+        return max(0.0, float(getattr(self, "remote_og_movement_input_delay", 0.0) or 0.0))
+
+    def _select_delayed_movement_input(
+        self,
+        ctx: ClientContext,
+        *,
+        current_fwd: float,
+        current_strafe: float,
+        delay_s: float,
+    ) -> tuple[float, float, str]:
+        """Replay remote OG movement slots at the phase the local client applies."""
+        delay = max(0.0, float(delay_s))
+        if delay <= 0.0:
+            return float(current_fwd), float(current_strafe), "current_slots"
+        history = getattr(ctx, "movement_input_history", None)
+        if not history:
+            return float(current_fwd), float(current_strafe), "current_slots_no_history"
+
+        target_time = time.monotonic() - delay
+        selected = None
+        for entry in reversed(history):
+            try:
+                sample_time = float(entry.get("time", 0.0))
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if sample_time <= target_time:
+                selected = entry
+                break
+
+        if selected is None:
+            # The first nonzero packet can arrive before OG local physics has
+            # consumed the key event. Hold neutral during that short replay
+            # window instead of advancing the server early.
+            return 0.0, 0.0, "delayed_remote_og_pre_history_zero"
+
+        try:
+            fwd = float(selected.get("fwd", 0.0))
+        except (TypeError, ValueError, AttributeError):
+            fwd = 0.0
+        try:
+            strafe = float(selected.get("strafe", 0.0))
+        except (TypeError, ValueError, AttributeError):
+            strafe = 0.0
+        return fwd, strafe, "delayed_remote_og_action_history"
 
     def _maybe_promote_remote_full_local_state(self, ctx: ClientContext, *, reason: str) -> bool:
         """Leave the spawn-safe minimal remote path once the client is stably in game."""
@@ -6277,13 +6583,26 @@ class WulframServer:
         dt = dt_override if dt_override > 0 else 1.0 / self.tick_rate_hz
 
         # Read movement input (slot 2 = forward, slot 3 = strafe)
+        raw_throttle_input = 0.0
+        raw_strafe_input = 0.0
+        movement_input_delay_s = 0.0
+        movement_input_source = "current_slots"
         if ctx.injected_input is not None:
             throttle_input, strafe_input = ctx.injected_input
+            raw_throttle_input, raw_strafe_input = throttle_input, strafe_input
+            movement_input_source = "injected"
         else:
             throttle_val = ctx.weapon_system.behavior_slots[BehaviorSlot.MOVING_FORWARD]
             strafe_val = ctx.weapon_system.behavior_slots[BehaviorSlot.MOVING_SIDEWAYS]
-            throttle_input = self._normalize_behavior_axis_value(ctx, throttle_val)
-            strafe_input = self._decode_network_strafe_input(ctx, strafe_val)
+            raw_throttle_input = self._normalize_behavior_axis_value(ctx, throttle_val)
+            raw_strafe_input = self._decode_network_strafe_input(ctx, strafe_val)
+            movement_input_delay_s = self._remote_og_movement_input_delay_for_ctx(ctx)
+            throttle_input, strafe_input, movement_input_source = self._select_delayed_movement_input(
+                ctx,
+                current_fwd=raw_throttle_input,
+                current_strafe=raw_strafe_input,
+                delay_s=movement_input_delay_s,
+            )
 
         if abs(throttle_input) < 0.05:
             throttle_input = 0.0
@@ -6362,14 +6681,27 @@ class WulframServer:
                     dh_dy = -avg_up[1] / avg_up[2]
                 else:
                     dh_dx, dh_dy = self.terrain.get_slope(ctx.player_pos[0], ctx.player_pos[1])
-                forward, right, _up = terrain_aligned_basis(dh_dx, dh_dy, yaw)
+                if getattr(self, "tank_drive_terrain_aligned", False):
+                    forward, right, _up = terrain_aligned_basis(dh_dx, dh_dy, yaw)
+                    drive_basis_source = "terrain_aligned"
+                else:
+                    # TankVehicle_apply_physics rotates the drive vector by the
+                    # entity's current Euler rotation. Live OG telemetry on
+                    # rough ground shows that the softbody terrain normal does
+                    # not directly tilt the drive vector; until pitch/roll are
+                    # modelled as entity rotation, keep drive horizontal.
+                    forward = (cos_yaw, sin_yaw, 0.0)
+                    right = (-sin_yaw, cos_yaw, 0.0)
+                    drive_basis_source = "entity_yaw_flat"
             else:
                 forward = (cos_yaw, sin_yaw, 0.0)
                 right = (-sin_yaw, cos_yaw, 0.0)
+                drive_basis_source = "flat"
             vertical_idx = 2
         else:
             forward = (cos_yaw, 0.0, sin_yaw)
             right = (-sin_yaw, 0.0, cos_yaw)
+            drive_basis_source = "y_up"
             vertical_idx = 1
 
         # Per-frame impulse (like entity[0x24], zeroed each frame by controller)
@@ -6395,7 +6727,12 @@ class WulframServer:
             impulse_y *= scale
             impulse_z *= scale
 
-        if ctx.entity_type == EntityType.TANK:
+        contact_x = 0.0
+        contact_y = 0.0
+        if (
+            ctx.entity_type == EntityType.TANK
+            and getattr(self, "tank_terrain_contact_coupling_enabled", False)
+        ):
             contact_x, contact_y = self._tank_terrain_contact_vector(ctx)
             impulse_x, impulse_y, _terrain_speed = tank_terrain_contact_coupling(
                 impulse_x,
@@ -6403,6 +6740,8 @@ class WulframServer:
                 contact_x,
                 contact_y,
             )
+        else:
+            _terrain_speed = 0.0
 
         # Add gravity to vertical impulse (matches GUESS3_Transform_accelerate_z)
         gravity = self.gravity
@@ -6464,6 +6803,17 @@ class WulframServer:
                     ground_override_release_reason = "terrain_change"
                 else:
                     ground_override_release_reason = "height"
+        if (
+            ctx.ground_level_override is not None
+            and terrain_ground_level is not None
+            and ctx.entity_type == EntityType.TANK
+            and getattr(self, "tank_suspension_enabled", False)
+            and getattr(self, "tank_suspension_model", "softbody") != "compact"
+        ):
+            ctx.ground_level_override = None
+            ground_override_released = True
+            ground_override_release_reason = "softbody_suspension"
+            ctx.ground_override_ref_terrain_level = None
         use_ground_override = ctx.ground_level_override is not None
         if use_ground_override:
             ground_level = ctx.ground_level_override
@@ -6474,6 +6824,8 @@ class WulframServer:
         else:
             ground_level = self.ground_level
             ground_level_source = "default"
+        horizontal_damp = linear_damp
+        tank_ground_contact_damp = 0.0
 
         jumpjet_input = self._get_jumpjet_input(ctx)
         if vertical_idx == 2:
@@ -6498,6 +6850,8 @@ class WulframServer:
         suspension_lift = 0.0
         suspension_clearance = None
         suspension_target_clearance = None
+        suspension_model = None
+        suspension_softbody = None
         if (
             getattr(self, "tank_suspension_enabled", False)
             and ctx.entity_type == EntityType.TANK
@@ -6507,16 +6861,66 @@ class WulframServer:
         ):
             if not self.terrain_pitch_enabled:
                 avg_up, _clearance_ratio = self._sample_tank_surface_state(ctx, yaw)
-            suspension_target_clearance = self._tank_hover_clearance_target(ctx)
-            suspension_clearance = _clearance_ratio * suspension_target_clearance
-            suspension_lift = tank_suspension_lift_accel(
-                suspension_clearance,
-                suspension_target_clearance,
-                vel_z,
-                stiffness=getattr(self, "tank_suspension_stiffness", 40.0),
-                damping=getattr(self, "tank_suspension_damping", 1.5),
-                lift_cap=getattr(self, "tank_suspension_lift_cap", 120.0),
+            spring_state = getattr(ctx, "debug_last_spring_state", {}) or {}
+            legacy_target_clearance = self._tank_hover_clearance_target(ctx)
+            try:
+                suspension_clearance = float(spring_state.get("average_clearance"))
+            except (TypeError, ValueError):
+                suspension_clearance = _clearance_ratio * legacy_target_clearance
+
+            if getattr(self, "tank_suspension_model", "softbody") == "compact":
+                suspension_model = "compact_legacy"
+                suspension_target_clearance = legacy_target_clearance
+                suspension_lift = tank_suspension_lift_accel(
+                    suspension_clearance,
+                    suspension_target_clearance,
+                    vel_z,
+                    stiffness=getattr(self, "tank_suspension_stiffness", 40.0),
+                    damping=getattr(self, "tank_suspension_damping", 1.5),
+                    lift_cap=getattr(self, "tank_suspension_lift_cap", 120.0),
+                )
+            else:
+                veh_cfg = VEHICLE_PHYSICS_CONFIGS.get(ctx.entity_type)
+                slot5 = (
+                    self._normalize_behavior_axis_value(
+                        ctx,
+                        tank_softbody_control_slot_value(ctx.weapon_system.behavior_slots),
+                    )
+                    if getattr(ctx, "weapon_system", None) is not None
+                    else 0.0
+                )
+                suspension_softbody = tank_softbody_suspension_force(
+                    suspension_clearance,
+                    vel_z,
+                    slot5,
+                    gravity=gravity,
+                    max_altitude=veh_cfg.max_altitude if veh_cfg else 3.25,
+                    gravity_pct=veh_cfg.gravity_pct if veh_cfg else 1.0,
+                    damping=getattr(self, "tank_suspension_damping", 6.0),
+                )
+                suspension_model = suspension_softbody.model
+                suspension_target_clearance = suspension_softbody.target_average_height
+                suspension_lift = suspension_softbody.lift_accel
+
+        if (
+            ctx.entity_type == EntityType.TANK
+            and self.up_axis == "z"
+            and self.terrain is not None
+            and not use_ground_override
+        ):
+            configured_contact_damp = max(
+                0.0,
+                float(getattr(self, "tank_ground_contact_damp", 0.0) or 0.0),
             )
+            if suspension_softbody is not None:
+                horizontal_damp, tank_ground_contact_damp = tank_softbody_horizontal_damping(
+                    linear_damp,
+                    configured_contact_damp,
+                    suspension_softbody.slot5,
+                )
+            elif configured_contact_damp > 0.0:
+                tank_ground_contact_damp = configured_contact_damp
+                horizontal_damp = max(linear_damp, configured_contact_damp)
 
         # Gravity and ground collision use terrain-aware ground_level (computed above).
         if vertical_idx == 2:
@@ -6531,8 +6935,8 @@ class WulframServer:
 
         # Damped effective acceleration: acc = impulse - vel * linear_damp
         # (from RigidBody_integrate_position, damped mode at Physics.c:5126-5129)
-        acc_x = impulse_x - vel_x * linear_damp
-        acc_y = impulse_y - vel_y * linear_damp
+        acc_x = impulse_x - vel_x * horizontal_damp
+        acc_y = impulse_y - vel_y * horizontal_damp
         acc_z = impulse_z - vel_z * linear_damp
 
         # Ground collision: zero vertical acc+vel when on ground and pushing down
@@ -6651,10 +7055,18 @@ class WulframServer:
             ),
             "forward_input": throttle_input,
             "strafe_input": strafe_input,
-            "thrust_input": self._normalize_behavior_axis_value(
-                ctx,
-                ctx.weapon_system.behavior_slots[BehaviorSlot.UPWARD_THRUST],
-            ) if getattr(ctx, "weapon_system", None) is not None else 0.0,
+            "raw_forward_input_current": raw_throttle_input,
+            "raw_strafe_input_current": raw_strafe_input,
+            "movement_input_source": movement_input_source,
+            "movement_input_delay_s": movement_input_delay_s,
+            "thrust_input": (
+                self._normalize_behavior_axis_value(
+                    ctx,
+                    tank_softbody_control_slot_value(ctx.weapon_system.behavior_slots),
+                )
+                if getattr(ctx, "weapon_system", None) is not None
+                else 0.0
+            ),
             "jumpjet_input": jumpjet_input,
             "pre_pos": pre_pos,
             "pre_vel": pre_vel,
@@ -6669,6 +7081,12 @@ class WulframServer:
             "spring_state": dict(getattr(ctx, "debug_last_spring_state", {}) or {}),
             "terrain_gradient": (dh_dx, dh_dy) if self.terrain and self.up_axis == "z" and self.terrain_pitch_enabled else (0.0, 0.0),
             "terrain_contact": (contact_x, contact_y) if ctx.entity_type == EntityType.TANK else (0.0, 0.0),
+            "terrain_contact_coupling_enabled": (
+                bool(getattr(self, "tank_terrain_contact_coupling_enabled", False))
+                if ctx.entity_type == EntityType.TANK
+                else False
+            ),
+            "drive_basis_source": drive_basis_source,
             "basis_forward": forward,
             "basis_right": right,
             "raw_impulse": (fwd_impulse, strafe_impulse),
@@ -6684,6 +7102,40 @@ class WulframServer:
             "suspension_lift": suspension_lift,
             "suspension_clearance": suspension_clearance,
             "suspension_target_clearance": suspension_target_clearance,
+            "suspension_model": suspension_model,
+            "softbody_target_average_height": (
+                None if suspension_softbody is None else suspension_softbody.target_average_height
+            ),
+            "softbody_height_error": (
+                None if suspension_softbody is None else suspension_softbody.height_error
+            ),
+            "softbody_height_ratio": (
+                None if suspension_softbody is None else suspension_softbody.height_ratio
+            ),
+            "softbody_vehicle_throttle": (
+                None if suspension_softbody is None else suspension_softbody.vehicle_throttle
+            ),
+            "softbody_stiffness": (
+                None if suspension_softbody is None else suspension_softbody.softbody_stiffness
+            ),
+            "softbody_response_scale": (
+                None if suspension_softbody is None else suspension_softbody.response_scale
+            ),
+            "softbody_support_accel": (
+                None if suspension_softbody is None else suspension_softbody.support_accel
+            ),
+            "softbody_force_curve_input": (
+                None if suspension_softbody is None else suspension_softbody.force_curve_input
+            ),
+            "softbody_force_bias_accel": (
+                None if suspension_softbody is None else suspension_softbody.force_bias_accel
+            ),
+            "softbody_height_response_accel": (
+                None if suspension_softbody is None else suspension_softbody.height_response_accel
+            ),
+            "softbody_damping_accel": (
+                None if suspension_softbody is None else suspension_softbody.damping_accel
+            ),
             "ground_level_override": ctx.ground_level_override,
             "ground_override_ref_pos": ground_override_ref_pos,
             "ground_override_ref_terrain_level": ground_override_ref_terrain_level,
@@ -6691,6 +7143,8 @@ class WulframServer:
             "ground_override_released": ground_override_released,
             "ground_override_release_reason": ground_override_release_reason,
             "linear_damp": linear_damp,
+            "horizontal_damp": horizontal_damp,
+            "tank_ground_contact_damp": tank_ground_contact_damp,
             "acceleration": (acc_x, acc_y, acc_z),
             "world_collision_ref_pos": getattr(ctx, "world_collision_ref_pos", None),
             "world_collision_bounds_dirty": bool(getattr(ctx, "world_collision_bounds_dirty", False)),
@@ -8108,6 +8562,32 @@ class WulframServer:
             return not is_loopback
         return True
 
+    def _remote_movement_input_active(self, ctx: ClientContext, *, now: Optional[float] = None) -> bool:
+        """Return true while a remote OG client is actively driving."""
+        if handlers._is_loopback_client(ctx):
+            return False
+        if bool(getattr(ctx, "_datagram_active_movement_input", False)):
+            return True
+        window = float(
+            getattr(self, "active_input_correction_suppress_window", 0.35) or 0.0
+        )
+        if window <= 0.0:
+            return False
+        last_action = float(getattr(ctx, "last_action_packet_time", 0.0) or 0.0)
+        if last_action <= 0.0:
+            return False
+        if now is None:
+            now = time.monotonic()
+        if (now - last_action) > window:
+            return False
+        decoded = getattr(ctx, "last_decoded_input", None) or {}
+        try:
+            fwd = float(decoded.get("fwd", 0.0) or 0.0)
+            strafe = float(decoded.get("strafe", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return False
+        return abs(fwd) > 0.05 or abs(strafe) > 0.05
+
     def _udp_ping_reply_allowed_for_client(self, ctx: ClientContext) -> bool:
         if self.udp_ping_reply_allow_all:
             return True
@@ -8852,7 +9332,7 @@ class WulframServer:
         turn = slots[BehaviorSlot.TURNING]
         fwd_input = slots[BehaviorSlot.MOVING_FORWARD]
         strafe = slots[BehaviorSlot.MOVING_SIDEWAYS]
-        thrust = slots[BehaviorSlot.UPWARD_THRUST]
+        thrust = tank_softbody_control_slot_value(slots)
         slot6 = slots[BehaviorSlot.SLOT6]
         slot7 = slots[BehaviorSlot.SLOT7]
         fire = slots[BehaviorSlot.FIRE]
@@ -9302,7 +9782,7 @@ class WulframServer:
                     ctx,
                     ctx.weapon_system.behavior_slots[BehaviorSlot.MOVING_SIDEWAYS],
                 )
-                thrust_input = ctx.weapon_system.behavior_slots[BehaviorSlot.UPWARD_THRUST]
+                thrust_input = tank_softbody_control_slot_value(ctx.weapon_system.behavior_slots)
                 # Only consider actual movement input (fwd/strafe), not thrust which may be constant
                 has_movement_input = abs(fwd_input) > 0.05 or abs(strafe_input) > 0.05
                 if has_movement_input:
@@ -9345,17 +9825,48 @@ class WulframServer:
                 send_update = True
                 burst_remaining = int(getattr(ctx, "correction_burst_remaining", 0) or 0)
                 burst_interval = float(getattr(ctx, "correction_burst_interval_s", 0.0) or 0.0)
+                active_movement_correction_suppressed = self._remote_movement_input_active(
+                    ctx,
+                    now=now,
+                )
                 burst_due = (
                     burst_remaining > 0
+                    and not active_movement_correction_suppressed
                     and (now - ctx.last_correction_send) >= burst_interval
                 )
+                movement_interval = float(getattr(self, "movement_correction_interval", 0.0) or 0.0)
+                movement_window = float(getattr(self, "movement_correction_window", 0.0) or 0.0)
+                recent_move_input_time = float(getattr(ctx, "last_nonzero_move_input_time", 0.0) or 0.0)
+                movement_correction_recent = (
+                    movement_interval > 0
+                    and recent_move_input_time > 0.0
+                    and (now - recent_move_input_time) <= movement_window
+                    and not handlers._is_loopback_client(ctx)
+                )
+                movement_correction_due = (
+                    movement_correction_recent
+                    and not active_movement_correction_suppressed
+                    and (now - ctx.last_correction_send) >= movement_interval
+                )
+                interval_correction_due = (
+                    self.correction_interval > 0
+                    and not active_movement_correction_suppressed
+                    and (now - ctx.last_correction_send) >= self.correction_interval
+                )
+                correction_reason = ""
+                if getattr(ctx, "force_correction_once", False):
+                    correction_reason = "forced"
+                elif burst_due:
+                    correction_reason = "burst"
+                elif movement_correction_due:
+                    correction_reason = "movement"
+                elif interval_correction_due:
+                    correction_reason = "interval"
                 correction_due = (
                     getattr(ctx, "force_correction_once", False)
                     or burst_due
-                    or (
-                        self.correction_interval > 0
-                        and (now - ctx.last_correction_send) >= self.correction_interval
-                    )
+                    or movement_correction_due
+                    or interval_correction_due
                 )
                 if self.update_on_change:
                     pos_changed = any(abs(a - b) > self.update_epsilon for a, b in zip(send_pos, ctx.last_sent_pos))
@@ -9635,13 +10146,25 @@ class WulframServer:
                         ctx.force_correction_once = False
                         if burst_remaining > 0:
                             ctx.correction_burst_remaining = burst_remaining - 1
-                        print(
-                            f"[CORRECTION] mode={self.correction_mode} client={ctx.client_id} "
-                            f"pos=({corr_pos[0]:.1f},{corr_pos[1]:.1f},{corr_pos[2]:.1f}) "
-                            f"yaw={math.degrees(corr_rot[2]):.1f}deg "
-                            f"inc_pos={int(inc_pos)} inc_rot={int(inc_rot)} "
-                            f"burst_left={int(getattr(ctx, 'correction_burst_remaining', 0))}"
-                        )
+                        if correction_reason == "movement":
+                            ctx.movement_correction_count = int(
+                                getattr(ctx, "movement_correction_count", 0) or 0
+                            ) + 1
+                            ctx.last_movement_correction_send_time = now
+                        log_due = correction_reason != "movement" or (
+                            now - float(getattr(ctx, "last_movement_correction_log", 0.0) or 0.0)
+                        ) >= 1.0
+                        if log_due:
+                            if correction_reason == "movement":
+                                ctx.last_movement_correction_log = now
+                            print(
+                                f"[CORRECTION] reason={correction_reason or 'unknown'} "
+                                f"mode={self.correction_mode} client={ctx.client_id} "
+                                f"pos=({corr_pos[0]:.1f},{corr_pos[1]:.1f},{corr_pos[2]:.1f}) "
+                                f"yaw={math.degrees(corr_rot[2]):.1f}deg "
+                                f"inc_pos={int(inc_pos)} inc_rot={int(inc_rot)} "
+                                f"burst_left={int(getattr(ctx, 'correction_burst_remaining', 0))}"
+                            )
                     else:
                         use_view = self.heartbeat_view_update
                         pkt_label = "VIEW_UPDATE_BEAT" if use_view else "UPDATE_ARRAY_BEAT"

@@ -1262,7 +1262,11 @@ def build_behavior_packet() -> bytes:
 
     def _write_spring_state(local_offsets: Tuple[Tuple[float, float], ...]) -> None:
         # Spring_read_from_stream reads u32 count, then position Vec3,
-        # velocity Vec3, pinned flag per point, followed by one fixed16 scalar.
+        # normal Vec3, pinned flag per point, followed by one fixed16 scalar.
+        # The decompile calls the second Vec3 "velocity" in the stream reader,
+        # but Spring_compute_suspension_forces uses it as the point normal. The
+        # allocator default is (0, 0, -1); writing zero normals leaves OG with a
+        # live softbody state that cannot generate visible vertical spring force.
         payload.extend(struct.pack(">I", len(local_offsets)))
         for x_pos, y_pos in local_offsets:
             payload.extend(pack_fixed16(float(x_pos)))
@@ -1270,7 +1274,7 @@ def build_behavior_packet() -> bytes:
             payload.extend(pack_fixed16(0.0))
             payload.extend(pack_fixed16(0.0))
             payload.extend(pack_fixed16(0.0))
-            payload.extend(pack_fixed16(0.0))
+            payload.extend(pack_fixed16(-1.0))
             payload.extend(struct.pack(">I", 0))
         payload.extend(pack_fixed16(0.0))
 

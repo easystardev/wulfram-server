@@ -53,6 +53,9 @@ def build_input_sync_diagnosis(
     state_requests: int,
     state_sync_replies: int,
     state_sync_view_replies: int,
+    last_correction_age_s: Optional[float] = None,
+    last_movement_correction_age_s: Optional[float] = None,
+    movement_corrections: int = 0,
 ) -> dict:
     """Summarize whether a live OG sync issue is packet-side or input-side."""
 
@@ -66,13 +69,21 @@ def build_input_sync_diagnosis(
             return 0.0
 
     action_stream_active = _recent(last_action_age_s, 2.0)
-    corrections_active = (
+    state_request_correction_packets_active = (
         state_requests > 0
         and state_sync_replies > 0
         and state_sync_view_replies > 0
         and _recent(last_state_request_age_s, 3.0)
         and _recent(last_state_sync_reply_age_s, 3.0)
     )
+    correction_stream_active = (
+        _recent(last_correction_age_s, 1.5)
+        or (
+            movement_corrections > 0
+            and _recent(last_movement_correction_age_s, 1.5)
+        )
+    )
+    correction_packets_active = state_request_correction_packets_active or correction_stream_active
     movement_input_recent = _recent(last_nonzero_move_input_age_s, 6.0)
     position_recent = _recent(last_position_change_age_s, 6.0)
     drive_idle = (
@@ -85,11 +96,11 @@ def build_input_sync_diagnosis(
         status = "not_in_game"
     elif not action_stream_active:
         status = "no_recent_action_packets"
-    elif corrections_active and movement_input_recent:
-        status = "moving_with_corrections"
-    elif corrections_active and drive_idle:
-        status = "idle_input_authoritative_snapback"
-    elif action_stream_active and movement_input_recent and not corrections_active:
+    elif correction_packets_active and movement_input_recent:
+        status = "moving_with_correction_packets"
+    elif correction_packets_active and drive_idle:
+        status = "idle_input_correction_packets_active"
+    elif action_stream_active and movement_input_recent and not correction_packets_active:
         status = "movement_without_targeted_corrections"
     elif action_stream_active and drive_idle:
         status = "idle_input_no_targeted_corrections"
@@ -99,7 +110,14 @@ def build_input_sync_diagnosis(
     return {
         "status": status,
         "action_stream_active": action_stream_active,
-        "corrections_active": corrections_active,
+        # This means authoritative correction-shaped packets are being emitted
+        # or answered. It does not prove OG visibly moved its local camera/tank:
+        # the decompiled local reconcile path is prediction/collision gated.
+        "corrections_active": correction_packets_active,
+        "correction_packets_active": correction_packets_active,
+        "correction_application_verified": False,
+        "state_request_corrections_active": state_request_correction_packets_active,
+        "correction_stream_active": correction_stream_active,
         "movement_input_recent": movement_input_recent,
         "position_recent": position_recent,
         "drive_idle": drive_idle,
@@ -238,7 +256,13 @@ class ControlServer:
                     return c, c.session.udp_addr
         return None, None
 
-    def _apply_exact_client_pose(self, ctx, pos: tuple[float, float, float], heading_rad: float | None = None) -> None:
+    def _apply_exact_client_pose(
+        self,
+        ctx,
+        pos: tuple[float, float, float],
+        heading_rad: float | None = None,
+        vel: tuple[float, float, float] | None = None,
+    ) -> None:
         """Apply an exact authoritative pose reset for a live client.
 
         This is stricter than respawn scheduling: it updates the current in-game
@@ -250,11 +274,19 @@ class ControlServer:
         now = time.monotonic()
         px, py, pz = (float(pos[0]), float(pos[1]), float(pos[2]))
         heading = float(ctx.player_heading if heading_rad is None else heading_rad)
-        zero_vel = (0.0, 0.0, 0.0)
+        applied_vel = (
+            (float(vel[0]), float(vel[1]), float(vel[2]))
+            if vel is not None
+            else (0.0, 0.0, 0.0)
+        )
 
         ctx.player_pos = (px, py, pz)
-        ctx.player_vel = zero_vel
-        ctx.player_speed = 0.0
+        ctx.player_vel = applied_vel
+        ctx.player_speed = math.sqrt(
+            applied_vel[0] * applied_vel[0]
+            + applied_vel[1] * applied_vel[1]
+            + applied_vel[2] * applied_vel[2]
+        )
         ctx.player_heading = heading
         ctx.player_yaw = -heading
         ctx.player_angular_vel = 0.0
@@ -264,7 +296,7 @@ class ControlServer:
         ctx.last_state_sync_vel = None
         ctx.last_state_sync_rot = None
         ctx.last_sent_pos = ctx.player_pos
-        ctx.last_sent_vel = zero_vel
+        ctx.last_sent_vel = applied_vel
         ctx.last_sent_yaw = -heading
         ctx.last_action_dump_time = now
         ctx.last_position_update = now
@@ -282,7 +314,7 @@ class ControlServer:
             ctx.authoritative_state_history.clear()
 
         ctx.player_pose["pos"] = ctx.player_pos
-        ctx.player_pose["vel"] = zero_vel
+        ctx.player_pose["vel"] = applied_vel
         ctx.player_pose["roll"] = 0.0
         ctx.player_pose["pitch"] = 0.0
         ctx.player_pose["yaw"] = -heading
@@ -300,9 +332,16 @@ class ControlServer:
             ctx.ground_override_ref_terrain_level = None
 
         if ctx.weapon_system:
+            from .weapons import BehaviorSlot, TANK_SOFTBODY_CONTROL_SLOT, tank_softbody_control_slot_value
+
+            softbody_value = tank_softbody_control_slot_value(ctx.weapon_system.behavior_slots)
             ctx.weapon_system.player_pos = ctx.player_pos
             ctx.weapon_system.player_rot = (0.0, 0.0, heading)
             ctx.weapon_system.behavior_slots = [0.0] * len(ctx.weapon_system.behavior_slots)
+            for slot_idx in {BehaviorSlot.UPWARD_THRUST, TANK_SOFTBODY_CONTROL_SLOT}:
+                idx = int(slot_idx)
+                if 0 <= idx < len(ctx.weapon_system.behavior_slots):
+                    ctx.weapon_system.behavior_slots[idx] = softbody_value
             ctx.weapon_system.client_frame_counter = 0
             ctx.weapon_system.turn_input_change_time = 0.0
             ctx.weapon_system.turn_input_prev_value = 0.0
@@ -1058,10 +1097,21 @@ Examples:
 
         if not args:
             interval = float(getattr(self.server, "correction_interval", 0.0) or 0.0)
-            status = "ON" if interval > 0 else "OFF"
+            movement_interval = float(
+                getattr(self.server, "movement_correction_interval", 0.0) or 0.0
+            )
+            movement_window = float(
+                getattr(self.server, "movement_correction_window", 0.0) or 0.0
+            )
+            status = "ON" if interval > 0 or movement_interval > 0 else "OFF"
             lines = [
                 f"Drift correction: {status} mode={self.server.correction_mode}",
                 f"  interval = {interval:.2f}s (0=disabled)",
+                (
+                    "  movement = "
+                    f"{movement_interval:.2f}s for {movement_window:.1f}s after input "
+                    "(0=disabled)"
+                ),
             ]
             for ctx in self.server._snapshot_in_game_clients():
                 age = time.monotonic() - ctx.last_correction_send if getattr(ctx, "last_correction_send", 0.0) > 0 else -1.0
@@ -1699,6 +1749,11 @@ Examples:
                     "last_state_request_age_s": _age(getattr(ctx, "last_state_request_time", 0.0)),
                     "last_state_request_id": getattr(ctx, "last_state_request_id", 0),
                     "last_state_request_len": getattr(ctx, "last_state_request_len", 0),
+                    "movement_corrections": getattr(ctx, "movement_correction_count", 0),
+                    "last_movement_correction_age_s": _age(
+                        getattr(ctx, "last_movement_correction_send_time", 0.0)
+                    ),
+                    "last_correction_age_s": _age(getattr(ctx, "last_correction_send", 0.0)),
                     "last_state_sync_reply_age_s": _age(
                         getattr(ctx, "last_state_sync_reply_time", 0.0)
                     ),
@@ -1753,7 +1808,17 @@ Examples:
                     state_requests=telemetry["state_requests"],
                     state_sync_replies=telemetry["state_sync_replies"],
                     state_sync_view_replies=telemetry["state_sync_view_replies"],
+                    last_correction_age_s=telemetry["last_correction_age_s"],
+                    last_movement_correction_age_s=telemetry["last_movement_correction_age_s"],
+                    movement_corrections=telemetry["movement_corrections"],
                 )
+                last_controller = telemetry.get("last_controller") or {}
+                if (
+                    telemetry["diagnosis"].get("status") == "idle_input_correction_packets_active"
+                    and last_controller.get("suspension_model") == "softbody_empirical_flat"
+                ):
+                    telemetry["diagnosis"]["status"] = "idle_input_softbody_correction_packets_active"
+                    telemetry["diagnosis"]["compact_target_snapback"] = False
                 entry = {
                     "client_id": ctx.client_id,
                     "entity_id": ctx.session.entity_id if ctx.session else None,
@@ -1890,7 +1955,7 @@ Examples:
             return "Error: No server reference"
         try:
             import math as _math
-            from .weapons import BehaviorSlot
+            from .weapons import BehaviorSlot, tank_softbody_control_slot_value
             lines = []
             with self.server.clients_lock:
                 for ctx in self.server.clients.values():
@@ -1902,7 +1967,7 @@ Examples:
                     side = ws.behavior_slots[BehaviorSlot.MOVING_SIDEWAYS]
                     fire = ws.behavior_slots[BehaviorSlot.FIRE]
                     jumpjet = ws.behavior_slots[BehaviorSlot.JUMPJET]
-                    thrust = ws.behavior_slots[BehaviorSlot.UPWARD_THRUST]
+                    thrust = tank_softbody_control_slot_value(ws.behavior_slots)
                     s6 = ws.behavior_slots[BehaviorSlot.SLOT6]
                     s7 = ws.behavior_slots[BehaviorSlot.SLOT7]
                     active_slots = ",".join(
@@ -3402,6 +3467,8 @@ Examples:
           pos x y z           - Set active player position
           pos c<id> x y z     - Set a specific client's position
           pos c<id> x y z h   - Set a specific client's position + heading degrees
+          pos c<id> x y z vel vx vy vz
+                              - Set position + velocity from live tap telemetry
         """
         if not self.server:
             return "Error: No server reference"
@@ -3427,17 +3494,45 @@ Examples:
                 x = float(rem[0])
                 y = float(rem[1]) if len(rem) > 1 else ctx.player_pos[1]
                 z = float(rem[2]) if len(rem) > 2 else ctx.player_pos[2]
-                heading_deg = float(rem[3]) if len(rem) > 3 else None
+                heading_deg = None
+                vel = None
+                idx = 3
+                while idx < len(rem):
+                    token = rem[idx].lower()
+                    if token in ("vel", "v"):
+                        if idx + 3 >= len(rem):
+                            return "pos arg error: vel requires vx vy vz"
+                        vel = (
+                            float(rem[idx + 1]),
+                            float(rem[idx + 2]),
+                            float(rem[idx + 3]),
+                        )
+                        idx += 4
+                    elif token in ("heading", "h"):
+                        if idx + 1 >= len(rem):
+                            return "pos arg error: heading requires degrees"
+                        heading_deg = float(rem[idx + 1])
+                        idx += 2
+                    elif heading_deg is None:
+                        heading_deg = float(rem[idx])
+                        idx += 1
+                    else:
+                        return f"pos arg error: unexpected token {rem[idx]!r}"
                 heading_rad = math.radians(heading_deg) if heading_deg is not None else None
-                self._apply_exact_client_pose(ctx, (x, y, z), heading_rad=heading_rad)
+                self._apply_exact_client_pose(ctx, (x, y, z), heading_rad=heading_rad, vel=vel)
+                vel_suffix = (
+                    f" vel=({vel[0]:.2f}, {vel[1]:.2f}, {vel[2]:.2f})"
+                    if vel is not None
+                    else ""
+                )
                 if heading_deg is None:
                     return (
                         f"Set client {ctx.client_id} pos to "
-                        f"({x:.1f}, {y:.1f}, {z:.1f})"
+                        f"({x:.1f}, {y:.1f}, {z:.1f}){vel_suffix}"
                     )
                 return (
                     f"Set client {ctx.client_id} pos to "
-                    f"({x:.1f}, {y:.1f}, {z:.1f}) heading={heading_deg:.2f}deg"
+                    f"({x:.1f}, {y:.1f}, {z:.1f}) heading={heading_deg:.2f}deg{vel_suffix}"
                 )
             except (ValueError, IndexError) as e:
                 return f"pos arg error: {e}"

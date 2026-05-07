@@ -108,6 +108,7 @@ class ClientContext:
     nonzero_move_input_count: int = 0
     last_nonzero_move_input_time: float = 0.0
     last_decoded_input: dict = field(default_factory=dict)
+    movement_input_history: Any = field(default_factory=lambda: deque(maxlen=180))
     input_feedback_count: int = 0
     last_input_feedback_time: float = 0.0
     state_request_count: int = 0
