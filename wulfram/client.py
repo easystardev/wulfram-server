@@ -64,6 +64,9 @@ class ClientContext:
     player_angular_vel: float = 0.0
     # Angular velocity from steering response, integrated in tick loop (rad/s)
     angular_vel_yaw: float = 0.0
+    # Spring/softbody pitch-roll angular velocity. OG Spring_apply_forces_to_entity
+    # contributes X/Y torque separately from yaw steering.
+    spring_body_ang_vel: tuple = (0.0, 0.0)
     player_fuel: float = 33000.0
     player_energy: float = 100.0
     player_health: float = 1.0  # Normalized 0.0-1.0, used for HUD health display

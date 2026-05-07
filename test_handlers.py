@@ -4678,6 +4678,329 @@ def test_tank_surface_state_uses_behavior_spring_offsets():
     return True
 
 
+def test_tank_surface_state_rotates_spring_points_through_body_pose():
+    """Spring_update_world_state rotates local points before terrain sampling."""
+    server = WulframServer.__new__(WulframServer)
+    sampled = []
+
+    def sample_height_normal(x, y):
+        sampled.append((x, y))
+        return 10.0, (0.0, 0.0, 1.0)
+
+    server.terrain = SimpleNamespace(sample_height_normal=sample_height_normal)
+    server.terrain_height_offset = 5.0
+    server.terrain_physics_height_offset = 0.0
+    server.tank_spring_base_offset = 2.0
+    server.terrain_pitch_enabled = True
+    server.tank_spring_sample_local_offsets = (
+        (5.0, 1.0),
+        (5.0, -1.0),
+        (-5.0, 1.0),
+        (-5.0, -1.0),
+    )
+
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    ctx.entity_type = EntityType.TANK
+    ctx.player_pos = (100.0, 200.0, 15.25)
+    ctx.player_heading = 0.0
+    ctx.player_pose["roll"] = math.radians(8.0)
+    ctx.player_pose["pitch"] = 0.0
+
+    server._sample_tank_surface_state(ctx)
+
+    cos_roll = math.cos(math.radians(8.0))
+    sin_roll = math.sin(math.radians(8.0))
+    assert abs(sampled[0][0] - 105.0) < 1e-6, sampled
+    assert abs(sampled[0][1] - (200.0 + cos_roll)) < 1e-6, sampled
+    spring_debug = ctx.debug_last_spring_state
+    assert spring_debug["rotation_source"] == "body_matrix"
+    assert abs(spring_debug["samples"][0]["world_offset_z"] - sin_roll) < 1e-5
+    assert abs(spring_debug["samples"][0]["clearance"] - (5.25 + sin_roll)) < 1e-5
+    assert abs(spring_debug["samples"][1]["world_offset_z"] + sin_roll) < 1e-5
+    print("test_tank_surface_state_rotates_spring_points_through_body_pose: PASSED")
+    return True
+
+
+def test_server_tank_drive_uses_body_matrix_when_body_pose_live():
+    """Tank drive should rotate through the live body pose before integration."""
+
+    def sample_height_normal(_x, _y):
+        nx, ny, nz = -0.25, -0.1, 1.0
+        mag = math.sqrt(nx * nx + ny * ny + nz * nz)
+        return 0.0, (nx / mag, ny / mag, nz / mag)
+
+    def make_server(body_matrix_enabled: bool):
+        server = WulframServer.__new__(WulframServer)
+        server.tick_rate_hz = 30.0
+        server.linear_damp_driving = 0.0
+        server.linear_damp_coasting = 0.0
+        server.turn_deadzone = 0.05
+        server.turn_sign = -1.0
+        server.up_axis = "z"
+        server.terrain = SimpleNamespace(
+            get_height=lambda _x, _y: 0.0,
+            get_slope=lambda _x, _y: (0.25, 0.1),
+            sample_height_normal=sample_height_normal,
+        )
+        server.terrain_height_offset = 0.0
+        server.terrain_physics_height_offset = 0.0
+        server.terrain_pitch_enabled = True
+        server.tank_drive_terrain_aligned = False
+        server.tank_drive_body_matrix = body_matrix_enabled
+        server.tank_terrain_contact_coupling_enabled = False
+        server.tank_suspension_enabled = False
+        server.tank_spring_base_offset = 2.0
+        server.tank_spring_attitude_model = "target"
+        server.gravity = 0.0
+        server.ground_level = 0.0
+        server.world_bound = 100000.0
+        server.f32_physics = False
+        server.jump_jets_enabled = False
+        server._resolve_entity_world_collision = (
+            lambda ctx, px, py, pz, vx, vy, vz: (px, py, pz, vx, vy, vz)
+        )
+        server._check_building_collisions = (
+            lambda ctx, px, py, pz, vx, vy: (px, py, vx, vy)
+        )
+        return server
+
+    def make_ctx():
+        ctx = ClientContext(
+            client_id=1,
+            client_addr=("10.10.10.2", 50000),
+            session=Session(),
+            entity_id=0x14EA,
+        )
+        ctx.injected_input = (1.0, 0.0)
+        ctx.entity_type = EntityType.TANK
+        ctx.player_pos = (100.0, 200.0, 20.0)
+        ctx.player_vel = (0.0, 0.0, 0.0)
+        ctx.player_speed = 0.0
+        ctx.player_fuel = 33000.0
+        ctx.player_energy = 100.0
+        ctx.player_heading = 0.0
+        ctx.ground_level_override = None
+        ctx.player_pose = {
+            "roll": math.radians(4.0),
+            "pitch": math.radians(-6.0),
+            "yaw": 0.0,
+            "pos": ctx.player_pos,
+            "vel": ctx.player_vel,
+        }
+        ctx.spring_body_ang_vel = (0.0, 0.0)
+        return ctx
+
+    server = make_server(True)
+    ctx = make_ctx()
+    server._update_player_position(ctx, dt_override=1.0 / 30.0)
+    debug = ctx.debug_last_controller_step
+    assert debug["drive_basis_source"] == "entity_body_matrix", debug
+    assert abs(debug["basis_forward"][2]) > 0.01, debug
+    assert abs(debug["move_impulse"][2]) > 0.01, debug
+    assert debug["tank_vehicle_impulse"] == debug["move_impulse"], debug
+    assert debug["gravity_impulse"] == (0.0, 0.0, 0.0), debug
+    assert debug["suspension_impulse"] == (0.0, 0.0, 0.0), debug
+
+    flat_server = make_server(False)
+    flat_ctx = make_ctx()
+    flat_server._update_player_position(flat_ctx, dt_override=1.0 / 30.0)
+    flat_debug = flat_ctx.debug_last_controller_step
+    assert flat_debug["drive_basis_source"] == "entity_yaw_flat", flat_debug
+    assert abs(flat_debug["basis_forward"][2]) < 1e-6, flat_debug
+    assert abs(flat_debug["move_impulse"][2]) < 1e-6, flat_debug
+    assert flat_debug["tank_vehicle_impulse"] == flat_debug["move_impulse"], flat_debug
+    print("test_server_tank_drive_uses_body_matrix_when_body_pose_live: PASSED")
+    return True
+
+
+def test_tank_surface_attitude_uses_spring_normal_for_replication():
+    """Replicated tank roll/pitch should follow the spring terrain normal."""
+    server = WulframServer.__new__(WulframServer)
+    slope = (0.3, 0.1)
+
+    def sample_height_normal(_x, _y):
+        nx, ny, nz = -slope[0], -slope[1], 1.0
+        mag = math.sqrt(nx * nx + ny * ny + nz * nz)
+        return 10.0, (nx / mag, ny / mag, nz / mag)
+
+    server.terrain = SimpleNamespace(
+        sample_height_normal=sample_height_normal,
+        get_slope=lambda _x, _y: slope,
+    )
+    server.up_axis = "z"
+    server.terrain_pitch_enabled = True
+    server.terrain_height_offset = 5.0
+    server.terrain_physics_height_offset = 0.0
+    server.tank_spring_base_offset = 2.0
+    server.tank_spring_sample_local_offsets = (
+        (5.0, 1.0),
+        (5.0, -1.0),
+        (-5.0, 1.0),
+        (-5.0, -1.0),
+    )
+
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    ctx.entity_type = EntityType.TANK
+    ctx.player_pos = (100.0, 200.0, 15.25)
+    ctx.player_heading = 0.0
+
+    attitude = server._update_player_surface_attitude(ctx)
+
+    assert attitude["source"] == "terrain_surface"
+    assert attitude["up"][2] < 1.0
+    assert abs(ctx.player_pose["roll"]) > 0.01 or abs(ctx.player_pose["pitch"]) > 0.01
+    assert abs(ctx.player_pose["yaw"] + ctx.player_heading) < 1e-6
+    print("test_tank_surface_attitude_uses_spring_normal_for_replication: PASSED")
+    return True
+
+
+def test_tank_surface_attitude_steps_toward_spring_normal():
+    """Live ticks should advance spring body pose by torque, not snap it."""
+    server = WulframServer.__new__(WulframServer)
+    slope = (0.3, 0.0)
+
+    def sample_height_normal(_x, _y):
+        nx, ny, nz = -slope[0], -slope[1], 1.0
+        mag = math.sqrt(nx * nx + ny * ny + nz * nz)
+        return 10.0, (nx / mag, ny / mag, nz / mag)
+
+    server.terrain = SimpleNamespace(
+        sample_height_normal=sample_height_normal,
+        get_slope=lambda _x, _y: slope,
+    )
+    server.up_axis = "z"
+    server.terrain_pitch_enabled = True
+    server.terrain_height_offset = 5.0
+    server.terrain_physics_height_offset = 0.0
+    server.tank_spring_base_offset = 2.0
+    server.tank_spring_sample_local_offsets = (
+        (5.0, 1.0),
+        (5.0, -1.0),
+        (-5.0, 1.0),
+        (-5.0, -1.0),
+    )
+    server.tank_spring_attitude_stiffness = 40.0
+    server.tank_spring_attitude_damping = 2.0
+
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    ctx.entity_type = EntityType.TANK
+    ctx.player_pos = (100.0, 200.0, 15.25)
+    ctx.player_heading = 0.0
+
+    snap = server._update_player_surface_attitude(ctx, snap=True)
+    ctx.player_pose["roll"] = 0.0
+    ctx.player_pose["pitch"] = 0.0
+    ctx.spring_body_ang_vel = (0.0, 0.0)
+
+    stepped = server._update_player_surface_attitude(ctx, dt=1.0 / 30.0)
+    initial_error = abs(stepped["spring_attitude"]["error"][1])
+    stepped_delta = abs((ctx.player_pose["pitch"] - 0.0 + math.pi) % (2.0 * math.pi) - math.pi)
+
+    assert stepped["source"] == "terrain_surface"
+    assert stepped_delta > 0.0
+    assert stepped_delta < initial_error
+    assert abs(ctx.spring_body_ang_vel[1]) > 0.0
+    assert stepped["spring_attitude"]["target"] == snap["target_rotation"]
+    print("test_tank_surface_attitude_steps_toward_spring_normal: PASSED")
+    return True
+
+
+def test_tank_surface_attitude_force_path_uses_point_clearance_torque():
+    """Live spring attitude can use per-point force torque instead of target snap."""
+    server = WulframServer.__new__(WulframServer)
+
+    def sample_height_normal(x, _y):
+        raw_height = 10.0 + 0.2 * (x - 100.0)
+        nx, ny, nz = -0.2, 0.0, 1.0
+        mag = math.sqrt(nx * nx + ny * ny + nz * nz)
+        return raw_height, (nx / mag, ny / mag, nz / mag)
+
+    server.terrain = SimpleNamespace(
+        sample_height_normal=sample_height_normal,
+        get_slope=lambda _x, _y: (0.2, 0.0),
+    )
+    server.up_axis = "z"
+    server.terrain_pitch_enabled = True
+    server.terrain_height_offset = 5.0
+    server.terrain_physics_height_offset = 0.0
+    server.tank_spring_base_offset = 2.0
+    server.tank_spring_sample_local_offsets = (
+        (5.0, 1.0),
+        (5.0, -1.0),
+        (-5.0, 1.0),
+        (-5.0, -1.0),
+    )
+    server.tank_spring_attitude_model = "force"
+    server.tank_spring_attitude_damping = 2.0
+
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    ctx.entity_type = EntityType.TANK
+    ctx.player_pos = (100.0, 200.0, 15.25)
+    ctx.player_heading = 0.0
+
+    attitude = server._update_player_surface_attitude(
+        ctx,
+        dt=1.0 / 30.0,
+        suspension_lift=50.0,
+    )
+    spring = attitude["spring_attitude"]
+
+    assert spring["model"] == "force", spring
+    assert abs(ctx.spring_body_ang_vel[1]) > 0.0, ctx.spring_body_ang_vel
+    assert spring["point_forces"][0] > spring["point_forces"][2], spring["point_forces"]
+    assert abs(spring["local_torque"][1]) > 0.0, spring["local_torque"]
+    print("test_tank_surface_attitude_force_path_uses_point_clearance_torque: PASSED")
+    return True
+
+
+def test_heading_physics_sync_preserves_spring_body_pose():
+    """Yaw-only VehiclePhysics must not flatten spring-derived tank pitch/roll."""
+    server = WulframServer.__new__(WulframServer)
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    ctx.player_pose["roll"] = math.radians(7.0)
+    ctx.player_pose["pitch"] = math.radians(-3.0)
+    physics = SimpleNamespace(
+        heading=math.radians(12.0),
+        angular_velocity=0.25,
+        rotation=(0.0, 0.0, math.radians(12.0)),
+    )
+
+    server._sync_heading_physics_to_context(ctx, physics)
+
+    assert abs(ctx.player_heading - physics.heading) < 1e-9
+    assert abs(ctx.angular_vel_yaw - physics.angular_velocity) < 1e-9
+    assert abs(ctx.player_pose["roll"] - math.radians(7.0)) < 1e-9
+    assert abs(ctx.player_pose["pitch"] - math.radians(-3.0)) < 1e-9
+    assert abs(ctx.player_pose["yaw"] + physics.heading) < 1e-9
+    print("test_heading_physics_sync_preserves_spring_body_pose: PASSED")
+    return True
+
+
 def test_tank_softbody_support_pulls_down_from_compact_equilibrium():
     """Default tank support should not hold the old compact 5.25-target Z."""
     server = WulframServer.__new__(WulframServer)
@@ -4731,7 +5054,11 @@ def test_tank_softbody_support_pulls_down_from_compact_equilibrium():
 
     assert ctx.player_vel[2] < 0.0, ctx.player_vel
     assert ctx.debug_last_controller_step["suspension_model"] == "softbody_empirical_flat"
-    assert ctx.debug_last_controller_step["suspension_lift"] < 50.0
+    assert (
+        ctx.debug_last_controller_step["suspension_lift"]
+        < ctx.debug_last_controller_step["softbody_support_accel"]
+    )
+    assert ctx.debug_last_controller_step["pre_ground_vertical_impulse"] < 0.0
     assert abs(
         ctx.debug_last_controller_step["suspension_target_clearance"]
         - OG_TANK_SOFTBODY_FLAT_AVERAGE_HEIGHT
@@ -4742,7 +5069,7 @@ def test_tank_softbody_support_pulls_down_from_compact_equilibrium():
 
 
 def test_tank_softbody_supports_gravity_at_og_flat_height():
-    """The softbody stand-in should support gravity at the live OG flat height."""
+    """The softbody stand-in should expose OG's spring force before gravity."""
     result = tank_softbody_suspension_force(
         OG_TANK_SOFTBODY_FLAT_AVERAGE_HEIGHT,
         0.0,
@@ -4751,7 +5078,7 @@ def test_tank_softbody_supports_gravity_at_og_flat_height():
     )
 
     assert result.model == "softbody_empirical_flat"
-    assert abs(result.lift_accel - 50.0) < 1e-6, result
+    assert abs(result.lift_accel - 100.0) < 1e-6, result
     assert abs(result.force_bias_accel) < 1e-6, result
     assert abs(result.height_ratio - 0.3324) < 0.001, result.height_ratio
     print("test_tank_softbody_supports_gravity_at_og_flat_height: PASSED")
@@ -4783,8 +5110,8 @@ def test_tank_softbody_slot5_changes_response_without_jumpjet():
     assert low.target_average_height < idle.target_average_height < high.target_average_height
     assert high.target_average_height - low.target_average_height > 1.0
     assert low.lift_accel < idle.lift_accel < high.lift_accel
-    assert high.lift_accel - idle.lift_accel < 20.0, high
-    assert idle.lift_accel - low.lift_accel < 20.0, low
+    assert high.lift_accel - idle.lift_accel < 40.0, high
+    assert idle.lift_accel - low.lift_accel < 40.0, low
     print("test_tank_softbody_slot5_changes_response_without_jumpjet: PASSED")
     return True
 
@@ -7554,6 +7881,12 @@ def main():
         test_remote_team_select_uses_remote_idle_timeout,
         test_tank_surface_state_uses_spring_base_clearance_target,
         test_tank_surface_state_uses_behavior_spring_offsets,
+        test_tank_surface_state_rotates_spring_points_through_body_pose,
+        test_server_tank_drive_uses_body_matrix_when_body_pose_live,
+        test_tank_surface_attitude_uses_spring_normal_for_replication,
+        test_tank_surface_attitude_steps_toward_spring_normal,
+        test_tank_surface_attitude_force_path_uses_point_clearance_torque,
+        test_heading_physics_sync_preserves_spring_body_pose,
         test_tank_softbody_support_pulls_down_from_compact_equilibrium,
         test_tank_softbody_supports_gravity_at_og_flat_height,
         test_tank_softbody_slot5_changes_response_without_jumpjet,

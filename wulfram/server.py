@@ -29,6 +29,7 @@ from .control import ControlServer
 from .terrain import Terrain
 from .building_collision import BuildingCollisionAssets, BuildingEntity
 from .world_collision import TerrainGridCollision
+from .physics import _extract_euler_angles, _matrix3_from_euler_xyz, _normalize_angle_client
 from .weapons import (
     WeaponSystem, build_projectile_spawn_packet, EntityType, BehaviorSlot,
     VEHICLE_PHYSICS_CONFIGS, TANK_WEAPON_SLOTS,
@@ -42,13 +43,17 @@ from wulfram2_protocol.entities import (
     JUMP_JET_SPAWN_LOCKOUT,
     LOCAL_STATE_PRIMARY_TURRET_WEAPON_TYPES,
     LOCAL_STATE_SECONDARY_TURRET_WEAPON_TYPES,
+    OG_PHYSICS_TIMESTEP_FACTOR,
     WEAPON_NAMES,
     tank_altitude_mobility_factor,
     tank_hover_clearance_target,
     tank_slope_mobility_factor,
     tank_spring_average_clearance,
+    tank_spring_attitude_step,
+    tank_body_matrix_drive_basis,
+    tank_spring_force_attitude_step,
     tank_suspension_local_sample_offsets,
-    tank_suspension_sample_offsets,
+    tank_suspension_world_sample_offsets,
     tank_suspension_lift_accel,
     tank_softbody_control_slot_value,
     tank_softbody_horizontal_damping,
@@ -621,8 +626,12 @@ class WulframServer:
         self.tank_drive_terrain_aligned = (
             os.environ.get("WULFRAM_TANK_DRIVE_TERRAIN_ALIGNED", "0") == "1"
         )
+        self.tank_drive_body_matrix = (
+            os.environ.get("WULFRAM_TANK_DRIVE_BODY_MATRIX", "1").strip().lower()
+            not in ("0", "false", "off", "no")
+        )
         self.tank_terrain_contact_coupling_enabled = (
-            os.environ.get("WULFRAM_TANK_TERRAIN_CONTACT_COUPLING", "0") == "1"
+            os.environ.get("WULFRAM_TANK_TERRAIN_CONTACT_COUPLING", "1") == "1"
         )
         self.tank_spring_sample_local_offsets = get_behavior_tank_spring_local_offsets()
         # Tank vertical support. Default to the decompile-shaped softbody
@@ -645,6 +654,26 @@ class WulframServer:
             self.tank_suspension_lift_cap = float(os.environ.get("WULFRAM_TANK_SUSPENSION_LIFT_CAP", "120.0"))
         except ValueError:
             self.tank_suspension_lift_cap = 120.0
+        try:
+            self.tank_spring_attitude_stiffness = float(os.environ.get(
+                "WULFRAM_TANK_SPRING_ATTITUDE_STIFFNESS",
+                str(self.tank_suspension_stiffness),
+            ))
+        except ValueError:
+            self.tank_spring_attitude_stiffness = self.tank_suspension_stiffness
+        try:
+            self.tank_spring_attitude_damping = float(os.environ.get(
+                "WULFRAM_TANK_SPRING_ATTITUDE_DAMPING",
+                str(VEHICLE_PHYSICS_CONFIGS[EntityType.TANK].angular_damping),
+            ))
+        except ValueError:
+            self.tank_spring_attitude_damping = VEHICLE_PHYSICS_CONFIGS[EntityType.TANK].angular_damping
+        self.tank_spring_attitude_model = os.environ.get(
+            "WULFRAM_TANK_SPRING_ATTITUDE_MODEL",
+            "force",
+        ).strip().lower()
+        if self.tank_spring_attitude_model not in ("force", "target"):
+            self.tank_spring_attitude_model = "force"
         self._load_terrain()
         self._terrain_grid_collision: Optional[TerrainGridCollision] = None
         self._entity_collision_extents_cache: Dict[tuple[int, int], tuple[float, float, float]] = {}
@@ -3521,6 +3550,10 @@ class WulframServer:
         ctx.player_yaw = 0.0
         ctx.player_heading = 0.0
         ctx.angular_vel_yaw = 0.0
+        ctx.spring_body_ang_vel = (0.0, 0.0)
+        ctx.player_pose["roll"] = 0.0
+        ctx.player_pose["pitch"] = 0.0
+        ctx.player_pose["yaw"] = 0.0
         ctx.player_speed = 0.0
         ctx.vehicle_physics.reset()
         self._set_ground_level_override_for_pose(ctx, spawn_pos)
@@ -3776,6 +3809,11 @@ class WulframServer:
         spawn_yaw = math.radians(float(spawn_heading_env)) if spawn_heading_env else 0.0
         ctx.player_yaw = -spawn_yaw
         ctx.player_heading = spawn_yaw
+        ctx.angular_vel_yaw = 0.0
+        ctx.spring_body_ang_vel = (0.0, 0.0)
+        ctx.player_pose["roll"] = 0.0
+        ctx.player_pose["pitch"] = 0.0
+        ctx.player_pose["yaw"] = -spawn_yaw
         ctx.player_energy = self.player_energy_max
         ctx.vehicle_physics.heading = spawn_yaw
         self._reset_jump_jet_state(ctx)
@@ -6148,7 +6186,7 @@ class WulframServer:
         if ctx.entity_type != EntityType.TANK or self.terrain is None:
             return (0.0, 0.0)
         avg_up, _clearance_ratio = self._sample_tank_surface_state(ctx)
-        return (avg_up[0] * 64.8, avg_up[1] * 64.8)
+        return (avg_up[0], avg_up[1])
 
     def _sample_tank_surface_state(
         self,
@@ -6168,11 +6206,19 @@ class WulframServer:
             lateral=self._TANK_RADIUS * 0.55,
             local_offsets=getattr(self, "tank_spring_sample_local_offsets", None),
         )
-        offsets = tank_suspension_sample_offsets(
+        body_matrix = None
+        if getattr(self, "terrain_pitch_enabled", False):
+            body_matrix = _matrix3_from_euler_xyz(
+                float(ctx.player_pose.get("roll", 0.0) or 0.0),
+                float(ctx.player_pose.get("pitch", 0.0) or 0.0),
+                heading,
+            )
+        offsets = tank_suspension_world_sample_offsets(
             heading,
             longitudinal=self._TANK_RADIUS * 0.85,
             lateral=self._TANK_RADIUS * 0.55,
             local_offsets=local_offsets,
+            rotation_matrix=body_matrix,
         )
         sum_up_x = 0.0
         sum_up_y = 0.0
@@ -6180,9 +6226,10 @@ class WulframServer:
         sum_clearance = 0.0
         samples = []
 
-        for (local_x, local_y), (dx, dy) in zip(local_offsets, offsets):
+        for (local_x, local_y), (dx, dy, dz) in zip(local_offsets, offsets):
             sx = ctx.player_pos[0] + dx
             sy = ctx.player_pos[1] + dy
+            sz = ctx.player_pos[2] + dz
             sample_height_normal = getattr(self.terrain, "sample_height_normal", None)
             if callable(sample_height_normal):
                 raw_ground_z, sample_up = sample_height_normal(sx, sy)
@@ -6195,7 +6242,7 @@ class WulframServer:
                 else:
                     inv_mag = 1.0 / math.sqrt(mag_sq)
                     sample_up = (-dh_dx * inv_mag, -dh_dy * inv_mag, inv_mag)
-            clearance = ctx.player_pos[2] - raw_ground_z
+            clearance = sz - raw_ground_z
             sum_up_x += sample_up[0]
             sum_up_y += sample_up[1]
             sum_up_z += sample_up[2]
@@ -6204,7 +6251,9 @@ class WulframServer:
                 {
                     "local_offset": [round(float(local_x), 5), round(float(local_y), 5)],
                     "world_offset": [round(float(dx), 5), round(float(dy), 5)],
+                    "world_offset_z": round(float(dz), 5),
                     "sample_xy": [round(float(sx), 5), round(float(sy), 5)],
+                    "sample_z": round(float(sz), 5),
                     "raw_ground_z": round(float(raw_ground_z), 5),
                     "clearance": round(float(clearance), 5),
                     "normal": [round(float(v), 6) for v in sample_up],
@@ -6234,9 +6283,152 @@ class WulframServer:
             "target_clearance": round(float(target_clearance), 5),
             "clearance_ratio": round(float(clearance_ratio), 6),
             "avg_normal": [round(float(v), 6) for v in avg_up],
+            "rotation_source": "body_matrix" if body_matrix is not None else "heading_flat",
             "samples": samples,
         }
         return avg_up, clearance_ratio
+
+    def _update_player_surface_attitude(
+        self,
+        ctx: ClientContext,
+        heading: float | None = None,
+        dt: float | None = None,
+        snap: bool = False,
+        suspension_lift: float | None = None,
+    ) -> dict:
+        """Update replicated tank body roll/pitch from the spring response path.
+
+        OG keeps the tank's yaw/input heading separate from the active softbody
+        surface normal. `Spring_compute_suspension_forces` then contributes
+        pitch/roll torque rather than snapping Euler angles directly, so keep a
+        small X/Y angular-velocity state for body attitude while the full
+        per-point force curve is being ported.
+        """
+        if heading is None:
+            heading = ctx.player_heading
+        if dt is None:
+            snap = True
+            dt = 1.0 / float(getattr(self, "tick_rate_hz", 30.0) or 30.0)
+
+        if (
+            ctx.entity_type != EntityType.TANK
+            or self.terrain is None
+            or self.up_axis != "z"
+            or not getattr(self, "terrain_pitch_enabled", False)
+        ):
+            ctx.player_pose["roll"] = 0.0
+            ctx.player_pose["pitch"] = 0.0
+            ctx.player_pose["yaw"] = -ctx.player_heading
+            ctx.spring_body_ang_vel = (0.0, 0.0)
+            return {
+                "source": "flat",
+                "rotation": (0.0, 0.0, ctx.player_heading),
+                "up": (0.0, 0.0, 1.0),
+                "target_rotation": (0.0, 0.0, ctx.player_heading),
+                "angular_velocity": (0.0, 0.0),
+            }
+
+        avg_up, _clearance_ratio = self._sample_tank_surface_state(ctx, heading)
+        if abs(avg_up[2]) > 1e-6:
+            dh_dx = -avg_up[0] / avg_up[2]
+            dh_dy = -avg_up[1] / avg_up[2]
+        else:
+            dh_dx, dh_dy = self.terrain.get_slope(ctx.player_pos[0], ctx.player_pos[1])
+
+        forward, right, up = terrain_aligned_basis(dh_dx, dh_dy, heading)
+        matrix = [
+            forward[0], right[0], up[0],
+            forward[1], right[1], up[1],
+            forward[2], right[2], up[2],
+        ]
+        target_roll, target_pitch, _yaw_from_matrix = _extract_euler_angles(matrix)
+        target_roll = _normalize_angle_client(target_roll)
+        target_pitch = _normalize_angle_client(target_pitch)
+        if snap:
+            roll = target_roll
+            pitch = target_pitch
+            step = None
+            ctx.spring_body_ang_vel = (0.0, 0.0)
+        else:
+            body_vel = getattr(ctx, "spring_body_ang_vel", (0.0, 0.0)) or (0.0, 0.0)
+            veh_cfg = VEHICLE_PHYSICS_CONFIGS.get(ctx.entity_type)
+            spring_state = getattr(ctx, "debug_last_spring_state", {}) or {}
+            samples = spring_state.get("samples") if isinstance(spring_state, dict) else None
+            damping = getattr(
+                self,
+                "tank_spring_attitude_damping",
+                veh_cfg.angular_damping if veh_cfg else 2.0,
+            )
+            if (
+                getattr(self, "tank_spring_attitude_model", "force") == "force"
+                and suspension_lift is not None
+                and isinstance(samples, (list, tuple))
+                and samples
+            ):
+                step = tank_spring_force_attitude_step(
+                    float(ctx.player_pose.get("roll", 0.0) or 0.0),
+                    float(ctx.player_pose.get("pitch", 0.0) or 0.0),
+                    heading,
+                    samples,
+                    float(body_vel[0]),
+                    float(body_vel[1]),
+                    float(dt),
+                    float(suspension_lift),
+                    damping=damping,
+                )
+            else:
+                step = tank_spring_attitude_step(
+                    float(ctx.player_pose.get("roll", 0.0) or 0.0),
+                    float(ctx.player_pose.get("pitch", 0.0) or 0.0),
+                    target_roll,
+                    target_pitch,
+                    float(body_vel[0]),
+                    float(body_vel[1]),
+                    float(dt),
+                    stiffness=getattr(self, "tank_spring_attitude_stiffness", 40.0),
+                    damping=damping,
+                )
+            roll = _normalize_angle_client(step.roll)
+            pitch = _normalize_angle_client(step.pitch)
+            ctx.spring_body_ang_vel = (step.roll_velocity, step.pitch_velocity)
+            matrix = _matrix3_from_euler_xyz(roll, pitch, heading)
+            up = (matrix[2], matrix[5], matrix[8])
+        ctx.player_pose["roll"] = roll
+        ctx.player_pose["pitch"] = pitch
+        ctx.player_pose["yaw"] = -ctx.player_heading
+        debug = {
+            "target": (target_roll, target_pitch, ctx.player_heading),
+            "angular_velocity": ctx.spring_body_ang_vel,
+        }
+        if step is not None:
+            debug["model"] = "force" if hasattr(step, "point_forces") else "target"
+            debug["torque"] = (step.roll_torque, step.pitch_torque)
+            debug["damping"] = step.damping
+            debug["dt"] = step.dt
+            if hasattr(step, "point_forces"):
+                debug.update(
+                    {
+                        "local_torque": (step.local_torque_x, step.local_torque_y),
+                        "point_forces": step.point_forces,
+                        "total_lift": step.total_lift,
+                        "torque_scale": step.torque_scale,
+                    }
+                )
+            else:
+                debug.update(
+                    {
+                        "error": (step.roll_error, step.pitch_error),
+                        "stiffness": step.stiffness,
+                    }
+                )
+        return {
+            "source": "terrain_surface",
+            "rotation": (roll, pitch, ctx.player_heading),
+            "up": up,
+            "target_rotation": (target_roll, target_pitch, ctx.player_heading),
+            "angular_velocity": ctx.spring_body_ang_vel,
+            "spring_attitude": debug,
+        }
 
     def _normalize_turn_input_value(self, ctx: ClientContext, turn_val: float) -> float:
         """Normalize a raw TURNING slot value to signed yaw input in [-1, 1]."""
@@ -6265,6 +6457,20 @@ class WulframServer:
         _f32_turn_adjust = _f32(float(turn_adj))
         torque = _f32(_f32_turn_adjust * _f32(raw_input))
         return _f32(torque * _f32(self._tank_altitude_mobility(ctx)))
+
+    def _sync_heading_physics_to_context(self, ctx: ClientContext, physics) -> None:
+        """Copy yaw physics into the context without flattening spring body pose.
+
+        The current `VehiclePhysics` model only integrates yaw torque. Tank
+        pitch/roll is produced by the spring/softbody attitude path in
+        `_update_player_position`, so copying `physics.rotation[0:2]` here would
+        erase the previous spring-derived body matrix before the next
+        `Spring_update_world_state` sample.
+        """
+        ctx.player_heading = physics.heading
+        ctx.angular_vel_yaw = physics.angular_velocity
+        ctx.player_yaw = -ctx.player_heading
+        ctx.player_pose["yaw"] = -ctx.player_heading
 
     def _get_raw_turn_input(self, ctx: ClientContext) -> float:
         """Get normalized turning input [-1, 1] with deadzone and sign applied.
@@ -6684,12 +6890,16 @@ class WulframServer:
                 if getattr(self, "tank_drive_terrain_aligned", False):
                     forward, right, _up = terrain_aligned_basis(dh_dx, dh_dy, yaw)
                     drive_basis_source = "terrain_aligned"
+                elif getattr(self, "tank_drive_body_matrix", True):
+                    forward, right = tank_body_matrix_drive_basis(
+                        yaw,
+                        roll=float(ctx.player_pose.get("roll", 0.0) or 0.0),
+                        pitch=float(ctx.player_pose.get("pitch", 0.0) or 0.0),
+                    )
+                    drive_basis_source = "entity_body_matrix"
                 else:
-                    # TankVehicle_apply_physics rotates the drive vector by the
-                    # entity's current Euler rotation. Live OG telemetry on
-                    # rough ground shows that the softbody terrain normal does
-                    # not directly tilt the drive vector; until pitch/roll are
-                    # modelled as entity rotation, keep drive horizontal.
+                    # Explicit debug fallback for isolating body-pose drive
+                    # effects against the older horizontal approximation.
                     forward = (cos_yaw, sin_yaw, 0.0)
                     right = (-sin_yaw, cos_yaw, 0.0)
                     drive_basis_source = "entity_yaw_flat"
@@ -6713,6 +6923,7 @@ class WulframServer:
         impulse_x = forward[0] * fwd_impulse + right[0] * strafe_impulse
         impulse_y = forward[1] * fwd_impulse + right[1] * strafe_impulse
         impulse_z = forward[2] * fwd_impulse + right[2] * strafe_impulse
+        drive_impulse_uncapped = (impulse_x, impulse_y, impulse_z)
 
         # TankVehicle_apply_physics clamps the movement vector against the same
         # move_adjust scalar used to build forward motion, not the separate
@@ -6726,22 +6937,31 @@ class WulframServer:
             impulse_x *= scale
             impulse_y *= scale
             impulse_z *= scale
+        drive_impulse_capped = (impulse_x, impulse_y, impulse_z)
 
         contact_x = 0.0
         contact_y = 0.0
+        terrain_contact_impulse = (0.0, 0.0, 0.0)
         if (
             ctx.entity_type == EntityType.TANK
             and getattr(self, "tank_terrain_contact_coupling_enabled", False)
         ):
             contact_x, contact_y = self._tank_terrain_contact_vector(ctx)
+            pre_contact_x, pre_contact_y, pre_contact_z = impulse_x, impulse_y, impulse_z
             impulse_x, impulse_y, _terrain_speed = tank_terrain_contact_coupling(
                 impulse_x,
                 impulse_y,
                 contact_x,
                 contact_y,
             )
+            terrain_contact_impulse = (
+                impulse_x - pre_contact_x,
+                impulse_y - pre_contact_y,
+                impulse_z - pre_contact_z,
+            )
         else:
             _terrain_speed = 0.0
+        tank_vehicle_impulse = (impulse_x, impulse_y, impulse_z)
 
         # Add gravity to vertical impulse (matches GUESS3_Transform_accelerate_z)
         gravity = self.gravity
@@ -6847,6 +7067,10 @@ class WulframServer:
                 current_vel_up=vel_y,
             )
 
+        gravity_impulse = (0.0, 0.0, 0.0)
+        suspension_impulse = (0.0, 0.0, 0.0)
+        pre_ground_vertical_impulse = None
+        vertical_ground_cancelled = False
         suspension_lift = 0.0
         suspension_clearance = None
         suspension_target_clearance = None
@@ -6894,6 +7118,9 @@ class WulframServer:
                     vel_z,
                     slot5,
                     gravity=gravity,
+                    physics_timestep_factor=(
+                        OG_PHYSICS_TIMESTEP_FACTOR if gravity < 0.0 else 0.0
+                    ),
                     max_altitude=veh_cfg.max_altitude if veh_cfg else 3.25,
                     gravity_pct=veh_cfg.gravity_pct if veh_cfg else 1.0,
                     damping=getattr(self, "tank_suspension_damping", 6.0),
@@ -6901,6 +7128,8 @@ class WulframServer:
                 suspension_model = suspension_softbody.model
                 suspension_target_clearance = suspension_softbody.target_average_height
                 suspension_lift = suspension_softbody.lift_accel
+                if gravity < 0.0:
+                    gravity = -abs(suspension_softbody.support_accel)
 
         if (
             ctx.entity_type == EntityType.TANK
@@ -6924,13 +7153,20 @@ class WulframServer:
 
         # Gravity and ground collision use terrain-aware ground_level (computed above).
         if vertical_idx == 2:
+            gravity_impulse = (0.0, 0.0, gravity)
+            suspension_impulse = (0.0, 0.0, suspension_lift)
             impulse_z += gravity  # gravity is negative
             impulse_z += suspension_lift
+            pre_ground_vertical_impulse = impulse_z
             if ctx.player_pos[2] <= ground_level and ctx.player_vel[2] + impulse_z * dt < 0:
+                vertical_ground_cancelled = True
                 impulse_z = 0.0
         else:
+            gravity_impulse = (0.0, gravity, 0.0)
             impulse_y += gravity
+            pre_ground_vertical_impulse = impulse_y
             if ctx.player_pos[1] <= ground_level and ctx.player_vel[1] + gravity * dt < 0:
+                vertical_ground_cancelled = True
                 impulse_y = 0.0
 
         # Damped effective acceleration: acc = impulse - vel * linear_damp
@@ -7090,6 +7326,14 @@ class WulframServer:
             "basis_forward": forward,
             "basis_right": right,
             "raw_impulse": (fwd_impulse, strafe_impulse),
+            "drive_impulse_uncapped": drive_impulse_uncapped,
+            "drive_impulse_capped": drive_impulse_capped,
+            "terrain_contact_impulse": terrain_contact_impulse,
+            "tank_vehicle_impulse": tank_vehicle_impulse,
+            "gravity_impulse": gravity_impulse,
+            "suspension_impulse": suspension_impulse,
+            "pre_ground_vertical_impulse": pre_ground_vertical_impulse,
+            "vertical_ground_cancelled": vertical_ground_cancelled,
             "move_impulse": (impulse_x, impulse_y, impulse_z),
             "ground_level": ground_level,
             "ground_level_source": ground_level_source,
@@ -7152,6 +7396,18 @@ class WulframServer:
             "pos": ctx.player_pos,
             "vel": ctx.player_vel,
         }
+        body_attitude = self._update_player_surface_attitude(
+            ctx,
+            yaw,
+            dt=dt,
+            suspension_lift=suspension_lift,
+        )
+        ctx.debug_last_controller_step["body_rotation_source"] = body_attitude["source"]
+        ctx.debug_last_controller_step["body_rotation"] = body_attitude["rotation"]
+        ctx.debug_last_controller_step["body_up"] = body_attitude["up"]
+        ctx.debug_last_controller_step["body_target_rotation"] = body_attitude.get("target_rotation")
+        ctx.debug_last_controller_step["body_angular_velocity"] = body_attitude.get("angular_velocity")
+        ctx.debug_last_controller_step["spring_attitude"] = body_attitude.get("spring_attitude")
 
         # Log position changes periodically
         dist = math.sqrt(
@@ -9702,13 +9958,7 @@ class WulframServer:
                     prev_torque = self._compute_turn_torque(ctx, prev_turn_input)
                     if pre_dt > 1e-6:
                         physics.step_client_substeps(prev_torque, pre_dt, use_f32=use_f32)
-                        body_rot = physics.rotation
-                        ctx.player_heading = physics.heading
-                        ctx.angular_vel_yaw = physics.angular_velocity
-                        ctx.player_yaw = -ctx.player_heading
-                        ctx.player_pose["roll"] = body_rot[0]
-                        ctx.player_pose["pitch"] = body_rot[1]
-                        ctx.player_pose["yaw"] = -ctx.player_heading
+                        self._sync_heading_physics_to_context(ctx, physics)
                         self._update_player_position(ctx, dt_override=pre_dt, heading_override=old_heading)
                         move_heading = ctx.player_heading
                     if post_dt > 1e-6:
@@ -9725,13 +9975,7 @@ class WulframServer:
                     physics.step_client_substeps(torque, physics_dt, use_f32=use_f32)
                 last_physics_wall_time = step_wall_now
 
-                body_rot = physics.rotation
-                ctx.player_heading = physics.heading
-                ctx.angular_vel_yaw = physics.angular_velocity
-                ctx.player_yaw = -ctx.player_heading
-                ctx.player_pose["roll"] = body_rot[0]
-                ctx.player_pose["pitch"] = body_rot[1]
-                ctx.player_pose["yaw"] = -ctx.player_heading
+                self._sync_heading_physics_to_context(ctx, physics)
 
                 if move_dt > 1e-6:
                     self._update_player_position(ctx, dt_override=move_dt, heading_override=move_heading)
