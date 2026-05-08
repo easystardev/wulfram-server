@@ -6925,6 +6925,110 @@ def test_entity_origin_probe_can_repeat_bucketed_pair_contacts():
     return True
 
 
+def test_collision_at_start_can_use_iterative_world_separation():
+    """Collision-at-start pair records can route to the OG iterative separation branch."""
+    old_origin = os.environ.get("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN")
+    old_response = os.environ.get("WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE")
+    old_timing = os.environ.get("WULFRAM_ENTITY_TERRAIN_CONTACT_TIMING")
+    old_iterations = os.environ.get("WULFRAM_ENTITY_TERRAIN_CONTACT_ITERATIONS")
+    old_start_iterative = os.environ.get("WULFRAM_ENTITY_TERRAIN_START_ITERATIVE")
+    try:
+        os.environ["WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN"] = "entity"
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE", None)
+        os.environ["WULFRAM_ENTITY_TERRAIN_CONTACT_TIMING"] = "bucket"
+        os.environ["WULFRAM_ENTITY_TERRAIN_CONTACT_ITERATIONS"] = "3"
+        os.environ["WULFRAM_ENTITY_TERRAIN_START_ITERATIVE"] = "1"
+
+        def fake_model_collision(model_center, *args, **kwargs):
+            if model_center[0] < 5.0 or model_center[2] >= 1.0:
+                return None
+            return TerrainContact(
+                position=(model_center[0], model_center[1], 0.0),
+                normal=(0.0, 0.0, 1.0),
+                penetration=1.0 - model_center[2],
+                sector_index=0,
+                cell=(0, 0),
+            )
+
+        server = WulframServer.__new__(WulframServer)
+        server._terrain_grid_collision = SimpleNamespace(
+            test_box_collision=lambda *args, **kwargs: None,
+            test_model_collision=fake_model_collision,
+        )
+        server._get_entity_world_half_extents = lambda ctx: (4.0, 4.0, 4.0)
+        server._get_entity_dirty_threshold_sq = lambda ctx, half_extents: 999.0
+        server._get_entity_world_collision_model = lambda ctx: (
+            [],
+            SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=5.0)),
+            5.0,
+            0.0,
+        )
+
+        ctx = ClientContext(
+            client_id=1,
+            client_addr=("10.10.10.2", 50000),
+            session=Session(),
+            entity_id=0x14EA,
+            entity_type=int(EntityType.TANK),
+        )
+        ctx.player_heading = 0.0
+        ctx.player_pos = (10.0, 0.0, 0.0)
+        ctx.world_collision_ref_pos = (10.0, 0.0, 0.0)
+
+        px, py, pz, vx, vy, vz = server._resolve_entity_world_collision(
+            ctx,
+            10.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            pre_pos=(10.0, 0.0, 0.0),
+            pre_vel=(0.0, 0.0, 0.0),
+            dt=1.0,
+        )
+
+        assert abs(px - 10.0) < 1e-6, px
+        assert abs(py) < 1e-6, py
+        assert abs(pz - 1.0) < 1e-6, pz
+        assert (vx, vy, vz) == (0.0, 0.0, 0.0)
+        assert (
+            ctx.debug_last_motion_collision["response"]
+            == "terrain_contact_iterative_position_rollback"
+        )
+        assert ctx.debug_last_motion_collision["collision_at_start"] is True
+        assert ctx.debug_last_motion_collision["contact_iteration_count"] == 1
+        assert ctx.debug_last_motion_collision["iterative_cleared"] is True
+        assert ctx.debug_last_motion_collision["iterative_iterations"] == 1
+        assert (
+            ctx.debug_last_motion_collision["contact_events"][0]["response"]
+            == "terrain_contact_iterative_position_rollback"
+        )
+    finally:
+        if old_origin is None:
+            os.environ.pop("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN", None)
+        else:
+            os.environ["WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN"] = old_origin
+        if old_response is None:
+            os.environ.pop("WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE", None)
+        else:
+            os.environ["WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE"] = old_response
+        if old_timing is None:
+            os.environ.pop("WULFRAM_ENTITY_TERRAIN_CONTACT_TIMING", None)
+        else:
+            os.environ["WULFRAM_ENTITY_TERRAIN_CONTACT_TIMING"] = old_timing
+        if old_iterations is None:
+            os.environ.pop("WULFRAM_ENTITY_TERRAIN_CONTACT_ITERATIONS", None)
+        else:
+            os.environ["WULFRAM_ENTITY_TERRAIN_CONTACT_ITERATIONS"] = old_iterations
+        if old_start_iterative is None:
+            os.environ.pop("WULFRAM_ENTITY_TERRAIN_START_ITERATIVE", None)
+        else:
+            os.environ["WULFRAM_ENTITY_TERRAIN_START_ITERATIVE"] = old_start_iterative
+    print("test_collision_at_start_can_use_iterative_world_separation: PASSED")
+    return True
+
+
 @_legacy_contact_response_test
 def test_entity_world_collision_falls_back_to_box_without_collision_model():
     """Non-mesh entities should keep the existing SAT-box terrain fallback."""
@@ -8752,6 +8856,7 @@ def main():
         test_entity_interpolation_decision_matches_decompile_gates,
         test_entity_origin_probe_applies_pair_solver_at_contact_time,
         test_entity_origin_probe_can_repeat_bucketed_pair_contacts,
+        test_collision_at_start_can_use_iterative_world_separation,
         test_entity_world_collision_falls_back_to_box_without_collision_model,
         test_entity_world_collision_uses_dirty_terrain_raycast_branch,
         test_entity_world_collision_uses_dirty_contact_before_raycast,

@@ -67,6 +67,7 @@ from wulfram2_protocol.entities import (
     mesh_aabb_half_extents_from_vertices,
     entity_interpolate_toward_target_decision,
     rigid_body_point_velocity,
+    resolve_iterative_terrain_start_contact,
     solve_static_terrain_constraint,
     vehicle_runtime_speed,
 )
@@ -7918,6 +7919,24 @@ class WulframServer:
         except ValueError:
             contact_iteration_limit = default_contact_iterations
         contact_iteration_limit = max(1, min(30, contact_iteration_limit))
+        start_iterative_mode = (
+            os.environ.get("WULFRAM_ENTITY_TERRAIN_START_ITERATIVE", "0").strip().lower()
+        )
+        start_iterative_enabled = start_iterative_mode in {
+            "1",
+            "true",
+            "on",
+            "yes",
+            "iterative",
+            "decompile",
+        }
+        try:
+            start_iterative_limit = int(
+                os.environ.get("WULFRAM_ENTITY_TERRAIN_START_ITERATIVE_LIMIT", "40")
+            )
+        except ValueError:
+            start_iterative_limit = 40
+        start_iterative_limit = max(1, min(200, start_iterative_limit))
         collision_model = self._get_entity_world_collision_model(ctx)
         if collision_model is not None:
             vertices, cbsp_tree, bounding_radius, z_lift = collision_model
@@ -8103,6 +8122,26 @@ class WulframServer:
                 "normal_velocity_before": vel_dot,
             }
 
+        def apply_iterative_start_contact(contact):
+            before_pos = (anchor[0], anchor[1], anchor[2])
+            before_vel = (vx, vy, vz)
+            result = resolve_iterative_terrain_start_contact(
+                position=before_pos,
+                contact_normal=contact.normal,
+                sample_contact=sample_contact_at,
+                slop=self._PENETRATION_SLOP_DEFAULT,
+                max_iterations=start_iterative_limit,
+                use_vertical_fallback=True,
+            )
+            anchor[0], anchor[1], anchor[2] = result.position
+            return {
+                "velocity_before": before_vel,
+                "velocity_after": before_vel,
+                "position_before_iterative": before_pos,
+                "position_after_iterative": result.position,
+                **dict(result.debug),
+            }
+
         def apply_dirty_bounds_contact(contact):
             nonlocal vx, vy, vz
             if pair_solver_response:
@@ -8280,7 +8319,10 @@ class WulframServer:
                 )
                 anchor[0], anchor[1], anchor[2] = contact_pos
                 vx, vy, vz = contact_vel
-                response_debug = apply_contact(contact)
+                if timed_contact["collision_at_start"] and start_iterative_enabled:
+                    response_debug = apply_iterative_start_contact(contact)
+                else:
+                    response_debug = apply_contact(contact)
 
                 elapsed += collision_time
                 current_pos = (anchor[0], anchor[1], anchor[2])
@@ -8300,6 +8342,13 @@ class WulframServer:
                 if response_debug:
                     event_debug.update({
                         "normal_velocity_before": response_debug.get("normal_velocity_before"),
+                        "response": response_debug.get("response"),
+                        "iterative_separation_model": response_debug.get("iterative_separation_model"),
+                        "iterative_cleared": response_debug.get("iterative_cleared"),
+                        "iterative_iterations": response_debug.get("iterative_iterations"),
+                        "iterative_position_delta": response_debug.get("iterative_position_delta"),
+                        "iterative_position_delta_mag": response_debug.get("iterative_position_delta_mag"),
+                        "iterative_final_penetration": response_debug.get("iterative_final_penetration"),
                         "point_normal_velocity_before": response_debug.get("point_normal_velocity_before"),
                         "point_normal_velocity_after": response_debug.get("point_normal_velocity_after"),
                         "normal_delta": response_debug.get("normal_delta"),
