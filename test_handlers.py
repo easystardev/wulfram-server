@@ -38,6 +38,23 @@ from wulfram.weapons import (
     build_projectile_spawn_packet,
     build_projectile_update_packet,
 )
+
+
+def _legacy_contact_response_test(fn):
+    """Run a legacy projection-path unit test without changing global defaults."""
+    def wrapper():
+        old_response = os.environ.get("WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE")
+        try:
+            os.environ["WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE"] = "legacy"
+            return fn()
+        finally:
+            if old_response is None:
+                os.environ.pop("WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE", None)
+            else:
+                os.environ["WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE"] = old_response
+
+    wrapper.__name__ = fn.__name__
+    return wrapper
 from wulfram.packets import (
     build_chat_message,
     build_behavior_packet,
@@ -61,6 +78,7 @@ from wulfram2_protocol.entities import (
     OG_TANK_SOFTBODY_IDLE_SLOT5,
     OG_TANK_SOFTBODY_Q_SLOT5,
     OG_TANK_SOFTBODY_Z_SLOT5,
+    OG_TANK_SPRING_STRETCH_SPEED_DENOMINATOR,
     TANK_SOFTBODY_CONTROL_SLOT,
     entity_interp_factor,
     entity_interpolate_toward_target_decision,
@@ -4141,6 +4159,12 @@ def test_tank_high_hover_uses_linear_damping_for_w_motion():
     assert abs(controller["linear_damp"] - 1.5) < 1e-6, controller
     assert abs(controller["horizontal_damp"] - 1.5) < 1e-6, controller
     assert abs(controller["tank_ground_contact_damp"]) < 1e-6, controller
+    assert controller["softbody_scalar_stretch_source"] == "entity_velocity", controller
+    assert abs(
+        controller["softbody_scalar_stretch_ratio"]
+        - abs(controller["pre_vel"][0]) / OG_TANK_SPRING_STRETCH_SPEED_DENOMINATOR
+    ) < 1e-6, controller
+    assert max(controller["softbody_point_blend_factors"]) > 0.0, controller
     assert 26.0 <= vx <= 30.0, vx
     assert abs(vy) < 1e-4, vy
     assert abs(vz) < 1e-4, vz
@@ -4969,12 +4993,71 @@ def test_tank_surface_attitude_force_path_uses_point_clearance_torque():
     spring = attitude["spring_attitude"]
 
     assert spring["model"] == "force", spring
-    assert spring["integration_model"] == "decompile_impulse", spring
+    assert spring["integration_model"] == "decompile_accel", spring
     assert abs(ctx.spring_body_ang_vel[1]) > 0.0, ctx.spring_body_ang_vel
     assert spring["point_forces"][0] > spring["point_forces"][2], spring["point_forces"]
     assert abs(spring["local_torque"][1]) > 0.0, spring["local_torque"]
-    assert spring["spring_angular_delta"][1] == spring["local_torque"][1], spring
+    assert abs(spring["spring_angular_delta"][1] - spring["local_torque"][1] / 30.0) < 1e-9, spring
     print("test_tank_surface_attitude_force_path_uses_point_clearance_torque: PASSED")
+    return True
+
+
+def test_tank_surface_attitude_reuses_force_sample_state_without_resampling():
+    """Spring attitude should use the same Spring_update_world_state rows as force."""
+    server = WulframServer.__new__(WulframServer)
+    sampled = []
+
+    def sample_height_normal(x, y):
+        sampled.append((x, y))
+        nx, ny, nz = -0.2, 0.05, 1.0
+        mag = math.sqrt(nx * nx + ny * ny + nz * nz)
+        return 10.0 + 0.1 * (x - 100.0), (nx / mag, ny / mag, nz / mag)
+
+    server.terrain = SimpleNamespace(
+        sample_height_normal=sample_height_normal,
+        get_slope=lambda _x, _y: (0.2, -0.05),
+    )
+    server.up_axis = "z"
+    server.terrain_pitch_enabled = True
+    server.terrain_height_offset = 5.0
+    server.terrain_physics_height_offset = 0.0
+    server.tank_spring_base_offset = 2.0
+    server.tank_spring_sample_local_offsets = (
+        (5.0, 1.0),
+        (5.0, -1.0),
+        (-5.0, 1.0),
+        (-5.0, -1.0),
+    )
+    server.tank_spring_attitude_model = "force"
+    server.tank_spring_attitude_damping = 2.0
+
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    ctx.entity_type = EntityType.TANK
+    ctx.player_pos = (100.0, 200.0, 15.25)
+    ctx.player_heading = 0.0
+
+    server._sample_tank_surface_state(ctx)
+    force_state = dict(ctx.debug_last_spring_state)
+    sampled_count = len(sampled)
+    ctx.player_pos = (125.0, 200.0, 15.25)
+
+    attitude = server._update_player_surface_attitude(
+        ctx,
+        dt=1.0 / 30.0,
+        suspension_lift=50.0,
+        spring_state_override=force_state,
+    )
+
+    assert len(sampled) == sampled_count, sampled
+    assert ctx.debug_last_spring_state == force_state
+    assert attitude["spring_attitude"]["model"] == "force"
+    assert attitude["spring_attitude"]["spring_state_source"] == "force_sample"
+    print("test_tank_surface_attitude_reuses_force_sample_state_without_resampling: PASSED")
     return True
 
 
@@ -5060,6 +5143,12 @@ def test_tank_softbody_support_pulls_down_from_compact_equilibrium():
     assert ctx.player_vel[2] < 0.0, ctx.player_vel
     assert ctx.debug_last_controller_step["suspension_model"] == "softbody_per_point_piecewise_probe"
     assert ctx.debug_last_controller_step["softbody_point_count"] == 4
+    assert ctx.debug_last_controller_step["softbody_point_velocity_z"] == (
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+    )
     assert (
         ctx.debug_last_controller_step["suspension_lift"]
         < ctx.debug_last_controller_step["softbody_support_accel"]
@@ -6071,6 +6160,7 @@ def test_entity_world_collision_can_be_disabled_for_player_sync():
     return True
 
 
+@_legacy_contact_response_test
 def test_entity_world_collision_prefers_mesh_contact_when_collision_model_exists():
     """Mesh-backed entities should resolve terrain contact from the CBSP path, not SAT box fallback."""
     box_calls = 0
@@ -6176,32 +6266,11 @@ def _fake_tank_collision_context():
     return ctx
 
 
-def test_entity_world_collision_model_defaults_to_lifted_mesh_until_pair_solver_ports():
-    """Keep the live default on the existing response path until OG contact pairs land."""
+def test_entity_world_collision_model_defaults_to_entity_origin_after_pair_solver_port():
+    """Default vehicle terrain CBSP origin should use entity.pos directly."""
     old_env = os.environ.get("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN")
     try:
         os.environ.pop("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN", None)
-        server = _fake_tank_collision_server()
-        ctx = _fake_tank_collision_context()
-
-        _vertices, _tree, radius, z_lift = server._get_entity_world_collision_model(ctx)
-
-        assert abs(radius - 7.5) < 1e-6, radius
-        assert abs(z_lift - 3.0) < 1e-6, z_lift
-    finally:
-        if old_env is None:
-            os.environ.pop("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN", None)
-        else:
-            os.environ["WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN"] = old_env
-    print("test_entity_world_collision_model_defaults_to_lifted_mesh_until_pair_solver_ports: PASSED")
-    return True
-
-
-def test_entity_world_collision_model_probe_can_use_entity_origin_without_z_lift():
-    """Vehicle terrain CBSP origin probe should use entity.pos directly, matching Physics.c."""
-    old_env = os.environ.get("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN")
-    try:
-        os.environ["WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN"] = "entity"
         server = _fake_tank_collision_server()
         ctx = _fake_tank_collision_context()
 
@@ -6214,7 +6283,28 @@ def test_entity_world_collision_model_probe_can_use_entity_origin_without_z_lift
             os.environ.pop("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN", None)
         else:
             os.environ["WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN"] = old_env
-    print("test_entity_world_collision_model_probe_can_use_entity_origin_without_z_lift: PASSED")
+    print("test_entity_world_collision_model_defaults_to_entity_origin_after_pair_solver_port: PASSED")
+    return True
+
+
+def test_entity_world_collision_model_legacy_lift_can_be_requested():
+    """The old lifted mesh transform remains available for A/B probes."""
+    old_env = os.environ.get("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN")
+    try:
+        os.environ["WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN"] = "lift"
+        server = _fake_tank_collision_server()
+        ctx = _fake_tank_collision_context()
+
+        _vertices, _tree, radius, z_lift = server._get_entity_world_collision_model(ctx)
+
+        assert abs(radius - 7.5) < 1e-6, radius
+        assert abs(z_lift - 3.0) < 1e-6, z_lift
+    finally:
+        if old_env is None:
+            os.environ.pop("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN", None)
+        else:
+            os.environ["WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN"] = old_env
+    print("test_entity_world_collision_model_legacy_lift_can_be_requested: PASSED")
     return True
 
 
@@ -6444,6 +6534,135 @@ def test_static_terrain_constraint_sleeping_body_uses_decompile_scaling():
     assert frozen_sleeping.debug["normal_iterations"] == 0
     assert frozen_sleeping.velocity == (0.0, 0.0, -2.0)
     print("test_static_terrain_constraint_sleeping_body_uses_decompile_scaling: PASSED")
+    return True
+
+
+def test_static_terrain_constraint_retests_inactive_penetrating_contact():
+    """Inactive first pass should rerun with cached separation +0.1 like OG."""
+    base_kwargs = dict(
+        position=(0.0, 0.0, 0.0),
+        velocity=(0.0, 0.0, 0.2),
+        angular_velocity=(0.0, -1.0, 0.0),
+        contact_point=(2.0, 0.0, 1.0),
+        contact_normal=(0.0, 0.0, 1.0),
+        penetration=0.1,
+        half_extents=(4.0, 4.0, 4.0),
+        inertia_half_extents=(4.0, 4.0, 4.0),
+        mass=6700.0,
+        friction=0.2,
+        restitution_fraction=0.0,
+    )
+
+    first_pass_only = solve_static_terrain_constraint(
+        **base_kwargs,
+        enable_inactive_retest=False,
+    )
+    retested = solve_static_terrain_constraint(
+        **base_kwargs,
+        enable_inactive_retest=True,
+    )
+
+    assert first_pass_only.debug["primary_start_separation_speed"] > 0.005
+    assert first_pass_only.debug["normal_iterations"] == 0
+    assert first_pass_only.debug["normal_impulse"] == 0.0
+    assert first_pass_only.debug["inactive_retest_applied"] is False
+    assert retested.debug["primary_normal_iterations"] == 0
+    assert retested.debug["inactive_retest_applied"] is True
+    assert retested.debug["inactive_retest_iterations"] > 0
+    assert retested.debug["normal_iterations"] == retested.debug["inactive_retest_iterations"]
+    assert retested.debug["normal_impulse"] > 0.0
+    assert math.isclose(
+        retested.debug["inactive_retest_target_separation"],
+        retested.debug["inactive_retest_start_separation_speed"] + 0.1,
+        rel_tol=1e-6,
+        abs_tol=1e-6,
+    )
+    print("test_static_terrain_constraint_retests_inactive_penetrating_contact: PASSED")
+    return True
+
+
+def test_static_terrain_constraint_friction_uses_pre_normal_projection_buffer():
+    """Friction should consume the pre-normal relative velocity buffer."""
+    result = solve_static_terrain_constraint(
+        position=(0.0, 0.0, 0.0),
+        velocity=(0.0, 0.0, -2.0),
+        angular_velocity=(0.0, 0.0, 0.0),
+        contact_point=(2.0, 0.0, 1.0),
+        contact_normal=(0.0, 0.0, 1.0),
+        penetration=0.1,
+        half_extents=(4.0, 4.0, 4.0),
+        inertia_half_extents=(4.0, 4.0, 4.0),
+        mass=6700.0,
+        friction=0.2,
+        constraint_iterations=1,
+        restitution_fraction=0.0,
+    )
+
+    assert result.debug["normal_iterations"] == 1
+    assert result.debug["friction_velocity_source"] == "pre_normal_projection_buffer"
+    assert result.debug["friction_iterations"] == 0
+    assert result.debug["friction_impulse"] == 0.0
+    assert result.debug["post_normal_tangent_speed_abs_max"] > 0.001
+    print("test_static_terrain_constraint_friction_uses_pre_normal_projection_buffer: PASSED")
+    return True
+
+
+def test_static_terrain_constraint_can_probe_entity_rotation_for_angular_frame():
+    """Constraint point velocity and angular impulse should use the entity frame."""
+    base_kwargs = dict(
+        position=(0.0, 0.0, 0.0),
+        velocity=(0.0, 0.0, -2.0),
+        angular_velocity=(0.0, 0.75, 0.0),
+        contact_point=(2.0, 0.0, 1.0),
+        contact_normal=(0.0, 0.0, 1.0),
+        penetration=0.1,
+        half_extents=(4.0, 4.0, 4.0),
+        inertia_half_extents=(4.0, 4.0, 4.0),
+        mass=6700.0,
+        friction=0.2,
+        constraint_iterations=1,
+        restitution_fraction=0.0,
+    )
+
+    flat = solve_static_terrain_constraint(**base_kwargs, body_rotation=(0.0, 0.0, 0.0))
+    roll = math.radians(30.0)
+    tilted = solve_static_terrain_constraint(
+        **base_kwargs,
+        body_rotation=(roll, 0.0, 0.0),
+    )
+
+    assert tilted.debug["rotation_source"] == "body_rotation_euler"
+    assert tilted.debug["angular_velocity_frame"] == "entity_local"
+    assert tilted.debug["torque_delta_frame"] == "entity_local"
+    assert tilted.debug["contact_lever"] == (2.0, 0.0, 1.0)
+
+    matrix = tilted.debug["rotation_matrix"]
+    expected_lever = (
+        1.0 * matrix[2] + 2.0 * matrix[0] + 0.0 * matrix[1],
+        1.0 * matrix[5] + 0.0 * matrix[4] + 2.0 * matrix[3],
+        1.0 * matrix[8] + 0.0 * matrix[7] + 2.0 * matrix[6],
+    )
+    for got, expected in zip(
+        tilted.debug["contact_lever_point_velocity_frame"],
+        expected_lever,
+    ):
+        assert math.isclose(got, expected, rel_tol=1e-6, abs_tol=1e-6)
+
+    assert not all(
+        math.isclose(got, base, rel_tol=1e-6, abs_tol=1e-6)
+        for got, base in zip(
+            tilted.debug["contact_lever_point_velocity_frame"],
+            tilted.debug["contact_lever"],
+        )
+    )
+    assert not all(
+        math.isclose(got, base, rel_tol=1e-6, abs_tol=1e-6)
+        for got, base in zip(
+            tilted.debug["angular_velocity_after"],
+            flat.debug["angular_velocity_after"],
+        )
+    )
+    print("test_static_terrain_constraint_can_probe_entity_rotation_for_angular_frame: PASSED")
     return True
 
 
@@ -6706,6 +6925,7 @@ def test_entity_origin_probe_can_repeat_bucketed_pair_contacts():
     return True
 
 
+@_legacy_contact_response_test
 def test_entity_world_collision_falls_back_to_box_without_collision_model():
     """Non-mesh entities should keep the existing SAT-box terrain fallback."""
     box_calls = 0
@@ -6826,6 +7046,7 @@ def test_entity_world_collision_uses_dirty_terrain_raycast_branch():
     return True
 
 
+@_legacy_contact_response_test
 def test_entity_world_collision_uses_dirty_contact_before_raycast():
     """Dirty large-displacement motion should resolve overlapping terrain contact before raycast fallback."""
     raycast_calls = 0
@@ -6896,6 +7117,7 @@ def test_entity_world_collision_uses_dirty_contact_before_raycast():
     return True
 
 
+@_legacy_contact_response_test
 def test_entity_world_collision_uses_dirty_bounds_contact_store():
     """Dirty terrain-bounds overlap should use the stored bounds contact directly before any fallback resample or raycast."""
     raycast_calls = 0
@@ -6973,6 +7195,7 @@ def test_entity_world_collision_uses_dirty_bounds_contact_store():
     return True
 
 
+@_legacy_contact_response_test
 def test_entity_world_collision_dirty_bounds_store_accepts_tiny_contact():
     """Dirty bounds-phase stored contacts should apply even when penetration is below the clean-path epsilon."""
     raycast_calls = 0
@@ -7038,6 +7261,7 @@ def test_entity_world_collision_dirty_bounds_store_accepts_tiny_contact():
     return True
 
 
+@_legacy_contact_response_test
 def test_entity_world_collision_dirty_bounds_store_uses_contact_point_radius_resolution():
     """Dirty stored bounds contacts should resolve from the stored contact point plus bounding radius, not SAT penetration depth."""
     server = WulframServer.__new__(WulframServer)
@@ -7720,6 +7944,7 @@ def test_entity_world_collision_uses_persistent_reference_pos_for_dirty_branch()
     return True
 
 
+@_legacy_contact_response_test
 def test_entity_world_collision_refreshes_reference_on_clean_contact():
     """Repeated flat-ground clean contacts should refresh the dirty reference instead of escalating into raycast."""
     raycast_calls = []
@@ -7944,6 +8169,7 @@ def test_entity_world_collision_static_separation_matches_decompile_clamp():
     return True
 
 
+@_legacy_contact_response_test
 def test_entity_world_collision_clean_path_uses_single_contact_store():
     """Clean-bounds entity/world contact should apply the first stored contact once, not iterate multiple pushes."""
     server = WulframServer.__new__(WulframServer)
@@ -8481,6 +8707,7 @@ def main():
         test_tank_surface_attitude_uses_spring_normal_for_replication,
         test_tank_surface_attitude_steps_toward_spring_normal,
         test_tank_surface_attitude_force_path_uses_point_clearance_torque,
+        test_tank_surface_attitude_reuses_force_sample_state_without_resampling,
         test_heading_physics_sync_preserves_spring_body_pose,
         test_tank_softbody_support_pulls_down_from_compact_equilibrium,
         test_tank_softbody_supports_gravity_at_og_flat_height,
@@ -8514,11 +8741,14 @@ def main():
         test_entity_world_collision_defaults_enabled_with_env_optout,
         test_entity_world_collision_can_be_disabled_for_player_sync,
         test_entity_world_collision_prefers_mesh_contact_when_collision_model_exists,
-        test_entity_world_collision_model_defaults_to_lifted_mesh_until_pair_solver_ports,
-        test_entity_world_collision_model_probe_can_use_entity_origin_without_z_lift,
+        test_entity_world_collision_model_defaults_to_entity_origin_after_pair_solver_port,
+        test_entity_world_collision_model_legacy_lift_can_be_requested,
         test_entity_origin_probe_uses_capped_pair_solver_contact_response,
         test_entity_origin_probe_uses_fed_target_for_interpolation_decision,
         test_static_terrain_constraint_sleeping_body_uses_decompile_scaling,
+        test_static_terrain_constraint_retests_inactive_penetrating_contact,
+        test_static_terrain_constraint_friction_uses_pre_normal_projection_buffer,
+        test_static_terrain_constraint_can_probe_entity_rotation_for_angular_frame,
         test_entity_interpolation_decision_matches_decompile_gates,
         test_entity_origin_probe_applies_pair_solver_at_contact_time,
         test_entity_origin_probe_can_repeat_bucketed_pair_contacts,

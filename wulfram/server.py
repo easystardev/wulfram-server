@@ -18,6 +18,7 @@ import socket
 import struct
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Dict, Sequence
@@ -44,6 +45,7 @@ from wulfram2_protocol.entities import (
     LOCAL_STATE_PRIMARY_TURRET_WEAPON_TYPES,
     LOCAL_STATE_SECONDARY_TURRET_WEAPON_TYPES,
     OG_PHYSICS_TIMESTEP_FACTOR,
+    OG_TANK_SPRING_STRETCH_SPEED_DENOMINATOR,
     WEAPON_NAMES,
     tank_altitude_mobility_factor,
     tank_hover_clearance_target,
@@ -55,6 +57,7 @@ from wulfram2_protocol.entities import (
     tank_suspension_local_sample_offsets,
     tank_suspension_world_sample_offsets,
     tank_suspension_lift_accel,
+    tank_spring_scalar_stretch_ratio,
     tank_softbody_control_slot_value,
     tank_softbody_horizontal_damping,
     tank_softbody_suspension_force,
@@ -63,6 +66,7 @@ from wulfram2_protocol.entities import (
     terrain_aligned_basis,
     mesh_aabb_half_extents_from_vertices,
     entity_interpolate_toward_target_decision,
+    rigid_body_point_velocity,
     solve_static_terrain_constraint,
     vehicle_runtime_speed,
 )
@@ -654,6 +658,33 @@ class WulframServer:
             os.environ.get("WULFRAM_TANK_SOFTBODY_PIECEWISE_HEIGHT", "0").strip().lower()
             in {"1", "true", "on", "yes"}
         )
+        self.tank_softbody_decompile_piecewise_force = (
+            os.environ.get("WULFRAM_TANK_SOFTBODY_DECOMPILE_FORCE", "0").strip().lower()
+            in {"1", "true", "on", "yes"}
+        )
+        self.tank_softbody_scalar_stretch_source = os.environ.get(
+            "WULFRAM_TANK_SOFTBODY_SCALAR_STRETCH_SOURCE",
+            "entity_velocity",
+        ).strip().lower()
+        if self.tank_softbody_scalar_stretch_source in {"0", "false", "off", "no"}:
+            self.tank_softbody_scalar_stretch_source = "off"
+        elif self.tank_softbody_scalar_stretch_source not in {
+            "entity_velocity",
+            "velocity",
+            "tank_vehicle_impulse",
+        }:
+            self.tank_softbody_scalar_stretch_source = "entity_velocity"
+        try:
+            self.tank_softbody_scalar_stretch_denominator = float(
+                os.environ.get(
+                    "WULFRAM_TANK_SOFTBODY_STRETCH_DENOMINATOR",
+                    str(OG_TANK_SPRING_STRETCH_SPEED_DENOMINATOR),
+                )
+            )
+        except ValueError:
+            self.tank_softbody_scalar_stretch_denominator = (
+                OG_TANK_SPRING_STRETCH_SPEED_DENOMINATOR
+            )
         try:
             self.tank_suspension_stiffness = float(os.environ.get("WULFRAM_TANK_SUSPENSION_STIFFNESS", "40.0"))
         except ValueError:
@@ -688,10 +719,14 @@ class WulframServer:
             self.tank_spring_attitude_model = "force"
         self.tank_spring_attitude_integration = os.environ.get(
             "WULFRAM_TANK_SPRING_ATTITUDE_INTEGRATION",
-            "decompile_impulse",
+            "decompile_accel",
         ).strip().lower()
-        if self.tank_spring_attitude_integration not in ("decompile_impulse", "legacy_accel"):
-            self.tank_spring_attitude_integration = "decompile_impulse"
+        if self.tank_spring_attitude_integration not in (
+            "decompile_accel",
+            "decompile_impulse",
+            "legacy_accel",
+        ):
+            self.tank_spring_attitude_integration = "decompile_accel"
         self._load_terrain()
         self._terrain_grid_collision: Optional[TerrainGridCollision] = None
         self._entity_collision_extents_cache: Dict[tuple[int, int], tuple[float, float, float]] = {}
@@ -6243,6 +6278,17 @@ class WulframServer:
         sum_up_z = 0.0
         sum_clearance = 0.0
         samples = []
+        body_ang_vel = getattr(ctx, "spring_body_ang_vel", (0.0, 0.0)) or (0.0, 0.0)
+        try:
+            roll_velocity = float(body_ang_vel[0])  # type: ignore[index]
+            pitch_velocity = float(body_ang_vel[1])  # type: ignore[index]
+        except (TypeError, IndexError, ValueError):
+            roll_velocity = 0.0
+            pitch_velocity = 0.0
+        try:
+            yaw_velocity = float(getattr(ctx, "angular_vel_yaw", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            yaw_velocity = 0.0
 
         for (local_x, local_y), (dx, dy, dz) in zip(local_offsets, offsets):
             sx = ctx.player_pos[0] + dx
@@ -6265,6 +6311,13 @@ class WulframServer:
             sum_up_y += sample_up[1]
             sum_up_z += sample_up[2]
             sum_clearance += clearance
+            point_velocity = rigid_body_point_velocity(
+                ctx.player_pos,
+                ctx.player_vel,
+                (roll_velocity, pitch_velocity, yaw_velocity),
+                (sx, sy, sz),
+                rotation_matrix=body_matrix,
+            )
             samples.append(
                 {
                     "local_offset": [round(float(local_x), 5), round(float(local_y), 5)],
@@ -6275,6 +6328,9 @@ class WulframServer:
                     "sample_z": round(float(sz), 5),
                     "raw_ground_z": round(float(raw_ground_z), 5),
                     "clearance": round(float(clearance), 5),
+                    "point_velocity": [round(float(v), 5) for v in point_velocity],
+                    "point_velocity_z": round(float(point_velocity[2]), 5),
+                    "point_velocity_source": "RigidBody_compute_point_velocity",
                     "normal": [round(float(v), 6) for v in sample_up],
                 }
             )
@@ -6316,6 +6372,7 @@ class WulframServer:
         suspension_lift: float | None = None,
         suspension_point_forces: Sequence[float] | None = None,
         suspension_point_blend_factors: Sequence[float] | None = None,
+        spring_state_override: Mapping[str, object] | None = None,
     ) -> dict:
         """Update replicated tank body roll/pitch from the spring response path.
 
@@ -6349,7 +6406,32 @@ class WulframServer:
                 "angular_velocity": (0.0, 0.0),
             }
 
-        avg_up, _clearance_ratio = self._sample_tank_surface_state(ctx, heading)
+        spring_state_for_attitude = (
+            spring_state_override
+            if isinstance(spring_state_override, Mapping)
+            else None
+        )
+        if spring_state_for_attitude is not None:
+            raw_up = spring_state_for_attitude.get("avg_normal")
+            if isinstance(raw_up, (list, tuple)) and len(raw_up) >= 3:
+                try:
+                    avg_up = (
+                        float(raw_up[0]),
+                        float(raw_up[1]),
+                        float(raw_up[2]),
+                    )
+                except (TypeError, ValueError):
+                    avg_up = (0.0, 0.0, 1.0)
+            else:
+                avg_up = (0.0, 0.0, 1.0)
+            try:
+                _clearance_ratio = float(
+                    spring_state_for_attitude.get("clearance_ratio", 1.0)
+                )
+            except (TypeError, ValueError):
+                _clearance_ratio = 1.0
+        else:
+            avg_up, _clearance_ratio = self._sample_tank_surface_state(ctx, heading)
         if abs(avg_up[2]) > 1e-6:
             dh_dx = -avg_up[0] / avg_up[2]
             dh_dy = -avg_up[1] / avg_up[2]
@@ -6373,7 +6455,11 @@ class WulframServer:
         else:
             body_vel = getattr(ctx, "spring_body_ang_vel", (0.0, 0.0)) or (0.0, 0.0)
             veh_cfg = VEHICLE_PHYSICS_CONFIGS.get(ctx.entity_type)
-            spring_state = getattr(ctx, "debug_last_spring_state", {}) or {}
+            spring_state = (
+                spring_state_for_attitude
+                if spring_state_for_attitude is not None
+                else getattr(ctx, "debug_last_spring_state", {}) or {}
+            )
             samples = spring_state.get("samples") if isinstance(spring_state, dict) else None
             damping = getattr(
                 self,
@@ -6401,7 +6487,7 @@ class WulframServer:
                     integration_model=getattr(
                         self,
                         "tank_spring_attitude_integration",
-                        "decompile_impulse",
+                        "decompile_accel",
                     ),
                 )
             else:
@@ -6427,6 +6513,11 @@ class WulframServer:
         debug = {
             "target": (target_roll, target_pitch, ctx.player_heading),
             "angular_velocity": ctx.spring_body_ang_vel,
+            "spring_state_source": (
+                "force_sample"
+                if spring_state_for_attitude is not None
+                else "resampled"
+            ),
         }
         if step is not None:
             debug["model"] = "force" if hasattr(step, "point_forces") else "target"
@@ -6997,6 +7088,42 @@ class WulframServer:
         else:
             _terrain_speed = 0.0
         tank_vehicle_impulse = (impulse_x, impulse_y, impulse_z)
+        softbody_scalar_stretch_source = "off"
+        softbody_scalar_stretch_speed = 0.0
+        softbody_scalar_stretch_denominator = float(
+            getattr(
+                self,
+                "tank_softbody_scalar_stretch_denominator",
+                OG_TANK_SPRING_STRETCH_SPEED_DENOMINATOR,
+            )
+            or OG_TANK_SPRING_STRETCH_SPEED_DENOMINATOR
+        )
+        softbody_scalar_stretch_ratio = 0.0
+        configured_stretch_source = str(
+            getattr(self, "tank_softbody_scalar_stretch_source", "entity_velocity")
+            or "entity_velocity"
+        ).strip().lower()
+        if configured_stretch_source in {"0", "false", "off", "no"}:
+            configured_stretch_source = "off"
+        if configured_stretch_source in {"entity_velocity", "velocity"}:
+            softbody_scalar_stretch_source = "entity_velocity"
+            softbody_scalar_stretch_speed = math.hypot(vel_x, vel_y)
+            softbody_scalar_stretch_ratio = tank_spring_scalar_stretch_ratio(
+                vel_x,
+                vel_y,
+                speed_denominator=softbody_scalar_stretch_denominator,
+            )
+        elif configured_stretch_source == "tank_vehicle_impulse":
+            softbody_scalar_stretch_source = "tank_vehicle_impulse"
+            softbody_scalar_stretch_speed = math.hypot(
+                tank_vehicle_impulse[0],
+                tank_vehicle_impulse[1],
+            )
+            softbody_scalar_stretch_ratio = tank_spring_scalar_stretch_ratio(
+                tank_vehicle_impulse[0],
+                tank_vehicle_impulse[1],
+                speed_denominator=softbody_scalar_stretch_denominator,
+            )
 
         # Add gravity to vertical impulse (matches GUESS3_Transform_accelerate_z)
         gravity = self.gravity
@@ -7111,6 +7238,7 @@ class WulframServer:
         suspension_target_clearance = None
         suspension_model = None
         suspension_softbody = None
+        spring_state_for_attitude = None
         if (
             getattr(self, "tank_suspension_enabled", False)
             and ctx.entity_type == EntityType.TANK
@@ -7121,6 +7249,8 @@ class WulframServer:
             if not self.terrain_pitch_enabled:
                 avg_up, _clearance_ratio = self._sample_tank_surface_state(ctx, yaw)
             spring_state = getattr(ctx, "debug_last_spring_state", {}) or {}
+            if isinstance(spring_state, dict) and spring_state:
+                spring_state_for_attitude = dict(spring_state)
             legacy_target_clearance = self._tank_hover_clearance_target(ctx)
             try:
                 suspension_clearance = float(spring_state.get("average_clearance"))
@@ -7167,6 +7297,11 @@ class WulframServer:
                         "tank_softbody_piecewise_height",
                         False,
                     ),
+                    use_decompile_piecewise_force=getattr(
+                        self,
+                        "tank_softbody_decompile_piecewise_force",
+                        False,
+                    ),
                     gravity=gravity,
                     physics_timestep_factor=(
                         OG_PHYSICS_TIMESTEP_FACTOR if gravity < 0.0 else 0.0
@@ -7174,6 +7309,10 @@ class WulframServer:
                     max_altitude=veh_cfg.max_altitude if veh_cfg else 3.25,
                     gravity_pct=veh_cfg.gravity_pct if veh_cfg else 1.0,
                     damping=getattr(self, "tank_suspension_damping", 6.0),
+                    scalar_stretch_ratio=softbody_scalar_stretch_ratio,
+                    scalar_stretch_source=softbody_scalar_stretch_source,
+                    scalar_stretch_speed=softbody_scalar_stretch_speed,
+                    scalar_stretch_denominator=softbody_scalar_stretch_denominator,
                 )
                 suspension_model = suspension_softbody.model
                 suspension_target_clearance = suspension_softbody.target_average_height
@@ -7481,6 +7620,33 @@ class WulframServer:
             "softbody_point_shear_corrections": (
                 None if suspension_softbody is None else suspension_softbody.point_shear_corrections
             ),
+            "softbody_point_velocity_z": (
+                None if suspension_softbody is None else suspension_softbody.point_velocity_z
+            ),
+            "softbody_point_decompile_force_magnitudes": (
+                None if suspension_softbody is None else suspension_softbody.point_decompile_force_magnitudes
+            ),
+            "softbody_point_decompile_react_blends": (
+                None if suspension_softbody is None else suspension_softbody.point_decompile_react_blends
+            ),
+            "softbody_point_decompile_fast_reacts": (
+                None if suspension_softbody is None else suspension_softbody.point_decompile_fast_reacts
+            ),
+            "softbody_point_decompile_slow_reacts": (
+                None if suspension_softbody is None else suspension_softbody.point_decompile_slow_reacts
+            ),
+            "softbody_scalar_stretch_ratio": (
+                None if suspension_softbody is None else suspension_softbody.scalar_stretch_ratio
+            ),
+            "softbody_scalar_stretch_source": (
+                None if suspension_softbody is None else suspension_softbody.scalar_stretch_source
+            ),
+            "softbody_scalar_stretch_speed": (
+                None if suspension_softbody is None else suspension_softbody.scalar_stretch_speed
+            ),
+            "softbody_scalar_stretch_denominator": (
+                None if suspension_softbody is None else suspension_softbody.scalar_stretch_denominator
+            ),
             "ground_level_override": ctx.ground_level_override,
             "ground_override_ref_pos": ground_override_ref_pos,
             "ground_override_ref_terrain_level": ground_override_ref_terrain_level,
@@ -7508,6 +7674,7 @@ class WulframServer:
             suspension_point_blend_factors=(
                 suspension_softbody.point_blend_factors if suspension_softbody is not None else None
             ),
+            spring_state_override=spring_state_for_attitude,
         )
         ctx.debug_last_controller_step["body_rotation_source"] = body_attitude["source"]
         ctx.debug_last_controller_step["body_rotation"] = body_attitude["rotation"]
@@ -7707,7 +7874,7 @@ class WulframServer:
         anchor = [px, py, pz]
         reference_pos = getattr(ctx, "world_collision_ref_pos", None) or ctx.player_pos
         origin_mode = (
-            os.environ.get("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN", "lift").strip().lower()
+            os.environ.get("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN", "entity").strip().lower()
         )
         contact_response = (
             os.environ.get("WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE", "auto").strip().lower()
@@ -7829,7 +7996,7 @@ class WulframServer:
                 entity_type,
                 self._ENTITY_COLLISION_DEFAULT,
             )
-            result = solve_static_terrain_constraint(
+            constraint_kwargs = dict(
                 position=(anchor[0], anchor[1], anchor[2]),
                 velocity=(vx, vy, vz),
                 angular_velocity=tuple(contact_angular_velocity),
@@ -7847,6 +8014,32 @@ class WulframServer:
                 constraint_iterations=constraint_iterations,
                 restitution_fraction=restitution_fraction,
             )
+            contact_rotation_frame = os.environ.get(
+                "WULFRAM_ENTITY_CONTACT_ROTATION_FRAME",
+                "0",
+            ).strip().lower()
+            if contact_rotation_frame in {"1", "true", "on", "yes", "body", "decompile"}:
+                constraint_kwargs["body_rotation"] = (
+                    float((getattr(ctx, "player_pose", {}) or {}).get("roll", 0.0) or 0.0),
+                    float((getattr(ctx, "player_pose", {}) or {}).get("pitch", 0.0) or 0.0),
+                    float(getattr(ctx, "player_heading", heading) or 0.0),
+                )
+            constraint_retest = os.environ.get(
+                "WULFRAM_ENTITY_TERRAIN_CONSTRAINT_RETEST",
+                "0",
+            ).strip().lower()
+            if constraint_retest in {"1", "true", "on", "yes", "retest", "decompile"}:
+                constraint_kwargs["enable_inactive_retest"] = True
+                try:
+                    constraint_kwargs["inactive_retest_bias"] = float(
+                        os.environ.get(
+                            "WULFRAM_ENTITY_TERRAIN_CONSTRAINT_RETEST_BIAS",
+                            "0.1",
+                        )
+                    )
+                except ValueError:
+                    constraint_kwargs["inactive_retest_bias"] = 0.1
+            result = solve_static_terrain_constraint(**constraint_kwargs)
             current_tick = int(getattr(getattr(ctx, "session", None), "tick", 0) or getattr(ctx, "last_client_tick", 0) or 0)
             interp_decision = entity_interpolate_toward_target_decision(
                 current_position=result.position,
@@ -8495,7 +8688,7 @@ class WulframServer:
     def _get_entity_world_collision_model(self, ctx: ClientContext):
         team_id = ctx.session.team_id or 1
         origin_mode = (
-            os.environ.get("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN", "lift").strip().lower()
+            os.environ.get("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN", "entity").strip().lower()
         )
         cache_key = (ctx.entity_type, team_id, origin_mode)
         if cache_key in self._entity_collision_model_cache:
@@ -8519,9 +8712,9 @@ class WulframServer:
         bounding_radius = root.radius if root is not None else 0.0
         min_z = min(getattr(vertex, "z", 0.0) for vertex in vertices)
         if origin_mode in {"entity", "origin", "raw"}:
-            # Probe mode for the decompile-backed entity.pos transform. The
-            # current discrete response path still needs the OG pair solver
-            # before this is safe as the live default on rough terrain.
+            # Decompile-backed transform: terrain contact tests use entity.pos
+            # directly. The old lifted mesh path remains available as an A/B
+            # escape hatch via WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN=lift.
             z_lift = 0.0
         else:
             z_lift = max(0.0, -float(min_z))
