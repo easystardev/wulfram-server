@@ -67,6 +67,14 @@ class ClientContext:
     # Spring/softbody pitch-roll angular velocity. OG Spring_apply_forces_to_entity
     # contributes X/Y torque separately from yaw steering.
     spring_body_ang_vel: tuple = (0.0, 0.0)
+    # Decompile rigid-body sleep flags: +0xAD is transient should-sleep,
+    # +0xAE is persistent sleeping. They are fed into contact probes only.
+    rigid_body_should_sleep: bool = False
+    rigid_body_sleeping: bool = False
+    rigid_body_target_pos: Optional[tuple] = None
+    rigid_body_target_rot: Optional[tuple] = None
+    rigid_body_interp_tolerance: float = 0.003
+    rigid_body_last_interp_tick: int = 0
     player_fuel: float = 33000.0
     player_energy: float = 100.0
     player_health: float = 1.0  # Normalized 0.0-1.0, used for HUD health display

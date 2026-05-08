@@ -20,7 +20,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Optional, Dict, Sequence
 
 from .session import Session, Phase, FEATURES
 from .transport import TCPHandler, UDPHandler, PacketLogger, print_packet
@@ -61,6 +61,9 @@ from wulfram2_protocol.entities import (
     tank_fuel_mobility_factor,
     tank_terrain_contact_coupling,
     terrain_aligned_basis,
+    mesh_aabb_half_extents_from_vertices,
+    entity_interpolate_toward_target_decision,
+    solve_static_terrain_constraint,
     vehicle_runtime_speed,
 )
 
@@ -605,7 +608,8 @@ class WulframServer:
             os.environ.get("WULFRAM_TERRAIN_COLLISION_WITH_GROUND_OVERRIDE", "0") == "1"
         )
         self.entity_terrain_collision_enabled = (
-            os.environ.get("WULFRAM_ENTITY_TERRAIN_COLLISION", "0") == "1"
+            os.environ.get("WULFRAM_ENTITY_TERRAIN_COLLISION", "1").strip().lower()
+            not in {"0", "false", "off", "no"}
         )
         try:
             self.terrain_height_offset = float(os.environ.get("WULFRAM_TERRAIN_HEIGHT_OFFSET", "5.0"))
@@ -642,6 +646,14 @@ class WulframServer:
             "WULFRAM_TANK_SUSPENSION_MODEL",
             "softbody",
         ).strip().lower()
+        self.tank_softbody_per_point_force = (
+            os.environ.get("WULFRAM_TANK_SOFTBODY_PER_POINT_FORCE", "0").strip().lower()
+            in {"1", "true", "on", "yes"}
+        )
+        self.tank_softbody_piecewise_height = (
+            os.environ.get("WULFRAM_TANK_SOFTBODY_PIECEWISE_HEIGHT", "0").strip().lower()
+            in {"1", "true", "on", "yes"}
+        )
         try:
             self.tank_suspension_stiffness = float(os.environ.get("WULFRAM_TANK_SUSPENSION_STIFFNESS", "40.0"))
         except ValueError:
@@ -674,6 +686,12 @@ class WulframServer:
         ).strip().lower()
         if self.tank_spring_attitude_model not in ("force", "target"):
             self.tank_spring_attitude_model = "force"
+        self.tank_spring_attitude_integration = os.environ.get(
+            "WULFRAM_TANK_SPRING_ATTITUDE_INTEGRATION",
+            "decompile_impulse",
+        ).strip().lower()
+        if self.tank_spring_attitude_integration not in ("decompile_impulse", "legacy_accel"):
+            self.tank_spring_attitude_integration = "decompile_impulse"
         self._load_terrain()
         self._terrain_grid_collision: Optional[TerrainGridCollision] = None
         self._entity_collision_extents_cache: Dict[tuple[int, int], tuple[float, float, float]] = {}
@@ -6250,6 +6268,7 @@ class WulframServer:
             samples.append(
                 {
                     "local_offset": [round(float(local_x), 5), round(float(local_y), 5)],
+                    "spring_normal": [0.0, 0.0, -1.0],
                     "world_offset": [round(float(dx), 5), round(float(dy), 5)],
                     "world_offset_z": round(float(dz), 5),
                     "sample_xy": [round(float(sx), 5), round(float(sy), 5)],
@@ -6295,6 +6314,8 @@ class WulframServer:
         dt: float | None = None,
         snap: bool = False,
         suspension_lift: float | None = None,
+        suspension_point_forces: Sequence[float] | None = None,
+        suspension_point_blend_factors: Sequence[float] | None = None,
     ) -> dict:
         """Update replicated tank body roll/pitch from the spring response path.
 
@@ -6375,6 +6396,13 @@ class WulframServer:
                     float(dt),
                     float(suspension_lift),
                     damping=damping,
+                    point_forces=suspension_point_forces,
+                    point_blend_factors=suspension_point_blend_factors,
+                    integration_model=getattr(
+                        self,
+                        "tank_spring_attitude_integration",
+                        "decompile_impulse",
+                    ),
                 )
             else:
                 step = tank_spring_attitude_step(
@@ -6412,6 +6440,13 @@ class WulframServer:
                         "point_forces": step.point_forces,
                         "total_lift": step.total_lift,
                         "torque_scale": step.torque_scale,
+                        "torque_model": step.torque_model,
+                        "torque_force_scales": step.torque_force_scales,
+                        "integration_model": step.integration_model,
+                        "angular_velocity_before": step.angular_velocity_before,
+                        "spring_angular_delta": step.spring_angular_delta,
+                        "angular_velocity_after_spring": step.angular_velocity_after_spring,
+                        "angular_velocity_after_damping": step.angular_velocity_after_damping,
                     }
                 )
             else:
@@ -7117,6 +7152,21 @@ class WulframServer:
                     suspension_clearance,
                     vel_z,
                     slot5,
+                    samples=(
+                        spring_state.get("samples")
+                        if isinstance(spring_state, dict)
+                        else None
+                    ),
+                    use_per_point_lift=getattr(
+                        self,
+                        "tank_softbody_per_point_force",
+                        False,
+                    ),
+                    use_piecewise_height_factor=getattr(
+                        self,
+                        "tank_softbody_piecewise_height",
+                        False,
+                    ),
                     gravity=gravity,
                     physics_timestep_factor=(
                         OG_PHYSICS_TIMESTEP_FACTOR if gravity < 0.0 else 0.0
@@ -7232,11 +7282,32 @@ class WulframServer:
 
         ctx.debug_last_collision = {}
         ctx.debug_last_motion_collision = {}
+        ctx.rigid_body_target_pos = (new_x, new_y, new_z)
+        ctx.rigid_body_target_rot = (
+            float((getattr(ctx, "player_pose", {}) or {}).get("roll", 0.0) or 0.0),
+            float((getattr(ctx, "player_pose", {}) or {}).get("pitch", 0.0) or 0.0),
+            float(heading_override if heading_override is not None else ctx.player_heading),
+        )
+        ctx.rigid_body_interp_tolerance = float(
+            os.environ.get("WULFRAM_ENTITY_INTERPOLATION_TOLERANCE", "0.003")
+        )
 
         # Decompile-shaped terrain/world contact pass before static blockers.
-        new_x, new_y, new_z, new_vel_x, new_vel_y, new_vel_z = self._resolve_entity_world_collision(
-            ctx, new_x, new_y, new_z, new_vel_x, new_vel_y, new_vel_z
-        )
+        ctx._world_collision_step_pre_pos = pre_pos
+        ctx._world_collision_step_pre_vel = pre_vel
+        ctx._world_collision_step_dt = dt
+        try:
+            new_x, new_y, new_z, new_vel_x, new_vel_y, new_vel_z = self._resolve_entity_world_collision(
+                ctx, new_x, new_y, new_z, new_vel_x, new_vel_y, new_vel_z
+            )
+        finally:
+            for attr_name in (
+                "_world_collision_step_pre_pos",
+                "_world_collision_step_pre_vel",
+                "_world_collision_step_dt",
+            ):
+                if hasattr(ctx, attr_name):
+                    delattr(ctx, attr_name)
 
         # Building AABB collision (matching client-side)
         new_x, new_y, new_vel_x, new_vel_y = self._check_building_collisions(
@@ -7380,6 +7451,36 @@ class WulframServer:
             "softbody_damping_accel": (
                 None if suspension_softbody is None else suspension_softbody.damping_accel
             ),
+            "softbody_point_count": (
+                None if suspension_softbody is None else suspension_softbody.point_count
+            ),
+            "softbody_point_forces": (
+                None if suspension_softbody is None else suspension_softbody.point_forces
+            ),
+            "softbody_point_vertical_forces": (
+                None if suspension_softbody is None else suspension_softbody.point_vertical_forces
+            ),
+            "softbody_point_clearances": (
+                None if suspension_softbody is None else suspension_softbody.point_clearances
+            ),
+            "softbody_point_height_errors": (
+                None if suspension_softbody is None else suspension_softbody.point_height_errors
+            ),
+            "softbody_point_normal_z": (
+                None if suspension_softbody is None else suspension_softbody.point_normal_z
+            ),
+            "softbody_point_force_curve_inputs": (
+                None if suspension_softbody is None else suspension_softbody.point_force_curve_inputs
+            ),
+            "softbody_point_height_curve_factors": (
+                None if suspension_softbody is None else suspension_softbody.point_height_curve_factors
+            ),
+            "softbody_point_blend_factors": (
+                None if suspension_softbody is None else suspension_softbody.point_blend_factors
+            ),
+            "softbody_point_shear_corrections": (
+                None if suspension_softbody is None else suspension_softbody.point_shear_corrections
+            ),
             "ground_level_override": ctx.ground_level_override,
             "ground_override_ref_pos": ground_override_ref_pos,
             "ground_override_ref_terrain_level": ground_override_ref_terrain_level,
@@ -7401,6 +7502,12 @@ class WulframServer:
             yaw,
             dt=dt,
             suspension_lift=suspension_lift,
+            suspension_point_forces=(
+                suspension_softbody.point_forces if suspension_softbody is not None else None
+            ),
+            suspension_point_blend_factors=(
+                suspension_softbody.point_blend_factors if suspension_softbody is not None else None
+            ),
         )
         ctx.debug_last_controller_step["body_rotation_source"] = body_attitude["source"]
         ctx.debug_last_controller_step["body_rotation"] = body_attitude["rotation"]
@@ -7564,7 +7671,20 @@ class WulframServer:
         penetration_limit = max(bounding_radius * 1.25, 8.0)
         return normal_z < 0.1 and contact.penetration > penetration_limit
 
-    def _resolve_entity_world_collision(self, ctx, px, py, pz, vx, vy, vz):
+    def _resolve_entity_world_collision(
+        self,
+        ctx,
+        px,
+        py,
+        pz,
+        vx,
+        vy,
+        vz,
+        *,
+        pre_pos=None,
+        pre_vel=None,
+        dt=None,
+    ):
         if self._terrain_grid_collision is None:
             return px, py, pz, vx, vy, vz
         if not getattr(self, "entity_terrain_collision_enabled", True):
@@ -7575,14 +7695,68 @@ class WulframServer:
             and not getattr(self, "terrain_collision_with_ground_override", False)
         ):
             return px, py, pz, vx, vy, vz
+        if pre_pos is None:
+            pre_pos = getattr(ctx, "_world_collision_step_pre_pos", None)
+        if pre_vel is None:
+            pre_vel = getattr(ctx, "_world_collision_step_pre_vel", None)
+        if dt is None:
+            dt = getattr(ctx, "_world_collision_step_dt", None)
 
         half_extents = self._get_entity_world_half_extents(ctx)
         heading = ctx.player_heading
         anchor = [px, py, pz]
         reference_pos = getattr(ctx, "world_collision_ref_pos", None) or ctx.player_pos
+        origin_mode = (
+            os.environ.get("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN", "lift").strip().lower()
+        )
+        contact_response = (
+            os.environ.get("WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE", "auto").strip().lower()
+        )
+        pair_solver_response = (
+            contact_response in {"pair", "solver", "constraint"}
+            or (
+                contact_response == "auto"
+                and origin_mode in {"entity", "origin", "raw"}
+            )
+        )
+        contact_timing_mode = (
+            os.environ.get("WULFRAM_ENTITY_TERRAIN_CONTACT_TIMING", "auto").strip().lower()
+        )
+        endpoint_vel_for_timing = (vx, vy, vz)
+        timing_ready = (
+            pre_pos is not None
+            and pre_vel is not None
+            and dt is not None
+            and float(dt) > 0.0
+        )
+        timed_pair_response = pair_solver_response and timing_ready and (
+            contact_timing_mode in {"1", "true", "on", "pair", "solver", "sweep", "toi", "probe", "bucket", "loop"}
+            or (
+                contact_timing_mode == "auto"
+                and origin_mode in {"entity", "origin", "raw"}
+            )
+        )
+        default_contact_iterations = (
+            1
+            if contact_timing_mode in {"probe", "sweep", "toi"}
+            else 8
+        )
+        try:
+            contact_iteration_limit = int(
+                os.environ.get(
+                    "WULFRAM_ENTITY_TERRAIN_CONTACT_ITERATIONS",
+                    str(default_contact_iterations),
+                )
+            )
+        except ValueError:
+            contact_iteration_limit = default_contact_iterations
+        contact_iteration_limit = max(1, min(30, contact_iteration_limit))
         collision_model = self._get_entity_world_collision_model(ctx)
         if collision_model is not None:
             vertices, cbsp_tree, bounding_radius, z_lift = collision_model
+            inertia_half_extents = (
+                mesh_aabb_half_extents_from_vertices(vertices) or half_extents
+            )
         else:
             vertices = None
             cbsp_tree = None
@@ -7592,10 +7766,17 @@ class WulframServer:
                 half_extents[2] * half_extents[2]
             )
             z_lift = half_extents[2]
+            inertia_half_extents = half_extents
+        body_ang_vel = getattr(ctx, "spring_body_ang_vel", (0.0, 0.0)) or (0.0, 0.0)
+        contact_angular_velocity = [
+            float(body_ang_vel[0]) if len(body_ang_vel) > 0 else 0.0,
+            float(body_ang_vel[1]) if len(body_ang_vel) > 1 else 0.0,
+            float(getattr(ctx, "angular_vel_yaw", 0.0) or 0.0),
+        ]
 
-        def sample_contact():
+        def sample_contact_at(pos):
             if collision_model is not None:
-                model_center = (anchor[0], anchor[1], anchor[2] + z_lift)
+                model_center = (pos[0], pos[1], pos[2] + z_lift)
                 return self._terrain_grid_collision.test_model_collision(
                     model_center,
                     heading,
@@ -7603,15 +7784,110 @@ class WulframServer:
                     cbsp_tree,
                     bounding_radius,
                 )
-            box_center = (anchor[0], anchor[1], anchor[2] + half_extents[2])
+            box_center = (pos[0], pos[1], pos[2] + half_extents[2])
             return self._terrain_grid_collision.test_box_collision(
                 box_center,
                 half_extents,
                 heading,
             )
 
+        def sample_contact():
+            return sample_contact_at((anchor[0], anchor[1], anchor[2]))
+
+        def apply_pair_solver_contact(contact):
+            nonlocal vx, vy, vz
+            try:
+                correction_cap = float(
+                    os.environ.get(
+                        "WULFRAM_ENTITY_CONTACT_POSITION_CORRECTION_CAP",
+                        str(self._PENETRATION_SLOP_DEFAULT),
+                    )
+                )
+            except ValueError:
+                correction_cap = self._PENETRATION_SLOP_DEFAULT
+            try:
+                constraint_iterations = int(
+                    os.environ.get("WULFRAM_ENTITY_TERRAIN_CONSTRAINT_ITERATIONS", "100")
+                )
+            except ValueError:
+                constraint_iterations = 100
+            try:
+                restitution_fraction = float(
+                    os.environ.get("WULFRAM_ENTITY_TERRAIN_RESTITUTION_FRACTION", "0.1")
+                )
+            except ValueError:
+                restitution_fraction = 0.1
+            before_vel = (vx, vy, vz)
+            before_ang = tuple(contact_angular_velocity)
+            entity_type = ctx.entity_type
+            if not isinstance(entity_type, EntityType):
+                try:
+                    entity_type = EntityType(int(entity_type))
+                except (TypeError, ValueError):
+                    entity_type = EntityType.TANK
+            collision_config = self._ENTITY_COLLISION_TABLE.get(
+                entity_type,
+                self._ENTITY_COLLISION_DEFAULT,
+            )
+            result = solve_static_terrain_constraint(
+                position=(anchor[0], anchor[1], anchor[2]),
+                velocity=(vx, vy, vz),
+                angular_velocity=tuple(contact_angular_velocity),
+                contact_point=contact.position,
+                contact_normal=contact.normal,
+                penetration=contact.penetration,
+                half_extents=half_extents,
+                inertia_half_extents=inertia_half_extents,
+                mass=collision_config["mass"],
+                friction=collision_config["friction"],
+                body_should_sleep=bool(getattr(ctx, "rigid_body_should_sleep", False)),
+                body_is_sleeping=bool(getattr(ctx, "rigid_body_sleeping", False)),
+                slop=self._PENETRATION_SLOP_DEFAULT,
+                correction_cap=correction_cap,
+                constraint_iterations=constraint_iterations,
+                restitution_fraction=restitution_fraction,
+            )
+            current_tick = int(getattr(getattr(ctx, "session", None), "tick", 0) or getattr(ctx, "last_client_tick", 0) or 0)
+            interp_decision = entity_interpolate_toward_target_decision(
+                current_position=result.position,
+                target_position=getattr(ctx, "rigid_body_target_pos", None),
+                current_rotation=(
+                    float((getattr(ctx, "player_pose", {}) or {}).get("roll", 0.0) or 0.0),
+                    float((getattr(ctx, "player_pose", {}) or {}).get("pitch", 0.0) or 0.0),
+                    float(getattr(ctx, "player_heading", heading) or 0.0),
+                ),
+                target_rotation=getattr(ctx, "rigid_body_target_rot", None),
+                tolerance=float(getattr(ctx, "rigid_body_interp_tolerance", self._PENETRATION_SLOP_DEFAULT) or self._PENETRATION_SLOP_DEFAULT),
+                combined_radius=bounding_radius,
+                current_tick=current_tick,
+                last_interp_tick=int(getattr(ctx, "rigid_body_last_interp_tick", 0) or 0),
+                delta_seconds=1.0 / max(float(getattr(self, "tick_rate_hz", 30.0) or 30.0), 1e-6),
+                wake_override=bool(getattr(ctx, "rigid_body_should_sleep", False)),
+            )
+            anchor[0], anchor[1], anchor[2] = result.position
+            vx, vy, vz = result.velocity
+            contact_angular_velocity[0], contact_angular_velocity[1], contact_angular_velocity[2] = result.angular_velocity
+            if interp_decision.update_last_interp_tick:
+                ctx.rigid_body_last_interp_tick = current_tick
+            ctx.spring_body_ang_vel = (contact_angular_velocity[0], contact_angular_velocity[1])
+            ctx.angular_vel_yaw = contact_angular_velocity[2]
+            after_vel = (vx, vy, vz)
+            return {
+                "velocity_before": before_vel,
+                "velocity_after": after_vel,
+                "angular_velocity_before": before_ang,
+                "angular_velocity_after": tuple(contact_angular_velocity),
+                **dict(interp_decision.debug),
+                "interpolation_reset_physics": interp_decision.reset_physics,
+                "interpolation_wake": interp_decision.wake,
+                "interpolation_update_last_interp_tick": interp_decision.update_last_interp_tick,
+                **dict(result.debug),
+            }
+
         def apply_contact(contact):
             nonlocal vx, vy, vz
+            if pair_solver_response:
+                return apply_pair_solver_contact(contact)
             push = contact.penetration + self._get_static_separation_from_contact(
                 (anchor[0], anchor[1], anchor[2]),
                 contact.position,
@@ -7628,9 +7904,26 @@ class WulframServer:
                 vx -= contact.normal[0] * vel_dot
                 vy -= contact.normal[1] * vel_dot
                 vz -= contact.normal[2] * vel_dot
+            return {
+                "response": "terrain_legacy_projection",
+                "position_correction": push,
+                "normal_velocity_before": vel_dot,
+            }
 
         def apply_dirty_bounds_contact(contact):
             nonlocal vx, vy, vz
+            if pair_solver_response:
+                response_debug = apply_pair_solver_contact(contact)
+                ctx.debug_last_collision = {
+                    "kind": "terrain_dirty_bounds",
+                    "point": contact.position,
+                    "normal": contact.normal,
+                    "depth": contact.penetration,
+                    "detail": f"reference={reference_pos!r}",
+                    **(response_debug or {}),
+                }
+                ctx.debug_last_motion_collision = dict(ctx.debug_last_collision)
+                return
             separation = self._get_static_separation_from_contact(
                 (anchor[0], anchor[1], anchor[2]),
                 contact.position,
@@ -7647,6 +7940,11 @@ class WulframServer:
                 vx -= contact.normal[0] * vel_dot
                 vy -= contact.normal[1] * vel_dot
                 vz -= contact.normal[2] * vel_dot
+            response_debug = {
+                "response": "terrain_dirty_bounds_radius_projection",
+                "position_correction": bounding_radius + separation,
+                "normal_velocity_before": vel_dot,
+            }
             ctx.debug_last_motion_collision = {
                 "kind": "terrain_clean_contact",
                 "point": contact.position,
@@ -7659,19 +7957,264 @@ class WulframServer:
                 "normal": contact.normal,
                 "depth": contact.penetration,
                 "detail": f"reference={reference_pos!r}",
+                **response_debug,
             }
             ctx.debug_last_motion_collision = dict(ctx.debug_last_collision)
 
-        def resolve_single_contact():
-            contact = sample_contact()
-            if contact is None or contact.penetration <= self._PENETRATION_SLOP_DEFAULT:
+        def motion_state_at(start_pos, start_vel, acc, elapsed_s, max_elapsed):
+            t = max(0.0, min(float(max_elapsed), float(elapsed_s)))
+            return (
+                (
+                    start_pos[0] + start_vel[0] * t + 0.5 * acc[0] * t * t,
+                    start_pos[1] + start_vel[1] * t + 0.5 * acc[1] * t * t,
+                    start_pos[2] + start_vel[2] * t + 0.5 * acc[2] * t * t,
+                ),
+                (
+                    start_vel[0] + acc[0] * t,
+                    start_vel[1] + acc[1] * t,
+                    start_vel[2] + acc[2] * t,
+                ),
+            )
+
+        def timing_acceleration():
+            frame_dt = max(float(dt), 1e-9)
+            acc = (
+                (endpoint_vel_for_timing[0] - pre_vel[0]) / frame_dt,
+                (endpoint_vel_for_timing[1] - pre_vel[1]) / frame_dt,
+                (endpoint_vel_for_timing[2] - pre_vel[2]) / frame_dt,
+            )
+            return acc
+
+        def estimate_timed_contact_from(start_pos, start_vel, acc, remaining_time):
+            if not timed_pair_response:
+                return None
+            remaining_time = max(0.0, float(remaining_time))
+            if remaining_time <= 0.0:
+                return None
+            start_contact = sample_contact_at(start_pos)
+            if (
+                start_contact is not None
+                and start_contact.penetration > self._PENETRATION_SLOP_DEFAULT
+            ):
+                return {
+                    "collision_time_s": 0.0,
+                    "contact": start_contact,
+                    "sweep_iterations": 0,
+                    "sweep_clear_count": 0,
+                    "sweep_contact_count": 1,
+                    "collision_at_start": True,
+                }
+
+            end_pos, _end_vel = motion_state_at(start_pos, start_vel, acc, remaining_time, remaining_time)
+            end_contact = sample_contact_at(end_pos)
+            if (
+                end_contact is None
+                or end_contact.penetration <= self._PENETRATION_SLOP_DEFAULT
+            ):
+                return None
+
+            lo = 0.0
+            hi = remaining_time
+            contact = end_contact
+            iterations = 0
+            clear_count = 0
+            contact_count = 1
+            while hi - lo > 0.0025 and iterations < 24:
+                mid = (lo + hi) * 0.5
+                mid_pos, _mid_vel = motion_state_at(start_pos, start_vel, acc, mid, remaining_time)
+                mid_contact = sample_contact_at(mid_pos)
+                iterations += 1
+                if (
+                    mid_contact is not None
+                    and mid_contact.penetration > self._PENETRATION_SLOP_DEFAULT
+                ):
+                    hi = mid
+                    contact = mid_contact
+                    contact_count += 1
+                else:
+                    lo = mid
+                    clear_count += 1
+
+            return {
+                "collision_time_s": hi,
+                "contact": contact,
+                "sweep_iterations": iterations,
+                "sweep_clear_count": clear_count,
+                "sweep_contact_count": contact_count,
+                "collision_at_start": False,
+            }
+
+        def resolve_timed_pair_contact():
+            nonlocal vx, vy, vz
+            frame_dt = float(dt)
+            acc = timing_acceleration()
+            elapsed = 0.0
+            current_pos = tuple(pre_pos)
+            current_vel = tuple(pre_vel)
+            contact_events = []
+            response_debug = None
+            contact = None
+            contact_pos = None
+            contact_vel = None
+
+            for iteration_index in range(contact_iteration_limit):
+                remaining = max(0.0, frame_dt - elapsed)
+                if remaining <= 0.0:
+                    break
+
+                timed_contact = estimate_timed_contact_from(current_pos, current_vel, acc, remaining)
+                if timed_contact is None:
+                    final_pos, final_vel = motion_state_at(
+                        current_pos,
+                        current_vel,
+                        acc,
+                        remaining,
+                        remaining,
+                    )
+                    current_pos = final_pos
+                    current_vel = final_vel
+                    elapsed = frame_dt
+                    break
+
+                collision_time = timed_contact["collision_time_s"]
+                contact = timed_contact["contact"]
+                contact_pos, contact_vel = motion_state_at(
+                    current_pos,
+                    current_vel,
+                    acc,
+                    collision_time,
+                    remaining,
+                )
+                anchor[0], anchor[1], anchor[2] = contact_pos
+                vx, vy, vz = contact_vel
+                response_debug = apply_contact(contact)
+
+                elapsed += collision_time
+                current_pos = (anchor[0], anchor[1], anchor[2])
+                current_vel = (vx, vy, vz)
+                event_debug = {
+                    "iteration": iteration_index + 1,
+                    "collision_time_s": collision_time,
+                    "elapsed_s": elapsed,
+                    "remaining_time_s": max(0.0, frame_dt - elapsed),
+                    "sweep_iterations": timed_contact["sweep_iterations"],
+                    "sweep_clear_count": timed_contact["sweep_clear_count"],
+                    "sweep_contact_count": timed_contact["sweep_contact_count"],
+                    "collision_at_start": timed_contact["collision_at_start"],
+                    "depth": contact.penetration,
+                    "normal": contact.normal,
+                }
+                if response_debug:
+                    event_debug.update({
+                        "normal_velocity_before": response_debug.get("normal_velocity_before"),
+                        "point_normal_velocity_before": response_debug.get("point_normal_velocity_before"),
+                        "point_normal_velocity_after": response_debug.get("point_normal_velocity_after"),
+                        "normal_delta": response_debug.get("normal_delta"),
+                        "position_correction": response_debug.get("position_correction"),
+                        "effective_mass_normal": response_debug.get("effective_mass_normal"),
+                        "inertia_model": response_debug.get("inertia_model"),
+                        "inertia_diagonal": response_debug.get("inertia_diagonal"),
+                        "normal_impulse": response_debug.get("normal_impulse"),
+                        "normal_iterations": response_debug.get("normal_iterations"),
+                        "friction_model": response_debug.get("friction_model"),
+                        "pair_friction_coeff": response_debug.get("pair_friction_coeff"),
+                        "terrain_friction_coeff": response_debug.get("terrain_friction_coeff"),
+                        "body_should_sleep": response_debug.get("body_should_sleep"),
+                        "body_is_sleeping": response_debug.get("body_is_sleeping"),
+                        "constraint_frozen": response_debug.get("constraint_frozen"),
+                        "effective_mass_sleep_scale": response_debug.get("effective_mass_sleep_scale"),
+                        "impulse_sleep_scale": response_debug.get("impulse_sleep_scale"),
+                        "friction_skip_reason": response_debug.get("friction_skip_reason"),
+                        "entity_interpolation_model": response_debug.get("entity_interpolation_model"),
+                        "interpolation_action": response_debug.get("interpolation_action"),
+                        "interpolation_reset_physics": response_debug.get("interpolation_reset_physics"),
+                        "interpolation_wake": response_debug.get("interpolation_wake"),
+                        "interpolation_update_last_interp_tick": response_debug.get("interpolation_update_last_interp_tick"),
+                        "friction_impulse": response_debug.get("friction_impulse"),
+                        "friction_iterations": response_debug.get("friction_iterations"),
+                        "restitution_impulse": response_debug.get("restitution_impulse"),
+                        "angular_delta": response_debug.get("angular_delta"),
+                    })
+                contact_events.append(event_debug)
+
+                if contact_iteration_limit == 1:
+                    remaining_after_contact = max(0.0, frame_dt - elapsed)
+                    if remaining_after_contact > 0.0:
+                        final_pos, final_vel = motion_state_at(
+                            current_pos,
+                            current_vel,
+                            acc,
+                            remaining_after_contact,
+                            remaining_after_contact,
+                        )
+                        current_pos = final_pos
+                        current_vel = final_vel
+                        elapsed = frame_dt
+                    break
+
+            if not contact_events:
                 return False
-            apply_contact(contact)
+
+            if elapsed < frame_dt:
+                remaining_after_contacts = frame_dt - elapsed
+                final_pos, final_vel = motion_state_at(
+                    current_pos,
+                    current_vel,
+                    acc,
+                    remaining_after_contacts,
+                    remaining_after_contacts,
+                )
+                current_pos = final_pos
+                current_vel = final_vel
+                elapsed = frame_dt
+
+            anchor[0], anchor[1], anchor[2] = current_pos
+            vx, vy, vz = current_vel
+            remaining = max(0.0, frame_dt - elapsed)
+
             ctx.debug_last_collision = {
                 "kind": "terrain_clean_contact",
                 "point": contact.position,
                 "normal": contact.normal,
                 "depth": contact.penetration,
+                "timing_response": (
+                    "terrain_contact_pair_toi_single_step"
+                    if contact_iteration_limit == 1
+                    else "terrain_contact_pair_bucketed_step"
+                ),
+                "contact_timing_mode": contact_timing_mode,
+                "collision_time_s": contact_events[0]["collision_time_s"],
+                "remaining_time_s": contact_events[0]["remaining_time_s"],
+                "final_remaining_time_s": remaining,
+                "contact_iteration_limit": contact_iteration_limit,
+                "contact_iteration_count": len(contact_events),
+                "sweep_iterations": sum(event["sweep_iterations"] for event in contact_events),
+                "sweep_clear_count": sum(event["sweep_clear_count"] for event in contact_events),
+                "sweep_contact_count": sum(event["sweep_contact_count"] for event in contact_events),
+                "collision_at_start": contact_events[0]["collision_at_start"],
+                "contact_events": contact_events[:8],
+                "pre_step_pos": pre_pos,
+                "pre_step_vel": pre_vel,
+                "contact_pos_at_time": contact_pos,
+                "contact_vel_before": contact_vel,
+                **(response_debug or {}),
+            }
+            ctx.debug_last_motion_collision = dict(ctx.debug_last_collision)
+            return True
+
+        def resolve_single_contact():
+            if timed_pair_response and resolve_timed_pair_contact():
+                return True
+            contact = sample_contact()
+            if contact is None or contact.penetration <= self._PENETRATION_SLOP_DEFAULT:
+                return False
+            response_debug = apply_contact(contact)
+            ctx.debug_last_collision = {
+                "kind": "terrain_clean_contact",
+                "point": contact.position,
+                "normal": contact.normal,
+                "depth": contact.penetration,
+                **(response_debug or {}),
             }
             ctx.debug_last_motion_collision = dict(ctx.debug_last_collision)
             return True
@@ -7951,7 +8494,10 @@ class WulframServer:
 
     def _get_entity_world_collision_model(self, ctx: ClientContext):
         team_id = ctx.session.team_id or 1
-        cache_key = (ctx.entity_type, team_id)
+        origin_mode = (
+            os.environ.get("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN", "lift").strip().lower()
+        )
+        cache_key = (ctx.entity_type, team_id, origin_mode)
         if cache_key in self._entity_collision_model_cache:
             return self._entity_collision_model_cache[cache_key]
 
@@ -7971,11 +8517,14 @@ class WulframServer:
 
         root = cbsp_tree.root
         bounding_radius = root.radius if root is not None else 0.0
-        min_z = None
-        for vertex in vertices:
-            if min_z is None or vertex.z < min_z:
-                min_z = vertex.z
-        z_lift = max(0.0, -(min_z or 0.0))
+        min_z = min(getattr(vertex, "z", 0.0) for vertex in vertices)
+        if origin_mode in {"entity", "origin", "raw"}:
+            # Probe mode for the decompile-backed entity.pos transform. The
+            # current discrete response path still needs the OG pair solver
+            # before this is safe as the live default on rough terrain.
+            z_lift = 0.0
+        else:
+            z_lift = max(0.0, -float(min_z))
         result = (vertices, cbsp_tree, bounding_radius, z_lift)
         self._entity_collision_model_cache[cache_key] = result
         return result

@@ -62,6 +62,9 @@ from wulfram2_protocol.entities import (
     OG_TANK_SOFTBODY_Q_SLOT5,
     OG_TANK_SOFTBODY_Z_SLOT5,
     TANK_SOFTBODY_CONTROL_SLOT,
+    entity_interp_factor,
+    entity_interpolate_toward_target_decision,
+    solve_static_terrain_constraint,
     tank_softbody_control_slot_value,
     tank_softbody_suspension_force,
     tank_suspension_lift_accel,
@@ -4966,9 +4969,11 @@ def test_tank_surface_attitude_force_path_uses_point_clearance_torque():
     spring = attitude["spring_attitude"]
 
     assert spring["model"] == "force", spring
+    assert spring["integration_model"] == "decompile_impulse", spring
     assert abs(ctx.spring_body_ang_vel[1]) > 0.0, ctx.spring_body_ang_vel
     assert spring["point_forces"][0] > spring["point_forces"][2], spring["point_forces"]
     assert abs(spring["local_torque"][1]) > 0.0, spring["local_torque"]
+    assert spring["spring_angular_delta"][1] == spring["local_torque"][1], spring
     print("test_tank_surface_attitude_force_path_uses_point_clearance_torque: PASSED")
     return True
 
@@ -5053,7 +5058,8 @@ def test_tank_softbody_support_pulls_down_from_compact_equilibrium():
     server._update_player_position(ctx, dt_override=1.0 / 30.0)
 
     assert ctx.player_vel[2] < 0.0, ctx.player_vel
-    assert ctx.debug_last_controller_step["suspension_model"] == "softbody_empirical_flat"
+    assert ctx.debug_last_controller_step["suspension_model"] == "softbody_per_point_piecewise_probe"
+    assert ctx.debug_last_controller_step["softbody_point_count"] == 4
     assert (
         ctx.debug_last_controller_step["suspension_lift"]
         < ctx.debug_last_controller_step["softbody_support_accel"]
@@ -5996,6 +6002,30 @@ def test_effective_inactivity_timeout_extends_remote_ingame_clients():
     return True
 
 
+def test_entity_world_collision_defaults_enabled_with_env_optout():
+    """Entity terrain collision should be live by default, with an explicit debug opt-out."""
+    old_env = os.environ.get("WULFRAM_ENTITY_TERRAIN_COLLISION")
+    try:
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_COLLISION", None)
+        server = WulframServer(host="127.0.0.1", port=0)
+        assert server.entity_terrain_collision_enabled is True
+
+        os.environ["WULFRAM_ENTITY_TERRAIN_COLLISION"] = "0"
+        server = WulframServer(host="127.0.0.1", port=0)
+        assert server.entity_terrain_collision_enabled is False
+
+        os.environ["WULFRAM_ENTITY_TERRAIN_COLLISION"] = "false"
+        server = WulframServer(host="127.0.0.1", port=0)
+        assert server.entity_terrain_collision_enabled is False
+    finally:
+        if old_env is None:
+            os.environ.pop("WULFRAM_ENTITY_TERRAIN_COLLISION", None)
+        else:
+            os.environ["WULFRAM_ENTITY_TERRAIN_COLLISION"] = old_env
+    print("test_entity_world_collision_defaults_enabled_with_env_optout: PASSED")
+    return True
+
+
 def test_entity_world_collision_can_be_disabled_for_player_sync():
     """Server can leave terrain shape collision out of player motion while keeping other terrain users."""
     collision_calls = 0
@@ -6108,6 +6138,571 @@ def test_entity_world_collision_prefers_mesh_contact_when_collision_model_exists
     assert abs(vy - 4.0) < 1e-6, vy
     assert abs(vz) < 1e-6, vz
     print("test_entity_world_collision_prefers_mesh_contact_when_collision_model_exists: PASSED")
+    return True
+
+
+def _fake_tank_collision_server():
+    server = WulframServer.__new__(WulframServer)
+    server._entity_collision_model_cache = {}
+    server._building_collision = SimpleNamespace(
+        available=True,
+        models={
+            "tank_1": SimpleNamespace(
+                collision_mesh=SimpleNamespace(
+                    vertices=[
+                        SimpleNamespace(x=-1.0, y=-2.0, z=-3.0),
+                        SimpleNamespace(x=1.0, y=2.0, z=4.0),
+                    ]
+                ),
+                cbsp_tree=SimpleNamespace(
+                    nodes=[object()],
+                    root=SimpleNamespace(radius=7.5),
+                ),
+            )
+        },
+    )
+    return server
+
+
+def _fake_tank_collision_context():
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+        entity_type=int(EntityType.TANK),
+    )
+    ctx.session.team_id = 2
+    return ctx
+
+
+def test_entity_world_collision_model_defaults_to_lifted_mesh_until_pair_solver_ports():
+    """Keep the live default on the existing response path until OG contact pairs land."""
+    old_env = os.environ.get("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN")
+    try:
+        os.environ.pop("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN", None)
+        server = _fake_tank_collision_server()
+        ctx = _fake_tank_collision_context()
+
+        _vertices, _tree, radius, z_lift = server._get_entity_world_collision_model(ctx)
+
+        assert abs(radius - 7.5) < 1e-6, radius
+        assert abs(z_lift - 3.0) < 1e-6, z_lift
+    finally:
+        if old_env is None:
+            os.environ.pop("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN", None)
+        else:
+            os.environ["WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN"] = old_env
+    print("test_entity_world_collision_model_defaults_to_lifted_mesh_until_pair_solver_ports: PASSED")
+    return True
+
+
+def test_entity_world_collision_model_probe_can_use_entity_origin_without_z_lift():
+    """Vehicle terrain CBSP origin probe should use entity.pos directly, matching Physics.c."""
+    old_env = os.environ.get("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN")
+    try:
+        os.environ["WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN"] = "entity"
+        server = _fake_tank_collision_server()
+        ctx = _fake_tank_collision_context()
+
+        _vertices, _tree, radius, z_lift = server._get_entity_world_collision_model(ctx)
+
+        assert abs(radius - 7.5) < 1e-6, radius
+        assert z_lift == 0.0, z_lift
+    finally:
+        if old_env is None:
+            os.environ.pop("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN", None)
+        else:
+            os.environ["WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN"] = old_env
+    print("test_entity_world_collision_model_probe_can_use_entity_origin_without_z_lift: PASSED")
+    return True
+
+
+def test_entity_origin_probe_uses_capped_pair_solver_contact_response():
+    """Entity-origin terrain probes should use capped solver response instead of full penetration snap."""
+    old_origin = os.environ.get("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN")
+    old_response = os.environ.get("WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE")
+    try:
+        os.environ["WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN"] = "entity"
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE", None)
+
+        def fake_model_collision(*args, **kwargs):
+            return TerrainContact(
+                position=(0.0, 0.0, 0.0),
+                normal=(0.0, 0.0, 1.0),
+                penetration=26.0,
+                sector_index=0,
+                cell=(0, 0),
+            )
+
+        server = WulframServer.__new__(WulframServer)
+        server._terrain_grid_collision = SimpleNamespace(
+            test_box_collision=lambda *args, **kwargs: None,
+            test_model_collision=fake_model_collision,
+        )
+        server._get_entity_world_half_extents = lambda ctx: (4.0, 4.0, 4.0)
+        server._get_entity_dirty_threshold_sq = lambda ctx, half_extents: 999.0
+        server._get_entity_world_collision_model = lambda ctx: (
+            [],
+            SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=5.0)),
+            5.0,
+            0.0,
+        )
+
+        ctx = ClientContext(
+            client_id=1,
+            client_addr=("10.10.10.2", 50000),
+            session=Session(),
+            entity_id=0x14EA,
+            entity_type=int(EntityType.TANK),
+        )
+        ctx.player_heading = 0.0
+        ctx.player_pos = (0.0, 0.0, 0.0)
+        ctx.world_collision_ref_pos = (0.0, 0.0, 0.0)
+
+        px, py, pz, vx, vy, vz = server._resolve_entity_world_collision(
+            ctx,
+            0.0,
+            0.0,
+            0.0,
+            10.0,
+            0.0,
+            -5.0,
+        )
+
+        assert abs(px) < 1e-6, px
+        assert abs(py) < 1e-6, py
+        assert 0.004 < pz < 0.006, pz
+        assert 0.0 < vx < 0.01, vx
+        assert abs(vy) < 1e-6, vy
+        assert 0.49 < vz < 0.52, vz
+        assert ctx.debug_last_motion_collision["response"] == "terrain_contact_constraint_solver"
+        assert ctx.debug_last_motion_collision["position_correction"] <= 0.005
+        assert (
+            ctx.debug_last_motion_collision["constraint_model"]
+            == "decompile_static_terrain_sequential_impulse"
+        )
+        assert (
+            ctx.debug_last_motion_collision["inertia_model"]
+            == "decompile_mesh_bounds_full_extents"
+        )
+        assert abs(
+            ctx.debug_last_motion_collision["inertia_diagonal"][0]
+            - ((8.0 * 8.0 * 8.0 * 8.0 * 6700.0) / 12.0)
+        ) < 1e-6
+        assert (
+            ctx.debug_last_motion_collision["friction_model"]
+            == "decompile_constraint_apply_friction_min_pair"
+        )
+        assert abs(ctx.debug_last_motion_collision["pair_friction_coeff"] - 0.2) < 1e-6
+        assert abs(ctx.debug_last_motion_collision["terrain_friction_coeff"] - 1.0) < 1e-6
+        assert ctx.debug_last_motion_collision["body_should_sleep"] is False
+        assert ctx.debug_last_motion_collision["body_is_sleeping"] is False
+        assert ctx.debug_last_motion_collision["effective_mass_sleep_scale"] == 1.0
+        assert ctx.debug_last_motion_collision["impulse_sleep_scale"] == 1.0
+        assert ctx.debug_last_motion_collision["friction_skip_reason"] is None
+        assert (
+            ctx.debug_last_motion_collision["entity_interpolation_model"]
+            == "decompile_entity_interpolate_toward_target"
+        )
+        assert ctx.debug_last_motion_collision["interpolation_action"] == "target_unavailable"
+        assert ctx.debug_last_motion_collision["effective_mass_normal"] > 0.0
+        assert ctx.debug_last_motion_collision["normal_iterations"] > 1
+        assert ctx.debug_last_motion_collision["friction_iterations"] > 1
+        assert ctx.debug_last_motion_collision["restitution_impulse"] > 0.0
+    finally:
+        if old_origin is None:
+            os.environ.pop("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN", None)
+        else:
+            os.environ["WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN"] = old_origin
+        if old_response is None:
+            os.environ.pop("WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE", None)
+        else:
+            os.environ["WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE"] = old_response
+    print("test_entity_origin_probe_uses_capped_pair_solver_contact_response: PASSED")
+    return True
+
+
+def test_entity_origin_probe_uses_fed_target_for_interpolation_decision():
+    """Server entity-origin probes should feed RigidBody target state into interpolation gates."""
+    old_origin = os.environ.get("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN")
+    old_response = os.environ.get("WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE")
+    try:
+        os.environ["WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN"] = "entity"
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE", None)
+
+        def fake_model_collision(*args, **kwargs):
+            return TerrainContact(
+                position=(0.0, 0.0, 0.0),
+                normal=(0.0, 0.0, 1.0),
+                penetration=26.0,
+                sector_index=0,
+                cell=(0, 0),
+            )
+
+        server = WulframServer.__new__(WulframServer)
+        server._terrain_grid_collision = SimpleNamespace(
+            test_box_collision=lambda *args, **kwargs: None,
+            test_model_collision=fake_model_collision,
+        )
+        server._get_entity_world_half_extents = lambda ctx: (4.0, 4.0, 4.0)
+        server._get_entity_dirty_threshold_sq = lambda ctx, half_extents: 999.0
+        server._get_entity_world_collision_model = lambda ctx: (
+            [],
+            SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=5.0)),
+            5.0,
+            0.0,
+        )
+
+        ctx = ClientContext(
+            client_id=1,
+            client_addr=("10.10.10.2", 50000),
+            session=Session(),
+            entity_id=0x14EA,
+            entity_type=int(EntityType.TANK),
+        )
+        ctx.player_heading = 0.0
+        ctx.player_pos = (0.0, 0.0, 0.0)
+        ctx.world_collision_ref_pos = (0.0, 0.0, 0.0)
+        ctx.last_client_tick = 123
+        ctx.rigid_body_target_pos = (0.0, 0.0, 0.005)
+        ctx.rigid_body_target_rot = (0.0, 0.0, 0.0)
+        ctx.rigid_body_interp_tolerance = 0.003
+        ctx.rigid_body_last_interp_tick = 0
+
+        server._resolve_entity_world_collision(
+            ctx,
+            0.0,
+            0.0,
+            0.0,
+            10.0,
+            0.0,
+            -5.0,
+        )
+
+        assert (
+            ctx.debug_last_motion_collision["entity_interpolation_model"]
+            == "decompile_entity_interpolate_toward_target"
+        )
+        assert ctx.debug_last_motion_collision["interpolation_action"] == "wake_update_last_interp_tick"
+        assert ctx.debug_last_motion_collision["interpolation_update_last_interp_tick"] is True
+        assert ctx.rigid_body_last_interp_tick == 123
+        assert ctx.debug_last_motion_collision["radius_gate"] is False
+    finally:
+        if old_origin is None:
+            os.environ.pop("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN", None)
+        else:
+            os.environ["WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN"] = old_origin
+        if old_response is None:
+            os.environ.pop("WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE", None)
+        else:
+            os.environ["WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE"] = old_response
+    print("test_entity_origin_probe_uses_fed_target_for_interpolation_decision: PASSED")
+    return True
+
+
+def test_static_terrain_constraint_sleeping_body_uses_decompile_scaling():
+    """Persistent +0xAE sleep should halve K and applied impulses, or freeze to zero."""
+    base_kwargs = dict(
+        position=(0.0, 0.0, 0.0),
+        velocity=(0.0, 0.0, -2.0),
+        angular_velocity=(0.0, 0.0, 0.0),
+        contact_point=(2.0, 0.0, 0.0),
+        contact_normal=(0.0, 0.0, 1.0),
+        penetration=0.1,
+        half_extents=(4.0, 4.0, 4.0),
+        inertia_half_extents=(4.0, 4.0, 4.0),
+        mass=6700.0,
+        friction=0.2,
+        constraint_iterations=1,
+        restitution_fraction=0.0,
+    )
+
+    awake = solve_static_terrain_constraint(**base_kwargs)
+    sleeping = solve_static_terrain_constraint(**base_kwargs, body_is_sleeping=True)
+    frozen_sleeping = solve_static_terrain_constraint(
+        **base_kwargs,
+        body_is_sleeping=True,
+        constraint_frozen=True,
+    )
+
+    assert awake.debug["effective_mass_sleep_scale"] == 1.0
+    assert awake.debug["impulse_sleep_scale"] == 1.0
+    assert awake.debug["body_is_sleeping"] is False
+    assert sleeping.debug["body_is_sleeping"] is True
+    assert sleeping.debug["effective_mass_sleep_scale"] == 0.5
+    assert sleeping.debug["impulse_sleep_scale"] == 0.5
+    assert math.isclose(
+        sleeping.debug["effective_mass_normal"],
+        awake.debug["effective_mass_normal"] * 0.5,
+        rel_tol=1e-6,
+    )
+    assert frozen_sleeping.debug["constraint_frozen"] is True
+    assert frozen_sleeping.debug["effective_mass_normal"] == 0.0
+    assert frozen_sleeping.debug["effective_mass_sleep_scale"] == 0.0
+    assert frozen_sleeping.debug["impulse_sleep_scale"] == 0.0
+    assert frozen_sleeping.debug["normal_iterations"] == 0
+    assert frozen_sleeping.velocity == (0.0, 0.0, -2.0)
+    print("test_static_terrain_constraint_sleeping_body_uses_decompile_scaling: PASSED")
+    return True
+
+
+def test_entity_interpolation_decision_matches_decompile_gates():
+    """Entity_interpolate_toward_target should expose reset/wake/tick-update gates."""
+    assert entity_interp_factor(0.03) == 1.0
+    assert entity_interp_factor(0.25) == 0.0
+    assert math.isclose(entity_interp_factor(0.1), 0.25, rel_tol=1e-6)
+
+    reset = entity_interpolate_toward_target_decision(
+        current_position=(0.0, 0.0, 0.0),
+        target_position=(0.001, 0.001, 0.001),
+        current_rotation=(0.0, 0.0, 0.0),
+        target_rotation=(0.0, 0.0, 0.001),
+        tolerance=5.0,
+        combined_radius=5.0,
+        current_tick=20,
+        last_interp_tick=0,
+        delta_seconds=1.0 / 30.0,
+    )
+    assert reset.action == "reset_physics"
+    assert reset.reset_physics is True
+    assert reset.wake is False
+    assert reset.update_last_interp_tick is False
+
+    wait = entity_interpolate_toward_target_decision(
+        current_position=(0.0, 0.0, 0.0),
+        target_position=(0.001, 0.001, 0.001),
+        current_rotation=(0.0, 0.0, 0.0),
+        target_rotation=(0.0, 0.0, 0.001),
+        tolerance=5.0,
+        combined_radius=5.0,
+        current_tick=2,
+        last_interp_tick=0,
+        delta_seconds=1.0 / 30.0,
+    )
+    assert wait.action == "wake_without_tick_update"
+    assert wait.wake is True
+    assert wait.update_last_interp_tick is False
+
+    far = entity_interpolate_toward_target_decision(
+        current_position=(0.0, 0.0, 0.0),
+        target_position=(20.0, 0.0, 0.0),
+        current_rotation=(0.0, 0.0, 0.0),
+        target_rotation=(0.0, 0.0, 0.0),
+        tolerance=0.005,
+        combined_radius=5.0,
+        current_tick=20,
+        last_interp_tick=0,
+        delta_seconds=1.0 / 30.0,
+    )
+    assert far.action == "wake_update_last_interp_tick"
+    assert far.reset_physics is False
+    assert far.wake is True
+    assert far.update_last_interp_tick is True
+
+    forced = entity_interpolate_toward_target_decision(
+        current_position=(0.0, 0.0, 0.0),
+        target_position=(20.0, 0.0, 0.0),
+        current_rotation=(0.0, 0.0, 0.0),
+        target_rotation=(0.0, 0.0, 0.0),
+        tolerance=0.005,
+        combined_radius=5.0,
+        current_tick=20,
+        last_interp_tick=0,
+        delta_seconds=1.0 / 30.0,
+        wake_override=True,
+    )
+    assert forced.action == "wake_forced"
+    assert forced.wake is True
+    print("test_entity_interpolation_decision_matches_decompile_gates: PASSED")
+    return True
+
+
+def test_entity_origin_probe_applies_pair_solver_at_contact_time():
+    """Entity-origin pair probes should resolve at estimated TOI and continue the remaining step."""
+    old_origin = os.environ.get("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN")
+    old_response = os.environ.get("WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE")
+    old_timing = os.environ.get("WULFRAM_ENTITY_TERRAIN_CONTACT_TIMING")
+    try:
+        os.environ["WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN"] = "entity"
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE", None)
+        os.environ["WULFRAM_ENTITY_TERRAIN_CONTACT_TIMING"] = "probe"
+
+        def fake_model_collision(model_center, *args, **kwargs):
+            if model_center[0] < 5.0:
+                return None
+            return TerrainContact(
+                position=(5.0, 0.0, 0.0),
+                normal=(0.0, 0.0, 1.0),
+                penetration=26.0,
+                sector_index=0,
+                cell=(0, 0),
+            )
+
+        server = WulframServer.__new__(WulframServer)
+        server._terrain_grid_collision = SimpleNamespace(
+            test_box_collision=lambda *args, **kwargs: None,
+            test_model_collision=fake_model_collision,
+        )
+        server._get_entity_world_half_extents = lambda ctx: (4.0, 4.0, 4.0)
+        server._get_entity_dirty_threshold_sq = lambda ctx, half_extents: 999.0
+        server._get_entity_world_collision_model = lambda ctx: (
+            [],
+            SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=5.0)),
+            5.0,
+            0.0,
+        )
+
+        ctx = ClientContext(
+            client_id=1,
+            client_addr=("10.10.10.2", 50000),
+            session=Session(),
+            entity_id=0x14EA,
+            entity_type=int(EntityType.TANK),
+        )
+        ctx.player_heading = 0.0
+        ctx.player_pos = (0.0, 0.0, 0.0)
+        ctx.world_collision_ref_pos = (0.0, 0.0, 0.0)
+
+        px, py, pz, vx, vy, vz = server._resolve_entity_world_collision(
+            ctx,
+            10.0,
+            0.0,
+            0.0,
+            10.0,
+            0.0,
+            0.0,
+            pre_pos=(0.0, 0.0, 0.0),
+            pre_vel=(10.0, 0.0, 0.0),
+            dt=1.0,
+        )
+
+        assert 8.8 < px < 9.2, px
+        assert abs(py) < 1e-6, py
+        assert 0.006 < pz < 0.010, pz
+        assert abs(vx - 8.0) < 1e-6, vx
+        assert abs(vy) < 1e-6, vy
+        assert 0.005 < vz < 0.006, vz
+        assert ctx.debug_last_motion_collision["timing_response"] == "terrain_contact_pair_toi_single_step"
+        assert 0.49 < ctx.debug_last_motion_collision["collision_time_s"] < 0.51
+        assert 0.49 < ctx.debug_last_motion_collision["remaining_time_s"] < 0.51
+    finally:
+        if old_origin is None:
+            os.environ.pop("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN", None)
+        else:
+            os.environ["WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN"] = old_origin
+        if old_response is None:
+            os.environ.pop("WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE", None)
+        else:
+            os.environ["WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE"] = old_response
+        if old_timing is None:
+            os.environ.pop("WULFRAM_ENTITY_TERRAIN_CONTACT_TIMING", None)
+        else:
+            os.environ["WULFRAM_ENTITY_TERRAIN_CONTACT_TIMING"] = old_timing
+    print("test_entity_origin_probe_applies_pair_solver_at_contact_time: PASSED")
+    return True
+
+
+def test_entity_origin_probe_can_repeat_bucketed_pair_contacts():
+    """Bucketed entity-origin probes should re-solve repeated contacts in one frame."""
+    old_origin = os.environ.get("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN")
+    old_response = os.environ.get("WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE")
+    old_timing = os.environ.get("WULFRAM_ENTITY_TERRAIN_CONTACT_TIMING")
+    old_iterations = os.environ.get("WULFRAM_ENTITY_TERRAIN_CONTACT_ITERATIONS")
+    try:
+        os.environ["WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN"] = "entity"
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE", None)
+        os.environ["WULFRAM_ENTITY_TERRAIN_CONTACT_TIMING"] = "bucket"
+        os.environ["WULFRAM_ENTITY_TERRAIN_CONTACT_ITERATIONS"] = "3"
+
+        def fake_model_collision(model_center, *args, **kwargs):
+            if model_center[0] < 5.0:
+                return None
+            return TerrainContact(
+                position=(5.0, 0.0, 0.0),
+                normal=(0.0, 0.0, 1.0),
+                penetration=26.0,
+                sector_index=0,
+                cell=(0, 0),
+            )
+
+        server = WulframServer.__new__(WulframServer)
+        server._terrain_grid_collision = SimpleNamespace(
+            test_box_collision=lambda *args, **kwargs: None,
+            test_model_collision=fake_model_collision,
+        )
+        server._get_entity_world_half_extents = lambda ctx: (4.0, 4.0, 4.0)
+        server._get_entity_dirty_threshold_sq = lambda ctx, half_extents: 999.0
+        server._get_entity_world_collision_model = lambda ctx: (
+            [],
+            SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=5.0)),
+            5.0,
+            0.0,
+        )
+
+        ctx = ClientContext(
+            client_id=1,
+            client_addr=("10.10.10.2", 50000),
+            session=Session(),
+            entity_id=0x14EA,
+            entity_type=int(EntityType.TANK),
+        )
+        ctx.player_heading = 0.0
+        ctx.player_pos = (0.0, 0.0, 0.0)
+        ctx.world_collision_ref_pos = (0.0, 0.0, 0.0)
+
+        px, py, pz, vx, vy, vz = server._resolve_entity_world_collision(
+            ctx,
+            10.0,
+            0.0,
+            0.0,
+            10.0,
+            0.0,
+            0.0,
+            pre_pos=(0.0, 0.0, 0.0),
+            pre_vel=(10.0, 0.0, 0.0),
+            dt=1.0,
+        )
+
+        assert 8.8 < px < 9.2, px
+        assert abs(py) < 1e-6, py
+        assert 0.017 < pz < 0.019, pz
+        assert abs(vx - 8.0) < 1e-6, vx
+        assert abs(vy) < 1e-6, vy
+        assert 0.005 < vz < 0.006, vz
+        assert ctx.debug_last_motion_collision["timing_response"] == "terrain_contact_pair_bucketed_step"
+        assert ctx.debug_last_motion_collision["contact_iteration_count"] == 3
+        assert ctx.debug_last_motion_collision["contact_events"][0]["collision_at_start"] is False
+        assert ctx.debug_last_motion_collision["contact_events"][1]["collision_at_start"] is True
+        first_event = ctx.debug_last_motion_collision["contact_events"][0]
+        assert ctx.debug_last_motion_collision["response"] == "terrain_contact_constraint_solver"
+        assert first_event["effective_mass_normal"] > 0.0
+        assert first_event["inertia_model"] == "decompile_mesh_bounds_full_extents"
+        assert first_event["friction_model"] == "decompile_constraint_apply_friction_min_pair"
+        assert abs(first_event["pair_friction_coeff"] - 0.2) < 1e-6
+        assert first_event["body_is_sleeping"] is False
+        assert first_event["effective_mass_sleep_scale"] == 1.0
+        assert first_event["interpolation_action"] == "target_unavailable"
+        assert first_event["normal_impulse"] > 0.0
+        assert first_event["restitution_impulse"] > 0.0
+    finally:
+        if old_origin is None:
+            os.environ.pop("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN", None)
+        else:
+            os.environ["WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN"] = old_origin
+        if old_response is None:
+            os.environ.pop("WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE", None)
+        else:
+            os.environ["WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE"] = old_response
+        if old_timing is None:
+            os.environ.pop("WULFRAM_ENTITY_TERRAIN_CONTACT_TIMING", None)
+        else:
+            os.environ["WULFRAM_ENTITY_TERRAIN_CONTACT_TIMING"] = old_timing
+        if old_iterations is None:
+            os.environ.pop("WULFRAM_ENTITY_TERRAIN_CONTACT_ITERATIONS", None)
+        else:
+            os.environ["WULFRAM_ENTITY_TERRAIN_CONTACT_ITERATIONS"] = old_iterations
+    print("test_entity_origin_probe_can_repeat_bucketed_pair_contacts: PASSED")
     return True
 
 
@@ -7916,8 +8511,17 @@ def main():
         test_building_collision_team_variant_matches_client_helper,
         test_server_team_model_name_matches_client_helper,
         test_effective_inactivity_timeout_extends_remote_ingame_clients,
+        test_entity_world_collision_defaults_enabled_with_env_optout,
         test_entity_world_collision_can_be_disabled_for_player_sync,
         test_entity_world_collision_prefers_mesh_contact_when_collision_model_exists,
+        test_entity_world_collision_model_defaults_to_lifted_mesh_until_pair_solver_ports,
+        test_entity_world_collision_model_probe_can_use_entity_origin_without_z_lift,
+        test_entity_origin_probe_uses_capped_pair_solver_contact_response,
+        test_entity_origin_probe_uses_fed_target_for_interpolation_decision,
+        test_static_terrain_constraint_sleeping_body_uses_decompile_scaling,
+        test_entity_interpolation_decision_matches_decompile_gates,
+        test_entity_origin_probe_applies_pair_solver_at_contact_time,
+        test_entity_origin_probe_can_repeat_bucketed_pair_contacts,
         test_entity_world_collision_falls_back_to_box_without_collision_model,
         test_entity_world_collision_uses_dirty_terrain_raycast_branch,
         test_entity_world_collision_uses_dirty_contact_before_raycast,
