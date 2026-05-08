@@ -26,6 +26,7 @@ from wulfram.client import ClientContext
 from wulfram.control import ControlServer, build_input_sync_diagnosis, build_player_terrain_probe
 from wulfram.session import Session, Phase, FEATURES
 from wulfram.server import WulframServer, _StaticWorldRayNode
+from wulfram.physics import _matrix3_from_euler_xyz
 from wulfram.terrain import Terrain
 from wulfram.building_collision import BuildingCollisionAssets
 from wulfram.world_collision import TerrainContact, TerrainGridCollision, TerrainRaycastHit
@@ -4833,6 +4834,22 @@ def test_server_tank_drive_uses_body_matrix_when_body_pose_live():
     assert debug["gravity_impulse"] == (0.0, 0.0, 0.0), debug
     assert debug["suspension_impulse"] == (0.0, 0.0, 0.0), debug
 
+    stale_server = make_server(True)
+    stale_ctx = make_ctx()
+    stale_ctx.player_heading = math.pi
+    stale_ctx.player_yaw = -math.pi
+    stale_ctx.player_pose["yaw"] = -math.pi
+    stale_ctx.spring_body_matrix = _matrix3_from_euler_xyz(
+        stale_ctx.player_pose["roll"],
+        stale_ctx.player_pose["pitch"],
+        0.0,
+    )
+    stale_server._update_player_position(stale_ctx, dt_override=1.0 / 30.0)
+    stale_debug = stale_ctx.debug_last_controller_step
+    assert stale_debug["drive_basis_source"] == "entity_body_matrix", stale_debug
+    assert stale_debug["basis_forward"][0] < -0.99, stale_debug
+    assert stale_debug["drive_impulse_capped"][0] < 0.0, stale_debug
+
     flat_server = make_server(False)
     flat_ctx = make_ctx()
     flat_server._update_player_position(flat_ctx, dt_override=1.0 / 30.0)
@@ -5076,6 +5093,11 @@ def test_heading_physics_sync_preserves_spring_body_pose():
     )
     ctx.player_pose["roll"] = math.radians(7.0)
     ctx.player_pose["pitch"] = math.radians(-3.0)
+    ctx.spring_body_matrix = _matrix3_from_euler_xyz(
+        ctx.player_pose["roll"],
+        ctx.player_pose["pitch"],
+        0.0,
+    )
     physics = SimpleNamespace(
         heading=math.radians(12.0),
         angular_velocity=0.25,
@@ -5089,6 +5111,8 @@ def test_heading_physics_sync_preserves_spring_body_pose():
     assert abs(ctx.player_pose["roll"] - math.radians(7.0)) < 1e-9
     assert abs(ctx.player_pose["pitch"] - math.radians(-3.0)) < 1e-9
     assert abs(ctx.player_pose["yaw"] + physics.heading) < 1e-9
+    assert abs(ctx.spring_body_matrix[0] - math.cos(physics.heading)) < 0.02
+    assert abs(ctx.spring_body_matrix[3] - math.sin(physics.heading)) < 0.13
     print("test_heading_physics_sync_preserves_spring_body_pose: PASSED")
     return True
 
@@ -8484,6 +8508,11 @@ def test_control_pos_exact_reset_targets_specific_client():
     assert ctx.player_pose["pos"] == (100.0, 200.0, 300.0), ctx.player_pose["pos"]
     assert ctx.player_pose["vel"] == (0.0, 0.0, 0.0), ctx.player_pose["vel"]
     assert abs(ctx.player_pose["yaw"] + math.radians(45.0)) < 1e-6, ctx.player_pose["yaw"]
+    assert tuple(round(float(v), 6) for v in ctx.spring_body_matrix[:3]) == (
+        round(math.cos(math.radians(45.0)), 6),
+        round(-math.sin(math.radians(45.0)), 6),
+        0.0,
+    ), ctx.spring_body_matrix
     softbody_slots = {int(BehaviorSlot.UPWARD_THRUST), int(TANK_SOFTBODY_CONTROL_SLOT)}
     assert abs(tank_softbody_control_slot_value(ctx.weapon_system.behavior_slots) - OG_TANK_SOFTBODY_IDLE_SLOT5) < 1e-6
     for idx, value in enumerate(ctx.weapon_system.behavior_slots):
@@ -8558,6 +8587,8 @@ def test_control_heading_set_preserves_yaw_sign_convention():
     assert abs(ctx.player_heading - math.radians(45.0)) < 1e-6, ctx.player_heading
     assert abs(ctx.player_yaw + math.radians(45.0)) < 1e-6, ctx.player_yaw
     assert abs(ctx.player_pose["yaw"] + math.radians(45.0)) < 1e-6, ctx.player_pose["yaw"]
+    assert abs(ctx.spring_body_matrix[0] - math.cos(math.radians(45.0))) < 1e-6
+    assert abs(ctx.spring_body_matrix[3] - math.sin(math.radians(45.0))) < 1e-6
     assert abs(ctx.vehicle_physics.heading - math.radians(45.0)) < 1e-6, ctx.vehicle_physics.heading
     assert ctx.vehicle_physics._angular_velocity == 0.0, ctx.vehicle_physics._angular_velocity
     print("test_control_heading_set_preserves_yaw_sign_convention: PASSED")

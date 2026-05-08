@@ -24,6 +24,7 @@ import shlex
 import time
 from typing import Optional, Callable, Dict, Any
 
+from .physics import _matrix3_from_euler_xyz
 from .session import Session, Phase, FEATURES
 from .packets import (
     PacketType, get_packet_name,
@@ -319,6 +320,8 @@ class ControlServer:
         ctx.player_pose["pitch"] = 0.0
         ctx.player_pose["yaw"] = -heading
         ctx.player_pose["last_tick"] = self.server._get_network_tick(ctx) if self.server else 0
+        ctx.spring_body_ang_vel = (0.0, 0.0)
+        ctx.spring_body_matrix = _matrix3_from_euler_xyz(0.0, 0.0, heading)
         if self.server and hasattr(self.server, "_set_ground_level_override_for_pose"):
             self.server._set_ground_level_override_for_pose(ctx, ctx.player_pos)
         elif self.server and getattr(self.server, "spawn_sets_ground_level", False):
@@ -931,7 +934,10 @@ Examples:
                     ctx.player_heading = 0.0
                     ctx.player_yaw = 0.0
                     ctx.player_pose["yaw"] = 0.0
-                    ctx.vehicle_physics.reset()
+                    ctx.spring_body_ang_vel = (0.0, 0.0)
+                    ctx.spring_body_matrix = _matrix3_from_euler_xyz(0.0, 0.0, 0.0)
+                    if ctx.vehicle_physics:
+                        ctx.vehicle_physics.reset()
                     count += 1
             return f"Reset heading to 0 for {count} client(s)"
 
@@ -955,6 +961,11 @@ Examples:
                     ctx.player_heading = rad
                     ctx.player_yaw = -rad
                     ctx.player_pose["yaw"] = -rad
+                    ctx.spring_body_matrix = _matrix3_from_euler_xyz(
+                        float(ctx.player_pose.get("roll", 0.0) or 0.0),
+                        float(ctx.player_pose.get("pitch", 0.0) or 0.0),
+                        rad,
+                    )
                     if ctx.vehicle_physics:
                         ctx.vehicle_physics.heading = rad
                         ctx.vehicle_physics._angular_velocity = 0.0

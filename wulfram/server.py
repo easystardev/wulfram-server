@@ -53,6 +53,7 @@ from wulfram2_protocol.entities import (
     tank_spring_average_clearance,
     tank_spring_attitude_step,
     tank_body_matrix_drive_basis,
+    tank_body_matrix_with_heading,
     tank_spring_force_attitude_step,
     tank_suspension_local_sample_offsets,
     tank_suspension_world_sample_offsets,
@@ -6277,6 +6278,13 @@ class WulframServer:
                     float(ctx.player_pose.get("pitch", 0.0) or 0.0),
                     heading,
                 )
+            else:
+                body_matrix = tank_body_matrix_with_heading(
+                    body_matrix,
+                    heading,
+                    fallback_roll=float(ctx.player_pose.get("roll", 0.0) or 0.0),
+                    fallback_pitch=float(ctx.player_pose.get("pitch", 0.0) or 0.0),
+                )
         offsets = tank_suspension_world_sample_offsets(
             heading,
             longitudinal=self._TANK_RADIUS * 0.85,
@@ -6628,6 +6636,12 @@ class WulframServer:
         ctx.angular_vel_yaw = physics.angular_velocity
         ctx.player_yaw = -ctx.player_heading
         ctx.player_pose["yaw"] = -ctx.player_heading
+        ctx.spring_body_matrix = tank_body_matrix_with_heading(
+            getattr(ctx, "spring_body_matrix", None),
+            ctx.player_heading,
+            fallback_roll=float(ctx.player_pose.get("roll", 0.0) or 0.0),
+            fallback_pitch=float(ctx.player_pose.get("pitch", 0.0) or 0.0),
+        )
 
     def _get_raw_turn_input(self, ctx: ClientContext) -> float:
         """Get normalized turning input [-1, 1] with deadzone and sign applied.
