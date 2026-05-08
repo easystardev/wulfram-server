@@ -454,6 +454,10 @@ class WulframServer:
         # available via env toggles for targeted experiments.
         self.projectile_aim_source = os.environ.get("WULFRAM_PROJECTILE_AIM_SOURCE", "body").lower()
         self.projectiles_enabled = os.environ.get("WULFRAM_PROJECTILES_ENABLED", "1") == "1"
+        self.remote_projectiles = os.environ.get("WULFRAM_REMOTE_PROJECTILES", "1") == "1"
+        self.remote_combat_observer_packets = (
+            os.environ.get("WULFRAM_REMOTE_COMBAT_OBSERVER_PACKETS", "1") == "1"
+        )
         # Projectile update mode:
         # 0=no updates after spawn, 1=5Hz, 2=15Hz (default), 3=30Hz
         try:
@@ -1051,6 +1055,8 @@ class WulframServer:
         print(
             "[CONFIG] projectiles_enabled="
             f"{int(self.projectiles_enabled)} projectile_update_mode={self.projectile_update_mode} "
+            f"remote_projectiles={int(self.remote_projectiles)} "
+            f"remote_combat_observer_packets={int(self.remote_combat_observer_packets)} "
             f"projectile_local_stats={int(self.projectile_local_stats)} "
             f"projectile_spawn_snap={int(self.projectile_spawn_snap)} "
             f"projectile_aim_source={self.projectile_aim_source} "
@@ -2515,7 +2521,24 @@ class WulframServer:
         target_ctx.known_roster_ids.add(player_id)
         print(f"[MULTI] Sent roster {name} (id={player_id}) -> client {target_ctx.client_id}")
 
-    def _broadcast_player_stats(self, player_ctx: ClientContext) -> None:
+    def _combat_observer_packets_allowed_for_client(
+        self,
+        ctx: ClientContext,
+        *participants: ClientContext,
+    ) -> bool:
+        """Return whether combat/death TCP packets are safe for this viewer."""
+        if handlers._is_loopback_client(ctx):
+            return True
+        if any(ctx is participant for participant in participants):
+            return True
+        return getattr(self, "remote_combat_observer_packets", True)
+
+    def _broadcast_player_stats(
+        self,
+        player_ctx: ClientContext,
+        *,
+        participants: tuple[ClientContext, ...] = (),
+    ) -> None:
         """Send UPDATE_STATS for player_ctx to all connected clients."""
         player_id = player_ctx.session.player_id or player_ctx.entity_id
         entity_id = player_ctx.entity_id
@@ -2528,6 +2551,8 @@ class WulframServer:
             team_id=team,
         )
         for client in self._snapshot_in_game_clients():
+            if not self._combat_observer_packets_allowed_for_client(client, *participants):
+                continue
             self._send_packet_to_client(
                 client,
                 pkt,
@@ -6061,6 +6086,12 @@ class WulframServer:
             return True
         return getattr(self, "remote_transient_fx", False)
 
+    def _projectile_packets_allowed_for_client(self, ctx: ClientContext) -> bool:
+        """Return whether projectile entity packets are currently safe for a client."""
+        if handlers._is_loopback_client(ctx):
+            return True
+        return getattr(self, "remote_projectiles", True)
+
     def _broadcast_transient_fx(self, events: list, *, exclude_client=None) -> bytes:
         """Broadcast cosmetic TRANSIENT_ARRAY FX on the safest currently supported path."""
         pkt = build_transient_array(events)
@@ -6095,6 +6126,8 @@ class WulframServer:
         if self.udp_handler:
             for target in self._snapshot_in_game_clients():
                 if not target.session.udp_addr or not target.session.translation_ack_received:
+                    continue
+                if not self._projectile_packets_allowed_for_client(target):
                     continue
                 tick = self._get_network_tick(target)
                 include_local_state, local_state_kwargs = self._get_projectile_local_state_for_viewer(target)
@@ -9656,6 +9689,8 @@ class WulframServer:
         """Broadcast projectile deletion and record it in the packet log."""
         delete_pkt = build_delete_object(tick, [proj.entity_id], with_effects=with_effects)
         for client in self._snapshot_in_game_clients():
+            if not self._projectile_packets_allowed_for_client(client):
+                continue
             self._send_packet_to_client(client, delete_pkt, prefer_tcp=True)
             if self.pktlog.enabled:
                 self.pktlog.log(
@@ -10009,6 +10044,8 @@ class WulframServer:
                     for target in self._snapshot_in_game_clients():
                         if not target.session.udp_addr or not target.session.translation_ack_received:
                             continue
+                        if not self._projectile_packets_allowed_for_client(target):
+                            continue
                         tick = self._get_network_tick(target)
                         include_local_state, local_state_kwargs = self._get_projectile_local_state_for_viewer(target)
                         pkt = build_projectile_update_packet(
@@ -10104,6 +10141,8 @@ class WulframServer:
             tick = self._get_network_tick(attacker)
             delete_proj_pkt = build_delete_object(tick, [proj.entity_id], with_effects=True)
             for client in self._snapshot_in_game_clients():
+                if not self._projectile_packets_allowed_for_client(client):
+                    continue
                 self._send_packet_to_client(client, delete_proj_pkt, prefer_tcp=True)
             return
 
@@ -10175,13 +10214,15 @@ class WulframServer:
         tick = self._get_network_tick(attacker)
         delete_proj_pkt = build_delete_object(tick, [proj.entity_id], with_effects=True)
         for client in self._snapshot_in_game_clients():
+            if not self._projectile_packets_allowed_for_client(client):
+                continue
             self._send_packet_to_client(client, delete_proj_pkt, prefer_tcp=True)
 
         # Chat notification
         hit_msg = f"HIT! {target_name} ({new_health*100:.0f}% health)"
         chat_pkt = build_chat_message(hit_msg, source_id=attacker.session.player_id or attacker.entity_id)
         for client in self._snapshot_in_game_clients():
-            if client.tcp_handler:
+            if client.tcp_handler and self._debug_comm_allowed_for_client(client):
                 client.tcp_handler.send(chat_pkt)
 
         # Send health refresh to ALL surviving clients (attacker etc.)
@@ -10191,6 +10232,11 @@ class WulframServer:
         for client in self._snapshot_in_game_clients():
             if client is target:
                 continue  # Already sent above
+            if (
+                client is not attacker
+                and not handlers._is_loopback_client(client)
+            ):
+                continue
             if self.udp_handler and client.session.udp_addr:
                 c_tick = self._get_network_tick(client)
                 c_pkt = self._build_local_state_heartbeat(
@@ -10213,12 +10259,13 @@ class WulframServer:
             kill_msg = f"KILL! {attacker_name} destroyed {target_name}!"
             kill_chat = build_chat_message(kill_msg, source_id=attacker.session.player_id or attacker.entity_id)
             for client in self._snapshot_in_game_clients():
-                if client.tcp_handler:
+                if client.tcp_handler and self._debug_comm_allowed_for_client(client):
                     client.tcp_handler.send(kill_chat)
 
             # Broadcast updated stats for attacker and target
-            self._broadcast_player_stats(attacker)
-            self._broadcast_player_stats(target)
+            combat_participants = (attacker, target)
+            self._broadcast_player_stats(attacker, participants=combat_participants)
+            self._broadcast_player_stats(target, participants=combat_participants)
 
             target_entity_id = target.session.entity_id or target.entity_id
 
@@ -10226,6 +10273,8 @@ class WulframServer:
             tick_del = self._get_network_tick(target)
             del_pkt = build_delete_object(tick_del, [target_entity_id], with_effects=True)
             for client in self._snapshot_in_game_clients():
+                if not self._combat_observer_packets_allowed_for_client(client, attacker, target):
+                    continue
                 self._send_packet_to_client(client, del_pkt, prefer_tcp=True)
 
             # Stop tick loop (entity no longer exists on client)
@@ -10304,19 +10353,25 @@ class WulframServer:
             print(f"[BUILDING] {btype_name} oid={building_oid} DESTROYED by {attacker_name}")
             # Track building kill
             attacker.kills += 1
-            self._broadcast_player_stats(attacker)
+            self._broadcast_player_stats(attacker, participants=(attacker,))
 
             # DELETE_OBJECT for building with explosion effects
             tick = self._get_network_tick(attacker)
             del_pkt = build_delete_object(tick, [building_oid], with_effects=True)
             for client in self._snapshot_in_game_clients():
+                if not self._combat_observer_packets_allowed_for_client(client, attacker):
+                    continue
                 self._send_packet_to_client(client, del_pkt, prefer_tcp=True)
             # Chat notification
             from .packets import build_chat_message
             msg = f"DESTROYED! {attacker_name} leveled a {btype_name}!"
             chat_pkt = build_chat_message(msg, source_id=attacker.session.player_id or attacker.entity_id)
             for client in self._snapshot_in_game_clients():
-                if client.tcp_handler:
+                if (
+                    client.tcp_handler
+                    and self._combat_observer_packets_allowed_for_client(client, attacker)
+                    and self._debug_comm_allowed_for_client(client)
+                ):
                     client.tcp_handler.send(chat_pkt)
 
     def _update_supply_buildings(self, ctx: ClientContext, dt: float):
@@ -10456,6 +10511,8 @@ class WulframServer:
             }])
             if fx_pkt:
                 for client in in_game:
+                    if not self._transient_fx_allowed_for_client(client):
+                        continue
                     if self.udp_handler and client.session.udp_addr:
                         self.udp_handler.send_to(fx_pkt, client.session.udp_addr)
 
@@ -10466,6 +10523,8 @@ class WulframServer:
             }])
             if impact_pkt:
                 for client in in_game:
+                    if not self._transient_fx_allowed_for_client(client):
+                        continue
                     if self.udp_handler and client.session.udp_addr:
                         self.udp_handler.send_to(impact_pkt, client.session.udp_addr)
 
@@ -10489,13 +10548,17 @@ class WulframServer:
             if best_target.player_health <= 0.0 and old_health > 0.0:
                 # Turret killed the player
                 best_target.deaths += 1
-                self._broadcast_player_stats(best_target)
+                self._broadcast_player_stats(best_target, participants=(best_target,))
                 print(f"[TURRET] {btype_name} oid={oid} KILLED {target_name}")
                 kill_msg = f"{target_name} was destroyed by a {btype_name}!"
                 from .packets import build_chat_message
                 kill_chat = build_chat_message(kill_msg, source_id=0)
                 for client in in_game:
-                    if client.tcp_handler:
+                    if (
+                        client.tcp_handler
+                        and self._combat_observer_packets_allowed_for_client(client, best_target)
+                        and self._debug_comm_allowed_for_client(client)
+                    ):
                         try:
                             client.tcp_handler.send(kill_chat)
                         except Exception:
@@ -10506,6 +10569,8 @@ class WulframServer:
                 tick_del = self._get_network_tick(best_target)
                 del_pkt = build_delete_object(tick_del, [target_eid], with_effects=True)
                 for client in in_game:
+                    if not self._combat_observer_packets_allowed_for_client(client, best_target):
+                        continue
                     self._send_packet_to_client(client, del_pkt, prefer_tcp=True)
                 best_target.session.in_game = False
                 for other in in_game:

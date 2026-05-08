@@ -8826,6 +8826,65 @@ def test_broadcast_player_stats_stays_tcp_only():
     return True
 
 
+def test_remote_combat_observer_stats_gate_skips_nonparticipant_og():
+    """Combat stat packets can exclude remote OG observers while keeping participants."""
+
+    class TcpSink:
+        def __init__(self):
+            self.sent = []
+
+        def send(self, payload, log=True):
+            self.sent.append(payload)
+
+    server = WulframServer.__new__(WulframServer)
+    server.udp_handler = None
+    server.remote_combat_observer_packets = False
+
+    observer_session = Session()
+    observer_session.in_game = True
+    observer_ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=observer_session,
+        entity_id=0x14EA,
+    )
+    observer_ctx.tcp_handler = TcpSink()
+
+    participant_session = Session()
+    participant_session.in_game = True
+    participant_session.player_id = 0x053B
+    participant_session.team_id = 1
+    participant_ctx = ClientContext(
+        client_id=2,
+        client_addr=("10.10.10.3", 50001),
+        session=participant_session,
+        entity_id=0x053B,
+    )
+    participant_ctx.tcp_handler = TcpSink()
+    participant_ctx.kills = 1
+    participant_ctx.deaths = 0
+
+    loopback_session = Session()
+    loopback_session.in_game = True
+    loopback_ctx = ClientContext(
+        client_id=3,
+        client_addr=("127.0.0.1", 50002),
+        session=loopback_session,
+        entity_id=0x053C,
+    )
+    loopback_ctx.tcp_handler = TcpSink()
+
+    server._snapshot_clients = lambda: [observer_ctx, participant_ctx, loopback_ctx]
+
+    server._broadcast_player_stats(participant_ctx, participants=(participant_ctx,))
+
+    assert observer_ctx.tcp_handler.sent == [], observer_ctx.tcp_handler.sent
+    assert len(participant_ctx.tcp_handler.sent) == 1
+    assert len(loopback_ctx.tcp_handler.sent) == 1
+    print("test_remote_combat_observer_stats_gate_skips_nonparticipant_og: PASSED")
+    return True
+
+
 def test_control_pos_exact_reset_targets_specific_client():
     """Control `pos c<id> ...` must reset authoritative motion state exactly."""
     server = SimpleNamespace(
@@ -9444,6 +9503,7 @@ def main():
         test_entity_world_collision_clean_path_uses_single_contact_store,
         test_roster_entry_stays_tcp_only,
         test_broadcast_player_stats_stays_tcp_only,
+        test_remote_combat_observer_stats_gate_skips_nonparticipant_og,
         test_control_pos_exact_reset_targets_specific_client,
         test_control_pos_can_apply_live_tap_velocity,
         test_control_heading_set_preserves_yaw_sign_convention,
