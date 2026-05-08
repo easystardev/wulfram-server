@@ -7566,6 +7566,12 @@ class WulframServer:
             "pre_vel": pre_vel,
             "old_heading": yaw,
             "new_heading": ctx.player_heading,
+            "yaw_angular_velocity": ctx.angular_vel_yaw,
+            "vehicle_physics_angular_velocity": (
+                ctx.vehicle_physics.angular_velocity
+                if getattr(ctx, "vehicle_physics", None) is not None
+                else None
+            ),
             "current_speed": current_speed,
             "current_fuel": current_fuel if ctx.entity_type == EntityType.TANK else None,
             "forward_mobility": forward_mobility,
@@ -8113,6 +8119,29 @@ class WulframServer:
                 except ValueError:
                     constraint_kwargs["inactive_retest_bias"] = 0.1
             result = solve_static_terrain_constraint(**constraint_kwargs)
+            result_debug = dict(result.debug)
+            yaw_feedback_mode = os.environ.get(
+                "WULFRAM_ENTITY_TERRAIN_CONTACT_YAW_FEEDBACK",
+                "0",
+            ).strip().lower()
+            yaw_feedback_enabled = yaw_feedback_mode in {
+                "1",
+                "true",
+                "on",
+                "yes",
+                "decompile",
+                "legacy",
+            }
+            raw_contact_angular_velocity = tuple(result.angular_velocity)
+            applied_contact_angular_velocity = (
+                raw_contact_angular_velocity
+                if yaw_feedback_enabled
+                else (
+                    raw_contact_angular_velocity[0],
+                    raw_contact_angular_velocity[1],
+                    before_ang[2],
+                )
+            )
             current_tick = int(getattr(getattr(ctx, "session", None), "tick", 0) or getattr(ctx, "last_client_tick", 0) or 0)
             interp_decision = entity_interpolate_toward_target_decision(
                 current_position=result.position,
@@ -8132,12 +8161,30 @@ class WulframServer:
             )
             anchor[0], anchor[1], anchor[2] = result.position
             vx, vy, vz = result.velocity
-            contact_angular_velocity[0], contact_angular_velocity[1], contact_angular_velocity[2] = result.angular_velocity
+            contact_angular_velocity[0], contact_angular_velocity[1], contact_angular_velocity[2] = applied_contact_angular_velocity
             if interp_decision.update_last_interp_tick:
                 ctx.rigid_body_last_interp_tick = current_tick
             ctx.spring_body_ang_vel = (contact_angular_velocity[0], contact_angular_velocity[1])
             ctx.angular_vel_yaw = contact_angular_velocity[2]
             after_vel = (vx, vy, vz)
+            result_debug["constraint_angular_velocity_after_raw"] = raw_contact_angular_velocity
+            result_debug["constraint_angular_delta_raw"] = (
+                raw_contact_angular_velocity[0] - before_ang[0],
+                raw_contact_angular_velocity[1] - before_ang[1],
+                raw_contact_angular_velocity[2] - before_ang[2],
+            )
+            result_debug["contact_yaw_feedback_enabled"] = yaw_feedback_enabled
+            result_debug["contact_yaw_delta_suppressed"] = (
+                0.0
+                if yaw_feedback_enabled
+                else raw_contact_angular_velocity[2] - before_ang[2]
+            )
+            result_debug["angular_velocity_after"] = tuple(contact_angular_velocity)
+            result_debug["angular_delta"] = (
+                contact_angular_velocity[0] - before_ang[0],
+                contact_angular_velocity[1] - before_ang[1],
+                contact_angular_velocity[2] - before_ang[2],
+            )
             return {
                 "velocity_before": before_vel,
                 "velocity_after": after_vel,
@@ -8147,7 +8194,7 @@ class WulframServer:
                 "interpolation_reset_physics": interp_decision.reset_physics,
                 "interpolation_wake": interp_decision.wake,
                 "interpolation_update_last_interp_tick": interp_decision.update_last_interp_tick,
-                **dict(result.debug),
+                **result_debug,
             }
 
         def apply_contact(contact):

@@ -5303,6 +5303,12 @@ def test_tank_softbody_support_pulls_down_from_compact_equilibrium():
     assert ctx.player_vel[2] < 0.0, ctx.player_vel
     assert ctx.debug_last_controller_step["suspension_model"] == "softbody_per_point_piecewise_probe"
     assert ctx.debug_last_controller_step["softbody_point_count"] == 4
+    assert "yaw_angular_velocity" in ctx.debug_last_controller_step
+    assert abs(ctx.debug_last_controller_step["yaw_angular_velocity"] - ctx.angular_vel_yaw) < 1e-9
+    assert (
+        ctx.debug_last_controller_step["vehicle_physics_angular_velocity"]
+        == ctx.debug_last_controller_step["yaw_angular_velocity"]
+    )
     assert ctx.debug_last_controller_step["softbody_point_velocity_z"] == (
         0.0,
         0.0,
@@ -6596,6 +6602,87 @@ def test_entity_origin_probe_uses_capped_pair_solver_contact_response():
         else:
             os.environ["WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE"] = old_response
     print("test_entity_origin_probe_uses_capped_pair_solver_contact_response: PASSED")
+    return True
+
+
+def test_entity_origin_probe_suppresses_static_terrain_yaw_feedback_by_default():
+    """Tank terrain contact should not feed solver yaw impulse into steering yaw."""
+    old_origin = os.environ.get("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN")
+    old_response = os.environ.get("WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE")
+    old_yaw_feedback = os.environ.get("WULFRAM_ENTITY_TERRAIN_CONTACT_YAW_FEEDBACK")
+    try:
+        os.environ["WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN"] = "entity"
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE", None)
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_CONTACT_YAW_FEEDBACK", None)
+
+        def fake_model_collision(*args, **kwargs):
+            return TerrainContact(
+                position=(2.0, 0.0, 1.0),
+                normal=(0.0, 0.0, 1.0),
+                penetration=0.1,
+                sector_index=0,
+                cell=(0, 0),
+            )
+
+        server = WulframServer.__new__(WulframServer)
+        server._terrain_grid_collision = SimpleNamespace(
+            test_box_collision=lambda *args, **kwargs: None,
+            test_model_collision=fake_model_collision,
+        )
+        server._get_entity_world_half_extents = lambda ctx: (4.0, 4.0, 4.0)
+        server._get_entity_dirty_threshold_sq = lambda ctx, half_extents: 999.0
+        server._get_entity_world_collision_model = lambda ctx: (
+            [],
+            SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=5.0)),
+            5.0,
+            0.0,
+        )
+
+        ctx = ClientContext(
+            client_id=1,
+            client_addr=("10.10.10.2", 50000),
+            session=Session(),
+            entity_id=0x14EA,
+            entity_type=int(EntityType.TANK),
+        )
+        ctx.player_heading = 0.0
+        ctx.player_pos = (0.0, 0.0, 0.0)
+        ctx.world_collision_ref_pos = (0.0, 0.0, 0.0)
+        ctx.angular_vel_yaw = 0.25
+        ctx.spring_body_ang_vel = (0.0, 0.0)
+
+        server._resolve_entity_world_collision(
+            ctx,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            10.0,
+            -2.0,
+        )
+
+        debug = ctx.debug_last_motion_collision
+        assert debug["response"] == "terrain_contact_constraint_solver", debug
+        assert debug["contact_yaw_feedback_enabled"] is False, debug
+        assert abs(debug["constraint_angular_delta_raw"][2]) > 0.01, debug
+        assert abs(debug["contact_yaw_delta_suppressed"]) > 0.01, debug
+        assert abs(ctx.angular_vel_yaw - 0.25) < 1e-9, ctx.angular_vel_yaw
+        assert abs(debug["angular_velocity_after"][2] - 0.25) < 1e-9, debug
+        assert abs(ctx.spring_body_ang_vel[1]) > 0.0, ctx.spring_body_ang_vel
+    finally:
+        if old_origin is None:
+            os.environ.pop("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN", None)
+        else:
+            os.environ["WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN"] = old_origin
+        if old_response is None:
+            os.environ.pop("WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE", None)
+        else:
+            os.environ["WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE"] = old_response
+        if old_yaw_feedback is None:
+            os.environ.pop("WULFRAM_ENTITY_TERRAIN_CONTACT_YAW_FEEDBACK", None)
+        else:
+            os.environ["WULFRAM_ENTITY_TERRAIN_CONTACT_YAW_FEEDBACK"] = old_yaw_feedback
+    print("test_entity_origin_probe_suppresses_static_terrain_yaw_feedback_by_default: PASSED")
     return True
 
 
@@ -9044,6 +9131,7 @@ def main():
         test_entity_world_collision_model_legacy_lift_can_be_requested,
         test_entity_world_half_extents_preserves_mesh_z_extent,
         test_entity_origin_probe_uses_capped_pair_solver_contact_response,
+        test_entity_origin_probe_suppresses_static_terrain_yaw_feedback_by_default,
         test_entity_origin_probe_uses_fed_target_for_interpolation_decision,
         test_static_terrain_constraint_sleeping_body_uses_decompile_scaling,
         test_static_terrain_constraint_retests_inactive_penetrating_contact,
