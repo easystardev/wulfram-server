@@ -3605,6 +3605,7 @@ class WulframServer:
         ctx.player_heading = 0.0
         ctx.angular_vel_yaw = 0.0
         ctx.spring_body_ang_vel = (0.0, 0.0)
+        ctx.spring_body_matrix = _matrix3_from_euler_xyz(0.0, 0.0, 0.0)
         ctx.player_pose["roll"] = 0.0
         ctx.player_pose["pitch"] = 0.0
         ctx.player_pose["yaw"] = 0.0
@@ -3865,6 +3866,7 @@ class WulframServer:
         ctx.player_heading = spawn_yaw
         ctx.angular_vel_yaw = 0.0
         ctx.spring_body_ang_vel = (0.0, 0.0)
+        ctx.spring_body_matrix = _matrix3_from_euler_xyz(0.0, 0.0, spawn_yaw)
         ctx.player_pose["roll"] = 0.0
         ctx.player_pose["pitch"] = 0.0
         ctx.player_pose["yaw"] = -spawn_yaw
@@ -6262,11 +6264,19 @@ class WulframServer:
         )
         body_matrix = None
         if getattr(self, "terrain_pitch_enabled", False):
-            body_matrix = _matrix3_from_euler_xyz(
-                float(ctx.player_pose.get("roll", 0.0) or 0.0),
-                float(ctx.player_pose.get("pitch", 0.0) or 0.0),
-                heading,
-            )
+            try:
+                body_matrix = tuple(
+                    float(v)
+                    for v in tuple(getattr(ctx, "spring_body_matrix", ()) or ())[:9]
+                )
+            except (TypeError, ValueError):
+                body_matrix = ()
+            if len(body_matrix) != 9:
+                body_matrix = _matrix3_from_euler_xyz(
+                    float(ctx.player_pose.get("roll", 0.0) or 0.0),
+                    float(ctx.player_pose.get("pitch", 0.0) or 0.0),
+                    heading,
+                )
         offsets = tank_suspension_world_sample_offsets(
             heading,
             longitudinal=self._TANK_RADIUS * 0.85,
@@ -6360,6 +6370,11 @@ class WulframServer:
             "clearance_ratio": round(float(clearance_ratio), 6),
             "avg_normal": [round(float(v), 6) for v in avg_up],
             "rotation_source": "body_matrix" if body_matrix is not None else "heading_flat",
+            "body_matrix": (
+                [round(float(v), 8) for v in body_matrix]
+                if body_matrix is not None
+                else None
+            ),
             "samples": samples,
         }
         return avg_up, clearance_ratio
@@ -6399,10 +6414,12 @@ class WulframServer:
             ctx.player_pose["pitch"] = 0.0
             ctx.player_pose["yaw"] = -ctx.player_heading
             ctx.spring_body_ang_vel = (0.0, 0.0)
+            ctx.spring_body_matrix = _matrix3_from_euler_xyz(0.0, 0.0, ctx.player_heading)
             return {
                 "source": "flat",
                 "rotation": (0.0, 0.0, ctx.player_heading),
                 "up": (0.0, 0.0, 1.0),
+                "matrix": ctx.spring_body_matrix,
                 "target_rotation": (0.0, 0.0, ctx.player_heading),
                 "angular_velocity": (0.0, 0.0),
             }
@@ -6453,6 +6470,7 @@ class WulframServer:
             pitch = target_pitch
             step = None
             ctx.spring_body_ang_vel = (0.0, 0.0)
+            matrix = _matrix3_from_euler_xyz(roll, pitch, heading)
         else:
             body_vel = getattr(ctx, "spring_body_ang_vel", (0.0, 0.0)) or (0.0, 0.0)
             veh_cfg = VEHICLE_PHYSICS_CONFIGS.get(ctx.entity_type)
@@ -6462,6 +6480,11 @@ class WulframServer:
                 else getattr(ctx, "debug_last_spring_state", {}) or {}
             )
             samples = spring_state.get("samples") if isinstance(spring_state, dict) else None
+            source_matrix = (
+                spring_state.get("body_matrix")
+                if isinstance(spring_state, dict)
+                else None
+            )
             damping = getattr(
                 self,
                 "tank_spring_attitude_damping",
@@ -6490,6 +6513,7 @@ class WulframServer:
                         "tank_spring_attitude_integration",
                         "decompile_accel",
                     ),
+                    rotation_matrix=source_matrix,
                 )
             else:
                 step = tank_spring_attitude_step(
@@ -6506,11 +6530,15 @@ class WulframServer:
             roll = _normalize_angle_client(step.roll)
             pitch = _normalize_angle_client(step.pitch)
             ctx.spring_body_ang_vel = (step.roll_velocity, step.pitch_velocity)
-            matrix = _matrix3_from_euler_xyz(roll, pitch, heading)
+            if hasattr(step, "rotation_matrix") and getattr(step, "rotation_matrix"):
+                matrix = tuple(float(v) for v in step.rotation_matrix)
+            else:
+                matrix = _matrix3_from_euler_xyz(roll, pitch, heading)
             up = (matrix[2], matrix[5], matrix[8])
         ctx.player_pose["roll"] = roll
         ctx.player_pose["pitch"] = pitch
         ctx.player_pose["yaw"] = -ctx.player_heading
+        ctx.spring_body_matrix = tuple(float(v) for v in matrix)
         debug = {
             "target": (target_roll, target_pitch, ctx.player_heading),
             "angular_velocity": ctx.spring_body_ang_vel,
@@ -6539,6 +6567,7 @@ class WulframServer:
                         "spring_angular_delta": step.spring_angular_delta,
                         "angular_velocity_after_spring": step.angular_velocity_after_spring,
                         "angular_velocity_after_damping": step.angular_velocity_after_damping,
+                        "rotation_matrix": step.rotation_matrix,
                     }
                 )
             else:
@@ -6552,6 +6581,7 @@ class WulframServer:
             "source": "terrain_surface",
             "rotation": (roll, pitch, ctx.player_heading),
             "up": up,
+            "matrix": ctx.spring_body_matrix,
             "target_rotation": (target_roll, target_pitch, ctx.player_heading),
             "angular_velocity": ctx.spring_body_ang_vel,
             "spring_attitude": debug,
@@ -7022,6 +7052,7 @@ class WulframServer:
                         yaw,
                         roll=float(ctx.player_pose.get("roll", 0.0) or 0.0),
                         pitch=float(ctx.player_pose.get("pitch", 0.0) or 0.0),
+                        rotation_matrix=getattr(ctx, "spring_body_matrix", None),
                     )
                     drive_basis_source = "entity_body_matrix"
                 else:
@@ -7680,6 +7711,7 @@ class WulframServer:
         ctx.debug_last_controller_step["body_rotation_source"] = body_attitude["source"]
         ctx.debug_last_controller_step["body_rotation"] = body_attitude["rotation"]
         ctx.debug_last_controller_step["body_up"] = body_attitude["up"]
+        ctx.debug_last_controller_step["body_matrix"] = body_attitude.get("matrix")
         ctx.debug_last_controller_step["body_target_rotation"] = body_attitude.get("target_rotation")
         ctx.debug_last_controller_step["body_angular_velocity"] = body_attitude.get("angular_velocity")
         ctx.debug_last_controller_step["spring_attitude"] = body_attitude.get("spring_attitude")
@@ -8042,6 +8074,11 @@ class WulframServer:
                     float((getattr(ctx, "player_pose", {}) or {}).get("roll", 0.0) or 0.0),
                     float((getattr(ctx, "player_pose", {}) or {}).get("pitch", 0.0) or 0.0),
                     float(getattr(ctx, "player_heading", heading) or 0.0),
+                )
+                constraint_kwargs["rotation_matrix"] = getattr(
+                    ctx,
+                    "spring_body_matrix",
+                    None,
                 )
             constraint_retest = os.environ.get(
                 "WULFRAM_ENTITY_TERRAIN_CONSTRAINT_RETEST",

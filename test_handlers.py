@@ -5055,6 +5055,10 @@ def test_tank_surface_attitude_reuses_force_sample_state_without_resampling():
 
     assert len(sampled) == sampled_count, sampled
     assert ctx.debug_last_spring_state == force_state
+    assert len(force_state["body_matrix"]) == 9
+    assert tuple(round(float(v), 8) for v in ctx.spring_body_matrix) == tuple(
+        round(float(v), 8) for v in attitude["spring_attitude"]["rotation_matrix"]
+    )
     assert attitude["spring_attitude"]["model"] == "force"
     assert attitude["spring_attitude"]["spring_state_source"] == "force_sample"
     print("test_tank_surface_attitude_reuses_force_sample_state_without_resampling: PASSED")
