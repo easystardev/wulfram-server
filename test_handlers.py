@@ -4862,6 +4862,138 @@ def test_server_tank_drive_uses_body_matrix_when_body_pose_live():
     return True
 
 
+def test_contact_yaw_velocity_feeds_next_vehicle_physics_tick():
+    """Terrain contact yaw velocity should feed the next steering integration step."""
+    server = WulframServer.__new__(WulframServer)
+    server.tick_rate_hz = 30.0
+    server.linear_damp_driving = 0.0
+    server.linear_damp_coasting = 0.0
+    server.turn_deadzone = 0.05
+    server.turn_sign = -1.0
+    server.strafe_sign = -1.0
+    server.up_axis = "z"
+    server.terrain = None
+    server.terrain_pitch_enabled = False
+    server.tank_drive_terrain_aligned = False
+    server.tank_drive_body_matrix = True
+    server.tank_terrain_contact_coupling_enabled = False
+    server.tank_suspension_enabled = False
+    server.tank_spring_base_offset = 2.0
+    server.tank_spring_attitude_model = "force"
+    server.tank_spring_attitude_damping = 2.0
+    server.gravity = 0.0
+    server.ground_level = 0.0
+    server.world_bound = 100000.0
+    server.f32_physics = False
+    server.jump_jets_enabled = False
+
+    def fake_contact(ctx, px, py, pz, vx, vy, vz):
+        ctx.angular_vel_yaw = 0.75
+        return px, py, pz, vx, vy, vz
+
+    server._resolve_entity_world_collision = fake_contact
+    server._check_building_collisions = lambda ctx, px, py, pz, vx, vy: (px, py, vx, vy)
+
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    ctx.injected_input = (0.0, 0.0)
+    ctx.entity_type = EntityType.TANK
+    ctx.player_pos = (100.0, 200.0, 20.0)
+    ctx.player_vel = (0.0, 0.0, 0.0)
+    ctx.player_speed = 0.0
+    ctx.player_fuel = 33000.0
+    ctx.player_energy = 100.0
+    ctx.player_heading = 0.25
+    ctx.ground_level_override = None
+    ctx.vehicle_physics = SimpleNamespace(heading=ctx.player_heading, angular_velocity=0.0)
+
+    server._update_player_position(ctx, dt_override=1.0 / 30.0)
+
+    assert abs(ctx.vehicle_physics.heading - ctx.player_heading) < 1e-9
+    assert abs(ctx.vehicle_physics.angular_velocity - 0.75) < 1e-9
+    print("test_contact_yaw_velocity_feeds_next_vehicle_physics_tick: PASSED")
+    return True
+
+
+def test_surface_attitude_uses_post_yaw_heading_after_drive_step():
+    """Drive impulse uses old heading, but spring/body attitude should use post-yaw heading."""
+    server = WulframServer.__new__(WulframServer)
+    server.tick_rate_hz = 30.0
+    server.linear_damp_driving = 0.0
+    server.linear_damp_coasting = 0.0
+    server.turn_deadzone = 0.05
+    server.turn_sign = -1.0
+    server.strafe_sign = -1.0
+    server.up_axis = "z"
+    server.terrain = None
+    server.terrain_pitch_enabled = False
+    server.tank_drive_terrain_aligned = False
+    server.tank_drive_body_matrix = True
+    server.tank_terrain_contact_coupling_enabled = False
+    server.tank_suspension_enabled = False
+    server.tank_spring_base_offset = 2.0
+    server.tank_spring_attitude_model = "force"
+    server.tank_spring_attitude_damping = 2.0
+    server.gravity = 0.0
+    server.ground_level = 0.0
+    server.world_bound = 100000.0
+    server.f32_physics = False
+    server.jump_jets_enabled = False
+    server._resolve_entity_world_collision = (
+        lambda ctx, px, py, pz, vx, vy, vz: (px, py, pz, vx, vy, vz)
+    )
+    server._check_building_collisions = lambda ctx, px, py, pz, vx, vy: (px, py, vx, vy)
+
+    headings_seen = []
+
+    def fake_surface_attitude(ctx, heading=None, **kwargs):
+        headings_seen.append(heading)
+        return {
+            "source": "test",
+            "rotation": (0.0, 0.0, heading),
+            "up": (0.0, 0.0, 1.0),
+            "matrix": None,
+            "target_rotation": (0.0, 0.0, heading),
+            "angular_velocity": (0.0, 0.0),
+            "spring_attitude": {},
+        }
+
+    server._update_player_surface_attitude = fake_surface_attitude
+
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    ctx.injected_input = (0.0, 0.0)
+    ctx.entity_type = EntityType.TANK
+    ctx.player_pos = (100.0, 200.0, 20.0)
+    ctx.player_vel = (0.0, 0.0, 0.0)
+    ctx.player_speed = 0.0
+    ctx.player_fuel = 33000.0
+    ctx.player_energy = 100.0
+    old_drive_heading = 0.25
+    ctx.player_heading = 0.5
+    ctx.player_yaw = -ctx.player_heading
+    ctx.angular_vel_yaw = 0.0
+    ctx.ground_level_override = None
+
+    server._update_player_position(
+        ctx,
+        dt_override=1.0 / 30.0,
+        heading_override=old_drive_heading,
+    )
+
+    assert headings_seen == [ctx.player_heading], headings_seen
+    print("test_surface_attitude_uses_post_yaw_heading_after_drive_step: PASSED")
+    return True
+
+
 def test_tank_surface_attitude_uses_spring_normal_for_replication():
     """Replicated tank roll/pitch should follow the spring terrain normal."""
     server = WulframServer.__new__(WulframServer)
@@ -6333,6 +6465,32 @@ def test_entity_world_collision_model_legacy_lift_can_be_requested():
         else:
             os.environ["WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN"] = old_env
     print("test_entity_world_collision_model_legacy_lift_can_be_requested: PASSED")
+    return True
+
+
+def test_entity_world_half_extents_preserves_mesh_z_extent():
+    """Mesh-backed vehicle contact should not inflate Z to the tank radius."""
+    server = WulframServer.__new__(WulframServer)
+    server._entity_collision_extents_cache = {}
+    server._building_collision = SimpleNamespace(
+        available=True,
+        models={
+            "tank_1": SimpleNamespace(
+                collision_mesh=SimpleNamespace(
+                    vertices=[
+                        SimpleNamespace(x=-1.0, y=-2.0, z=-1.5),
+                        SimpleNamespace(x=1.0, y=2.0, z=1.25),
+                    ]
+                )
+            )
+        },
+    )
+    ctx = _fake_tank_collision_context()
+
+    half_extents = server._get_entity_world_half_extents(ctx)
+
+    assert half_extents == (4.0, 4.0, 1.5), half_extents
+    print("test_entity_world_half_extents_preserves_mesh_z_extent: PASSED")
     return True
 
 
@@ -8843,6 +9001,8 @@ def main():
         test_tank_surface_state_uses_behavior_spring_offsets,
         test_tank_surface_state_rotates_spring_points_through_body_pose,
         test_server_tank_drive_uses_body_matrix_when_body_pose_live,
+        test_contact_yaw_velocity_feeds_next_vehicle_physics_tick,
+        test_surface_attitude_uses_post_yaw_heading_after_drive_step,
         test_tank_surface_attitude_uses_spring_normal_for_replication,
         test_tank_surface_attitude_steps_toward_spring_normal,
         test_tank_surface_attitude_force_path_uses_point_clearance_torque,
@@ -8882,6 +9042,7 @@ def main():
         test_entity_world_collision_prefers_mesh_contact_when_collision_model_exists,
         test_entity_world_collision_model_defaults_to_entity_origin_after_pair_solver_port,
         test_entity_world_collision_model_legacy_lift_can_be_requested,
+        test_entity_world_half_extents_preserves_mesh_z_extent,
         test_entity_origin_probe_uses_capped_pair_solver_contact_response,
         test_entity_origin_probe_uses_fed_target_for_interpolation_decision,
         test_static_terrain_constraint_sleeping_body_uses_decompile_scaling,

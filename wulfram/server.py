@@ -7532,6 +7532,8 @@ class WulframServer:
         )
         ctx.player_pose["pos"] = ctx.player_pos
         ctx.player_pose["vel"] = ctx.player_vel
+        if getattr(ctx, "vehicle_physics", None) is not None:
+            ctx.vehicle_physics.angular_velocity = ctx.angular_vel_yaw
         ctx.debug_last_controller_step = {
             "turn_input": (
                 self.turn_sign * ctx.injected_turn
@@ -7711,7 +7713,7 @@ class WulframServer:
         }
         body_attitude = self._update_player_surface_attitude(
             ctx,
-            yaw,
+            ctx.player_heading,
             dt=dt,
             suspension_lift=suspension_lift,
             suspension_point_forces=(
@@ -7808,10 +7810,11 @@ class WulframServer:
             if vertices:
                 xs = [v.x for v in vertices]
                 ys = [v.y for v in vertices]
+                zs = [v.z for v in vertices]
                 half_extents = (
                     max(self._TANK_RADIUS, max(abs(min(xs)), abs(max(xs)))),
                     max(self._TANK_RADIUS, max(abs(min(ys)), abs(max(ys)))),
-                    self._TANK_RADIUS,
+                    max(abs(min(zs)), abs(max(zs))),
                 )
 
         self._entity_collision_extents_cache[cache_key] = half_extents
