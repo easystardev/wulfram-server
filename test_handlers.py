@@ -28,7 +28,7 @@ from wulfram.session import Session, Phase, FEATURES
 from wulfram.server import WulframServer, _StaticWorldRayNode
 from wulfram.physics import _matrix3_from_euler_xyz
 from wulfram.terrain import Terrain
-from wulfram.building_collision import BuildingCollisionAssets
+from wulfram.building_collision import BuildingCollisionAssets, BuildingEntity
 from wulfram.world_collision import TerrainContact, TerrainGridCollision, TerrainRaycastHit
 from wulfram.weapons import (
     WeaponSystem,
@@ -6540,6 +6540,7 @@ def test_entity_origin_probe_uses_capped_pair_solver_contact_response():
         )
         ctx.player_heading = 0.0
         ctx.player_pos = (0.0, 0.0, 0.0)
+        ctx.spring_body_matrix = _matrix3_from_euler_xyz(0.0, 0.0, 0.0)
         ctx.world_collision_ref_pos = (0.0, 0.0, 0.0)
 
         px, py, pz, vx, vy, vz = server._resolve_entity_world_collision(
@@ -6558,11 +6559,46 @@ def test_entity_origin_probe_uses_capped_pair_solver_contact_response():
         assert 0.0 < vx < 0.01, vx
         assert abs(vy) < 1e-6, vy
         assert 0.49 < vz < 0.52, vz
+        assert ctx.debug_last_motion_collision["contact_sector_index"] == 0
+        assert ctx.debug_last_motion_collision["contact_cell"] == (0, 0)
         assert ctx.debug_last_motion_collision["response"] == "terrain_contact_constraint_solver"
         assert ctx.debug_last_motion_collision["position_correction"] <= 0.005
         assert (
             ctx.debug_last_motion_collision["constraint_model"]
             == "decompile_static_terrain_sequential_impulse"
+        )
+        assert ctx.debug_last_motion_collision["rotation_source"] == "rotation_matrix"
+        assert ctx.debug_last_motion_collision["torque_delta_frame"] == "entity_local"
+        assert ctx.debug_last_motion_collision["constraint_record_order"] == "body_static_world"
+        assert (
+            ctx.debug_last_motion_collision["constraint_projection_model"]
+            == "Constraint_compute_velocity_projection_body_minus_world"
+        )
+        assert ctx.debug_last_motion_collision["constraint_world_point_velocity_before"] == (
+            0.0,
+            0.0,
+            0.0,
+        )
+        assert (
+            ctx.debug_last_motion_collision["constraint_relative_velocity_before"]
+            == ctx.debug_last_motion_collision["point_velocity_before"]
+        )
+        assert math.isclose(
+            ctx.debug_last_motion_collision["constraint_separation_speed_before"],
+            ctx.debug_last_motion_collision["point_normal_velocity_before"],
+            rel_tol=1e-6,
+            abs_tol=1e-6,
+        )
+        assert math.isclose(
+            ctx.debug_last_motion_collision["constraint_opposite_separation_speed_before"],
+            -ctx.debug_last_motion_collision["point_normal_velocity_before"],
+            rel_tol=1e-6,
+            abs_tol=1e-6,
+        )
+        assert ctx.debug_last_motion_collision["normal_impulse_body_direction"] == (
+            0.0,
+            0.0,
+            1.0,
         )
         assert (
             ctx.debug_last_motion_collision["inertia_model"]
@@ -6602,6 +6638,93 @@ def test_entity_origin_probe_uses_capped_pair_solver_contact_response():
         else:
             os.environ["WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE"] = old_response
     print("test_entity_origin_probe_uses_capped_pair_solver_contact_response: PASSED")
+    return True
+
+
+def test_entity_origin_probe_can_retest_inactive_penetrating_contact_when_enabled():
+    """Entity-origin terrain contacts can rerun inactive constraints when enabled."""
+    old_origin = os.environ.get("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN")
+    old_response = os.environ.get("WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE")
+    old_retest = os.environ.get("WULFRAM_ENTITY_TERRAIN_CONSTRAINT_RETEST")
+    try:
+        os.environ["WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN"] = "entity"
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE", None)
+        os.environ["WULFRAM_ENTITY_TERRAIN_CONSTRAINT_RETEST"] = "1"
+
+        def fake_model_collision(*args, **kwargs):
+            return TerrainContact(
+                position=(0.0, 0.0, 0.0),
+                normal=(0.0, 0.0, 1.0),
+                penetration=1.0,
+                sector_index=0,
+                cell=(0, 0),
+            )
+
+        server = WulframServer.__new__(WulframServer)
+        server._terrain_grid_collision = SimpleNamespace(
+            test_box_collision=lambda *args, **kwargs: None,
+            test_model_collision=fake_model_collision,
+        )
+        server._get_entity_world_half_extents = lambda ctx: (4.0, 4.0, 4.0)
+        server._get_entity_dirty_threshold_sq = lambda ctx, half_extents: 999.0
+        server._get_entity_world_collision_model = lambda ctx: (
+            [],
+            SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=5.0)),
+            5.0,
+            0.0,
+        )
+
+        ctx = ClientContext(
+            client_id=1,
+            client_addr=("10.10.10.2", 50000),
+            session=Session(),
+            entity_id=0x14EA,
+            entity_type=int(EntityType.TANK),
+        )
+        ctx.player_heading = 0.0
+        ctx.player_pos = (0.0, 0.0, 0.0)
+        ctx.world_collision_ref_pos = (0.0, 0.0, 0.0)
+
+        _px, _py, _pz, _vx, _vy, _vz = server._resolve_entity_world_collision(
+            ctx,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.2,
+        )
+        debug = ctx.debug_last_motion_collision
+
+        assert debug["response"] == "terrain_contact_constraint_solver"
+        assert debug["primary_start_separation_speed"] > 0.005
+        assert debug["primary_normal_iterations"] == 0
+        assert debug["inactive_retest_enabled"] is True
+        assert debug["inactive_retest_applied"] is True
+        assert debug["inactive_retest_iterations"] > 0
+        assert debug["normal_impulse"] > 0.0
+        assert debug["point_normal_velocity_after"] > debug["point_normal_velocity_before"]
+        assert math.isclose(
+            debug["inactive_retest_target_separation"],
+            debug["inactive_retest_start_separation_speed"] + 0.1,
+            rel_tol=1e-6,
+            abs_tol=1e-6,
+        )
+        assert debug["velocity_before"] != debug["velocity_after"]
+    finally:
+        if old_origin is None:
+            os.environ.pop("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN", None)
+        else:
+            os.environ["WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN"] = old_origin
+        if old_response is None:
+            os.environ.pop("WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE", None)
+        else:
+            os.environ["WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE"] = old_response
+        if old_retest is None:
+            os.environ.pop("WULFRAM_ENTITY_TERRAIN_CONSTRAINT_RETEST", None)
+        else:
+            os.environ["WULFRAM_ENTITY_TERRAIN_CONSTRAINT_RETEST"] = old_retest
+    print("test_entity_origin_probe_can_retest_inactive_penetrating_contact_when_enabled: PASSED")
     return True
 
 
@@ -7101,11 +7224,13 @@ def test_entity_origin_probe_can_repeat_bucketed_pair_contacts():
     old_response = os.environ.get("WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE")
     old_timing = os.environ.get("WULFRAM_ENTITY_TERRAIN_CONTACT_TIMING")
     old_iterations = os.environ.get("WULFRAM_ENTITY_TERRAIN_CONTACT_ITERATIONS")
+    old_start_clamp = os.environ.get("WULFRAM_ENTITY_TERRAIN_START_TIME_CLAMP")
     try:
         os.environ["WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN"] = "entity"
         os.environ.pop("WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE", None)
         os.environ["WULFRAM_ENTITY_TERRAIN_CONTACT_TIMING"] = "bucket"
         os.environ["WULFRAM_ENTITY_TERRAIN_CONTACT_ITERATIONS"] = "3"
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_START_TIME_CLAMP", None)
 
         def fake_model_collision(model_center, *args, **kwargs):
             if model_center[0] < 5.0:
@@ -7166,17 +7291,30 @@ def test_entity_origin_probe_can_repeat_bucketed_pair_contacts():
         assert ctx.debug_last_motion_collision["contact_iteration_count"] == 3
         assert ctx.debug_last_motion_collision["contact_events"][0]["collision_at_start"] is False
         assert ctx.debug_last_motion_collision["contact_events"][1]["collision_at_start"] is True
+        assert ctx.debug_last_motion_collision["contact_events"][1]["collision_time_s"] == 0.0
+        assert (
+            ctx.debug_last_motion_collision["contact_events"][1].get("start_time_clamped", False)
+            is False
+        )
         first_event = ctx.debug_last_motion_collision["contact_events"][0]
         assert ctx.debug_last_motion_collision["response"] == "terrain_contact_constraint_solver"
         assert first_event["effective_mass_normal"] > 0.0
         assert first_event["inertia_model"] == "decompile_mesh_bounds_full_extents"
         assert first_event["friction_model"] == "decompile_constraint_apply_friction_min_pair"
+        assert first_event["constraint_record_order"] == "body_static_world"
+        assert (
+            first_event["constraint_projection_model"]
+            == "Constraint_compute_velocity_projection_body_minus_world"
+        )
+        assert "constraint_relative_velocity_before" in first_event
+        assert "constraint_opposite_separation_speed_before" in first_event
         assert abs(first_event["pair_friction_coeff"] - 0.2) < 1e-6
         assert first_event["body_is_sleeping"] is False
         assert first_event["effective_mass_sleep_scale"] == 1.0
         assert first_event["interpolation_action"] == "target_unavailable"
         assert first_event["normal_impulse"] > 0.0
         assert first_event["restitution_impulse"] > 0.0
+        assert first_event["velocity_before"] != first_event["velocity_after"]
     finally:
         if old_origin is None:
             os.environ.pop("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN", None)
@@ -7194,6 +7332,10 @@ def test_entity_origin_probe_can_repeat_bucketed_pair_contacts():
             os.environ.pop("WULFRAM_ENTITY_TERRAIN_CONTACT_ITERATIONS", None)
         else:
             os.environ["WULFRAM_ENTITY_TERRAIN_CONTACT_ITERATIONS"] = old_iterations
+        if old_start_clamp is None:
+            os.environ.pop("WULFRAM_ENTITY_TERRAIN_START_TIME_CLAMP", None)
+        else:
+            os.environ["WULFRAM_ENTITY_TERRAIN_START_TIME_CLAMP"] = old_start_clamp
     print("test_entity_origin_probe_can_repeat_bucketed_pair_contacts: PASSED")
     return True
 
@@ -8936,6 +9078,7 @@ def test_players_json_includes_transport_addresses():
     server = SimpleNamespace(
         clients_lock=threading.Lock(),
         clients={},
+        _get_energy_value=lambda ctx: max(0.0, min(100.0, ctx.player_energy)) / 100.0,
     )
     session = Session()
     session.username = "Player9"
@@ -8952,6 +9095,8 @@ def test_players_json_includes_transport_addresses():
     ctx.player_pos = (5172.77, 5093.27, 5.0)
     ctx.player_vel = (0.0, 0.0, 0.0)
     ctx.player_heading = math.radians(169.8)
+    ctx.player_energy = 42.5
+    ctx.player_fuel = 16500.0
     ctx.action_packet_count = 3
     ctx.nonzero_move_input_count = 1
     ctx.state_request_count = 2
@@ -8969,6 +9114,9 @@ def test_players_json_includes_transport_addresses():
     entry = entries[0]
     assert entry["client_addr"] == ["10.10.10.2", 52731]
     assert entry["udp_addr"] == ["10.10.10.2", 52732]
+    assert entry["energy"] == 42.5
+    assert entry["energy_pct"] == 42.5
+    assert entry["fuel_pct"] == 50.0
     assert entry["telemetry"]["action_packets"] == 3
     assert entry["telemetry"]["nonzero_move_inputs"] == 1
     assert entry["telemetry"]["state_requests"] == 2
@@ -8976,6 +9124,132 @@ def test_players_json_includes_transport_addresses():
     assert entry["telemetry"]["state_sync_view_replies"] == 2
     assert entry["telemetry"]["last_input"]["fwd"] == 0.5
     print("test_players_json_includes_transport_addresses: PASSED")
+    return True
+
+
+def test_energy_control_sets_absolute_or_fractional_energy():
+    """Control `energy set` should expose fuel/energy-pad recovery setup."""
+    server = SimpleNamespace(
+        clients_lock=threading.Lock(),
+        clients={},
+        player_energy_max=100.0,
+        udp_handler=None,
+    )
+    session = Session()
+    session.username = "EnergyBot"
+    session.team_id = 1
+    session.entity_id = 0x542
+    session.udp_addr = ("127.0.0.1", 30000)
+    session.phase = Session().phase.__class__.IN_GAME
+    ctx = ClientContext(
+        client_id=10,
+        client_addr=("127.0.0.1", 30000),
+        session=session,
+        entity_id=0x542,
+    )
+    ctx.player_energy = 100.0
+    server.clients[ctx.client_id] = ctx
+
+    control = ControlServer(port=0)
+    control.server = server
+
+    result = control._cmd_energy(["set", "25", "c10"])
+    assert "25.0/100.0" in result, result
+    assert ctx.player_energy == 25.0, ctx.player_energy
+    result = control._cmd_energy(["set", "0.5", "c10"])
+    assert "50.0/100.0" in result, result
+    assert ctx.player_energy == 50.0, ctx.player_energy
+    text = control._cmd_energy(["c10"])
+    assert "EnergyBot" in text and "50%" in text, text
+    print("test_energy_control_sets_absolute_or_fractional_energy: PASSED")
+    return True
+
+
+def test_buildings_json_exposes_playable_slice_observability():
+    """Control `buildings json` should expose service/turret state for slice smokes."""
+    server = SimpleNamespace(
+        clients_lock=threading.Lock(),
+        clients={},
+        _building_entities={
+            5001: BuildingEntity(
+                x=10.0,
+                y=20.0,
+                z=5.0,
+                entity_type=EntityType.REPAIR_BUILDING,
+                team_id=2,
+            ),
+            5002: BuildingEntity(
+                x=100.0,
+                y=100.0,
+                z=8.0,
+                entity_type=EntityType.GUN_TURRET,
+                team_id=2,
+            ),
+        },
+        _building_health={5001: 1500.0, 5002: 600.0},
+        _building_max_health={5001: 2000.0, 5002: 1200.0},
+        _turret_last_fire={5002: time.monotonic() - 1.0},
+    )
+    server._building_blocks_vehicle_collision = (
+        lambda building: int(building.entity_type) != int(EntityType.REPAIR_BUILDING)
+    )
+    server._building_has_mesh_collision = (
+        lambda building: int(building.entity_type) == int(EntityType.GUN_TURRET)
+    )
+    server._get_building_world_half_extents = lambda _building: (4.0, 5.0, 6.0)
+    server._terrain_ground_z_at = lambda _x, _y: 4.0
+
+    friendly_session = Session()
+    friendly_session.phase = Phase.IN_GAME
+    friendly_session.team_id = 2
+    friendly_ctx = ClientContext(
+        client_id=1,
+        client_addr=("127.0.0.1", 30001),
+        session=friendly_session,
+        entity_id=0x1001,
+    )
+    friendly_ctx.player_pos = (20.0, 20.0, 5.0)
+
+    enemy_session = Session()
+    enemy_session.phase = Phase.IN_GAME
+    enemy_session.team_id = 1
+    enemy_ctx = ClientContext(
+        client_id=2,
+        client_addr=("127.0.0.1", 30002),
+        session=enemy_session,
+        entity_id=0x1002,
+    )
+    enemy_ctx.player_pos = (110.0, 100.0, 5.0)
+
+    server.clients[1] = friendly_ctx
+    server.clients[2] = enemy_ctx
+
+    control = ControlServer(port=0)
+    control.server = server
+
+    entries = json.loads(control._cmd_buildings(["json"]))
+    by_oid = {entry["oid"]: entry for entry in entries}
+
+    repair = by_oid[5001]
+    assert repair["entity_type_name"] == "REPAIR_BUILDING", repair
+    assert repair["service_kind"] == "repair", repair
+    assert repair["blocks_vehicles"] is False, repair
+    assert repair["clients_in_service_range"] == [1], repair
+    assert repair["health_pct"] == 75.0, repair
+    assert repair["terrain_delta_z"] == 1.0, repair
+
+    turret = by_oid[5002]
+    assert turret["entity_type_name"] == "GUN_TURRET", turret
+    assert turret["turret_kind"] == "gun", turret
+    assert turret["has_mesh_collision"] is True, turret
+    assert turret["enemy_clients_in_turret_range"] == [2], turret
+    assert turret["last_turret_fire_age_s"] is not None, turret
+    assert turret["health_pct"] == 50.0, turret
+
+    text = control._cmd_buildings([])
+    assert "REPAIR_BUILDING" in text and "nonblocking" in text, text
+    assert "GUN_TURRET" in text and "turret=gun" in text, text
+    print("test_buildings_json_exposes_playable_slice_observability: PASSED")
     return True
 
 
@@ -9131,6 +9405,7 @@ def main():
         test_entity_world_collision_model_legacy_lift_can_be_requested,
         test_entity_world_half_extents_preserves_mesh_z_extent,
         test_entity_origin_probe_uses_capped_pair_solver_contact_response,
+        test_entity_origin_probe_can_retest_inactive_penetrating_contact_when_enabled,
         test_entity_origin_probe_suppresses_static_terrain_yaw_feedback_by_default,
         test_entity_origin_probe_uses_fed_target_for_interpolation_decision,
         test_static_terrain_constraint_sleeping_body_uses_decompile_scaling,
@@ -9175,6 +9450,8 @@ def main():
         test_solo_local_player_keepalive_shape_triggers_og_state_request_gate,
         test_view_update_pos_without_rot_clamps_to_safe_shape,
         test_players_json_includes_transport_addresses,
+        test_energy_control_sets_absolute_or_fractional_energy,
+        test_buildings_json_exposes_playable_slice_observability,
     ]
 
     passed = 0

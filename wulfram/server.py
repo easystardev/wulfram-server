@@ -7992,6 +7992,17 @@ class WulframServer:
         except ValueError:
             start_iterative_limit = 40
         start_iterative_limit = max(1, min(200, start_iterative_limit))
+        start_time_clamp_mode = (
+            os.environ.get("WULFRAM_ENTITY_TERRAIN_START_TIME_CLAMP", "0").strip().lower()
+        )
+        start_time_clamp_enabled = start_time_clamp_mode in {
+            "1",
+            "true",
+            "on",
+            "yes",
+            "clamp",
+            "decompile",
+        }
         collision_model = self._get_entity_world_collision_model(ctx)
         if collision_model is not None:
             vertices, cbsp_tree, bounding_radius, z_lift = collision_model
@@ -8014,6 +8025,12 @@ class WulframServer:
             float(body_ang_vel[1]) if len(body_ang_vel) > 1 else 0.0,
             float(getattr(ctx, "angular_vel_yaw", 0.0) or 0.0),
         ]
+
+        def contact_debug_fields(contact):
+            return {
+                "contact_sector_index": getattr(contact, "sector_index", None),
+                "contact_cell": getattr(contact, "cell", None),
+            }
 
         def sample_contact_at(pos):
             if collision_model is not None:
@@ -8090,9 +8107,16 @@ class WulframServer:
             )
             contact_rotation_frame = os.environ.get(
                 "WULFRAM_ENTITY_CONTACT_ROTATION_FRAME",
-                "0",
+                "decompile",
             ).strip().lower()
-            if contact_rotation_frame in {"1", "true", "on", "yes", "body", "decompile"}:
+            if contact_rotation_frame not in {
+                "0",
+                "false",
+                "off",
+                "no",
+                "identity",
+                "legacy",
+            }:
                 constraint_kwargs["body_rotation"] = (
                     float((getattr(ctx, "player_pose", {}) or {}).get("roll", 0.0) or 0.0),
                     float((getattr(ctx, "player_pose", {}) or {}).get("pitch", 0.0) or 0.0),
@@ -8252,6 +8276,7 @@ class WulframServer:
                     "point": contact.position,
                     "normal": contact.normal,
                     "depth": contact.penetration,
+                    **contact_debug_fields(contact),
                     "detail": f"reference={reference_pos!r}",
                     **(response_debug or {}),
                 }
@@ -8283,12 +8308,14 @@ class WulframServer:
                 "point": contact.position,
                 "normal": contact.normal,
                 "depth": contact.penetration,
+                **contact_debug_fields(contact),
             }
             ctx.debug_last_collision = {
                 "kind": "terrain_dirty_bounds",
                 "point": contact.position,
                 "normal": contact.normal,
                 "depth": contact.penetration,
+                **contact_debug_fields(contact),
                 "detail": f"reference={reference_pos!r}",
                 **response_debug,
             }
@@ -8329,13 +8356,30 @@ class WulframServer:
                 start_contact is not None
                 and start_contact.penetration > self._PENETRATION_SLOP_DEFAULT
             ):
+                collision_time = min(remaining_time, 0.005) if start_time_clamp_enabled else 0.0
+                contact = start_contact
+                if collision_time > 0.0:
+                    contact_pos, _contact_vel = motion_state_at(
+                        start_pos,
+                        start_vel,
+                        acc,
+                        collision_time,
+                        remaining_time,
+                    )
+                    contact_at_time = sample_contact_at(contact_pos)
+                    if (
+                        contact_at_time is not None
+                        and contact_at_time.penetration > self._PENETRATION_SLOP_DEFAULT
+                    ):
+                        contact = contact_at_time
                 return {
-                    "collision_time_s": 0.0,
-                    "contact": start_contact,
+                    "collision_time_s": collision_time,
+                    "contact": contact,
                     "sweep_iterations": 0,
                     "sweep_clear_count": 0,
-                    "sweep_contact_count": 1,
+                    "sweep_contact_count": 2 if contact is not start_contact else 1,
                     "collision_at_start": True,
+                    "start_time_clamped": collision_time > 0.0,
                 }
 
             end_pos, _end_vel = motion_state_at(start_pos, start_vel, acc, remaining_time, remaining_time)
@@ -8437,8 +8481,11 @@ class WulframServer:
                     "sweep_clear_count": timed_contact["sweep_clear_count"],
                     "sweep_contact_count": timed_contact["sweep_contact_count"],
                     "collision_at_start": timed_contact["collision_at_start"],
+                    "start_time_clamped": timed_contact.get("start_time_clamped", False),
                     "depth": contact.penetration,
                     "normal": contact.normal,
+                    "point": contact.position,
+                    **contact_debug_fields(contact),
                 }
                 if response_debug:
                     event_debug.update({
@@ -8454,9 +8501,32 @@ class WulframServer:
                         "point_normal_velocity_after": response_debug.get("point_normal_velocity_after"),
                         "normal_delta": response_debug.get("normal_delta"),
                         "position_correction": response_debug.get("position_correction"),
+                        "constraint_pair_order": response_debug.get("constraint_pair_order"),
+                        "constraint_record_order": response_debug.get("constraint_record_order"),
+                        "constraint_record_order_source": response_debug.get("constraint_record_order_source"),
+                        "constraint_projection_model": response_debug.get("constraint_projection_model"),
+                        "constraint_world_point_velocity_before": response_debug.get("constraint_world_point_velocity_before"),
+                        "constraint_body_point_velocity_before": response_debug.get("constraint_body_point_velocity_before"),
+                        "constraint_relative_velocity_before": response_debug.get("constraint_relative_velocity_before"),
+                        "constraint_opposite_relative_velocity_before": response_debug.get("constraint_opposite_relative_velocity_before"),
+                        "constraint_normal_used_for_projection": response_debug.get("constraint_normal_used_for_projection"),
+                        "constraint_separation_speed_before": response_debug.get("constraint_separation_speed_before"),
+                        "constraint_opposite_separation_speed_before": response_debug.get("constraint_opposite_separation_speed_before"),
+                        "normal_impulse_body_sign": response_debug.get("normal_impulse_body_sign"),
+                        "normal_impulse_world_sign": response_debug.get("normal_impulse_world_sign"),
+                        "normal_impulse_body_direction": response_debug.get("normal_impulse_body_direction"),
                         "effective_mass_normal": response_debug.get("effective_mass_normal"),
                         "inertia_model": response_debug.get("inertia_model"),
                         "inertia_diagonal": response_debug.get("inertia_diagonal"),
+                        "primary_normal_iterations": response_debug.get("primary_normal_iterations"),
+                        "primary_start_separation_speed": response_debug.get("primary_start_separation_speed"),
+                        "primary_final_separation_speed": response_debug.get("primary_final_separation_speed"),
+                        "inactive_retest_enabled": response_debug.get("inactive_retest_enabled"),
+                        "inactive_retest_applied": response_debug.get("inactive_retest_applied"),
+                        "inactive_retest_iterations": response_debug.get("inactive_retest_iterations"),
+                        "inactive_retest_start_separation_speed": response_debug.get("inactive_retest_start_separation_speed"),
+                        "inactive_retest_target_separation": response_debug.get("inactive_retest_target_separation"),
+                        "inactive_retest_final_separation_speed": response_debug.get("inactive_retest_final_separation_speed"),
                         "normal_impulse": response_debug.get("normal_impulse"),
                         "normal_iterations": response_debug.get("normal_iterations"),
                         "friction_model": response_debug.get("friction_model"),
@@ -8476,6 +8546,10 @@ class WulframServer:
                         "friction_impulse": response_debug.get("friction_impulse"),
                         "friction_iterations": response_debug.get("friction_iterations"),
                         "restitution_impulse": response_debug.get("restitution_impulse"),
+                        "velocity_before": response_debug.get("velocity_before"),
+                        "velocity_after": response_debug.get("velocity_after"),
+                        "angular_velocity_before": response_debug.get("angular_velocity_before"),
+                        "angular_velocity_after": response_debug.get("angular_velocity_after"),
                         "angular_delta": response_debug.get("angular_delta"),
                     })
                 contact_events.append(event_debug)
@@ -8520,6 +8594,7 @@ class WulframServer:
                 "point": contact.position,
                 "normal": contact.normal,
                 "depth": contact.penetration,
+                **contact_debug_fields(contact),
                 "timing_response": (
                     "terrain_contact_pair_toi_single_step"
                     if contact_iteration_limit == 1
@@ -8557,6 +8632,7 @@ class WulframServer:
                 "point": contact.position,
                 "normal": contact.normal,
                 "depth": contact.penetration,
+                **contact_debug_fields(contact),
                 **(response_debug or {}),
             }
             ctx.debug_last_motion_collision = dict(ctx.debug_last_collision)
@@ -8613,6 +8689,7 @@ class WulframServer:
                             "point": contact.position,
                             "normal": contact.normal,
                             "depth": contact.penetration,
+                            **contact_debug_fields(contact),
                             "detail": f"reference={reference_pos!r}",
                         }
                     else:
@@ -8699,6 +8776,8 @@ class WulframServer:
                     "point": terrain_hit.position,
                     "normal": contact_normal,
                     "depth": separation,
+                    "contact_sector_index": terrain_hit.sector_index,
+                    "contact_cell": terrain_hit.cell,
                     "detail": f"reference={reference_pos!r}",
                 }
                 ctx.debug_last_motion_collision = dict(ctx.debug_last_collision)

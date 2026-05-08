@@ -502,6 +502,8 @@ class ControlServer:
             return self._cmd_spawn_entity(args)
         elif cmd == 'health':
             return self._cmd_send_health(args)
+        elif cmd == 'energy' or cmd == 'fuel':
+            return self._cmd_energy(args)
         elif cmd == 'spawn_points':
             return self._cmd_spawn_points(args)
         elif cmd == 'turn':
@@ -535,6 +537,8 @@ class ControlServer:
             return self._cmd_players(args)
         elif cmd == 'projectiles' or cmd == 'proj':
             return self._cmd_projectiles(args)
+        elif cmd == 'buildings' or cmd == 'bld':
+            return self._cmd_buildings(args)
         elif cmd == 'input' or cmd == 'inp':
             return self._cmd_input(args)
         elif cmd == 'move' or cmd == 'mv':
@@ -591,8 +595,11 @@ class ControlServer:
   damage <amt> [c<id>]   - Apply damage (0.2=20%, or 20=20%)
   health [c<id>]         - Show player health
   health set <val> [c<id>] - Set health directly (0.0-1.0)
+  energy [c<id>]         - Show player energy/fuel-local-state value
+  energy set <val> [c<id>] - Set energy (0..1 fraction or absolute units)
   players / pl [json]    - Show all connected players' positions and headings
   projectiles / proj [json] - Dump live in-flight projectile state for divergence probes
+  buildings / bld [json] - Dump static building, supply-pad, and turret state
   jump / jj [secs] [c<id>] - Pulse opt-in server-side jumpjet action
   help                   - Show this help
   quit                   - Disconnect
@@ -1845,6 +1852,16 @@ Examples:
                     "aim_yaw_deg": round(math.degrees(ctx.player_aim_yaw), 1),
                     "aim_pitch_deg": round(math.degrees(ctx.player_aim_pitch), 1),
                     "health_pct": round(ctx.player_health * 100),
+                    "energy": round(float(getattr(ctx, "player_energy", 0.0) or 0.0), 3),
+                    "energy_pct": round(float(self.server._get_energy_value(ctx)) * 100.0, 3)
+                    if callable(getattr(self.server, "_get_energy_value", None))
+                    else None,
+                    "fuel": round(float(getattr(ctx, "player_fuel", 0.0) or 0.0), 3),
+                    "fuel_pct": round(
+                        max(0.0, min(1.0, float(getattr(ctx, "player_fuel", 0.0) or 0.0) / 33000.0))
+                        * 100.0,
+                        3,
+                    ),
                     "terrain": build_player_terrain_probe(
                         self.server,
                         ctx.player_pos,
@@ -1890,6 +1907,196 @@ Examples:
                 f"pos=({x:.1f}, {y:.1f}, {z:.1f}) "
                 f"heading={c['heading_deg']}° aim={c['aim_yaw_deg']}°"
                 f"{vel_str}{hp_str}{input_str}{sync_str}{diagnosis_str}"
+            )
+        return "\n".join(lines)
+
+    def _cmd_buildings(self, args: list) -> str:
+        """Dump static building, supply-pad, and turret state for slice smokes.
+
+        Usage:
+          buildings       - Human-readable one-line-per-building
+          buildings json  - JSON array for tooling
+        """
+        import json as _json
+        import math as _math
+        import time as _time
+        from .weapons import EntityType
+
+        if not self.server:
+            return "Error: No server reference"
+
+        json_mode = bool(args) and args[0].lower() == "json"
+        now = _time.monotonic()
+        building_entities = getattr(self.server, "_building_entities", {}) or {}
+        building_health = getattr(self.server, "_building_health", {}) or {}
+        building_max_health = getattr(self.server, "_building_max_health", {}) or {}
+        turret_last_fire = getattr(self.server, "_turret_last_fire", {}) or {}
+
+        def _entity_type_name(value: object) -> str:
+            try:
+                return EntityType(int(value)).name
+            except Exception:
+                return str(value)
+
+        def _age(ts: float) -> Optional[float]:
+            if not ts or ts <= 0.0:
+                return None
+            return round(max(0.0, now - float(ts)), 3)
+
+        def _xy_distance(a: tuple[float, float], b: tuple[float, float]) -> float:
+            return _math.hypot(float(a[0]) - float(b[0]), float(a[1]) - float(b[1]))
+
+        def _service_kind(entity_type_id: int) -> str:
+            if entity_type_id == int(EntityType.REPAIR_BUILDING):
+                return "repair"
+            if entity_type_id == int(EntityType.FUEL_BUILDING):
+                return "fuel"
+            if entity_type_id == int(EntityType.ENERGY_BUILDING):
+                return "energy"
+            return ""
+
+        def _turret_kind(entity_type_id: int) -> str:
+            if entity_type_id == int(EntityType.GUN_TURRET):
+                return "gun"
+            if entity_type_id == int(EntityType.LAUNCHER):
+                return "launcher"
+            return ""
+
+        players = []
+        with self.server.clients_lock:
+            for ctx in self.server.clients.values():
+                if not ctx or not ctx.running:
+                    continue
+                phase = ctx.session.phase.name if ctx.session else "NONE"
+                if phase != "IN_GAME":
+                    continue
+                players.append(
+                    {
+                        "client_id": ctx.client_id,
+                        "team_id": ctx.session.team_id if ctx.session else 0,
+                        "pos": tuple(float(v) for v in ctx.player_pos),
+                        "health": float(getattr(ctx, "player_health", 0.0) or 0.0),
+                    }
+                )
+
+        entries = []
+        for oid, building in sorted(building_entities.items(), key=lambda item: int(item[0])):
+            entity_type_id = int(getattr(building, "entity_type", -1))
+            team_id = int(getattr(building, "team_id", 0) or 0)
+            pos = (
+                float(getattr(building, "x", 0.0) or 0.0),
+                float(getattr(building, "y", 0.0) or 0.0),
+                float(getattr(building, "z", 0.0) or 0.0),
+            )
+            max_hp = float(building_max_health.get(oid, building_health.get(oid, 0.0)) or 0.0)
+            hp = float(building_health.get(oid, max_hp) or 0.0)
+            half_extents = None
+            get_half_extents = getattr(self.server, "_get_building_world_half_extents", None)
+            if callable(get_half_extents):
+                try:
+                    half_extents = [float(v) for v in get_half_extents(building)]
+                except Exception:
+                    half_extents = None
+            has_mesh = False
+            mesh_probe = getattr(self.server, "_building_has_mesh_collision", None)
+            if callable(mesh_probe):
+                try:
+                    has_mesh = bool(mesh_probe(building))
+                except Exception:
+                    has_mesh = False
+            blocks_vehicles = True
+            block_probe = getattr(self.server, "_building_blocks_vehicle_collision", None)
+            if callable(block_probe):
+                try:
+                    blocks_vehicles = bool(block_probe(building))
+                except Exception:
+                    blocks_vehicles = True
+            terrain_ground_z = None
+            terrain_delta_z = None
+            terrain_probe = getattr(self.server, "_terrain_ground_z_at", None)
+            if callable(terrain_probe):
+                try:
+                    terrain_ground_z = terrain_probe(pos[0], pos[1])
+                except Exception:
+                    terrain_ground_z = None
+            if terrain_ground_z is not None:
+                terrain_ground_z = float(terrain_ground_z)
+                terrain_delta_z = pos[2] - terrain_ground_z
+
+            service_kind = _service_kind(entity_type_id)
+            turret_kind = _turret_kind(entity_type_id)
+            friendly_distances = [
+                _xy_distance((pos[0], pos[1]), (p["pos"][0], p["pos"][1]))
+                for p in players
+                if int(p["team_id"]) == team_id
+            ]
+            enemy_distances = [
+                _xy_distance((pos[0], pos[1]), (p["pos"][0], p["pos"][1]))
+                for p in players
+                if int(p["team_id"]) != team_id
+            ]
+            service_clients = []
+            if service_kind:
+                for p in players:
+                    dist = _xy_distance((pos[0], pos[1]), (p["pos"][0], p["pos"][1]))
+                    if int(p["team_id"]) == team_id and dist <= 40.0:
+                        service_clients.append(int(p["client_id"]))
+            turret_targets = []
+            if turret_kind:
+                range_limit = 200.0 if turret_kind == "launcher" else 120.0
+                for p in players:
+                    dist = _xy_distance((pos[0], pos[1]), (p["pos"][0], p["pos"][1]))
+                    if int(p["team_id"]) != team_id and dist <= range_limit and p["health"] > 0.0:
+                        turret_targets.append(int(p["client_id"]))
+
+            entry = {
+                "oid": int(oid),
+                "entity_type": entity_type_id,
+                "entity_type_name": _entity_type_name(entity_type_id),
+                "team_id": team_id,
+                "pos": [round(v, 5) for v in pos],
+                "heading": float(getattr(building, "heading", 0.0) or 0.0),
+                "health": hp,
+                "max_health": max_hp,
+                "health_pct": round((hp / max_hp * 100.0), 3) if max_hp > 0.0 else None,
+                "alive": hp > 0.0,
+                "service_kind": service_kind,
+                "turret_kind": turret_kind,
+                "last_turret_fire_age_s": _age(float(turret_last_fire.get(oid, 0.0) or 0.0)),
+                "clients_in_service_range": service_clients,
+                "enemy_clients_in_turret_range": turret_targets,
+                "nearest_friendly_distance": round(min(friendly_distances), 3) if friendly_distances else None,
+                "nearest_enemy_distance": round(min(enemy_distances), 3) if enemy_distances else None,
+                "blocks_vehicles": blocks_vehicles,
+                "has_mesh_collision": has_mesh,
+                "half_extents": half_extents,
+                "terrain_ground_z": None if terrain_ground_z is None else round(terrain_ground_z, 5),
+                "terrain_delta_z": None if terrain_delta_z is None else round(terrain_delta_z, 5),
+            }
+            entries.append(entry)
+
+        if json_mode:
+            return _json.dumps(entries, indent=2)
+        if not entries:
+            return "No map buildings loaded"
+        lines = []
+        for entry in entries:
+            flags = []
+            if entry["service_kind"]:
+                flags.append(f"service={entry['service_kind']}")
+            if entry["turret_kind"]:
+                flags.append(f"turret={entry['turret_kind']}")
+            if not entry["blocks_vehicles"]:
+                flags.append("nonblocking")
+            if entry["terrain_delta_z"] is not None:
+                flags.append(f"dz={entry['terrain_delta_z']:.2f}")
+            flag_text = f" {' '.join(flags)}" if flags else ""
+            x, y, z = entry["pos"]
+            hp_pct = entry["health_pct"]
+            hp_text = f"{hp_pct:.0f}%" if hp_pct is not None else "n/a"
+            lines.append(
+                f"oid={entry['oid']} {entry['entity_type_name']} team={entry['team_id']} "
+                f"pos=({x:.1f},{y:.1f},{z:.1f}) hp={hp_text}{flag_text}"
             )
         return "\n".join(lines)
 
@@ -3886,6 +4093,91 @@ Examples:
                 lines.append(
                     f"Client {ctx.client_id} ({name}) [{phase}]: "
                     f"health={ctx.player_health*100:.0f}%"
+                )
+        return "\n".join(lines) if lines else "No matching clients"
+
+    def _cmd_energy(self, args: list) -> str:
+        """
+        Show or set player energy/fuel-local-state value.
+        Usage:
+          energy                    - Show all players' energy
+          energy [c<id>]            - Show a specific player's energy
+          energy set <val> [c<id>]  - Set energy; 0..1 is a fraction, >1 is absolute units
+        """
+        if not self.server:
+            return "Error: No server reference"
+
+        max_energy = float(getattr(self.server, "player_energy_max", 100.0) or 100.0)
+        if max_energy <= 0.0:
+            max_energy = 100.0
+
+        def _client_arg(tokens: list[str], default_active: bool = True):
+            client_filter = None
+            for token in tokens:
+                if token.lower().startswith("c") and token[1:].isdigit():
+                    client_filter = int(token[1:])
+            if client_filter is not None:
+                ctx, _addr = self._get_client_by_id(client_filter)
+                return ctx
+            if default_active:
+                ctx, _addr = self._get_active_client()
+                return ctx
+            return None
+
+        if args and args[0].lower() == "set":
+            if len(args) < 2:
+                return "Usage: energy set <value> [c<id>]"
+            try:
+                requested = float(args[1])
+            except ValueError:
+                return f"Invalid energy value: {args[1]}"
+
+            new_energy = requested * max_energy if 0.0 <= requested <= 1.0 else requested
+            new_energy = max(0.0, min(max_energy, new_energy))
+            ctx = _client_arg(args[2:])
+            if not ctx:
+                return "Error: No connected client"
+
+            old_energy = float(getattr(ctx, "player_energy", 0.0) or 0.0)
+            ctx.player_energy = new_energy
+
+            udp_handler = getattr(self.server, "udp_handler", None)
+            if udp_handler and ctx.session and ctx.session.udp_addr:
+                tick = self.server._get_network_tick(ctx)
+                packet = self.server._build_local_state_heartbeat(
+                    ctx,
+                    tick=tick,
+                    entity_id=ctx.session.entity_id or ctx.entity_id,
+                    include_health=True,
+                    health=self.server._get_health_value(ctx),
+                    fuel=self.server._get_energy_value(ctx),
+                )
+                udp_handler.send_to(packet, ctx.session.udp_addr)
+
+            return (
+                f"Client {ctx.client_id}: energy {old_energy:.1f}/{max_energy:.1f} "
+                f"({old_energy / max_energy * 100.0:.0f}%) -> "
+                f"{new_energy:.1f}/{max_energy:.1f} ({new_energy / max_energy * 100.0:.0f}%)"
+            )
+
+        client_filter = None
+        for token in args:
+            if token.lower().startswith("c") and token[1:].isdigit():
+                client_filter = int(token[1:])
+
+        lines = []
+        with self.server.clients_lock:
+            for ctx in self.server.clients.values():
+                if not ctx or not ctx.running:
+                    continue
+                if client_filter is not None and ctx.client_id != client_filter:
+                    continue
+                phase = ctx.session.phase.name if ctx.session else "NONE"
+                name = ctx.session.username if ctx.session else f"Player{ctx.client_id}"
+                energy = float(getattr(ctx, "player_energy", 0.0) or 0.0)
+                lines.append(
+                    f"Client {ctx.client_id} ({name}) [{phase}]: "
+                    f"energy={energy:.1f}/{max_energy:.1f} ({energy / max_energy * 100.0:.0f}%)"
                 )
         return "\n".join(lines) if lines else "No matching clients"
 
