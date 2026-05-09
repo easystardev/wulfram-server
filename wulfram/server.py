@@ -2946,7 +2946,7 @@ class WulframServer:
             build_ship_status(int(ship["oid"]), team_id, str(ship["name"])),
             build_carrying_info(player_oid, cargo_type=0, has_uplink=True, cargo_count=0),
             # State 3 is the decompile-labeled "in use" uplink state.
-            build_uplink_info(team_id, 3, player_oid),
+            build_uplink_info(team_id, player_oid, 3),
         )
         sent = 0
         for payload in packets:

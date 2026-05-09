@@ -372,17 +372,22 @@ def build_carrying_info(
     )
 
 
-def build_uplink_info(team_index: int, state: int, holder_entity_id: int) -> bytes:
+def build_uplink_info(team_index: int, holder_entity_id: int, state: int) -> bytes:
     """Build UPLINK_INFO (0x2A).
 
-    Decompile (Network/Handlers.c, PacketHandler_UPLINK_INFO):
-      u8 team_index, u32 uplink_state, u32 holder_entity_oid
+    Decompile cross-check:
+      PacketHandler_UPLINK_INFO reads u8, u32, u32 and passes them to
+      Common_TeamUpdateUplinkState(team, arg2, arg3). Team.c stores arg2 as
+      TeamData+0x08 holder entity and arg3 as TeamData+0x04 uplink state.
+
+    Wire body:
+      u8 team_index, u32 holder_entity_oid, u32 uplink_state
     """
     return (
         b'\x2A'
         + struct.pack("B", team_index & 0xFF)
-        + struct.pack(">I", state & 0xFFFFFFFF)
         + struct.pack(">I", holder_entity_id & 0xFFFFFFFF)
+        + struct.pack(">I", state & 0xFFFFFFFF)
     )
 
 

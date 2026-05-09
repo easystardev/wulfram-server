@@ -9697,7 +9697,7 @@ def test_uplink_mvp_bootstrap_sends_minimal_status_packets():
     ship_status = next(payload for payload in sent_payloads if payload and payload[0] == 0x27)
     assert ship_status == build_ship_status(29002, 2, "Team 2 Supply Ship"), ship_status.hex()
     assert build_carrying_info(0x14EA, has_uplink=True) in sent_payloads
-    assert build_uplink_info(2, 3, 0x14EA) in sent_payloads
+    assert build_uplink_info(2, 0x14EA, 3) in sent_payloads
     print("test_uplink_mvp_bootstrap_sends_minimal_status_packets: PASSED")
     return True
 

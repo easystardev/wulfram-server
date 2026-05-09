@@ -334,11 +334,11 @@ def test_carrying_info():
 
 def test_uplink_info():
     """Test UPLINK_INFO packet."""
-    payload = build_uplink_info(1, 3, 0x14EA)
+    payload = build_uplink_info(1, 0x14EA, 3)
 
     print(f"UPLINK_INFO:")
     print(f"  Got: {payload.hex().upper()}")
-    expected = bytes.fromhex("2A0100000003000014EA")
+    expected = bytes.fromhex("2A01000014EA00000003")
     match = payload == expected
     print(f"  Match: {match}")
     return match
