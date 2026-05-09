@@ -2882,10 +2882,18 @@ class WulframServer:
         if ship is not None:
             return ship
         base_pos = tuple(float(v) for v in (ctx.player_pos or (2600.0, 3040.0, 5.0)))
-        x = base_pos[0] + 55.0
-        y = base_pos[1] + 35.0
+        try:
+            offset_x = float(os.environ.get("WULFRAM_UPLINK_SHIP_OFFSET_X", "-450.0"))
+            offset_y = float(os.environ.get("WULFRAM_UPLINK_SHIP_OFFSET_Y", "0.0"))
+            offset_z = float(os.environ.get("WULFRAM_UPLINK_SHIP_OFFSET_Z", "12.0"))
+        except ValueError:
+            offset_x = -450.0
+            offset_y = 0.0
+            offset_z = 12.0
+        x = base_pos[0] + offset_x
+        y = base_pos[1] + offset_y
         ground_z = self._terrain_ground_z_at(x, y)
-        z = (float(ground_z) + 12.0) if ground_z is not None else base_pos[2] + 12.0
+        z = (float(ground_z) + offset_z) if ground_z is not None else base_pos[2] + offset_z
         try:
             base_oid = int(os.environ.get("WULFRAM_UPLINK_SHIP_BASE_OID", "29000"), 0)
         except ValueError:
