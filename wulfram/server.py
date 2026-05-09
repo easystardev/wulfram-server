@@ -8648,18 +8648,38 @@ class WulframServer:
                 return None
             return result if finite_values(result) else None
 
+        def sane_position_triplet(value):
+            result = finite_triplet(value)
+            if result is None:
+                return None
+            pos_limit = max(float(getattr(self, "world_bound", 8192.0) or 8192.0) * 4.0, 32768.0)
+            if any(abs(component) > pos_limit for component in result):
+                return None
+            return result
+
+        def sane_velocity_triplet(value):
+            result = finite_triplet(value)
+            if result is None:
+                return None
+            if any(abs(component) > 10000.0 for component in result):
+                return None
+            return result
+
         def finish_result(px_out, py_out, pz_out, vx_out, vy_out, vz_out, *, reason="terrain_motion_nonfinite_output"):
-            if finite_values((px_out, py_out, pz_out, vx_out, vy_out, vz_out)):
+            if (
+                sane_position_triplet((px_out, py_out, pz_out)) is not None
+                and sane_velocity_triplet((vx_out, vy_out, vz_out)) is not None
+            ):
                 return px_out, py_out, pz_out, vx_out, vy_out, vz_out
 
             fallback_pos = (
-                finite_triplet(pre_pos)
-                or finite_triplet(getattr(ctx, "player_pos", None))
+                sane_position_triplet(pre_pos)
+                or sane_position_triplet(getattr(ctx, "player_pos", None))
                 or (0.0, 0.0, float(getattr(self, "ground_level", 0.0) or 0.0))
             )
             fallback_vel = (
-                finite_triplet(pre_vel)
-                or finite_triplet(getattr(ctx, "player_vel", None))
+                sane_velocity_triplet(pre_vel)
+                or sane_velocity_triplet(getattr(ctx, "player_vel", None))
                 or (0.0, 0.0, 0.0)
             )
             ctx.debug_last_collision = {
@@ -8681,7 +8701,10 @@ class WulframServer:
                 fallback_vel[2],
             )
 
-        if not finite_values((px, py, pz, vx, vy, vz)):
+        if (
+            sane_position_triplet((px, py, pz)) is None
+            or sane_velocity_triplet((vx, vy, vz)) is None
+        ):
             return finish_result(px, py, pz, vx, vy, vz, reason="terrain_motion_nonfinite_input")
 
         half_extents = self._get_entity_world_half_extents(ctx)

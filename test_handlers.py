@@ -7189,6 +7189,40 @@ def test_entity_world_collision_restores_previous_motion_after_nonfinite_input()
     return True
 
 
+def test_entity_world_collision_rejects_pathological_finite_fallback_state():
+    """Huge finite fallback state should fail closed instead of poisoning terrain sampling."""
+    server = WulframServer.__new__(WulframServer)
+    server._terrain_grid_collision = object()
+    server.ground_level = 4.0
+    server.world_bound = 8192.0
+
+    ctx = _fake_tank_collision_context()
+    ctx.player_pos = (1.0e46, -2.0e46, 3.0e45)
+    ctx.player_vel = (4.0e47, -5.0e47, 6.0e46)
+
+    result = server._resolve_entity_world_collision(
+        ctx,
+        -8192.0,
+        -8192.0,
+        -2030.0,
+        -math.inf,
+        -math.inf,
+        0.0,
+        pre_pos=(1.0e46, -2.0e46, 3.0e45),
+        pre_vel=(4.0e47, -5.0e47, 6.0e46),
+        dt=1.0 / 30.0,
+    )
+
+    assert result == (0.0, 0.0, 4.0, 0.0, 0.0, 0.0), result
+    debug = ctx.debug_last_motion_collision
+    assert debug["kind"] == "terrain_motion_nonfinite_input", debug
+    assert debug["fallback_pos"] == (0.0, 0.0, 4.0), debug
+    assert debug["fallback_vel"] == (0.0, 0.0, 0.0), debug
+    assert ctx.world_collision_ref_pos == (0.0, 0.0, 4.0)
+    print("test_entity_world_collision_rejects_pathological_finite_fallback_state: PASSED")
+    return True
+
+
 def test_entity_world_half_extents_preserves_mesh_z_extent():
     """Mesh-backed vehicle contact should not inflate Z to the tank radius."""
     server = WulframServer.__new__(WulframServer)
@@ -10682,6 +10716,7 @@ def main():
         test_entity_world_collision_raw_origin_fallback_can_preserve_angular_velocity,
         test_entity_world_collision_raw_origin_fallback_skips_normal_delta_when_separating,
         test_entity_world_collision_restores_previous_motion_after_nonfinite_input,
+        test_entity_world_collision_rejects_pathological_finite_fallback_state,
         test_entity_world_half_extents_preserves_mesh_z_extent,
         test_entity_origin_probe_uses_capped_pair_solver_contact_response,
         test_entity_origin_probe_can_retest_inactive_penetrating_contact_when_enabled,
