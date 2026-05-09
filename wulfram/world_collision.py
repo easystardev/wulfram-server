@@ -142,6 +142,7 @@ class TerrainContact:
     penetration: float
     sector_index: int
     cell: tuple[int, int]
+    normal_source: str = "unknown"
 
 
 @dataclass(frozen=True)
@@ -156,11 +157,24 @@ class TerrainRaycastHit:
 class TerrainGridCollision:
     """3x3 terrain-sector collision traversal modeled after BSP.c."""
 
-    def __init__(self, terrain, height_offset: float, sector_rows: int = 3, sector_cols: int = 3):
+    def __init__(
+        self,
+        terrain,
+        height_offset: float,
+        sector_rows: int = 3,
+        sector_cols: int = 3,
+        model_contact_normal_source: str = "mesh",
+    ):
         self.terrain = terrain
         self.height_offset = height_offset
         self.sector_rows = sector_rows
         self.sector_cols = sector_cols
+        normal_source = str(model_contact_normal_source or "mesh").strip().lower()
+        self.model_contact_normal_source = (
+            "terrain"
+            if normal_source in {"terrain", "face", "triangle"}
+            else "mesh"
+        )
         self.cell_x = terrain.cell_x
         self.cell_y = terrain.cell_z
         self.world_w = terrain.world_w
@@ -179,6 +193,28 @@ class TerrainGridCollision:
         if normal[2] < 0.0:
             return (-normal[0], -normal[1], -normal[2])
         return normal
+
+    def _contact_normal_for_model_hit(
+        self,
+        tri_world,
+        normal_local,
+        cos_h: float,
+        sin_h: float,
+    ) -> tuple[tuple[float, float, float], str]:
+        if self.model_contact_normal_source == "mesh":
+            normal_world = self._local_to_world_dir(normal_local, cos_h, sin_h)
+            return self._orient_terrain_normal(normal_world), "entity_cbsp_split"
+        # The terrain-face path is a default-off rough-terrain A/B probe.
+        terrain_normal = _normalize3(
+            _cross3(
+                _sub3(tri_world[1], tri_world[0]),
+                _sub3(tri_world[2], tri_world[0]),
+            )
+        )
+        if terrain_normal is None:
+            normal_world = self._local_to_world_dir(normal_local, cos_h, sin_h)
+            return self._orient_terrain_normal(normal_world), "entity_cbsp_split_fallback"
+        return self._orient_terrain_normal(terrain_normal), "terrain_triangle"
 
     @staticmethod
     def _all_finite(values) -> bool:
@@ -413,14 +449,20 @@ class TerrainGridCollision:
                     if mesh_contact is None:
                         continue
                     contact_point_local, normal_local, penetration = mesh_contact
-                    normal_world = self._local_to_world_dir(normal_local, cos_h, sin_h)
+                    normal_world, normal_source = self._contact_normal_for_model_hit(
+                        tri_world,
+                        normal_local,
+                        cos_h,
+                        sin_h,
+                    )
                     contact_world = self._local_to_world_point(contact_point_local, center, cos_h, sin_h)
                     contact = TerrainContact(
                         position=contact_world,
-                        normal=self._orient_terrain_normal(normal_world),
+                        normal=normal_world,
                         penetration=penetration,
                         sector_index=sector.index,
                         cell=(cell_x, cell_y),
+                        normal_source=normal_source,
                     )
                     return contact
 
@@ -467,14 +509,20 @@ class TerrainGridCollision:
                     if mesh_contact is None:
                         continue
                     contact_point_local, normal_local, penetration = mesh_contact
-                    normal_world = self._local_to_world_dir(normal_local, cos_h, sin_h)
+                    normal_world, normal_source = self._contact_normal_for_model_hit(
+                        tri_world,
+                        normal_local,
+                        cos_h,
+                        sin_h,
+                    )
                     contact_world = self._local_to_world_point(contact_point_local, collision_center, cos_h, sin_h)
                     return TerrainContact(
                         position=contact_world,
-                        normal=self._orient_terrain_normal(normal_world),
+                        normal=normal_world,
                         penetration=penetration,
                         sector_index=sector.index,
                         cell=(cell_x, cell_y),
+                        normal_source=normal_source,
                     )
 
         return None

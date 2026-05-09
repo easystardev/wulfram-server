@@ -754,10 +754,15 @@ class WulframServer:
             self._terrain_grid_collision = TerrainGridCollision(
                 self.terrain,
                 self.terrain_physics_height_offset,
+                model_contact_normal_source=os.environ.get(
+                    "WULFRAM_ENTITY_TERRAIN_MODEL_CONTACT_NORMAL",
+                    "mesh",
+                ),
             )
             print(
                 "[COLLISION] Terrain grid collision initialized "
-                f"with {self._terrain_grid_collision.sector_count} sectors"
+                f"with {self._terrain_grid_collision.sector_count} sectors "
+                f"model_contact_normal={self._terrain_grid_collision.model_contact_normal_source}"
             )
         self._load_map_buildings()
         try:
@@ -8782,6 +8787,7 @@ class WulframServer:
             return {
                 "contact_sector_index": getattr(contact, "sector_index", None),
                 "contact_cell": getattr(contact, "cell", None),
+                "contact_normal_source": getattr(contact, "normal_source", None),
             }
 
         def sample_contact_at(pos):
