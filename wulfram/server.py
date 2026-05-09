@@ -93,7 +93,7 @@ from .packets import (
     build_ping_reply,
     build_identified_udp, build_login_status, build_tank_packet,
     build_udp_tank_packet_wf, build_update_array_heartbeat,
-    build_chat_message, build_add_to_roster, build_update_stats, build_player, build_player_info,
+    build_chat_message, build_add_to_roster, build_update_stats, build_update_stats_team_first, build_player, build_player_info,
     build_birth_notice, build_game_clock, build_reincarnate,
     build_update_array_create_tank, build_update_array_player_update,
     build_view_update_create_tank,
@@ -2943,6 +2943,10 @@ class WulframServer:
         player_oid = int(ctx.session.entity_id or ctx.entity_id)
         ship = self._get_or_create_uplink_ship(ctx, team_id)
         packets = (
+            # ADD_TO_ROSTER creates the local PlayerEntry, but the decompile shows
+            # UPDATE_STATS is the path that writes g_player_team.  The uplink UI
+            # uses that global to find the team supply ship.
+            build_update_stats_team_first(player_id=player_oid, entity_id=player_oid, team_id=team_id),
             build_ship_status(int(ship["oid"]), team_id, str(ship["name"])),
             build_carrying_info(player_oid, cargo_type=0, has_uplink=True, cargo_count=0),
             # State 3 is the decompile-labeled "in use" uplink state.

@@ -65,6 +65,7 @@ from wulfram.packets import (
     build_view_update_create_tank,
     build_update_array_heartbeat,
     build_world_stats,
+    build_update_stats_team_first,
     build_ship_status,
     build_carrying_info,
     build_uplink_info,
@@ -9681,7 +9682,7 @@ def test_build_uplink_command_creates_dynamic_building():
 
 
 def test_uplink_mvp_bootstrap_sends_minimal_status_packets():
-    """Default-off build/uplink bootstrap should send ship, carrying, and uplink state."""
+    """Default-off build/uplink bootstrap should send local team and uplink state."""
     ctx = _in_game_context()
     server = _minimal_build_uplink_server(ctx)
 
@@ -9691,9 +9692,11 @@ def test_uplink_mvp_bootstrap_sends_minimal_status_packets():
     opcodes = [payload[0] for payload in sent_payloads if payload]
     assert ctx.uplink_mvp_bootstrap_sent is True, opcodes
     assert 0x0E in opcodes, opcodes
+    assert 0x1C in opcodes, opcodes
     assert 0x27 in opcodes, opcodes
     assert 0x29 in opcodes, opcodes
     assert 0x2A in opcodes, opcodes
+    assert build_update_stats_team_first(player_id=0x14EA, entity_id=0x14EA, team_id=2) in sent_payloads
     ship_status = next(payload for payload in sent_payloads if payload and payload[0] == 0x27)
     assert ship_status == build_ship_status(29002, 2, "Team 2 Supply Ship"), ship_status.hex()
     assert build_carrying_info(0x14EA, has_uplink=True) in sent_payloads
