@@ -8839,6 +8839,21 @@ class WulframServer:
             "fallback",
             "decompile",
         }
+        raw_fallback_timed_mode = (
+            os.environ.get("WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_TIMED_FALLBACK", "0")
+            .strip()
+            .lower()
+        )
+        raw_fallback_timed_enabled = raw_fallback_enabled and raw_fallback_timed_mode in {
+            "1",
+            "true",
+            "on",
+            "yes",
+            "timed",
+            "sweep",
+            "bucket",
+            "decompile",
+        }
         try:
             raw_fallback_min_depth = float(
                 os.environ.get("WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_MIN_DEPTH", "2.0")
@@ -8977,7 +8992,7 @@ class WulframServer:
                         raw_bounds_contact = None
             return raw_contact, raw_bounds_contact, None
 
-        def raw_origin_fallback_reject_reason(raw_contact):
+        def raw_origin_fallback_reject_reason(raw_contact, *, velocity=None):
             if not raw_fallback_enabled:
                 return "disabled"
             if raw_contact is None:
@@ -8985,7 +9000,12 @@ class WulframServer:
             try:
                 depth = float(raw_contact.penetration)
                 normal_z = float(raw_contact.normal[2])
-                speed = math.sqrt(vx * vx + vy * vy + vz * vz)
+                speed_vel = velocity if velocity is not None else (vx, vy, vz)
+                speed = math.sqrt(
+                    float(speed_vel[0]) * float(speed_vel[0])
+                    + float(speed_vel[1]) * float(speed_vel[1])
+                    + float(speed_vel[2]) * float(speed_vel[2])
+                )
             except (TypeError, ValueError, OverflowError, IndexError):
                 return "nonfinite_raw_origin_contact"
             if depth <= self._PENETRATION_SLOP_DEFAULT:
@@ -9025,6 +9045,21 @@ class WulframServer:
                 cell=raw_contact.cell,
                 normal_source="terrain_triangle",
             )
+
+        def sample_raw_origin_fallback_contact_at(pos, *, velocity=None):
+            raw_contact, raw_bounds_contact, raw_error = sample_raw_origin_contact_at(pos)
+            fallback_contact = raw_origin_contact_for_fallback(raw_contact)
+            reject = raw_origin_fallback_reject_reason(
+                fallback_contact,
+                velocity=velocity,
+            )
+            return {
+                "contact": fallback_contact,
+                "raw_contact": fallback_contact,
+                "raw_bounds_contact": raw_bounds_contact,
+                "raw_error": raw_error,
+                "reject": reject,
+            }
 
         def update_contact_probe(
             pos,
@@ -9664,13 +9699,60 @@ class WulframServer:
             remaining_time = max(0.0, float(remaining_time))
             if remaining_time <= 0.0:
                 return None
-            start_contact = sample_contact_at(start_pos)
+
+            def timed_contact_candidate_at(pos, velocity):
+                lifted_contact = sample_contact_at(pos)
+                if (
+                    lifted_contact is not None
+                    and lifted_contact.penetration > self._PENETRATION_SLOP_DEFAULT
+                ):
+                    return {
+                        "contact": lifted_contact,
+                        "raw_origin_fallback": False,
+                    }
+                if not raw_fallback_timed_enabled:
+                    return {
+                        "contact": lifted_contact,
+                        "raw_origin_fallback": False,
+                    }
+                raw_probe = sample_raw_origin_fallback_contact_at(pos, velocity=velocity)
+                raw_contact = raw_probe.get("contact")
+                if (
+                    raw_probe.get("raw_error") is None
+                    and raw_contact is not None
+                    and raw_probe.get("reject") == ""
+                    and raw_contact.penetration > self._PENETRATION_SLOP_DEFAULT
+                ):
+                    return {
+                        "contact": raw_contact,
+                        "raw_origin_fallback": True,
+                        "raw_origin_fallback_reject": "",
+                        "raw_origin_fallback_probe_reason": (
+                            "timed_lifted_clear_raw_origin_contact"
+                            if lifted_contact is None
+                            else "timed_lifted_below_slop_raw_origin_contact"
+                        ),
+                    }
+                return {
+                    "contact": lifted_contact,
+                    "raw_origin_fallback": False,
+                    "raw_origin_fallback_reject": raw_probe.get("reject"),
+                    "raw_origin_fallback_probe_reason": (
+                        "timed_lifted_clear_raw_origin_rejected"
+                        if lifted_contact is None
+                        else "timed_lifted_below_slop_raw_origin_rejected"
+                    ),
+                }
+
+            start_candidate = timed_contact_candidate_at(start_pos, start_vel)
+            start_contact = start_candidate.get("contact")
             if (
                 start_contact is not None
                 and start_contact.penetration > self._PENETRATION_SLOP_DEFAULT
             ):
                 collision_time = min(remaining_time, 0.005) if start_time_clamp_enabled else 0.0
                 contact = start_contact
+                contact_candidate = start_candidate
                 if collision_time > 0.0:
                     contact_pos, _contact_vel = motion_state_at(
                         start_pos,
@@ -9679,12 +9761,17 @@ class WulframServer:
                         collision_time,
                         remaining_time,
                     )
-                    contact_at_time = sample_contact_at(contact_pos)
+                    contact_candidate_at_time = timed_contact_candidate_at(
+                        contact_pos,
+                        _contact_vel,
+                    )
+                    contact_at_time = contact_candidate_at_time.get("contact")
                     if (
                         contact_at_time is not None
                         and contact_at_time.penetration > self._PENETRATION_SLOP_DEFAULT
                     ):
                         contact = contact_at_time
+                        contact_candidate = contact_candidate_at_time
                 return {
                     "collision_time_s": collision_time,
                     "contact": contact,
@@ -9693,10 +9780,20 @@ class WulframServer:
                     "sweep_contact_count": 2 if contact is not start_contact else 1,
                     "collision_at_start": True,
                     "start_time_clamped": collision_time > 0.0,
+                    "raw_origin_fallback": bool(
+                        contact_candidate.get("raw_origin_fallback")
+                    ),
+                    "raw_origin_fallback_reject": contact_candidate.get(
+                        "raw_origin_fallback_reject"
+                    ),
+                    "raw_origin_fallback_probe_reason": contact_candidate.get(
+                        "raw_origin_fallback_probe_reason"
+                    ),
                 }
 
-            end_pos, _end_vel = motion_state_at(start_pos, start_vel, acc, remaining_time, remaining_time)
-            end_contact = sample_contact_at(end_pos)
+            end_pos, end_vel = motion_state_at(start_pos, start_vel, acc, remaining_time, remaining_time)
+            end_candidate = timed_contact_candidate_at(end_pos, end_vel)
+            end_contact = end_candidate.get("contact")
             if (
                 end_contact is None
                 or end_contact.penetration <= self._PENETRATION_SLOP_DEFAULT
@@ -9706,13 +9803,15 @@ class WulframServer:
             lo = 0.0
             hi = remaining_time
             contact = end_contact
+            contact_candidate = end_candidate
             iterations = 0
             clear_count = 0
             contact_count = 1
             while hi - lo > 0.0025 and iterations < 24:
                 mid = (lo + hi) * 0.5
-                mid_pos, _mid_vel = motion_state_at(start_pos, start_vel, acc, mid, remaining_time)
-                mid_contact = sample_contact_at(mid_pos)
+                mid_pos, mid_vel = motion_state_at(start_pos, start_vel, acc, mid, remaining_time)
+                mid_candidate = timed_contact_candidate_at(mid_pos, mid_vel)
+                mid_contact = mid_candidate.get("contact")
                 iterations += 1
                 if (
                     mid_contact is not None
@@ -9720,6 +9819,7 @@ class WulframServer:
                 ):
                     hi = mid
                     contact = mid_contact
+                    contact_candidate = mid_candidate
                     contact_count += 1
                 else:
                     lo = mid
@@ -9732,6 +9832,15 @@ class WulframServer:
                 "sweep_clear_count": clear_count,
                 "sweep_contact_count": contact_count,
                 "collision_at_start": False,
+                "raw_origin_fallback": bool(
+                    contact_candidate.get("raw_origin_fallback")
+                ),
+                "raw_origin_fallback_reject": contact_candidate.get(
+                    "raw_origin_fallback_reject"
+                ),
+                "raw_origin_fallback_probe_reason": contact_candidate.get(
+                    "raw_origin_fallback_probe_reason"
+                ),
             }
 
         def resolve_timed_pair_contact():
@@ -9779,8 +9888,25 @@ class WulframServer:
                 vx, vy, vz = contact_vel
                 if timed_contact["collision_at_start"] and start_iterative_enabled:
                     response_debug = apply_iterative_start_contact(contact)
+                elif timed_contact.get("raw_origin_fallback"):
+                    response_debug, applied_raw_fallback = apply_raw_origin_fallback_contact(
+                        contact
+                    )
+                    if not applied_raw_fallback:
+                        return False
                 else:
                     response_debug = apply_contact(contact)
+                if timed_contact.get("raw_origin_fallback") and response_debug is not None:
+                    response_debug.update({
+                        "raw_origin_fallback": True,
+                        "raw_origin_timed_fallback": True,
+                        "raw_origin_fallback_reject": timed_contact.get(
+                            "raw_origin_fallback_reject"
+                        ),
+                        "raw_origin_fallback_probe_reason": timed_contact.get(
+                            "raw_origin_fallback_probe_reason"
+                        ),
+                    })
 
                 elapsed += collision_time
                 current_pos = (anchor[0], anchor[1], anchor[2])
@@ -9795,6 +9921,14 @@ class WulframServer:
                     "sweep_contact_count": timed_contact["sweep_contact_count"],
                     "collision_at_start": timed_contact["collision_at_start"],
                     "start_time_clamped": timed_contact.get("start_time_clamped", False),
+                    "raw_origin_fallback": bool(timed_contact.get("raw_origin_fallback")),
+                    "raw_origin_timed_fallback": bool(timed_contact.get("raw_origin_fallback")),
+                    "raw_origin_fallback_reject": timed_contact.get(
+                        "raw_origin_fallback_reject"
+                    ),
+                    "raw_origin_fallback_probe_reason": timed_contact.get(
+                        "raw_origin_fallback_probe_reason"
+                    ),
                     "depth": contact.penetration,
                     "normal": contact.normal,
                     "point": contact.position,
@@ -9925,6 +10059,10 @@ class WulframServer:
                 "final_remaining_time_s": remaining,
                 "contact_iteration_limit": contact_iteration_limit,
                 "contact_iteration_count": len(contact_events),
+                "raw_origin_timed_fallback_enabled": raw_fallback_timed_enabled,
+                "raw_origin_timed_fallback_event_count": sum(
+                    1 for event in contact_events if event.get("raw_origin_timed_fallback")
+                ),
                 "sweep_iterations": sum(event["sweep_iterations"] for event in contact_events),
                 "sweep_clear_count": sum(event["sweep_clear_count"] for event in contact_events),
                 "sweep_contact_count": sum(event["sweep_contact_count"] for event in contact_events),

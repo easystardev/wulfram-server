@@ -8143,6 +8143,122 @@ def test_entity_origin_probe_can_repeat_bucketed_pair_contacts():
     return True
 
 
+def test_lifted_timed_probe_can_use_guarded_raw_origin_contact():
+    """Opt-in timed raw-origin fallback should fill lifted sweep misses at the contact time."""
+    env_keys = [
+        "WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN",
+        "WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE",
+        "WULFRAM_ENTITY_TERRAIN_CONTACT_TIMING",
+        "WULFRAM_ENTITY_TERRAIN_CONTACT_ITERATIONS",
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK",
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_TIMED_FALLBACK",
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_MIN_DEPTH",
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_MAX_DEPTH",
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_MIN_SPEED",
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_MAX_VELOCITY_DELTA",
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_MAX_SPEED",
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_MAX_ANGULAR_DELTA",
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_NORMAL_SOURCE",
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_DELTA_MODE",
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_ANGULAR_MODE",
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_CLOSING_ONLY",
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FRICTION",
+    ]
+    old_env = {key: os.environ.get(key) for key in env_keys}
+    try:
+        os.environ.pop("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN", None)
+        os.environ["WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE"] = "pair"
+        os.environ["WULFRAM_ENTITY_TERRAIN_CONTACT_TIMING"] = "bucket"
+        os.environ["WULFRAM_ENTITY_TERRAIN_CONTACT_ITERATIONS"] = "1"
+        os.environ["WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK"] = "1"
+        os.environ["WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_TIMED_FALLBACK"] = "1"
+        os.environ["WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_MIN_DEPTH"] = "0.1"
+        os.environ["WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_MAX_DEPTH"] = "40.0"
+        os.environ["WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_MIN_SPEED"] = "0.0"
+        os.environ["WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_MAX_VELOCITY_DELTA"] = "20.0"
+        os.environ["WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_MAX_SPEED"] = "200.0"
+        os.environ["WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_MAX_ANGULAR_DELTA"] = "0.5"
+        os.environ["WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_NORMAL_SOURCE"] = "mesh"
+        os.environ["WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_DELTA_MODE"] = "solver"
+        os.environ["WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_ANGULAR_MODE"] = "solver"
+        os.environ["WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_CLOSING_ONLY"] = "1"
+        os.environ["WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FRICTION"] = "default"
+        calls = []
+
+        def fake_model_collision(model_center, *args, **kwargs):
+            calls.append(model_center)
+            if abs(model_center[2]) > 1e-6 or model_center[0] < 5.0:
+                return None
+            return TerrainContact(
+                position=(5.0, 0.0, 0.0),
+                normal=(0.0, 0.0, 1.0),
+                penetration=26.0,
+                sector_index=0,
+                cell=(0, 0),
+                normal_source="terrain_triangle",
+            )
+
+        server = WulframServer.__new__(WulframServer)
+        server._terrain_grid_collision = SimpleNamespace(
+            test_box_collision=lambda *args, **kwargs: None,
+            test_model_collision=fake_model_collision,
+        )
+        server._get_entity_world_half_extents = lambda ctx: (4.0, 4.0, 4.0)
+        server._get_entity_dirty_threshold_sq = lambda ctx, half_extents: 999.0
+        server._get_entity_world_collision_model = lambda ctx: (
+            [],
+            SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=5.0)),
+            5.0,
+            3.0,
+        )
+
+        ctx = ClientContext(
+            client_id=1,
+            client_addr=("10.10.10.2", 50000),
+            session=Session(),
+            entity_id=0x14EA,
+            entity_type=int(EntityType.TANK),
+        )
+        ctx.player_heading = 0.0
+        ctx.player_pos = (0.0, 0.0, 0.0)
+        ctx.world_collision_ref_pos = (0.0, 0.0, 0.0)
+
+        px, py, pz, vx, vy, vz = server._resolve_entity_world_collision(
+            ctx,
+            10.0,
+            0.0,
+            0.0,
+            10.0,
+            0.0,
+            0.0,
+            pre_pos=(0.0, 0.0, 0.0),
+            pre_vel=(10.0, 0.0, 0.0),
+            dt=1.0,
+        )
+
+        debug = ctx.debug_last_motion_collision
+        assert debug["timing_response"] == "terrain_contact_pair_toi_single_step", debug
+        assert debug["raw_origin_timed_fallback_event_count"] == 1, debug
+        assert debug["raw_origin_timed_fallback"] is True, debug
+        assert debug["raw_origin_fallback"] is True, debug
+        assert debug["raw_origin_fallback_reject"] == "", debug
+        assert debug["contact_events"][0]["raw_origin_timed_fallback"] is True, debug
+        assert debug["contact_events"][0]["raw_origin_fallback_reject"] == "", debug
+        assert 0.49 < debug["collision_time_s"] < 0.51, debug
+        assert pz > 0.0, (px, py, pz)
+        assert vz > 0.0, (vx, vy, vz)
+        assert any(abs(call[2] - 3.0) < 1e-6 for call in calls), calls
+        assert any(abs(call[2]) < 1e-6 for call in calls), calls
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    print("test_lifted_timed_probe_can_use_guarded_raw_origin_contact: PASSED")
+    return True
+
+
 def test_collision_at_start_can_use_iterative_world_separation():
     """Collision-at-start pair records can route to the OG iterative separation branch."""
     old_origin = os.environ.get("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN")
@@ -10730,6 +10846,7 @@ def main():
         test_entity_interpolation_decision_matches_decompile_gates,
         test_entity_origin_probe_applies_pair_solver_at_contact_time,
         test_entity_origin_probe_can_repeat_bucketed_pair_contacts,
+        test_lifted_timed_probe_can_use_guarded_raw_origin_contact,
         test_collision_at_start_can_use_iterative_world_separation,
         test_entity_world_collision_falls_back_to_box_without_collision_model,
         test_entity_world_collision_uses_dirty_terrain_raycast_branch,
