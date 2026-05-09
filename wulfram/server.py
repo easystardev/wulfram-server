@@ -8171,6 +8171,7 @@ class WulframServer:
 
         ctx.debug_last_collision = {}
         ctx.debug_last_motion_collision = {}
+        ctx.debug_last_terrain_contact_probe = {}
         ctx.rigid_body_target_pos = (new_x, new_y, new_z)
         ctx.rigid_body_target_rot = (
             float((getattr(ctx, "player_pose", {}) or {}).get("roll", 0.0) or 0.0),
@@ -8418,6 +8419,7 @@ class WulframServer:
             "world_collision_ref_pos": getattr(ctx, "world_collision_ref_pos", None),
             "world_collision_bounds_dirty": bool(getattr(ctx, "world_collision_bounds_dirty", False)),
             "motion_collision": dict(getattr(ctx, "debug_last_motion_collision", {}) or {}),
+            "terrain_contact_probe": dict(getattr(ctx, "debug_last_terrain_contact_probe", {}) or {}),
             "pos": ctx.player_pos,
             "vel": ctx.player_vel,
         }
@@ -8790,6 +8792,123 @@ class WulframServer:
                 "contact_normal_source": getattr(contact, "normal_source", None),
             }
 
+        contact_probe_mode = (
+            os.environ.get("WULFRAM_ENTITY_TERRAIN_CONTACT_PROBE", "1").strip().lower()
+        )
+        contact_probe_enabled = contact_probe_mode not in {
+            "0",
+            "false",
+            "off",
+            "no",
+            "disabled",
+        }
+
+        def probe_contact_fields(contact, *, center, z_lift_used):
+            if contact is None:
+                return None
+            return {
+                "point": getattr(contact, "position", None),
+                "normal": getattr(contact, "normal", None),
+                "depth": getattr(contact, "penetration", None),
+                "contact_sector_index": getattr(contact, "sector_index", None),
+                "contact_cell": getattr(contact, "cell", None),
+                "contact_normal_source": getattr(contact, "normal_source", None),
+                "model_center": center,
+                "z_lift": z_lift_used,
+            }
+
+        def update_contact_probe(pos, lifted_contact, *, reason):
+            ctx.debug_last_terrain_contact_probe = {}
+            if (
+                not contact_probe_enabled
+                or collision_model is None
+                or vertices is None
+                or cbsp_tree is None
+            ):
+                return
+            if not finite_values((*pos, heading)):
+                ctx.debug_last_terrain_contact_probe = {
+                    "reason": "nonfinite_probe_position",
+                    "origin_mode": origin_mode,
+                    "probe_enabled": True,
+                }
+                return
+            lifted_center = (pos[0], pos[1], pos[2] + z_lift)
+            raw_center = (pos[0], pos[1], pos[2])
+            raw_contact = None
+            raw_bounds_contact = None
+            if lifted_contact is None and origin_mode not in {"entity", "origin", "raw"}:
+                try:
+                    raw_contact = self._terrain_grid_collision.test_model_collision(
+                        raw_center,
+                        heading,
+                        vertices,
+                        cbsp_tree,
+                        bounding_radius,
+                    )
+                except Exception as exc:  # pragma: no cover - diagnostic only
+                    ctx.debug_last_terrain_contact_probe = {
+                        "reason": "raw_origin_probe_error",
+                        "error": str(exc),
+                        "origin_mode": origin_mode,
+                        "probe_enabled": True,
+                    }
+                    return
+                if raw_contact is None:
+                    bounds_probe = getattr(
+                        self._terrain_grid_collision,
+                        "test_model_bounds_contact",
+                        None,
+                    )
+                    if callable(bounds_probe):
+                        try:
+                            raw_bounds_contact = bounds_probe(
+                                raw_center,
+                                raw_center,
+                                heading,
+                                vertices,
+                                cbsp_tree,
+                                bounding_radius,
+                            )
+                        except Exception:
+                            raw_bounds_contact = None
+
+            if lifted_contact is not None:
+                probe_reason = "lifted_contact"
+            elif raw_contact is not None:
+                probe_reason = "lifted_clear_raw_origin_contact"
+            elif raw_bounds_contact is not None:
+                probe_reason = "lifted_clear_raw_origin_bounds_contact"
+            else:
+                probe_reason = reason
+            ctx.debug_last_terrain_contact_probe = {
+                "reason": probe_reason,
+                "origin_mode": origin_mode,
+                "contact_response": contact_response,
+                "contact_timing_mode": contact_timing_mode,
+                "probe_enabled": True,
+                "position": pos,
+                "velocity": (vx, vy, vz),
+                "heading": heading,
+                "model_z_lift": z_lift,
+                "bounding_radius": bounding_radius,
+                "lifted_contact": probe_contact_fields(
+                    lifted_contact,
+                    center=lifted_center,
+                    z_lift_used=z_lift,
+                ),
+                "raw_origin_contact": probe_contact_fields(
+                    raw_contact,
+                    center=raw_center,
+                    z_lift_used=0.0,
+                ),
+                "raw_origin_bounds_contact": probe_contact_fields(
+                    raw_bounds_contact,
+                    center=raw_center,
+                    z_lift_used=0.0,
+                ),
+            }
+
         def sample_contact_at(pos):
             if not finite_values((*pos, heading)):
                 return None
@@ -8864,6 +8983,10 @@ class WulframServer:
                 correction_cap=correction_cap,
                 constraint_iterations=constraint_iterations,
                 restitution_fraction=restitution_fraction,
+                projection_order=os.environ.get(
+                    "WULFRAM_ENTITY_TERRAIN_PROJECTION_ORDER",
+                    "body_minus_world",
+                ),
             )
             contact_rotation_frame = os.environ.get(
                 "WULFRAM_ENTITY_CONTACT_ROTATION_FRAME",
@@ -9276,11 +9399,17 @@ class WulframServer:
                         "constraint_record_order": response_debug.get("constraint_record_order"),
                         "constraint_record_order_source": response_debug.get("constraint_record_order_source"),
                         "constraint_projection_model": response_debug.get("constraint_projection_model"),
+                        "constraint_projection_order": response_debug.get("constraint_projection_order"),
+                        "constraint_projection_speed_source": response_debug.get("constraint_projection_speed_source"),
+                        "constraint_primary_projection_speed_source": response_debug.get("constraint_primary_projection_speed_source"),
                         "constraint_world_point_velocity_before": response_debug.get("constraint_world_point_velocity_before"),
                         "constraint_body_point_velocity_before": response_debug.get("constraint_body_point_velocity_before"),
                         "constraint_relative_velocity_before": response_debug.get("constraint_relative_velocity_before"),
                         "constraint_opposite_relative_velocity_before": response_debug.get("constraint_opposite_relative_velocity_before"),
                         "constraint_normal_used_for_projection": response_debug.get("constraint_normal_used_for_projection"),
+                        "constraint_body_minus_world_speed_before": response_debug.get("constraint_body_minus_world_speed_before"),
+                        "constraint_world_minus_body_speed_before": response_debug.get("constraint_world_minus_body_speed_before"),
+                        "constraint_selected_separation_speed_before": response_debug.get("constraint_selected_separation_speed_before"),
                         "constraint_separation_speed_before": response_debug.get("constraint_separation_speed_before"),
                         "constraint_opposite_separation_speed_before": response_debug.get("constraint_opposite_separation_speed_before"),
                         "normal_impulse_body_sign": response_debug.get("normal_impulse_body_sign"),
@@ -9396,7 +9525,21 @@ class WulframServer:
                 return True
             contact = sample_contact()
             if contact is None or contact.penetration <= self._PENETRATION_SLOP_DEFAULT:
+                update_contact_probe(
+                    (anchor[0], anchor[1], anchor[2]),
+                    contact,
+                    reason=(
+                        "lifted_clear"
+                        if contact is None
+                        else "lifted_contact_below_slop"
+                    ),
+                )
                 return False
+            update_contact_probe(
+                (anchor[0], anchor[1], anchor[2]),
+                contact,
+                reason="lifted_contact",
+            )
             response_debug = apply_contact(contact)
             ctx.debug_last_collision = {
                 "kind": "terrain_clean_contact",

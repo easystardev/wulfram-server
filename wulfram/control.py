@@ -1844,6 +1844,7 @@ Examples:
                     "last_controller": getattr(ctx, "debug_last_controller_step", {}) or {},
                     "last_collision": getattr(ctx, "debug_last_collision", {}) or {},
                     "last_motion_collision": getattr(ctx, "debug_last_motion_collision", {}) or {},
+                    "last_terrain_contact_probe": getattr(ctx, "debug_last_terrain_contact_probe", {}) or {},
                 }
                 telemetry["diagnosis"] = build_input_sync_diagnosis(
                     phase=phase,

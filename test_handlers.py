@@ -6607,6 +6607,69 @@ def test_entity_world_collision_model_entity_origin_can_be_requested():
     return True
 
 
+def test_entity_world_collision_records_raw_origin_probe_without_applying_contact():
+    """Default lifted misses should expose raw-origin contact evidence without changing physics."""
+    calls = []
+
+    def fake_model_collision(center, *args, **kwargs):
+        calls.append(center)
+        if abs(center[2] - 10.0) < 1e-6:
+            return TerrainContact(
+                position=(1.0, 2.0, 3.0),
+                normal=(0.0, 0.0, 1.0),
+                penetration=4.0,
+                sector_index=2,
+                cell=(7, 8),
+                normal_source="terrain_triangle",
+            )
+        return None
+
+    server = WulframServer.__new__(WulframServer)
+    server._terrain_grid_collision = SimpleNamespace(
+        test_box_collision=lambda *args, **kwargs: None,
+        test_model_collision=fake_model_collision,
+    )
+    server._get_entity_world_half_extents = lambda ctx: (2.0, 2.0, 3.0)
+    server._get_entity_world_collision_model = lambda ctx: (
+        [],
+        SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=7.5)),
+        7.5,
+        3.0,
+    )
+    server._get_entity_dirty_threshold_sq = lambda ctx, half_extents: 999999.0
+
+    ctx = _fake_tank_collision_context()
+    ctx.player_heading = 0.0
+    ctx.player_pos = (0.0, 0.0, 10.0)
+    ctx.world_collision_ref_pos = (0.0, 0.0, 10.0)
+
+    result = server._resolve_entity_world_collision(
+        ctx,
+        0.0,
+        0.0,
+        10.0,
+        1.0,
+        2.0,
+        3.0,
+        pre_pos=(0.0, 0.0, 10.0),
+        pre_vel=(1.0, 2.0, 3.0),
+        dt=1.0 / 30.0,
+    )
+
+    assert result == (0.0, 0.0, 10.0, 1.0, 2.0, 3.0), result
+    assert getattr(ctx, "debug_last_motion_collision", {}) == {}
+    probe = ctx.debug_last_terrain_contact_probe
+    assert probe["reason"] == "lifted_clear_raw_origin_contact", probe
+    assert probe["model_z_lift"] == 3.0
+    assert probe["lifted_contact"] is None
+    assert probe["raw_origin_contact"]["depth"] == 4.0
+    assert probe["raw_origin_contact"]["contact_cell"] == (7, 8)
+    assert calls[0] == (0.0, 0.0, 13.0)
+    assert calls[1] == (0.0, 0.0, 10.0)
+    print("test_entity_world_collision_records_raw_origin_probe_without_applying_contact: PASSED")
+    return True
+
+
 def test_entity_world_collision_restores_previous_motion_after_nonfinite_input():
     """Bad timed-contact output should not feed non-finite positions into terrain lookup."""
     server = WulframServer.__new__(WulframServer)
@@ -7163,6 +7226,60 @@ def test_static_terrain_constraint_friction_uses_pre_normal_projection_buffer():
     assert result.debug["friction_impulse"] == 0.0
     assert result.debug["post_normal_tangent_speed_abs_max"] > 0.001
     print("test_static_terrain_constraint_friction_uses_pre_normal_projection_buffer: PASSED")
+    return True
+
+
+def test_static_terrain_constraint_opposite_projection_probe_activates_separating_penetration():
+    """The rough-terrain probe can test OG's opposite projection without changing defaults."""
+    base_kwargs = dict(
+        position=(0.0, 0.0, 0.0),
+        velocity=(0.0, 0.0, 2.0),
+        angular_velocity=(0.0, 0.0, 0.0),
+        contact_point=(0.0, 0.0, -1.0),
+        contact_normal=(0.0, 0.0, 1.0),
+        penetration=0.1,
+        half_extents=(4.0, 4.0, 4.0),
+        inertia_half_extents=(4.0, 4.0, 4.0),
+        mass=6700.0,
+        friction=0.2,
+        constraint_iterations=1,
+        restitution_fraction=0.0,
+    )
+
+    default = solve_static_terrain_constraint(**base_kwargs)
+    opposite_probe = solve_static_terrain_constraint(
+        **base_kwargs,
+        projection_order="opposite_if_separating",
+    )
+    falling = solve_static_terrain_constraint(
+        **{**base_kwargs, "velocity": (0.0, 0.0, -2.0)},
+        projection_order="opposite_if_separating",
+    )
+
+    assert default.debug["constraint_projection_order"] == "body_minus_world"
+    assert default.debug["normal_iterations"] == 0
+    assert default.debug["normal_impulse"] == 0.0
+    assert opposite_probe.debug["constraint_projection_order"] == "opposite_if_separating"
+    assert (
+        opposite_probe.debug["constraint_primary_projection_speed_source"]
+        == "world_minus_body_if_body_separating"
+    )
+    assert math.isclose(
+        opposite_probe.debug["constraint_body_minus_world_speed_before"],
+        2.0,
+        rel_tol=1e-6,
+    )
+    assert math.isclose(
+        opposite_probe.debug["constraint_selected_separation_speed_before"],
+        -2.0,
+        rel_tol=1e-6,
+    )
+    assert opposite_probe.debug["normal_iterations"] == 1
+    assert opposite_probe.debug["normal_impulse"] > 0.0
+    assert opposite_probe.velocity[2] > base_kwargs["velocity"][2]
+    assert falling.debug["constraint_primary_projection_speed_source"] == "body_minus_world"
+    assert falling.debug["normal_impulse"] > 0.0
+    print("test_static_terrain_constraint_opposite_projection_probe_activates_separating_penetration: PASSED")
     return True
 
 
@@ -9933,6 +10050,7 @@ def main():
         test_entity_world_collision_prefers_mesh_contact_when_collision_model_exists,
         test_entity_world_collision_model_defaults_to_legacy_lift,
         test_entity_world_collision_model_entity_origin_can_be_requested,
+        test_entity_world_collision_records_raw_origin_probe_without_applying_contact,
         test_entity_world_collision_restores_previous_motion_after_nonfinite_input,
         test_entity_world_half_extents_preserves_mesh_z_extent,
         test_entity_origin_probe_uses_capped_pair_solver_contact_response,
@@ -9942,6 +10060,7 @@ def main():
         test_static_terrain_constraint_sleeping_body_uses_decompile_scaling,
         test_static_terrain_constraint_retests_inactive_penetrating_contact,
         test_static_terrain_constraint_friction_uses_pre_normal_projection_buffer,
+        test_static_terrain_constraint_opposite_projection_probe_activates_separating_penetration,
         test_static_terrain_constraint_can_probe_entity_rotation_for_angular_frame,
         test_entity_interpolation_decision_matches_decompile_gates,
         test_entity_origin_probe_applies_pair_solver_at_contact_time,
