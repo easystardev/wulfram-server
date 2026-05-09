@@ -2653,6 +2653,7 @@ class WulframServer:
             "energy": EntityType.ENERGY_BUILDING,
             "energybuilding": EntityType.ENERGY_BUILDING,
             "energypad": EntityType.ENERGY_BUILDING,
+            "powercell": EntityType.ENERGY_BUILDING,
             "gun": EntityType.GUN_TURRET,
             "turret": EntityType.GUN_TURRET,
             "gunturret": EntityType.GUN_TURRET,

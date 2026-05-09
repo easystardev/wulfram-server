@@ -9648,6 +9648,10 @@ def test_comm_message_request_decodes_og_type2_build_command():
     assert parsed["ship_oid"] == 29002, parsed
     assert parsed["entity_type"] == int(EntityType.REPAIR_BUILDING), parsed
     assert parsed["slot"] == 1, parsed
+    captured = server._parse_build_uplink_command('build 29002 "Power Cell" 0')
+    assert captured["ok"] is True, captured
+    assert captured["entity_type"] == int(EntityType.ENERGY_BUILDING), captured
+    assert captured["slot"] == 0, captured
     print("test_comm_message_request_decodes_og_type2_build_command: PASSED")
     return True
 
