@@ -10133,13 +10133,20 @@ class WulframServer:
                 ctx.world_collision_ref_pos = (anchor[0], anchor[1], anchor[2])
                 return finish_result(anchor[0], anchor[1], anchor[2], vx, vy, vz)
             ctx.world_collision_ref_pos = (anchor[0], anchor[1], anchor[2])
-            return finish_result(anchor[0], anchor[1], anchor[2], vx, vy, vz)
+            # Dirty terrain dispatch can miss when the lifted model is clear and
+            # the center-to-center ray remains above the height field. Preserve
+            # the decompile-style dirty reference refresh, but still fall through
+            # to the clean/raw-origin probe so reports can explain the miss and
+            # default-off fallback A/Bs are not hidden by the dirty branch.
 
-        resolve_single_contact()
+        clean_contact_resolved = resolve_single_contact()
         # Keep the dirty-reference anchored to the latest clean-resolution pose.
         # Otherwise repeated flat-ground clamp contacts accumulate displacement
         # against an old reference and falsely enter the dirty terrain-ray path.
-        ctx.world_collision_ref_pos = (anchor[0], anchor[1], anchor[2])
+        # A lifted clear must not refresh this reference: OG's bounds-dirty flag
+        # compares current position against the last recorded physics position.
+        if clean_contact_resolved:
+            ctx.world_collision_ref_pos = (anchor[0], anchor[1], anchor[2])
 
         return finish_result(anchor[0], anchor[1], anchor[2], vx, vy, vz)
 
