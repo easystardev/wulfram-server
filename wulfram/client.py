@@ -142,6 +142,11 @@ class ClientContext:
     last_state_sync_update_hex: str = ""
     last_state_sync_view_hex: str = ""
     position_change_count: int = 0
+    comm_message_request_count: int = 0
+    last_comm_message_request: dict = field(default_factory=dict)
+    build_uplink_command_count: int = 0
+    last_build_uplink_command: dict = field(default_factory=dict)
+    uplink_mvp_bootstrap_sent: bool = False
 
     last_sent_tick: int = 0
     tick_lock: threading.Lock = field(default_factory=threading.Lock)

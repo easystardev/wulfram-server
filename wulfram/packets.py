@@ -339,6 +339,53 @@ def build_chat_message(message: str, source_id: int = 0, target_id: int = 0) -> 
     return payload
 
 
+def build_ship_status(ship_id: int, team_id: int, name: str = "Supply Ship") -> bytes:
+    """Build SHIP_STATUS (0x27).
+
+    Decompile (Network/Handlers.c, PacketHandler_SHIP_STATUS):
+      u32 ship_oid, u16 team_id, string ship_name
+    """
+    name_bytes = (name + '\x00').encode('ascii', errors='ignore')
+    payload = b'\x27'
+    payload += struct.pack(">I", ship_id & 0xFFFFFFFF)
+    payload += struct.pack(">H", team_id & 0xFFFF)
+    payload += struct.pack(">H", len(name_bytes)) + name_bytes
+    return payload
+
+
+def build_carrying_info(
+    player_id: int,
+    *,
+    cargo_type: int = 0,
+    has_uplink: bool = False,
+    cargo_count: int = 0,
+) -> bytes:
+    """Build CARRYING_INFO (0x29).
+
+    Decompile (Network/Handlers.c, PacketHandler_CARRYING_INFO):
+      u32 player_oid, u8 cargo_type, u8 has_uplink, u8 cargo_count
+    """
+    return (
+        b'\x29'
+        + struct.pack(">I", player_id & 0xFFFFFFFF)
+        + struct.pack("BBB", cargo_type & 0xFF, 1 if has_uplink else 0, cargo_count & 0xFF)
+    )
+
+
+def build_uplink_info(team_index: int, state: int, holder_entity_id: int) -> bytes:
+    """Build UPLINK_INFO (0x2A).
+
+    Decompile (Network/Handlers.c, PacketHandler_UPLINK_INFO):
+      u8 team_index, u32 uplink_state, u32 holder_entity_oid
+    """
+    return (
+        b'\x2A'
+        + struct.pack("B", team_index & 0xFF)
+        + struct.pack(">I", state & 0xFFFFFFFF)
+        + struct.pack(">I", holder_entity_id & 0xFFFFFFFF)
+    )
+
+
 def build_player_info(entity_oid: int, vehicle_type: int, pos: Tuple[float, float, float],
                       rot: Tuple[float, float, float] = (0.0, 0.0, 0.0),
                       *, include_local_state: bool = False,

@@ -21,6 +21,9 @@ from wulfram.packets import (
     build_world_stats,
     build_bps_response,
     build_chat_message,
+    build_ship_status,
+    build_carrying_info,
+    build_uplink_info,
 )
 from wulfram.codec import frame_packet
 
@@ -302,6 +305,45 @@ def test_chat_message():
     return match
 
 
+def test_ship_status():
+    """Test SHIP_STATUS packet."""
+    payload = build_ship_status(0x12345678, 2, "Supply Ship")
+
+    print(f"SHIP_STATUS:")
+    print(f"  Got: {payload.hex().upper()}")
+    match = (
+        payload[:7] == bytes.fromhex("27123456780002")
+        and payload[7:9] == b"\x00\x0c"
+        and payload[9:] == b"Supply Ship\x00"
+    )
+    print(f"  Match: {match}")
+    return match
+
+
+def test_carrying_info():
+    """Test CARRYING_INFO packet."""
+    payload = build_carrying_info(0x14EA, cargo_type=3, has_uplink=True, cargo_count=4)
+
+    print(f"CARRYING_INFO:")
+    print(f"  Got: {payload.hex().upper()}")
+    expected = bytes.fromhex("29000014EA030104")
+    match = payload == expected
+    print(f"  Match: {match}")
+    return match
+
+
+def test_uplink_info():
+    """Test UPLINK_INFO packet."""
+    payload = build_uplink_info(1, 3, 0x14EA)
+
+    print(f"UPLINK_INFO:")
+    print(f"  Got: {payload.hex().upper()}")
+    expected = bytes.fromhex("2A0100000003000014EA")
+    match = payload == expected
+    print(f"  Match: {match}")
+    return match
+
+
 def test_world_stats():
     """Test WORLD_STATS packet."""
     payload = build_world_stats()
@@ -339,6 +381,9 @@ def main():
         test_behavior_packet,
         test_translation_packet,
         test_chat_message,
+        test_ship_status,
+        test_carrying_info,
+        test_uplink_info,
         test_world_stats,
     ]
 

@@ -800,7 +800,7 @@ def _send_spawn_points_for_client(server: "WulframServer", ctx: "ClientContext")
 
 
 def handle_udp_chat(server: "WulframServer", ctx: Optional["ClientContext"], data: bytes, addr: tuple):
-    """Handle UDP COMM_REQ (0x20) for /s spawn."""
+    """Handle UDP COMM_REQ (0x20) for /s spawn and uplink commands."""
     if len(data) < 9:
         return
 
@@ -816,6 +816,19 @@ def handle_udp_chat(server: "WulframServer", ctx: Optional["ClientContext"], dat
 
     if ctx is None:
         return
+
+    comm_handler = getattr(server, "_handle_comm_message_request", None)
+    if callable(comm_handler):
+        event = comm_handler(
+            ctx,
+            data,
+            transport="udp",
+            body=data[5:],
+            addr=addr,
+            sequence=seq_num,
+        )
+        if event.get("handled"):
+            return
 
     cmd = msg.strip()
     if cmd.lower().startswith("/s "):

@@ -21,7 +21,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Dict, Sequence
+from typing import Any, Optional, Dict, Sequence
 
 from .session import Session, Phase, FEATURES
 from .transport import TCPHandler, UDPHandler, PacketLogger, print_packet
@@ -100,6 +100,7 @@ from .packets import (
     build_update_array_multi, build_view_update_multi, build_view_update_player_update,
     get_behavior_weapon_capability_counts, build_world_stats,
     build_delete_object,
+    build_ship_status, build_carrying_info, build_uplink_info,
     _encode_health_bits, _compress_value, VEC_VEL_MAX, VEC_VEL_RANGE,
     build_transient_array, FX_CHAIN_GUN_FIRE, FX_PULSE_FIRE,
     FX_FLAK_FIRE, FX_MISSILE_FIRE, FX_IMPACT_VEHICLE,
@@ -596,6 +597,10 @@ class WulframServer:
         self._building_entities = {}
         self._building_health = {}  # oid -> health (1.0 = full, 0.0 = destroyed)
         self._turret_last_fire = {}  # oid -> monotonic time of last fire
+        self._dynamic_building_ids: set[int] = set()
+        self._dynamic_building_sources: dict[int, dict[str, Any]] = {}
+        self._build_uplink_command_events: list[dict[str, Any]] = []
+        self._uplink_ships: dict[int, dict[str, Any]] = {}
         self._static_world_raycast_root: Optional[_StaticWorldRayNode] = None
         self._building_collision = BuildingCollisionAssets()
         if self._building_collision.load_default():
@@ -755,6 +760,19 @@ class WulframServer:
                 f"with {self._terrain_grid_collision.sector_count} sectors"
             )
         self._load_map_buildings()
+        try:
+            self._dynamic_building_next_oid = int(os.environ.get("WULFRAM_DYNAMIC_BUILDING_BASE_OID", "30000"), 0)
+        except ValueError:
+            self._dynamic_building_next_oid = 30000
+        if self._building_entities:
+            self._dynamic_building_next_oid = max(
+                int(self._dynamic_building_next_oid),
+                max(int(oid) for oid in self._building_entities) + 1,
+            )
+        self.build_uplink_mvp = (
+            os.environ.get("WULFRAM_BUILD_UPLINK_MVP", "0").strip().lower()
+            not in {"0", "false", "off", "no"}
+        )
         world_bound_env = os.environ.get("WULFRAM_WORLD_BOUND")
         try:
             # Clamp world X/Y to the protocol position domain by default (VEC_POS max=8192).
@@ -2503,6 +2521,520 @@ class WulframServer:
             sent = True
         return sent
 
+    def _decode_comm_message_request_body(self, body: bytes) -> dict[str, Any]:
+        """Decode the body shared by TCP and reliable-UDP COMM_MESSAGE_REQUEST.
+
+        Decompile-backed OG uplink commands write:
+          u16 message_type, u16 flags_or_target, string command
+
+        Python chat uses the same leading fields with different message types,
+        so this decoder stays generic and lets the caller decide semantics.
+        """
+        decoded: dict[str, Any] = {
+            "ok": False,
+            "message_type": None,
+            "flags_or_target": None,
+            "text": "",
+            "body_hex": body.hex(),
+        }
+        if len(body) < 6:
+            decoded["error"] = f"body too short: {len(body)}"
+            return decoded
+        try:
+            message_type = struct.unpack_from(">H", body, 0)[0]
+            flags_or_target = struct.unpack_from(">H", body, 2)[0]
+            text, offset = handlers.decode_lp_string(body, 4)
+        except (struct.error, ValueError) as exc:
+            decoded["error"] = str(exc)
+            return decoded
+        decoded.update(
+            {
+                "ok": True,
+                "message_type": message_type,
+                "flags_or_target": flags_or_target,
+                "text": text,
+                "end_offset": offset,
+                "trailing_hex": body[offset:].hex() if offset < len(body) else "",
+            }
+        )
+        return decoded
+
+    def _parse_build_uplink_command(self, text: str) -> dict[str, Any]:
+        """Parse OG type-2 starship/uplink text commands."""
+        import shlex
+
+        result: dict[str, Any] = {"ok": False, "text": text, "action": ""}
+        try:
+            parts = shlex.split(text or "")
+        except ValueError as exc:
+            result["error"] = f"shlex: {exc}"
+            return result
+        if not parts:
+            result["error"] = "empty command"
+            return result
+        action = parts[0].lower()
+        result["action"] = action
+        result["parts"] = parts
+
+        def _parse_int(value: str, field: str) -> int | None:
+            try:
+                return int(value, 0)
+            except (TypeError, ValueError):
+                result["error"] = f"invalid {field}: {value!r}"
+                return None
+
+        if action in ("build", "delete"):
+            if len(parts) < 4:
+                result["error"] = f"{action} requires ship_oid, entity name, and slot"
+                return result
+            ship_oid = _parse_int(parts[1], "ship_oid")
+            slot = _parse_int(parts[3], "slot")
+            if ship_oid is None or slot is None:
+                return result
+            entity_type = self._build_uplink_entity_type_from_name(parts[2])
+            result.update(
+                {
+                    "ok": entity_type is not None,
+                    "ship_oid": ship_oid,
+                    "entity_name": parts[2],
+                    "entity_type": entity_type,
+                    "slot": slot,
+                }
+            )
+            if entity_type is None:
+                result["error"] = f"unsupported build entity: {parts[2]!r}"
+            return result
+
+        if action == "move":
+            if len(parts) < 3:
+                result["error"] = "move requires ship_oid and cell"
+                return result
+            ship_oid = _parse_int(parts[1], "ship_oid")
+            if ship_oid is None:
+                return result
+            result.update({"ok": True, "ship_oid": ship_oid, "cell": parts[2]})
+            return result
+
+        if action == "bomb":
+            if len(parts) < 2:
+                result["error"] = "bomb requires ship_oid"
+                return result
+            ship_oid = _parse_int(parts[1], "ship_oid")
+            if ship_oid is None:
+                return result
+            result.update({"ok": True, "ship_oid": ship_oid})
+            return result
+
+        if action == "set":
+            if len(parts) < 4:
+                result["error"] = "set requires ship_oid, field, and value"
+                return result
+            ship_oid = _parse_int(parts[1], "ship_oid")
+            value = _parse_int(parts[3], "value")
+            if ship_oid is None or value is None:
+                return result
+            result.update({"ok": True, "ship_oid": ship_oid, "field": parts[2], "value": value})
+            return result
+
+        result["error"] = f"unsupported action: {action!r}"
+        return result
+
+    @staticmethod
+    def _build_uplink_entity_type_from_name(name: str) -> Optional[int]:
+        key = "".join(ch for ch in str(name or "").lower() if ch.isalnum())
+        aliases = {
+            "repair": EntityType.REPAIR_BUILDING,
+            "repairbuilding": EntityType.REPAIR_BUILDING,
+            "repairpad": EntityType.REPAIR_BUILDING,
+            "fuel": EntityType.FUEL_BUILDING,
+            "fuelbuilding": EntityType.FUEL_BUILDING,
+            "refuel": EntityType.FUEL_BUILDING,
+            "refuelpad": EntityType.FUEL_BUILDING,
+            "energy": EntityType.ENERGY_BUILDING,
+            "energybuilding": EntityType.ENERGY_BUILDING,
+            "energypad": EntityType.ENERGY_BUILDING,
+            "gun": EntityType.GUN_TURRET,
+            "turret": EntityType.GUN_TURRET,
+            "gunturret": EntityType.GUN_TURRET,
+            "gunbuilding": EntityType.GUN_TURRET,
+        }
+        value = aliases.get(key)
+        return int(value) if value is not None else None
+
+    @staticmethod
+    def _building_max_health_for_type(entity_type: int) -> float:
+        max_health = {
+            EntityType.GUN_TURRET: 1200.0,
+            EntityType.LAUNCHER: 1200.0,
+            EntityType.SENSOR_BUILDING: 1200.0,
+            EntityType.FUEL_BUILDING: 2000.0,
+            EntityType.REPAIR_BUILDING: 2000.0,
+            EntityType.ENERGY_BUILDING: 2000.0,
+            EntityType.PAD: 5000.0,
+            EntityType.DARK_LIGHT: 800.0,
+        }
+        try:
+            key = EntityType(int(entity_type))
+        except ValueError:
+            key = int(entity_type)
+        return float(max_health.get(key, 2000.0))
+
+    def _allocate_dynamic_building_oid(self) -> int:
+        oid = int(getattr(self, "_dynamic_building_next_oid", 30000) or 30000)
+        while oid in self._building_entities or oid in self._dynamic_building_ids:
+            oid += 1
+        self._dynamic_building_next_oid = oid + 1
+        return oid
+
+    def _choose_dynamic_building_pos(self, ctx: ClientContext, slot: int) -> tuple[float, float, float]:
+        heading = float(getattr(ctx, "player_heading", 0.0) or 0.0)
+        base = tuple(float(v) for v in (getattr(ctx, "player_pos", None) or (2600.0, 3040.0, 5.0)))
+        distance = 35.0 + max(0, int(slot)) * 12.0
+        x = base[0] + math.cos(heading) * distance
+        y = base[1] + math.sin(heading) * distance
+        ground_z = self._terrain_ground_z_at(x, y)
+        if ground_z is None or not math.isfinite(float(ground_z)):
+            z = base[2]
+        else:
+            z = float(ground_z)
+        return (x, y, z)
+
+    def _send_dynamic_entity_definition(
+        self,
+        target_ctx: ClientContext,
+        *,
+        entity_id: int,
+        entity_type: int,
+        team_id: int,
+        pos: tuple[float, float, float],
+        heading: float = 0.0,
+        is_static: bool = True,
+    ) -> bool:
+        if not target_ctx.session or not target_ctx.session.translation_ack_received:
+            return False
+        tick = self._get_network_tick(target_ctx)
+        include_local_state, ls = self._get_update_array_local_state_for_viewer(target_ctx)
+        local_state_kwargs = dict(ls)
+        local_state_kwargs.setdefault("health", self._get_health_value(target_ctx))
+        local_state_kwargs.setdefault("fuel", self._get_energy_value(target_ctx))
+        payload = build_update_array_create_tank(
+            tick=tick,
+            entity_id=entity_id,
+            entity_type=entity_type,
+            team=team_id,
+            pos=self._to_client_pos(pos),
+            behavior_type=team_id,
+            include_health=include_local_state,
+            include_entity_vitals=False,
+            is_manned=False,
+            is_static=is_static,
+            rot=(0.0, 0.0, float(heading)),
+            **local_state_kwargs,
+        )
+        sent = self._send_packet_to_client(target_ctx, payload, prefer_tcp=False)
+        if sent:
+            target_ctx.known_entity_ids.add(entity_id)
+            if self.pktlog.enabled:
+                self.pktlog.log(
+                    client_id=target_ctx.client_id,
+                    label="DYNAMIC_ENTITY_CREATE",
+                    tick=tick,
+                    payload=payload,
+                    transport="UDP",
+                    entity_count=1,
+                    entity_ids=(entity_id,),
+                    mask_bits=(0b1011,),
+                    has_local_state=include_local_state,
+                    health=self._get_health_value(target_ctx) if include_local_state else -1.0,
+                    extra=f"type={entity_type} team={team_id}",
+                )
+        return sent
+
+    def _broadcast_dynamic_entity_definition(
+        self,
+        *,
+        entity_id: int,
+        entity_type: int,
+        team_id: int,
+        pos: tuple[float, float, float],
+        heading: float = 0.0,
+        is_static: bool = True,
+    ) -> int:
+        sent = 0
+        for target in self._snapshot_in_game_clients():
+            if self._send_dynamic_entity_definition(
+                target,
+                entity_id=entity_id,
+                entity_type=entity_type,
+                team_id=team_id,
+                pos=pos,
+                heading=heading,
+                is_static=is_static,
+            ):
+                sent += 1
+        return sent
+
+    def _create_dynamic_building_from_uplink(
+        self,
+        ctx: ClientContext,
+        command: dict[str, Any],
+    ) -> dict[str, Any]:
+        entity_type = int(command["entity_type"])
+        team_id = int(ctx.session.team_id or 1)
+        slot = int(command.get("slot", 0) or 0)
+        oid = self._allocate_dynamic_building_oid()
+        x, y, z = self._choose_dynamic_building_pos(ctx, slot)
+        heading = float(getattr(ctx, "player_heading", 0.0) or 0.0)
+        building = BuildingEntity(
+            x=x,
+            y=y,
+            z=z,
+            entity_type=entity_type,
+            team_id=team_id,
+            heading=heading,
+        )
+        max_hp = self._building_max_health_for_type(entity_type)
+        self._building_entities[oid] = building
+        self._building_health[oid] = max_hp
+        self._building_max_health[oid] = max_hp
+        self._dynamic_building_ids.add(oid)
+        source = {
+            "client_id": ctx.client_id,
+            "player_entity_id": ctx.session.entity_id or ctx.entity_id,
+            "ship_oid": command.get("ship_oid"),
+            "slot": slot,
+            "command": command,
+            "created_at": time.time(),
+        }
+        self._dynamic_building_sources[oid] = source
+        ship = self._uplink_ships.get(team_id)
+        if ship is not None:
+            cargo = list(ship.get("cargo", [40, 40, 40, 40]))
+            if 0 <= slot < len(cargo):
+                cargo[slot] = entity_type
+            ship["cargo"] = cargo
+            ship["last_build_oid"] = oid
+        self._rebuild_static_world_raycast_index()
+        sent = self._broadcast_dynamic_entity_definition(
+            entity_id=oid,
+            entity_type=entity_type,
+            team_id=team_id,
+            pos=building.pos,
+            heading=heading,
+            is_static=True,
+        )
+        event = {
+            "ok": sent > 0,
+            "oid": oid,
+            "entity_type": entity_type,
+            "entity_type_name": getattr(EntityType(entity_type), "name", str(entity_type)),
+            "team_id": team_id,
+            "pos": [round(float(v), 5) for v in building.pos],
+            "health": max_hp,
+            "replication_targets": sent,
+        }
+        print(
+            f"[BUILD-UPLINK] created oid={oid} type={event['entity_type_name']} "
+            f"team={team_id} pos=({x:.1f},{y:.1f},{z:.1f}) targets={sent}"
+        )
+        return event
+
+    def _delete_dynamic_building_from_uplink(
+        self,
+        ctx: ClientContext,
+        command: dict[str, Any],
+    ) -> dict[str, Any]:
+        entity_type = int(command.get("entity_type", -1) or -1)
+        team_id = int(ctx.session.team_id or 1)
+        slot = command.get("slot")
+        candidates = []
+        for oid in sorted(self._dynamic_building_ids):
+            building = self._building_entities.get(oid)
+            if not building:
+                continue
+            source = self._dynamic_building_sources.get(oid, {})
+            if entity_type >= 0 and int(building.entity_type) != entity_type:
+                continue
+            if int(building.team_id) != team_id:
+                continue
+            if slot is not None and source.get("slot") != slot:
+                continue
+            candidates.append(oid)
+        if not candidates:
+            return {"ok": False, "error": "no matching dynamic building"}
+        oid = candidates[-1]
+        self._building_entities.pop(oid, None)
+        self._building_health.pop(oid, None)
+        self._building_max_health.pop(oid, None)
+        self._dynamic_building_ids.discard(oid)
+        self._dynamic_building_sources.pop(oid, None)
+        self._rebuild_static_world_raycast_index()
+        packet = build_delete_object(get_ticks(), [oid], with_effects=True)
+        sent = 0
+        for target in self._snapshot_in_game_clients():
+            if self._send_packet_to_client(target, packet, prefer_tcp=False):
+                target.known_entity_ids.discard(oid)
+                sent += 1
+        return {"ok": sent > 0, "oid": oid, "replication_targets": sent}
+
+    def _get_or_create_uplink_ship(self, ctx: ClientContext, team_id: int) -> dict[str, Any]:
+        ship = self._uplink_ships.get(team_id)
+        if ship is not None:
+            return ship
+        base_pos = tuple(float(v) for v in (ctx.player_pos or (2600.0, 3040.0, 5.0)))
+        x = base_pos[0] + 55.0
+        y = base_pos[1] + 35.0
+        ground_z = self._terrain_ground_z_at(x, y)
+        z = (float(ground_z) + 12.0) if ground_z is not None else base_pos[2] + 12.0
+        try:
+            base_oid = int(os.environ.get("WULFRAM_UPLINK_SHIP_BASE_OID", "29000"), 0)
+        except ValueError:
+            base_oid = 29000
+        ship = {
+            "oid": base_oid + int(team_id),
+            "team_id": team_id,
+            "name": f"Team {team_id} Supply Ship",
+            "pos": (x, y, z),
+            "heading": 0.0,
+            "cargo": [40, 40, 40, 40],
+            "build_mode": 2,
+        }
+        self._uplink_ships[team_id] = ship
+        return ship
+
+    def _send_existing_build_uplink_entities(self, ctx: ClientContext) -> int:
+        sent = 0
+        for team_id, ship in sorted(self._uplink_ships.items(), key=lambda item: int(item[0])):
+            if self._send_dynamic_entity_definition(
+                ctx,
+                entity_id=int(ship["oid"]),
+                entity_type=int(EntityType.SUPPLY_SHIP),
+                team_id=int(team_id),
+                pos=ship["pos"],
+                heading=float(ship.get("heading", 0.0) or 0.0),
+                is_static=True,
+            ):
+                sent += 1
+        for oid in sorted(self._dynamic_building_ids):
+            building = self._building_entities.get(oid)
+            if not building:
+                continue
+            if self._send_dynamic_entity_definition(
+                ctx,
+                entity_id=int(oid),
+                entity_type=int(building.entity_type),
+                team_id=int(building.team_id),
+                pos=building.pos,
+                heading=float(getattr(building, "heading", 0.0) or 0.0),
+                is_static=True,
+            ):
+                sent += 1
+        return sent
+
+    def _ensure_uplink_mvp_state(self, ctx: ClientContext) -> None:
+        """Default-off bootstrap for the OG uplink/build MVP probe."""
+        if not getattr(self, "build_uplink_mvp", False):
+            return
+        if getattr(ctx, "uplink_mvp_bootstrap_sent", False):
+            return
+        if not ctx.session or not ctx.session.in_game or not ctx.session.translation_ack_received:
+            return
+        team_id = int(ctx.session.team_id or 1)
+        player_oid = int(ctx.session.entity_id or ctx.entity_id)
+        ship = self._get_or_create_uplink_ship(ctx, team_id)
+        packets = (
+            build_ship_status(int(ship["oid"]), team_id, str(ship["name"])),
+            build_carrying_info(player_oid, cargo_type=0, has_uplink=True, cargo_count=0),
+            # State 3 is the decompile-labeled "in use" uplink state.
+            build_uplink_info(team_id, 3, player_oid),
+        )
+        sent = 0
+        for payload in packets:
+            if self._send_packet_to_client(ctx, payload, prefer_tcp=True):
+                sent += 1
+        dynamic_sent = self._send_existing_build_uplink_entities(ctx)
+        ctx.uplink_mvp_bootstrap_sent = sent == len(packets) and dynamic_sent > 0
+        print(
+            f"[BUILD-UPLINK] bootstrap client={ctx.client_id} team={team_id} "
+            f"ship={ship['oid']} player={player_oid} packets={sent}/{len(packets)} "
+            f"dynamic_entities={dynamic_sent}"
+        )
+
+    def _handle_comm_message_request(
+        self,
+        ctx: Optional[ClientContext],
+        packet: bytes,
+        *,
+        transport: str,
+        body: bytes,
+        addr: Optional[tuple] = None,
+        sequence: Optional[int] = None,
+    ) -> dict[str, Any]:
+        decoded = self._decode_comm_message_request_body(body)
+        event: dict[str, Any] = {
+            "time": time.time(),
+            "transport": transport,
+            "client_id": getattr(ctx, "client_id", None),
+            "addr": list(addr) if addr else None,
+            "sequence": sequence,
+            "raw_hex": packet.hex(),
+            "decoded": decoded,
+            "handled": False,
+            "mvp_enabled": bool(getattr(self, "build_uplink_mvp", False)),
+        }
+        if ctx is not None:
+            ctx.comm_message_request_count = int(getattr(ctx, "comm_message_request_count", 0) or 0) + 1
+            ctx.last_comm_message_request = event
+        if not decoded.get("ok"):
+            return event
+
+        text = str(decoded.get("text") or "")
+        msg_type = int(decoded.get("message_type") or 0)
+        if msg_type != 2:
+            return event
+
+        command = self._parse_build_uplink_command(text)
+        event["build_uplink_command"] = command
+        event["handled"] = True
+        if ctx is not None:
+            ctx.build_uplink_command_count = int(getattr(ctx, "build_uplink_command_count", 0) or 0) + 1
+            ctx.last_build_uplink_command = event
+        if not getattr(self, "build_uplink_mvp", False):
+            event["result"] = {"ok": False, "error": "WULFRAM_BUILD_UPLINK_MVP disabled"}
+        elif ctx is None:
+            event["result"] = {"ok": False, "error": "unknown client"}
+        elif not command.get("ok"):
+            event["result"] = {"ok": False, "error": command.get("error", "parse failed")}
+        elif command.get("action") == "build":
+            event["result"] = self._create_dynamic_building_from_uplink(ctx, command)
+        elif command.get("action") == "delete":
+            event["result"] = self._delete_dynamic_building_from_uplink(ctx, command)
+        elif command.get("action") == "set":
+            team_id = int(ctx.session.team_id or 1)
+            ship = self._uplink_ships.get(team_id)
+            if ship is not None and str(command.get("field", "")).lower() == "build_mode":
+                ship["build_mode"] = int(command.get("value", 2) or 2)
+            event["result"] = {"ok": True, "noted": True}
+        else:
+            event["result"] = {"ok": True, "noted": True}
+
+        self._build_uplink_command_events.append(event)
+        del self._build_uplink_command_events[:-100]
+        print(
+            f"[BUILD-UPLINK] c{getattr(ctx, 'client_id', '?')} {transport} "
+            f"type=2 text={text!r} result={event.get('result')}"
+        )
+        return event
+
+    def _handle_tcp_comm_message_request(self, ctx: ClientContext, packet: bytes) -> dict[str, Any]:
+        return self._handle_comm_message_request(
+            ctx,
+            packet,
+            transport="tcp",
+            body=packet[1:],
+            addr=getattr(ctx, "client_addr", None),
+        )
+
     def _og_viewer_replication_enabled(self, target_ctx: ClientContext, stream: str) -> bool:
         """Return whether a replication stream is enabled for an OG/remote viewer."""
         if handlers._is_loopback_client(target_ctx):
@@ -2682,6 +3214,7 @@ class WulframServer:
         """Ensure ctx sees other players and vice versa once translation is ready."""
         if not ctx.session.translation_ack_received:
             return
+        self._ensure_uplink_mvp_state(ctx)
         others = [c for c in self._snapshot_in_game_clients() if c is not ctx]
         if ctx.session.tick % 300 == 0 and others:
             print(f"[MULTI-DBG] client={ctx.client_id} trans_ack={ctx.session.translation_ack_received} "
@@ -4285,6 +4818,7 @@ class WulframServer:
 
         # Sync roster/entity visibility with other in-game clients.
         self._sync_clients_on_spawn(ctx)
+        self._ensure_uplink_mvp_state(ctx)
 
         self._resume_remote_full_local_state_after_spawn(
             ctx,
@@ -5186,6 +5720,8 @@ class WulframServer:
                 ctx.session.translation_ack_received = True
                 ctx.session.translation_ack_time = time.monotonic()
                 print("[GAME] Translation ACK received")
+            elif pkt_type == 0x20:
+                self._handle_tcp_comm_message_request(ctx, packet)
             elif pkt_type == PacketType.PING_REQUEST:
                 # The client echoes server PING_REQUEST packets back on TCP.
                 # Treat that as a latency reply, not an unknown gameplay opcode.

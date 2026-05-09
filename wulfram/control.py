@@ -1787,6 +1787,10 @@ Examples:
                     ),
                     "last_projectile_update_id": getattr(ctx, "last_projectile_update_id", 0),
                     "last_projectile_update_targets": getattr(ctx, "last_projectile_update_targets", 0),
+                    "comm_message_requests": getattr(ctx, "comm_message_request_count", 0),
+                    "last_comm_message_request": getattr(ctx, "last_comm_message_request", {}) or {},
+                    "build_uplink_commands": getattr(ctx, "build_uplink_command_count", 0),
+                    "last_build_uplink_command": getattr(ctx, "last_build_uplink_command", {}) or {},
                     "state_requests": getattr(ctx, "state_request_count", 0),
                     "state_sync_replies": getattr(ctx, "state_sync_reply_count", 0),
                     "state_sync_view_replies": getattr(ctx, "state_sync_view_reply_count", 0),
@@ -1957,6 +1961,8 @@ Examples:
         building_health = getattr(self.server, "_building_health", {}) or {}
         building_max_health = getattr(self.server, "_building_max_health", {}) or {}
         turret_last_fire = getattr(self.server, "_turret_last_fire", {}) or {}
+        dynamic_building_ids = set(getattr(self.server, "_dynamic_building_ids", set()) or set())
+        dynamic_building_sources = getattr(self.server, "_dynamic_building_sources", {}) or {}
 
         def _entity_type_name(value: object) -> str:
             try:
@@ -2098,6 +2104,8 @@ Examples:
                 "half_extents": half_extents,
                 "terrain_ground_z": None if terrain_ground_z is None else round(terrain_ground_z, 5),
                 "terrain_delta_z": None if terrain_delta_z is None else round(terrain_delta_z, 5),
+                "dynamic": int(oid) in dynamic_building_ids,
+                "dynamic_source": dynamic_building_sources.get(int(oid), {}) or {},
             }
             entries.append(entry)
 

@@ -65,6 +65,9 @@ from wulfram.packets import (
     build_view_update_create_tank,
     build_update_array_heartbeat,
     build_world_stats,
+    build_ship_status,
+    build_carrying_info,
+    build_uplink_info,
 )
 from wulfram2_protocol.codec import BitReader, BitWriter, quantize_float
 from client.wulfram_client.network.behavior import parse_behavior
@@ -9496,6 +9499,8 @@ def test_buildings_json_exposes_playable_slice_observability():
         _building_health={5001: 1500.0, 5002: 600.0},
         _building_max_health={5001: 2000.0, 5002: 1200.0},
         _turret_last_fire={5002: time.monotonic() - 1.0},
+        _dynamic_building_ids={5002},
+        _dynamic_building_sources={5002: {"command": {"action": "build"}, "slot": 0}},
     )
     server._building_blocks_vehicle_collision = (
         lambda building: int(building.entity_type) != int(EntityType.REPAIR_BUILDING)
@@ -9544,6 +9549,7 @@ def test_buildings_json_exposes_playable_slice_observability():
     assert repair["clients_in_service_range"] == [1], repair
     assert repair["health_pct"] == 75.0, repair
     assert repair["terrain_delta_z"] == 1.0, repair
+    assert repair["dynamic"] is False, repair
 
     turret = by_oid[5002]
     assert turret["entity_type_name"] == "GUN_TURRET", turret
@@ -9552,11 +9558,147 @@ def test_buildings_json_exposes_playable_slice_observability():
     assert turret["enemy_clients_in_turret_range"] == [2], turret
     assert turret["last_turret_fire_age_s"] is not None, turret
     assert turret["health_pct"] == 50.0, turret
+    assert turret["dynamic"] is True, turret
+    assert turret["dynamic_source"]["command"]["action"] == "build", turret
 
     text = control._cmd_buildings([])
     assert "REPAIR_BUILDING" in text and "nonblocking" in text, text
     assert "GUN_TURRET" in text and "turret=gun" in text, text
     print("test_buildings_json_exposes_playable_slice_observability: PASSED")
+    return True
+
+
+def _comm_request_body(text: str) -> bytes:
+    encoded = (text + "\x00").encode("ascii")
+    return struct.pack(">HHH", 2, 0, len(encoded)) + encoded
+
+
+def _minimal_build_uplink_server(ctx: ClientContext) -> WulframServer:
+    class DummyUDP:
+        def __init__(self):
+            self.sent = []
+
+        def send_to(self, payload, addr):
+            self.sent.append((payload, addr))
+
+    server = WulframServer.__new__(WulframServer)
+    server.clients_lock = threading.Lock()
+    server.clients = {ctx.client_id: ctx}
+    server.udp_handler = DummyUDP()
+    server.pktlog = SimpleNamespace(enabled=False)
+    server.up_axis = "z"
+    server.pos_offset = 0.0
+    server.use_client_ticks = False
+    server.debug_health_value = 1.0
+    server.debug_health_pattern = False
+    server.player_energy_max = 100.0
+    server.spawn_tank_weapon_type = 2
+    server.local_state_turret_max = 6.3
+    server.local_state_turret_range = 12.6
+    server.build_uplink_mvp = True
+    server._building_entities = {}
+    server._building_health = {}
+    server._building_max_health = {}
+    server._turret_last_fire = {}
+    server._dynamic_building_ids = set()
+    server._dynamic_building_sources = {}
+    server._dynamic_building_next_oid = 30000
+    server._build_uplink_command_events = []
+    server._uplink_ships = {}
+    server._terrain_ground_z_at = lambda _x, _y: 4.0
+    server._rebuild_static_world_raycast_index = lambda: None
+    return server
+
+
+def _in_game_context(client_id: int = 1) -> ClientContext:
+    session = Session()
+    session.phase = Phase.IN_GAME
+    session.in_game = True
+    session.translation_ack_received = True
+    session.team_id = 2
+    session.entity_id = 0x14EA
+    session.udp_addr = ("10.10.10.2", 62588)
+    ctx = ClientContext(
+        client_id=client_id,
+        client_addr=("10.10.10.2", 50000 + client_id),
+        session=session,
+        entity_id=0x14EA,
+    )
+    ctx.player_pos = (2600.0, 3040.0, 6.0)
+    ctx.player_heading = 0.0
+    return ctx
+
+
+def test_comm_message_request_decodes_og_type2_build_command():
+    """Decompile-backed uplink commands are type-2 COMM_MESSAGE_REQUEST strings."""
+    server = WulframServer.__new__(WulframServer)
+    body = _comm_request_body('build 29002 "Repair Building" 1')
+
+    decoded = server._decode_comm_message_request_body(body)
+    parsed = server._parse_build_uplink_command(decoded["text"])
+
+    assert decoded["ok"] is True, decoded
+    assert decoded["message_type"] == 2, decoded
+    assert decoded["flags_or_target"] == 0, decoded
+    assert decoded["text"] == 'build 29002 "Repair Building" 1', decoded
+    assert parsed["ok"] is True, parsed
+    assert parsed["action"] == "build", parsed
+    assert parsed["ship_oid"] == 29002, parsed
+    assert parsed["entity_type"] == int(EntityType.REPAIR_BUILDING), parsed
+    assert parsed["slot"] == 1, parsed
+    print("test_comm_message_request_decodes_og_type2_build_command: PASSED")
+    return True
+
+
+def test_build_uplink_command_creates_dynamic_building():
+    """Accepted OG build commands should create and replicate a dynamic building."""
+    ctx = _in_game_context()
+    server = _minimal_build_uplink_server(ctx)
+    packet = b"\x20\x00\x44\x00\x00" + _comm_request_body('build 29002 "Repair Building" 1')
+
+    event = server._handle_comm_message_request(
+        ctx,
+        packet,
+        transport="udp",
+        body=packet[5:],
+        addr=ctx.session.udp_addr,
+        sequence=0x44,
+    )
+
+    assert event["handled"] is True, event
+    assert event["decoded"]["ok"] is True, event
+    assert event["build_uplink_command"]["action"] == "build", event
+    assert event["result"]["ok"] is True, event
+    oid = int(event["result"]["oid"])
+    assert oid in server._dynamic_building_ids, event
+    assert oid in server._building_entities, event
+    assert int(server._building_entities[oid].entity_type) == int(EntityType.REPAIR_BUILDING), event
+    assert server._dynamic_building_sources[oid]["slot"] == 1, event
+    assert ctx.build_uplink_command_count == 1, ctx.last_build_uplink_command
+    assert any(payload and payload[0] == 0x0E for payload, _addr in server.udp_handler.sent), server.udp_handler.sent
+    print("test_build_uplink_command_creates_dynamic_building: PASSED")
+    return True
+
+
+def test_uplink_mvp_bootstrap_sends_minimal_status_packets():
+    """Default-off build/uplink bootstrap should send ship, carrying, and uplink state."""
+    ctx = _in_game_context()
+    server = _minimal_build_uplink_server(ctx)
+
+    server._ensure_uplink_mvp_state(ctx)
+
+    sent_payloads = [payload for payload, _addr in server.udp_handler.sent]
+    opcodes = [payload[0] for payload in sent_payloads if payload]
+    assert ctx.uplink_mvp_bootstrap_sent is True, opcodes
+    assert 0x0E in opcodes, opcodes
+    assert 0x27 in opcodes, opcodes
+    assert 0x29 in opcodes, opcodes
+    assert 0x2A in opcodes, opcodes
+    ship_status = next(payload for payload in sent_payloads if payload and payload[0] == 0x27)
+    assert ship_status == build_ship_status(29002, 2, "Team 2 Supply Ship"), ship_status.hex()
+    assert build_carrying_info(0x14EA, has_uplink=True) in sent_payloads
+    assert build_uplink_info(2, 3, 0x14EA) in sent_payloads
+    print("test_uplink_mvp_bootstrap_sends_minimal_status_packets: PASSED")
     return True
 
 
@@ -9764,6 +9906,9 @@ def main():
         test_players_json_includes_transport_addresses,
         test_health_control_uses_server_heartbeat_helper,
         test_energy_control_sets_absolute_or_fractional_energy,
+        test_comm_message_request_decodes_og_type2_build_command,
+        test_build_uplink_command_creates_dynamic_building,
+        test_uplink_mvp_bootstrap_sends_minimal_status_packets,
         test_buildings_json_exposes_playable_slice_observability,
     ]
 
