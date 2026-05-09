@@ -391,6 +391,46 @@ def build_uplink_info(team_index: int, holder_entity_id: int, state: int) -> byt
     )
 
 
+def build_supply_ship_info(
+    ship_id: int,
+    *,
+    shield_pct: int = 100,
+    status_template: int = 0,
+    cargo_slots: tuple[int, int, int, int] | list[int] = (40, 40, 40, 40),
+    cargo_times: tuple[int, int, int, int] | list[int] = (0, 0, 0, 0),
+    build_mode: int = 3,
+) -> bytes:
+    """Build SUPPLY_SHIP_INFO (0x2D).
+
+    Direct disasm of PacketHandler_SUPPLY_SHIP_INFO at 0x0046e590:
+      u32 ship_oid
+      u32 shield_pct
+      u32 status_template_index
+      repeat 4: u32 cargo_entity_type, u32 cargo_build_time
+      u8 build_mode
+
+    The handler finds the existing SHIP_STATUS marker by OID, copies the
+    4 cargo types, 4 timers, and build mode into marker+0x0c, then writes
+    shield_pct to marker+0x14 and status_template_index to marker+0x18.
+    """
+    slots = list(cargo_slots)[:4]
+    times = list(cargo_times)[:4]
+    while len(slots) < 4:
+        slots.append(40)
+    while len(times) < 4:
+        times.append(0)
+
+    payload = b"\x2D"
+    payload += struct.pack(">I", ship_id & 0xFFFFFFFF)
+    payload += struct.pack(">I", int(shield_pct) & 0xFFFFFFFF)
+    payload += struct.pack(">I", int(status_template) & 0xFFFFFFFF)
+    for cargo_type, cargo_time in zip(slots, times):
+        payload += struct.pack(">I", int(cargo_type) & 0xFFFFFFFF)
+        payload += struct.pack(">I", int(cargo_time) & 0xFFFFFFFF)
+    payload += struct.pack("B", int(build_mode) & 0xFF)
+    return payload
+
+
 def build_player_info(entity_oid: int, vehicle_type: int, pos: Tuple[float, float, float],
                       rot: Tuple[float, float, float] = (0.0, 0.0, 0.0),
                       *, include_local_state: bool = False,

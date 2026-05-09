@@ -100,7 +100,7 @@ from .packets import (
     build_update_array_multi, build_view_update_multi, build_view_update_player_update,
     get_behavior_weapon_capability_counts, build_world_stats,
     build_delete_object,
-    build_ship_status, build_carrying_info, build_uplink_info,
+    build_ship_status, build_carrying_info, build_uplink_info, build_supply_ship_info,
     _encode_health_bits, _compress_value, VEC_VEL_MAX, VEC_VEL_RANGE,
     build_transient_array, FX_CHAIN_GUN_FIRE, FX_PULSE_FIRE,
     FX_FLAK_FIRE, FX_MISSILE_FIRE, FX_IMPACT_VEHICLE,
@@ -2807,13 +2807,13 @@ class WulframServer:
             "created_at": time.time(),
         }
         self._dynamic_building_sources[oid] = source
-        ship = self._uplink_ships.get(team_id)
-        if ship is not None:
-            cargo = list(ship.get("cargo", [40, 40, 40, 40]))
-            if 0 <= slot < len(cargo):
-                cargo[slot] = entity_type
-            ship["cargo"] = cargo
-            ship["last_build_oid"] = oid
+        ship = self._uplink_ships.get(team_id) or self._get_or_create_uplink_ship(ctx, team_id)
+        cargo = list(ship.get("cargo", [40, 40, 40, 40]))
+        if 0 <= slot < len(cargo):
+            cargo[slot] = entity_type
+        ship["cargo"] = cargo
+        ship["last_build_oid"] = oid
+        self._broadcast_uplink_ship_info(ship)
         self._rebuild_static_world_raycast_index()
         sent = self._broadcast_dynamic_entity_definition(
             entity_id=oid,
@@ -2868,6 +2868,17 @@ class WulframServer:
         self._building_max_health.pop(oid, None)
         self._dynamic_building_ids.discard(oid)
         self._dynamic_building_sources.pop(oid, None)
+        ship = self._uplink_ships.get(team_id)
+        if ship is not None and slot is not None:
+            cargo = list(ship.get("cargo", [40, 40, 40, 40]))
+            try:
+                slot_index = int(slot)
+            except (TypeError, ValueError):
+                slot_index = -1
+            if 0 <= slot_index < len(cargo):
+                cargo[slot_index] = 40
+            ship["cargo"] = cargo
+            self._broadcast_uplink_ship_info(ship)
         self._rebuild_static_world_raycast_index()
         packet = build_delete_object(get_ticks(), [oid], with_effects=True)
         sent = 0
@@ -2905,10 +2916,33 @@ class WulframServer:
             "pos": (x, y, z),
             "heading": 0.0,
             "cargo": [40, 40, 40, 40],
-            "build_mode": 2,
+            "cargo_times": [0, 0, 0, 0],
+            "build_mode": 3,
+            "shield_pct": 100,
+            "status_template": 0,
         }
         self._uplink_ships[team_id] = ship
         return ship
+
+    def _build_uplink_ship_info_packet(self, ship: dict[str, Any]) -> bytes:
+        return build_supply_ship_info(
+            int(ship["oid"]),
+            shield_pct=int(ship.get("shield_pct", 100) or 100),
+            status_template=int(ship.get("status_template", 0) or 0),
+            cargo_slots=list(ship.get("cargo", [40, 40, 40, 40])),
+            cargo_times=list(ship.get("cargo_times", [0, 0, 0, 0])),
+            build_mode=int(ship.get("build_mode", 3) or 3),
+        )
+
+    def _send_uplink_ship_info(self, ctx: ClientContext, ship: dict[str, Any]) -> bool:
+        return self._send_packet_to_client(ctx, self._build_uplink_ship_info_packet(ship), prefer_tcp=True)
+
+    def _broadcast_uplink_ship_info(self, ship: dict[str, Any]) -> int:
+        sent = 0
+        for target in self._snapshot_in_game_clients():
+            if self._send_uplink_ship_info(target, ship):
+                sent += 1
+        return sent
 
     def _send_existing_build_uplink_entities(self, ctx: ClientContext) -> int:
         sent = 0
@@ -2956,6 +2990,7 @@ class WulframServer:
             # uses that global to find the team supply ship.
             build_update_stats_team_first(player_id=player_oid, entity_id=player_oid, team_id=team_id),
             build_ship_status(int(ship["oid"]), team_id, str(ship["name"])),
+            self._build_uplink_ship_info_packet(ship),
             build_carrying_info(player_oid, cargo_type=0, has_uplink=True, cargo_count=0),
             # State 3 is the decompile-labeled "in use" uplink state.
             build_uplink_info(team_id, player_oid, 3),
@@ -3026,6 +3061,7 @@ class WulframServer:
             ship = self._uplink_ships.get(team_id)
             if ship is not None and str(command.get("field", "")).lower() == "build_mode":
                 ship["build_mode"] = int(command.get("value", 2) or 2)
+                self._broadcast_uplink_ship_info(ship)
             event["result"] = {"ok": True, "noted": True}
         else:
             event["result"] = {"ok": True, "noted": True}

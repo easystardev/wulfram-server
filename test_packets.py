@@ -24,6 +24,7 @@ from wulfram.packets import (
     build_ship_status,
     build_carrying_info,
     build_uplink_info,
+    build_supply_ship_info,
 )
 from wulfram.codec import frame_packet
 
@@ -344,6 +345,35 @@ def test_uplink_info():
     return match
 
 
+def test_supply_ship_info():
+    """Test SUPPLY_SHIP_INFO packet."""
+    payload = build_supply_ship_info(
+        0x12345678,
+        shield_pct=100,
+        status_template=0,
+        cargo_slots=[40, 27, 26, 30],
+        cargo_times=[0, 3000, 6000, 9000],
+        build_mode=3,
+    )
+
+    print(f"SUPPLY_SHIP_INFO:")
+    print(f"  Got: {payload.hex().upper()}")
+    expected = bytes.fromhex(
+        "2D"
+        "12345678"
+        "00000064"
+        "00000000"
+        "00000028" "00000000"
+        "0000001B" "00000BB8"
+        "0000001A" "00001770"
+        "0000001E" "00002328"
+        "03"
+    )
+    match = payload == expected
+    print(f"  Match: {match}")
+    return match
+
+
 def test_world_stats():
     """Test WORLD_STATS packet."""
     payload = build_world_stats()
@@ -384,6 +414,7 @@ def main():
         test_ship_status,
         test_carrying_info,
         test_uplink_info,
+        test_supply_ship_info,
         test_world_stats,
     ]
 

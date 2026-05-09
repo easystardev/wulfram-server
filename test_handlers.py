@@ -69,6 +69,7 @@ from wulfram.packets import (
     build_ship_status,
     build_carrying_info,
     build_uplink_info,
+    build_supply_ship_info,
 )
 from wulfram2_protocol.codec import BitReader, BitWriter, quantize_float
 from client.wulfram_client.network.behavior import parse_behavior
@@ -9677,6 +9678,7 @@ def test_build_uplink_command_creates_dynamic_building():
     assert server._dynamic_building_sources[oid]["slot"] == 1, event
     assert ctx.build_uplink_command_count == 1, ctx.last_build_uplink_command
     assert any(payload and payload[0] == 0x0E for payload, _addr in server.udp_handler.sent), server.udp_handler.sent
+    assert any(payload and payload[0] == 0x2D for payload, _addr in server.udp_handler.sent), server.udp_handler.sent
     print("test_build_uplink_command_creates_dynamic_building: PASSED")
     return True
 
@@ -9694,11 +9696,14 @@ def test_uplink_mvp_bootstrap_sends_minimal_status_packets():
     assert 0x0E in opcodes, opcodes
     assert 0x1C in opcodes, opcodes
     assert 0x27 in opcodes, opcodes
+    assert 0x2D in opcodes, opcodes
     assert 0x29 in opcodes, opcodes
     assert 0x2A in opcodes, opcodes
     assert build_update_stats_team_first(player_id=0x14EA, entity_id=0x14EA, team_id=2) in sent_payloads
     ship_status = next(payload for payload in sent_payloads if payload and payload[0] == 0x27)
     assert ship_status == build_ship_status(29002, 2, "Team 2 Supply Ship"), ship_status.hex()
+    supply_ship_info = next(payload for payload in sent_payloads if payload and payload[0] == 0x2D)
+    assert supply_ship_info == build_supply_ship_info(29002, shield_pct=100, status_template=0, build_mode=3), supply_ship_info.hex()
     assert build_carrying_info(0x14EA, has_uplink=True) in sent_payloads
     assert build_uplink_info(2, 0x14EA, 3) in sent_payloads
     print("test_uplink_mvp_bootstrap_sends_minimal_status_packets: PASSED")
