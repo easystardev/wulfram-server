@@ -180,6 +180,13 @@ class TerrainGridCollision:
             return (-normal[0], -normal[1], -normal[2])
         return normal
 
+    @staticmethod
+    def _all_finite(values) -> bool:
+        try:
+            return all(math.isfinite(float(value)) for value in values)
+        except (TypeError, ValueError, OverflowError):
+            return False
+
     def coords_to_index(self, row: int, col: int) -> int:
         return row * self.sector_cols + col
 
@@ -187,10 +194,14 @@ class TerrainGridCollision:
         """Classify world-space XY into the top-level 3x3 terrain-sector grid."""
         if self.world_w <= 0.0:
             row = 0
+        elif not math.isfinite(float(wx)):
+            row = self.sector_rows - 1 if wx > 0.0 else 0
         else:
             row = int(math.floor(wx / (self.world_w / self.sector_rows)))
         if self.world_h <= 0.0:
             col = 0
+        elif not math.isfinite(float(wy)):
+            col = self.sector_cols - 1 if wy > 0.0 else 0
         else:
             col = int(math.floor(wy / (self.world_h / self.sector_cols)))
         return (
@@ -204,6 +215,8 @@ class TerrainGridCollision:
         radius: float,
     ) -> Optional[TerrainHit]:
         """Test a sphere against sectorized terrain triangles."""
+        if not self._all_finite((*center, radius)):
+            return None
         aabb_min = (center[0] - radius, center[1] - radius, center[2] - radius)
         aabb_max = (center[0] + radius, center[1] + radius, center[2] + radius)
 
@@ -228,6 +241,8 @@ class TerrainGridCollision:
         aabb_max: tuple[float, float, float],
     ) -> bool:
         """Test whether any terrain triangle overlaps XY bounds, mirroring the dirty-path broadphase."""
+        if not self._all_finite((*aabb_min, *aabb_max)):
+            return False
         for sector in self._iter_aabb_sectors(aabb_min, aabb_max):
             for cell_x, cell_y in self._iter_sector_cells(aabb_min, aabb_max, sector):
                 for tri in self._iter_cell_triangles(cell_x, cell_y):
@@ -248,6 +263,8 @@ class TerrainGridCollision:
         heading: float,
     ) -> Optional[TerrainContact]:
         """Test a heading-rotated entity box against sectorized terrain triangles."""
+        if not self._all_finite((*center, *half_extents, heading)):
+            return None
         radius = math.sqrt(
             half_extents[0] * half_extents[0] +
             half_extents[1] * half_extents[1] +
@@ -300,6 +317,11 @@ class TerrainGridCollision:
         bounding_radius: Optional[float] = None,
     ) -> Optional[TerrainContact]:
         """Return the first terrain contact found while scanning bounds-overlapping cells."""
+        finite_values = (*bounds_center, *collision_center, *half_extents, heading)
+        if bounding_radius is not None:
+            finite_values = (*finite_values, bounding_radius)
+        if not self._all_finite(finite_values):
+            return None
         radius = bounding_radius
         if radius is None:
             radius = math.sqrt(
@@ -349,6 +371,8 @@ class TerrainGridCollision:
         end: tuple[float, float, float],
     ) -> Optional[TerrainRaycastHit]:
         """Raycast a segment against terrain using patch sweep + per-patch DDA traversal."""
+        if not self._all_finite((*start, *end)):
+            return None
         for sector in self._iter_ray_sectors(start, end):
             hit = self._raycast_sector_cells(start, end, sector)
             if hit is not None:
@@ -364,6 +388,8 @@ class TerrainGridCollision:
         bounding_radius: float,
     ) -> Optional[TerrainContact]:
         """Test sectorized terrain triangles against an entity collision mesh."""
+        if not self._all_finite((*center, heading, bounding_radius)):
+            return None
         aabb_min = (center[0] - bounding_radius, center[1] - bounding_radius, center[2] - bounding_radius)
         aabb_max = (center[0] + bounding_radius, center[1] + bounding_radius, center[2] + bounding_radius)
         cos_h = math.cos(heading)
@@ -410,6 +436,8 @@ class TerrainGridCollision:
         bounding_radius: float,
     ) -> Optional[TerrainContact]:
         """Return the first model/terrain contact found while scanning bounds-overlapping cells."""
+        if not self._all_finite((*bounds_center, *collision_center, heading, bounding_radius)):
+            return None
         aabb_min = (
             bounds_center[0] - bounding_radius,
             bounds_center[1] - bounding_radius,

@@ -151,6 +151,18 @@ class ClientContext:
     # Active projectiles for this client
     active_projectiles: list = field(default_factory=list)
     projectile_lock: threading.Lock = field(default_factory=threading.Lock)
+    weapon_fire_count: int = 0
+    last_weapon_fire_time: float = 0.0
+    last_weapon_fire_source: str = ""
+    last_weapon_fire_client_tick: int = 0
+    last_weapon_fire_projectile_ids: list = field(default_factory=list)
+    last_weapon_fire_projectile_types: list = field(default_factory=list)
+    last_weapon_fire_energy_spent: float = 0.0
+    last_weapon_fire_input: dict = field(default_factory=dict)
+    projectile_update_packet_count: int = 0
+    last_projectile_update_time: float = 0.0
+    last_projectile_update_id: int = 0
+    last_projectile_update_targets: int = 0
 
     # Thread management
     tick_thread: Optional[threading.Thread] = None

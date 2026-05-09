@@ -34,6 +34,7 @@ from .physics import _extract_euler_angles, _matrix3_from_euler_xyz, _normalize_
 from .weapons import (
     WeaponSystem, build_projectile_spawn_packet, EntityType, BehaviorSlot,
     VEHICLE_PHYSICS_CONFIGS, TANK_WEAPON_SLOTS,
+    OG_DIRECT_TRIGGER_WEAPON_SLOTS,
 )
 from .jump_jets import JumpJetSystem
 from .client import ClientContext
@@ -334,6 +335,12 @@ class WulframServer:
         self.send_player_updates = os.environ.get("WULFRAM_SEND_PLAYER_UPDATES", "1") == "1"
         # Remote player updates (multiplayer position sync) â€” independent of local heartbeat.
         self.send_remote_updates = os.environ.get("WULFRAM_SEND_REMOTE_UPDATES", "1") == "1"
+        # T3 OG-participant isolation gates. These default on so normal
+        # behavior is unchanged, but live probes can selectively disable
+        # target->OG visibility streams without disturbing loopback clients.
+        self.og_viewer_roster_entry = os.environ.get("WULFRAM_OG_VIEWER_ROSTER_ENTRY", "1") == "1"
+        self.og_viewer_entity_create = os.environ.get("WULFRAM_OG_VIEWER_ENTITY_CREATE", "1") == "1"
+        self.og_viewer_remote_updates = os.environ.get("WULFRAM_OG_VIEWER_REMOTE_UPDATES", "1") == "1"
         # Wulf-forge sends UPDATE_ARRAY over UDP only.
         self.send_updates_tcp = os.environ.get("WULFRAM_UPDATE_TCP", "0") == "1"
         self.send_updates_udp = os.environ.get("WULFRAM_UPDATE_UDP", "1") == "1"
@@ -2496,8 +2503,22 @@ class WulframServer:
             sent = True
         return sent
 
+    def _og_viewer_replication_enabled(self, target_ctx: ClientContext, stream: str) -> bool:
+        """Return whether a replication stream is enabled for an OG/remote viewer."""
+        if handlers._is_loopback_client(target_ctx):
+            return True
+        if stream == "roster":
+            return bool(getattr(self, "og_viewer_roster_entry", True))
+        if stream == "entity_create":
+            return bool(getattr(self, "og_viewer_entity_create", True))
+        if stream == "remote_updates":
+            return bool(getattr(self, "og_viewer_remote_updates", True))
+        return True
+
     def _send_roster_entry(self, target_ctx: ClientContext, player_ctx: ClientContext) -> None:
         """Send ADD_TO_ROSTER for player_ctx to target_ctx (once)."""
+        if not self._og_viewer_replication_enabled(target_ctx, "roster"):
+            return
         player_id = player_ctx.session.player_id or player_ctx.entity_id
         if player_id in target_ctx.known_roster_ids:
             return
@@ -2576,6 +2597,8 @@ class WulframServer:
         retry period after the first attempt, so that one eventually
         arrives when the guard is open.
         """
+        if not self._og_viewer_replication_enabled(target_ctx, "entity_create"):
+            return
         if not target_ctx.session.translation_ack_received:
             return
         entity_id = player_ctx.session.entity_id or player_ctx.entity_id
@@ -2687,6 +2710,8 @@ class WulframServer:
 
     def _send_remote_player_updates(self, ctx: ClientContext, tick: int, *, prefer_tcp: bool = True) -> None:
         """Send other players' transforms to a client."""
+        if not self._og_viewer_replication_enabled(ctx, "remote_updates"):
+            return
         mode = self.remote_update_mode
         if mode in ("off", "none", "disabled"):
             return
@@ -3698,9 +3723,7 @@ class WulframServer:
         # Start tick loop.
         session.last_spawn_time = time.monotonic()
         ctx.last_action_dump_time = time.monotonic()
-        if FEATURES.tick_loop_enabled and (ctx.tick_thread is None or not ctx.tick_thread.is_alive()):
-            ctx.tick_thread = threading.Thread(target=self._tick_loop, args=(ctx,), daemon=True)
-            ctx.tick_thread.start()
+        if self._ensure_tick_loop(ctx):
             print(f"[GHOST] Started tick loop for ghost client {client_id}")
 
         return ctx
@@ -4271,9 +4294,7 @@ class WulframServer:
             previously_promoted=restore_promoted_remote_sync_after_spawn,
         )
 
-        if FEATURES.tick_loop_enabled and (ctx.tick_thread is None or not ctx.tick_thread.is_alive()):
-            ctx.tick_thread = threading.Thread(target=self._tick_loop, args=(ctx,), daemon=True)
-            ctx.tick_thread.start()
+        if self._ensure_tick_loop(ctx):
             print(f"[SPAWN] Started tick loop (local_state_updates={self.update_local_state_mode})")
 
     def _spawn_wf_minimal(self, ctx: ClientContext, team_id: int, net_id: int, addr: tuple):
@@ -5890,6 +5911,13 @@ class WulframServer:
                         f"fire_pos={fire_pos}"
                     )
                     self._log_fire_pose_context(ctx, client_tick, "ACTION_DUMP")
+                    self._record_client_weapon_fire(
+                        ctx,
+                        "ACTION_DUMP",
+                        client_tick,
+                        new_projectiles,
+                        energy_spent,
+                    )
                 for proj in new_projectiles:
                     self._spawn_moving_projectile(ctx, proj, addr)
 
@@ -5963,6 +5991,13 @@ class WulframServer:
                         f"fire_pos={fire_pos}"
                     )
                     self._log_fire_pose_context(ctx, client_tick, "ACTION_UPDATE")
+                    self._record_client_weapon_fire(
+                        ctx,
+                        "ACTION_UPDATE",
+                        client_tick,
+                        new_projectiles,
+                        energy_spent,
+                    )
                 for proj in new_projectiles:
                     self._spawn_moving_projectile(ctx, proj, addr)
 
@@ -6776,6 +6811,52 @@ class WulframServer:
 
         ctx.jump_prev_thrust_input = jumpjet_input
         return current_vel_up, fired, impulse
+
+    def _record_client_weapon_fire(
+        self,
+        ctx: ClientContext,
+        packet_type: str,
+        client_tick: int,
+        projectiles,
+        energy_spent: float,
+    ) -> None:
+        """Record client-input-triggered projectile fire for live T3 gates."""
+        if ctx is None or ctx.weapon_system is None:
+            return
+        projectiles = list(projectiles or [])
+        if not projectiles:
+            return
+
+        now = time.monotonic()
+        ws = ctx.weapon_system
+        active_slots = {
+            str(idx): float(value)
+            for idx, value in enumerate(ws.behavior_slots)
+            if abs(float(value)) > 0.001
+        }
+        direct_slots = {
+            str(idx): float(ws.behavior_slots[idx])
+            for idx in OG_DIRECT_TRIGGER_WEAPON_SLOTS
+            if idx < len(ws.behavior_slots) and abs(float(ws.behavior_slots[idx])) > 0.001
+        }
+
+        ctx.weapon_fire_count = int(getattr(ctx, "weapon_fire_count", 0) or 0) + len(projectiles)
+        ctx.last_weapon_fire_time = now
+        ctx.last_weapon_fire_source = packet_type
+        ctx.last_weapon_fire_client_tick = int(client_tick or 0)
+        ctx.last_weapon_fire_projectile_ids = [int(getattr(proj, "entity_id", 0) or 0) for proj in projectiles]
+        ctx.last_weapon_fire_projectile_types = [
+            getattr(getattr(proj, "entity_type", None), "name", str(getattr(proj, "entity_type", "")))
+            for proj in projectiles
+        ]
+        ctx.last_weapon_fire_energy_spent = float(energy_spent or 0.0)
+        ctx.last_weapon_fire_input = {
+            "active_slots": active_slots,
+            "direct_slots": direct_slots,
+            "fire": float(ws.behavior_slots[BehaviorSlot.FIRE]),
+            "thrust": float(tank_softbody_control_slot_value(ws.behavior_slots)),
+            "jumpjet": float(ws.behavior_slots[BehaviorSlot.JUMPJET]),
+        }
 
     def _record_client_action_telemetry(
         self,
@@ -7958,12 +8039,65 @@ class WulframServer:
         if dt is None:
             dt = getattr(ctx, "_world_collision_step_dt", None)
 
+        def finite_values(values) -> bool:
+            try:
+                return all(math.isfinite(float(value)) for value in values)
+            except (TypeError, ValueError, OverflowError):
+                return False
+
+        def finite_triplet(value):
+            if value is None:
+                return None
+            try:
+                if len(value) < 3:
+                    return None
+                result = (float(value[0]), float(value[1]), float(value[2]))
+            except (TypeError, ValueError, OverflowError):
+                return None
+            return result if finite_values(result) else None
+
+        def finish_result(px_out, py_out, pz_out, vx_out, vy_out, vz_out, *, reason="terrain_motion_nonfinite_output"):
+            if finite_values((px_out, py_out, pz_out, vx_out, vy_out, vz_out)):
+                return px_out, py_out, pz_out, vx_out, vy_out, vz_out
+
+            fallback_pos = (
+                finite_triplet(pre_pos)
+                or finite_triplet(getattr(ctx, "player_pos", None))
+                or (0.0, 0.0, float(getattr(self, "ground_level", 0.0) or 0.0))
+            )
+            fallback_vel = (
+                finite_triplet(pre_vel)
+                or finite_triplet(getattr(ctx, "player_vel", None))
+                or (0.0, 0.0, 0.0)
+            )
+            ctx.debug_last_collision = {
+                "kind": reason,
+                "bad_pos": (px_out, py_out, pz_out),
+                "bad_vel": (vx_out, vy_out, vz_out),
+                "fallback_pos": fallback_pos,
+                "fallback_vel": fallback_vel,
+            }
+            ctx.debug_last_motion_collision = dict(ctx.debug_last_collision)
+            ctx.world_collision_bounds_dirty = False
+            ctx.world_collision_ref_pos = fallback_pos
+            return (
+                fallback_pos[0],
+                fallback_pos[1],
+                fallback_pos[2],
+                fallback_vel[0],
+                fallback_vel[1],
+                fallback_vel[2],
+            )
+
+        if not finite_values((px, py, pz, vx, vy, vz)):
+            return finish_result(px, py, pz, vx, vy, vz, reason="terrain_motion_nonfinite_input")
+
         half_extents = self._get_entity_world_half_extents(ctx)
         heading = ctx.player_heading
         anchor = [px, py, pz]
         reference_pos = getattr(ctx, "world_collision_ref_pos", None) or ctx.player_pos
         origin_mode = (
-            os.environ.get("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN", "entity").strip().lower()
+            os.environ.get("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN", "lift").strip().lower()
         )
         contact_response = (
             os.environ.get("WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE", "auto").strip().lower()
@@ -8066,6 +8200,8 @@ class WulframServer:
             }
 
         def sample_contact_at(pos):
+            if not finite_values((*pos, heading)):
+                return None
             if collision_model is not None:
                 model_center = (pos[0], pos[1], pos[2] + z_lift)
                 return self._terrain_grid_collision.test_model_collision(
@@ -8176,6 +8312,17 @@ class WulframServer:
                 except ValueError:
                     constraint_kwargs["inactive_retest_bias"] = 0.1
             result = solve_static_terrain_constraint(**constraint_kwargs)
+            if not finite_values((*result.position, *result.velocity, *result.angular_velocity)):
+                return {
+                    "response": "terrain_pair_solver_nonfinite_rejected",
+                    "velocity_before": before_vel,
+                    "velocity_after": before_vel,
+                    "angular_velocity_before": before_ang,
+                    "angular_velocity_after": before_ang,
+                    "bad_position": result.position,
+                    "bad_velocity": result.velocity,
+                    "bad_angular_velocity": result.angular_velocity,
+                }
             result_debug = dict(result.debug)
             yaw_feedback_mode = os.environ.get(
                 "WULFRAM_ENTITY_TERRAIN_CONTACT_YAW_FEEDBACK",
@@ -8728,7 +8875,7 @@ class WulframServer:
                     else:
                         apply_dirty_bounds_contact(contact)
                         ctx.world_collision_ref_pos = (anchor[0], anchor[1], anchor[2])
-                        return anchor[0], anchor[1], anchor[2], vx, vy, vz
+                        return finish_result(anchor[0], anchor[1], anchor[2], vx, vy, vz)
             else:
                 bounds_overlap_fn = getattr(self._terrain_grid_collision, "test_bounds_intersection", None)
                 if callable(bounds_overlap_fn):
@@ -8745,10 +8892,10 @@ class WulframServer:
                     if bounds_overlap_fn(dirty_aabb_min, dirty_aabb_max):
                         if resolve_dirty_contact():
                             ctx.world_collision_ref_pos = (anchor[0], anchor[1], anchor[2])
-                            return anchor[0], anchor[1], anchor[2], vx, vy, vz
+                            return finish_result(anchor[0], anchor[1], anchor[2], vx, vy, vz)
                 elif resolve_dirty_contact():
                     ctx.world_collision_ref_pos = (anchor[0], anchor[1], anchor[2])
-                    return anchor[0], anchor[1], anchor[2], vx, vy, vz
+                    return finish_result(anchor[0], anchor[1], anchor[2], vx, vy, vz)
             terrain_hit = raycast_fn(reference_pos, (anchor[0], anchor[1], anchor[2]))
             if terrain_hit is not None:
                 ray_dir = (
@@ -8815,9 +8962,9 @@ class WulframServer:
                 }
                 ctx.debug_last_motion_collision = dict(ctx.debug_last_collision)
                 ctx.world_collision_ref_pos = (anchor[0], anchor[1], anchor[2])
-                return anchor[0], anchor[1], anchor[2], vx, vy, vz
+                return finish_result(anchor[0], anchor[1], anchor[2], vx, vy, vz)
             ctx.world_collision_ref_pos = (anchor[0], anchor[1], anchor[2])
-            return anchor[0], anchor[1], anchor[2], vx, vy, vz
+            return finish_result(anchor[0], anchor[1], anchor[2], vx, vy, vz)
 
         resolve_single_contact()
         # Keep the dirty-reference anchored to the latest clean-resolution pose.
@@ -8825,7 +8972,7 @@ class WulframServer:
         # against an old reference and falsely enter the dirty terrain-ray path.
         ctx.world_collision_ref_pos = (anchor[0], anchor[1], anchor[2])
 
-        return anchor[0], anchor[1], anchor[2], vx, vy, vz
+        return finish_result(anchor[0], anchor[1], anchor[2], vx, vy, vz)
 
     def _resolve_entity_entity_collisions(self, ctx: ClientContext):
         """Resolve entity-entity collisions using impulse-based sphere-sphere detection.
@@ -8950,7 +9097,7 @@ class WulframServer:
     def _get_entity_world_collision_model(self, ctx: ClientContext):
         team_id = ctx.session.team_id or 1
         origin_mode = (
-            os.environ.get("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN", "entity").strip().lower()
+            os.environ.get("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN", "lift").strip().lower()
         )
         cache_key = (ctx.entity_type, team_id, origin_mode)
         if cache_key in self._entity_collision_model_cache:
@@ -8974,9 +9121,9 @@ class WulframServer:
         bounding_radius = root.radius if root is not None else 0.0
         min_z = min(getattr(vertex, "z", 0.0) for vertex in vertices)
         if origin_mode in {"entity", "origin", "raw"}:
-            # Decompile-backed transform: terrain contact tests use entity.pos
-            # directly. The old lifted mesh path remains available as an A/B
-            # escape hatch via WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN=lift.
+            # Experimental decompile-backed transform: terrain contact tests
+            # use entity.pos directly. Keep this opt-in until live rough-terrain
+            # gates prove the pair/timed response path stable.
             z_lift = 0.0
         else:
             z_lift = max(0.0, -float(min_z))
@@ -10040,6 +10187,7 @@ class WulframServer:
                 # Send position update (dt=0 since we already advanced pos above)
                 # Build per-client packets so each viewer gets their OWN health
                 # in local_state (not the shooter's health).
+                sent_update_count = 0
                 if self.udp_handler:
                     for target in self._snapshot_in_game_clients():
                         if not target.session.udp_addr or not target.session.translation_ack_received:
@@ -10054,8 +10202,9 @@ class WulframServer:
                             0.0,  # Position already advanced above
                             include_local_state=include_local_state,
                             **local_state_kwargs,
-                        )
+                            )
                         self.udp_handler.send_to(pkt, target.session.udp_addr)
+                        sent_update_count += 1
                         if self.pktlog.enabled:
                             self.pktlog.log(
                                 client_id=target.client_id,
@@ -10069,6 +10218,14 @@ class WulframServer:
                                 has_local_state=include_local_state,
                                 health=self._get_health_value(target) if include_local_state else -1.0,
                             )
+                if sent_update_count:
+                    ctx.projectile_update_packet_count = (
+                        int(getattr(ctx, "projectile_update_packet_count", 0) or 0)
+                        + sent_update_count
+                    )
+                    ctx.last_projectile_update_time = time.monotonic()
+                    ctx.last_projectile_update_id = int(getattr(proj, "entity_id", 0) or 0)
+                    ctx.last_projectile_update_targets = sent_update_count
 
                 if i % 15 == 0:  # Log every 0.5 sec at 30Hz
                     print(f"[PROJ] id={proj.entity_id} pos=({proj.pos[0]:.1f},{proj.pos[1]:.1f},{proj.pos[2]:.1f}) vel=({proj.vel[0]:.0f},{proj.vel[1]:.0f},{proj.vel[2]:.0f}) tick={tick}")
@@ -10857,8 +11014,25 @@ class WulframServer:
 
         print("[RELOAD] _apply_reload_defaults done")
 
+    def _ensure_tick_loop(self, ctx: ClientContext) -> bool:
+        """Start exactly one authoritative tick loop for a client context."""
+        if not FEATURES.tick_loop_enabled:
+            return False
+        with ctx.tick_lock:
+            if ctx.tick_thread is not None and ctx.tick_thread.is_alive():
+                return False
+            thread = threading.Thread(target=self._tick_loop, args=(ctx,), daemon=True)
+            ctx.tick_thread = thread
+            thread.start()
+            return True
+
     def _tick_loop(self, ctx: ClientContext):
         """Game tick loop - sends UPDATE_ARRAY periodically."""
+        current_thread = threading.current_thread()
+        with ctx.tick_lock:
+            if ctx.tick_thread is not current_thread:
+                print(f"[TICK] Stale tick loop rejected for client {ctx.client_id}")
+                return
         print(f"[TICK] Starting tick loop for client {ctx.client_id}")
         tcp_failed = False
         tick_start_time = time.monotonic()
@@ -11221,7 +11395,7 @@ class WulframServer:
                         include_rpos = mode not in ("heartbeat", "mask0", "off", "none", "disabled")
                         include_rvel = mode in ("pos_vel", "pos_vel_rot", "full", "all")
                         include_rrot = mode in ("pos_rot", "pos_vel_rot", "full", "all")
-                        if mode not in ("off", "none", "disabled"):
+                        if mode not in ("off", "none", "disabled") and self._og_viewer_replication_enabled(ctx, "remote_updates"):
                             for other in self._snapshot_in_game_clients():
                                 if other is ctx:
                                     continue
@@ -11732,7 +11906,9 @@ class WulframServer:
                 # Don't break - try to continue even with errors
                 time.sleep(0.1)
 
-        ctx.tick_thread = None
+        with ctx.tick_lock:
+            if ctx.tick_thread is current_thread:
+                ctx.tick_thread = None
         print(f"[TICK] Tick loop ended for client {ctx.client_id}")
 
 

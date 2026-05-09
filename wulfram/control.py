@@ -1761,6 +1761,32 @@ Examples:
                     "last_position_change_age_s": _age(getattr(ctx, "last_position_update", 0.0)),
                     "position_changes": getattr(ctx, "position_change_count", 0),
                     "last_input": getattr(ctx, "last_decoded_input", {}) or {},
+                    "weapon_fire_count": getattr(ctx, "weapon_fire_count", 0),
+                    "last_weapon_fire_age_s": _age(getattr(ctx, "last_weapon_fire_time", 0.0)),
+                    "last_weapon_fire_source": getattr(ctx, "last_weapon_fire_source", ""),
+                    "last_weapon_fire_client_tick": getattr(ctx, "last_weapon_fire_client_tick", 0),
+                    "last_weapon_fire_projectile_ids": getattr(
+                        ctx,
+                        "last_weapon_fire_projectile_ids",
+                        [],
+                    ),
+                    "last_weapon_fire_projectile_types": getattr(
+                        ctx,
+                        "last_weapon_fire_projectile_types",
+                        [],
+                    ),
+                    "last_weapon_fire_energy_spent": getattr(
+                        ctx,
+                        "last_weapon_fire_energy_spent",
+                        0.0,
+                    ),
+                    "last_weapon_fire_input": getattr(ctx, "last_weapon_fire_input", {}) or {},
+                    "projectile_update_packets": getattr(ctx, "projectile_update_packet_count", 0),
+                    "last_projectile_update_age_s": _age(
+                        getattr(ctx, "last_projectile_update_time", 0.0)
+                    ),
+                    "last_projectile_update_id": getattr(ctx, "last_projectile_update_id", 0),
+                    "last_projectile_update_targets": getattr(ctx, "last_projectile_update_targets", 0),
                     "state_requests": getattr(ctx, "state_request_count", 0),
                     "state_sync_replies": getattr(ctx, "state_sync_reply_count", 0),
                     "state_sync_view_replies": getattr(ctx, "state_sync_view_reply_count", 0),
@@ -3311,15 +3337,9 @@ Examples:
             self.server
             and active_ctx
             and FEATURES.tick_loop_enabled
-            and (active_ctx.tick_thread is None or not active_ctx.tick_thread.is_alive())
+            and self.server._ensure_tick_loop(active_ctx)
         ):
             active_ctx.last_action_dump_time = time.monotonic()
-            active_ctx.tick_thread = threading.Thread(
-                target=self.server._tick_loop,
-                args=(active_ctx,),
-                daemon=True,
-            )
-            active_ctx.tick_thread.start()
 
         return ("Spawn sequence sent: team=%d entity=%d vehicle=%d behavior=%d pos=(%.1f,%.1f,%.1f) delay_ms=%d"
                 % (team_id, entity_id, vehicle_type, behavior_type, x, y, z, delay_ms))
@@ -4031,8 +4051,6 @@ Examples:
         if not self.server:
             return "Error: No server reference"
 
-        from .packets import build_update_array_heartbeat, get_ticks
-
         # Parse args
         if args and args[0].lower() == "set":
             # health set <val> [c<id>]
@@ -4060,14 +4078,13 @@ Examples:
             # Send health update packet
             if self.server.udp_handler and ctx.session and ctx.session.udp_addr:
                 tick = self.server._get_network_tick(ctx)
-                weapon_type = self.server._get_local_state_weapon_type(ctx)
-                packet = build_update_array_heartbeat(
+                packet = self.server._build_local_state_heartbeat(
+                    ctx,
                     tick=tick,
                     entity_id=ctx.session.entity_id or ctx.entity_id,
                     include_health=True,
-                    weapon_id=weapon_type,
                     health=self.server._get_health_value(ctx),
-                    fuel=1.0,
+                    fuel=self.server._get_energy_value(ctx),
                 )
                 self.server.udp_handler.send_to(packet, ctx.session.udp_addr)
 

@@ -3355,6 +3355,67 @@ def test_send_entity_create_uses_udp_only():
     return True
 
 
+def test_og_viewer_replication_gates_skip_remote_only():
+    """T3 isolation gates should suppress OG-viewer streams without blocking loopback clients."""
+    server = WulframServer.__new__(WulframServer)
+    server.og_viewer_roster_entry = False
+    server.og_viewer_entity_create = False
+    server.og_viewer_remote_updates = False
+
+    remote_session = Session()
+    remote_session.translation_ack_received = True
+    remote_ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=remote_session,
+        entity_id=1337,
+    )
+    remote_ctx.known_roster_ids = set()
+    remote_ctx.known_entity_ids = set()
+
+    loopback_session = Session()
+    loopback_session.translation_ack_received = True
+    loopback_ctx = ClientContext(
+        client_id=2,
+        client_addr=("127.0.0.1", 50001),
+        session=loopback_session,
+        entity_id=1338,
+    )
+
+    assert server._og_viewer_replication_enabled(remote_ctx, "roster") is False
+    assert server._og_viewer_replication_enabled(remote_ctx, "entity_create") is False
+    assert server._og_viewer_replication_enabled(remote_ctx, "remote_updates") is False
+    assert server._og_viewer_replication_enabled(loopback_ctx, "roster") is True
+    assert server._og_viewer_replication_enabled(loopback_ctx, "entity_create") is True
+    assert server._og_viewer_replication_enabled(loopback_ctx, "remote_updates") is True
+
+    player_session = Session()
+    player_session.player_id = 1338
+    player_session.entity_id = 1338
+    player_session.username = "Target"
+    player_session.team_id = 2
+    player_ctx = ClientContext(
+        client_id=3,
+        client_addr=("127.0.0.1", 50002),
+        session=player_session,
+        entity_id=1338,
+    )
+    player_ctx.kills = 0
+    player_ctx.deaths = 0
+
+    sent = []
+    server._send_packet_to_client = lambda *args, **kwargs: sent.append((args, kwargs)) or True
+    server._send_roster_entry(remote_ctx, player_ctx)
+    server._send_entity_create(remote_ctx, player_ctx)
+    server._send_remote_player_updates(remote_ctx, tick=0x12345678)
+
+    assert sent == [], sent
+    assert remote_ctx.known_roster_ids == set(), remote_ctx.known_roster_ids
+    assert remote_ctx.known_entity_ids == set(), remote_ctx.known_entity_ids
+    print("test_og_viewer_replication_gates_skip_remote_only: PASSED")
+    return True
+
+
 def test_transient_fx_stays_off_for_remote_og_by_default():
     """Remote OG viewers should not receive crash-prone cosmetic TRANSIENT_ARRAY by default."""
     sent = []
@@ -6432,32 +6493,11 @@ def _fake_tank_collision_context():
     return ctx
 
 
-def test_entity_world_collision_model_defaults_to_entity_origin_after_pair_solver_port():
-    """Default vehicle terrain CBSP origin should use entity.pos directly."""
+def test_entity_world_collision_model_defaults_to_legacy_lift():
+    """Default vehicle terrain CBSP origin stays on the live-stable lifted mesh path."""
     old_env = os.environ.get("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN")
     try:
         os.environ.pop("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN", None)
-        server = _fake_tank_collision_server()
-        ctx = _fake_tank_collision_context()
-
-        _vertices, _tree, radius, z_lift = server._get_entity_world_collision_model(ctx)
-
-        assert abs(radius - 7.5) < 1e-6, radius
-        assert z_lift == 0.0, z_lift
-    finally:
-        if old_env is None:
-            os.environ.pop("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN", None)
-        else:
-            os.environ["WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN"] = old_env
-    print("test_entity_world_collision_model_defaults_to_entity_origin_after_pair_solver_port: PASSED")
-    return True
-
-
-def test_entity_world_collision_model_legacy_lift_can_be_requested():
-    """The old lifted mesh transform remains available for A/B probes."""
-    old_env = os.environ.get("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN")
-    try:
-        os.environ["WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN"] = "lift"
         server = _fake_tank_collision_server()
         ctx = _fake_tank_collision_context()
 
@@ -6470,7 +6510,58 @@ def test_entity_world_collision_model_legacy_lift_can_be_requested():
             os.environ.pop("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN", None)
         else:
             os.environ["WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN"] = old_env
-    print("test_entity_world_collision_model_legacy_lift_can_be_requested: PASSED")
+    print("test_entity_world_collision_model_defaults_to_legacy_lift: PASSED")
+    return True
+
+
+def test_entity_world_collision_model_entity_origin_can_be_requested():
+    """The entity-origin terrain transform remains available as an opt-in probe."""
+    old_env = os.environ.get("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN")
+    try:
+        os.environ["WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN"] = "entity"
+        server = _fake_tank_collision_server()
+        ctx = _fake_tank_collision_context()
+
+        _vertices, _tree, radius, z_lift = server._get_entity_world_collision_model(ctx)
+
+        assert abs(radius - 7.5) < 1e-6, radius
+        assert z_lift == 0.0, z_lift
+    finally:
+        if old_env is None:
+            os.environ.pop("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN", None)
+        else:
+            os.environ["WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN"] = old_env
+    print("test_entity_world_collision_model_entity_origin_can_be_requested: PASSED")
+    return True
+
+
+def test_entity_world_collision_restores_previous_motion_after_nonfinite_input():
+    """Bad timed-contact output should not feed non-finite positions into terrain lookup."""
+    server = WulframServer.__new__(WulframServer)
+    server._terrain_grid_collision = object()
+    server.ground_level = 0.0
+
+    ctx = _fake_tank_collision_context()
+    ctx.player_pos = (1.0, 2.0, 3.0)
+    ctx.player_vel = (4.0, 5.0, 6.0)
+
+    result = server._resolve_entity_world_collision(
+        ctx,
+        math.inf,
+        20.0,
+        30.0,
+        40.0,
+        50.0,
+        60.0,
+        pre_pos=(7.0, 8.0, 9.0),
+        pre_vel=(0.1, 0.2, 0.3),
+        dt=1.0 / 30.0,
+    )
+
+    assert result == (7.0, 8.0, 9.0, 0.1, 0.2, 0.3), result
+    assert ctx.debug_last_motion_collision["kind"] == "terrain_motion_nonfinite_input"
+    assert ctx.world_collision_ref_pos == (7.0, 8.0, 9.0)
+    print("test_entity_world_collision_restores_previous_motion_after_nonfinite_input: PASSED")
     return True
 
 
@@ -9132,6 +9223,83 @@ def test_view_update_pos_without_rot_clamps_to_safe_shape():
     return True
 
 
+def test_tick_loop_start_guard_allows_one_live_thread():
+    """Concurrent spawn paths should not start duplicate physics/update loops."""
+    server = WulframServer.__new__(WulframServer)
+    ctx = ClientContext(
+        client_id=22,
+        client_addr=("127.0.0.1", 2627),
+        session=Session(),
+        entity_id=1337,
+    )
+    entered = threading.Event()
+    stop = threading.Event()
+    calls = []
+    old_tick_enabled = FEATURES.tick_loop_enabled
+
+    def fake_tick_loop(loop_ctx):
+        current = threading.current_thread()
+        with loop_ctx.tick_lock:
+            if loop_ctx.tick_thread is not current:
+                return
+        calls.append(current)
+        entered.set()
+        stop.wait(1.0)
+        with loop_ctx.tick_lock:
+            if loop_ctx.tick_thread is current:
+                loop_ctx.tick_thread = None
+
+    try:
+        FEATURES.tick_loop_enabled = True
+        server._tick_loop = fake_tick_loop
+
+        assert server._ensure_tick_loop(ctx) is True
+        assert entered.wait(1.0), "tick loop did not start"
+        first_thread = ctx.tick_thread
+        assert first_thread is not None
+        assert server._ensure_tick_loop(ctx) is False
+        stop.set()
+        first_thread.join(timeout=1.0)
+
+        assert len(calls) == 1
+        assert ctx.tick_thread is None
+    finally:
+        stop.set()
+        FEATURES.tick_loop_enabled = old_tick_enabled
+    print("test_tick_loop_start_guard_allows_one_live_thread: PASSED")
+    return True
+
+
+def test_client_weapon_fire_telemetry_records_input_projectiles():
+    """Client-input projectile fire should leave structured control-plane evidence."""
+    server = WulframServer.__new__(WulframServer)
+    session = Session()
+    session.username = "OgShooter"
+    session.team_id = 2
+    ctx = ClientContext(
+        client_id=11,
+        client_addr=("10.10.10.2", 52731),
+        session=session,
+        entity_id=0x611,
+    )
+    ctx.weapon_system = WeaponSystem()
+    ctx.weapon_system.behavior_slots[12] = 1.0
+
+    projectile = SimpleNamespace(entity_id=7001, entity_type=EntityType.PULSE_SHELL)
+    server._record_client_weapon_fire(ctx, "ACTION_UPDATE", 1234, [projectile], 8.0)
+
+    assert ctx.weapon_fire_count == 1
+    assert ctx.last_weapon_fire_source == "ACTION_UPDATE"
+    assert ctx.last_weapon_fire_client_tick == 1234
+    assert ctx.last_weapon_fire_projectile_ids == [7001]
+    assert ctx.last_weapon_fire_projectile_types == ["PULSE_SHELL"]
+    assert ctx.last_weapon_fire_energy_spent == 8.0
+    assert ctx.last_weapon_fire_input["direct_slots"]["12"] == 1.0
+    assert ctx.last_weapon_fire_input["active_slots"]["12"] == 1.0
+    print("test_client_weapon_fire_telemetry_records_input_projectiles: PASSED")
+    return True
+
+
 def test_players_json_includes_transport_addresses():
     """Control `players json` should expose client and UDP addresses for diagnostics."""
     server = SimpleNamespace(
@@ -9162,6 +9330,18 @@ def test_players_json_includes_transport_addresses():
     ctx.state_sync_reply_count = 2
     ctx.state_sync_view_reply_count = 2
     ctx.last_decoded_input = {"fwd": 0.5, "strafe": 0.0}
+    ctx.weapon_fire_count = 1
+    ctx.last_weapon_fire_time = time.monotonic() - 0.5
+    ctx.last_weapon_fire_source = "ACTION_UPDATE"
+    ctx.last_weapon_fire_client_tick = 1122
+    ctx.last_weapon_fire_projectile_ids = [7001]
+    ctx.last_weapon_fire_projectile_types = ["PULSE_SHELL"]
+    ctx.last_weapon_fire_energy_spent = 8.0
+    ctx.last_weapon_fire_input = {"direct_slots": {"12": 1.0}}
+    ctx.projectile_update_packet_count = 3
+    ctx.last_projectile_update_time = time.monotonic() - 0.25
+    ctx.last_projectile_update_id = 7001
+    ctx.last_projectile_update_targets = 2
     server.clients[ctx.client_id] = ctx
 
     control = ControlServer(port=0)
@@ -9182,7 +9362,75 @@ def test_players_json_includes_transport_addresses():
     assert entry["telemetry"]["state_sync_replies"] == 2
     assert entry["telemetry"]["state_sync_view_replies"] == 2
     assert entry["telemetry"]["last_input"]["fwd"] == 0.5
+    assert entry["telemetry"]["weapon_fire_count"] == 1
+    assert entry["telemetry"]["last_weapon_fire_age_s"] is not None
+    assert entry["telemetry"]["last_weapon_fire_source"] == "ACTION_UPDATE"
+    assert entry["telemetry"]["last_weapon_fire_client_tick"] == 1122
+    assert entry["telemetry"]["last_weapon_fire_projectile_ids"] == [7001]
+    assert entry["telemetry"]["last_weapon_fire_projectile_types"] == ["PULSE_SHELL"]
+    assert entry["telemetry"]["last_weapon_fire_energy_spent"] == 8.0
+    assert entry["telemetry"]["last_weapon_fire_input"]["direct_slots"]["12"] == 1.0
+    assert entry["telemetry"]["projectile_update_packets"] == 3
+    assert entry["telemetry"]["last_projectile_update_age_s"] is not None
+    assert entry["telemetry"]["last_projectile_update_id"] == 7001
+    assert entry["telemetry"]["last_projectile_update_targets"] == 2
     print("test_players_json_includes_transport_addresses: PASSED")
+    return True
+
+
+def test_health_control_uses_server_heartbeat_helper():
+    """Control `health set` should use the OG-safe server heartbeat helper."""
+    sent = []
+    helper_calls = []
+
+    def build_safe_hb(ctx, **kwargs):
+        helper_calls.append((ctx.client_id, kwargs))
+        return b"SAFE-HB"
+
+    server = SimpleNamespace(
+        clients_lock=threading.Lock(),
+        clients={},
+        udp_handler=SimpleNamespace(send_to=lambda payload, addr: sent.append((payload, addr))),
+        _get_network_tick=lambda _ctx: 0x12345678,
+        _build_local_state_heartbeat=build_safe_hb,
+        _get_health_value=lambda ctx: ctx.player_health,
+        _get_energy_value=lambda _ctx: 0.75,
+    )
+    session = Session()
+    session.username = "HealthBot"
+    session.team_id = 1
+    session.entity_id = 0x543
+    session.udp_addr = ("10.10.10.2", 30000)
+    ctx = ClientContext(
+        client_id=12,
+        client_addr=("10.10.10.2", 30000),
+        session=session,
+        entity_id=0x543,
+    )
+    ctx.player_health = 1.0
+    server.clients[ctx.client_id] = ctx
+
+    control = ControlServer(port=0)
+    control.server = server
+
+    result = control._cmd_send_health(["set", "0.5", "c12"])
+
+    assert "Client 12" in result, result
+    assert ctx.player_health == 0.5, ctx.player_health
+    assert sent == [(b"SAFE-HB", ("10.10.10.2", 30000))], sent
+    assert helper_calls == [
+        (
+            12,
+            {
+                "tick": 0x12345678,
+                "entity_id": 0x543,
+                "include_health": True,
+                "health": 0.5,
+                "fuel": 0.75,
+            },
+        )
+    ], helper_calls
+    print("test_health_control_uses_server_heartbeat_helper: PASSED")
     return True
 
 
@@ -9389,6 +9637,7 @@ def main():
         test_weapon_system_action_dump_slot5_nonzero_updates_og_slider_value,
         test_tank_softbody_control_ignores_live_slot6_lean_by_default,
         test_send_entity_create_uses_udp_only,
+        test_og_viewer_replication_gates_skip_remote_only,
         test_transient_fx_stays_off_for_remote_og_by_default,
         test_transient_fx_can_be_enabled_for_remote_clients,
         test_entity_create_uses_spawn_safe_local_state_for_og_viewer,
@@ -9460,8 +9709,9 @@ def main():
         test_entity_world_collision_defaults_enabled_with_env_optout,
         test_entity_world_collision_can_be_disabled_for_player_sync,
         test_entity_world_collision_prefers_mesh_contact_when_collision_model_exists,
-        test_entity_world_collision_model_defaults_to_entity_origin_after_pair_solver_port,
-        test_entity_world_collision_model_legacy_lift_can_be_requested,
+        test_entity_world_collision_model_defaults_to_legacy_lift,
+        test_entity_world_collision_model_entity_origin_can_be_requested,
+        test_entity_world_collision_restores_previous_motion_after_nonfinite_input,
         test_entity_world_half_extents_preserves_mesh_z_extent,
         test_entity_origin_probe_uses_capped_pair_solver_contact_response,
         test_entity_origin_probe_can_retest_inactive_penetrating_contact_when_enabled,
@@ -9509,7 +9759,10 @@ def main():
         test_control_heading_set_preserves_yaw_sign_convention,
         test_solo_local_player_keepalive_shape_triggers_og_state_request_gate,
         test_view_update_pos_without_rot_clamps_to_safe_shape,
+        test_tick_loop_start_guard_allows_one_live_thread,
+        test_client_weapon_fire_telemetry_records_input_projectiles,
         test_players_json_includes_transport_addresses,
+        test_health_control_uses_server_heartbeat_helper,
         test_energy_control_sets_absolute_or_fractional_energy,
         test_buildings_json_exposes_playable_slice_observability,
     ]
