@@ -9224,6 +9224,10 @@ class WulframServer:
                 slop=self._PENETRATION_SLOP_DEFAULT,
                 correction_cap=correction_cap,
                 constraint_iterations=constraint_iterations,
+                solver_variant=os.environ.get(
+                    "WULFRAM_ENTITY_TERRAIN_CONSTRAINT_SOLVER",
+                    "constraint",
+                ),
                 restitution_fraction=restitution_fraction,
                 projection_order=(
                     projection_order_override
@@ -9952,6 +9956,11 @@ class WulframServer:
                         "constraint_record_order": response_debug.get("constraint_record_order"),
                         "constraint_record_order_source": response_debug.get("constraint_record_order_source"),
                         "constraint_projection_model": response_debug.get("constraint_projection_model"),
+                        "constraint_solver_variant": response_debug.get("constraint_solver_variant"),
+                        "constraint_iteration_limit": response_debug.get("constraint_iteration_limit"),
+                        "constraint_min_correction_initial": response_debug.get("constraint_min_correction_initial"),
+                        "constraint_min_correction_increment": response_debug.get("constraint_min_correction_increment"),
+                        "constraint_progressive_scaling": response_debug.get("constraint_progressive_scaling"),
                         "constraint_projection_order": response_debug.get("constraint_projection_order"),
                         "constraint_projection_speed_source": response_debug.get("constraint_projection_speed_source"),
                         "constraint_primary_projection_speed_source": response_debug.get("constraint_primary_projection_speed_source"),

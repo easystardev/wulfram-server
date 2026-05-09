@@ -7865,6 +7865,55 @@ def test_static_terrain_constraint_can_probe_entity_rotation_for_angular_frame()
     return True
 
 
+def test_static_terrain_constraint_can_probe_contact_iterative_solver_shape():
+    """The direct-contact solver probe should expose OG's aggressive threshold path."""
+    base_kwargs = dict(
+        position=(0.0, 0.0, 0.0),
+        velocity=(0.0, 0.0, -2.0),
+        angular_velocity=(0.0, 0.0, 0.0),
+        contact_point=(0.0, 0.0, 0.0),
+        contact_normal=(0.0, 0.0, 1.0),
+        penetration=0.1,
+        half_extents=(4.0, 4.0, 4.0),
+        inertia_half_extents=(4.0, 4.0, 4.0),
+        mass=6700.0,
+        friction=0.0,
+        constraint_iterations=1,
+        restitution_fraction=0.0,
+    )
+
+    constraint = solve_static_terrain_constraint(**base_kwargs)
+    contact = solve_static_terrain_constraint(
+        **base_kwargs,
+        solver_variant="contact",
+    )
+
+    assert constraint.debug["constraint_solver_variant"] == "constraint_iterative"
+    assert constraint.debug["constraint_iteration_limit"] == 1
+    assert math.isclose(
+        constraint.debug["constraint_min_correction_initial"],
+        0.005,
+        rel_tol=1e-6,
+    )
+    assert constraint.debug["constraint_progressive_scaling"] is True
+    assert contact.debug["constraint_solver_variant"] == "contact_iterative"
+    assert contact.debug["constraint_iteration_limit"] == 1
+    assert math.isclose(
+        contact.debug["constraint_min_correction_initial"],
+        0.1,
+        rel_tol=1e-6,
+    )
+    assert math.isclose(
+        contact.debug["constraint_min_correction_increment"],
+        0.002,
+        rel_tol=1e-6,
+    )
+    assert contact.debug["constraint_progressive_scaling"] is False
+    assert contact.velocity[2] > constraint.velocity[2] + 1.0
+    print("test_static_terrain_constraint_can_probe_contact_iterative_solver_shape: PASSED")
+    return True
+
+
 def test_entity_interpolation_decision_matches_decompile_gates():
     """Entity_interpolate_toward_target should expose reset/wake/tick-update gates."""
     assert entity_interp_factor(0.03) == 1.0
@@ -10843,6 +10892,7 @@ def main():
         test_static_terrain_constraint_friction_uses_pre_normal_projection_buffer,
         test_static_terrain_constraint_opposite_projection_probe_activates_separating_penetration,
         test_static_terrain_constraint_can_probe_entity_rotation_for_angular_frame,
+        test_static_terrain_constraint_can_probe_contact_iterative_solver_shape,
         test_entity_interpolation_decision_matches_decompile_gates,
         test_entity_origin_probe_applies_pair_solver_at_contact_time,
         test_entity_origin_probe_can_repeat_bucketed_pair_contacts,
