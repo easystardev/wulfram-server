@@ -8834,6 +8834,9 @@ class WulframServer:
                 "contact_sector_index": getattr(contact, "sector_index", None),
                 "contact_cell": getattr(contact, "cell", None),
                 "contact_normal_source": getattr(contact, "normal_source", None),
+                "contact_cbsp_split_normal": getattr(contact, "cbsp_split_normal", None),
+                "contact_terrain_face_normal": getattr(contact, "terrain_face_normal", None),
+                "contact_mesh_face_normal": getattr(contact, "mesh_face_normal", None),
             }
 
         contact_probe_mode = (
@@ -9006,6 +9009,9 @@ class WulframServer:
                 "contact_sector_index": getattr(contact, "sector_index", None),
                 "contact_cell": getattr(contact, "cell", None),
                 "contact_normal_source": getattr(contact, "normal_source", None),
+                "contact_cbsp_split_normal": getattr(contact, "cbsp_split_normal", None),
+                "contact_terrain_face_normal": getattr(contact, "terrain_face_normal", None),
+                "contact_mesh_face_normal": getattr(contact, "mesh_face_normal", None),
                 "model_center": center,
                 "z_lift": z_lift_used,
             }
@@ -9102,7 +9108,57 @@ class WulframServer:
         def raw_origin_contact_for_fallback(raw_contact):
             if raw_contact is None:
                 return None
-            if raw_fallback_normal_source not in {"terrain", "face", "triangle"}:
+            contact_face_modes = {
+                "face",
+                "triangle",
+                "terrain_face",
+                "contact_face",
+                "decompile_face",
+                "terrain_triangle_contact",
+            }
+            sampled_terrain_modes = {"terrain", "sampled_terrain", "heightfield"}
+            if raw_fallback_normal_source in contact_face_modes:
+                face_normal = getattr(raw_contact, "terrain_face_normal", None)
+                try:
+                    face_normal = (
+                        float(face_normal[0]),
+                        float(face_normal[1]),
+                        float(face_normal[2]),
+                    )
+                    face_len = math.sqrt(
+                        face_normal[0] * face_normal[0]
+                        + face_normal[1] * face_normal[1]
+                        + face_normal[2] * face_normal[2]
+                    )
+                except (TypeError, ValueError, OverflowError, IndexError):
+                    face_normal = None
+                    face_len = 0.0
+                if face_normal is not None and face_len > 1e-8:
+                    face_normal = (
+                        face_normal[0] / face_len,
+                        face_normal[1] / face_len,
+                        face_normal[2] / face_len,
+                    )
+                    if face_normal[2] < 0.0:
+                        face_normal = (
+                            -face_normal[0],
+                            -face_normal[1],
+                            -face_normal[2],
+                        )
+                    return TerrainContact(
+                        position=raw_contact.position,
+                        normal=face_normal,
+                        penetration=raw_contact.penetration,
+                        sector_index=raw_contact.sector_index,
+                        cell=raw_contact.cell,
+                        normal_source="terrain_triangle_contact_face",
+                        cbsp_split_normal=getattr(raw_contact, "cbsp_split_normal", None),
+                        terrain_face_normal=getattr(raw_contact, "terrain_face_normal", None),
+                        mesh_face_normal=getattr(raw_contact, "mesh_face_normal", None),
+                    )
+                if raw_fallback_normal_source not in sampled_terrain_modes:
+                    return raw_contact
+            if raw_fallback_normal_source not in sampled_terrain_modes:
                 return raw_contact
             terrain = getattr(self, "terrain", None)
             if terrain is None:
@@ -9123,6 +9179,9 @@ class WulframServer:
                 sector_index=raw_contact.sector_index,
                 cell=raw_contact.cell,
                 normal_source="terrain_triangle",
+                cbsp_split_normal=getattr(raw_contact, "cbsp_split_normal", None),
+                terrain_face_normal=getattr(raw_contact, "terrain_face_normal", None),
+                mesh_face_normal=getattr(raw_contact, "mesh_face_normal", None),
             )
 
         def sample_raw_origin_fallback_contact_at(pos, *, velocity=None):
@@ -9669,7 +9728,16 @@ class WulframServer:
             before_center_normal_speed = None
             before_normal_speed_source = ""
             normal_delta_skip_reason = ""
-            if raw_fallback_delta_mode in {"normal", "normal_only", "contact_normal"}:
+            if raw_fallback_delta_mode in {
+                "normal",
+                "normal_only",
+                "contact_normal",
+                "closing",
+                "closing_velocity",
+                "projection_speed",
+                "target_speed",
+                "decompile_projection",
+            }:
                 normal = None
                 try:
                     normal_mag = vec_mag(contact.normal)
@@ -9701,11 +9769,34 @@ class WulframServer:
                             before_normal_speed = candidate_speed
                             before_normal_speed_source = speed_key
                             break
-                    normal_component = (
-                        raw_delta[0] * normal[0]
-                        + raw_delta[1] * normal[1]
-                        + raw_delta[2] * normal[2]
-                    )
+                    if raw_fallback_delta_mode in {
+                        "closing",
+                        "closing_velocity",
+                        "projection_speed",
+                        "target_speed",
+                        "decompile_projection",
+                    }:
+                        try:
+                            target_separation_speed = float(
+                                response_debug.get(
+                                    "target_separation",
+                                    self._PENETRATION_SLOP_DEFAULT,
+                                )
+                            )
+                        except (TypeError, ValueError, OverflowError):
+                            target_separation_speed = self._PENETRATION_SLOP_DEFAULT
+                        if not math.isfinite(target_separation_speed):
+                            target_separation_speed = self._PENETRATION_SLOP_DEFAULT
+                        normal_component = max(
+                            0.0,
+                            target_separation_speed - before_normal_speed,
+                        )
+                    else:
+                        normal_component = (
+                            raw_delta[0] * normal[0]
+                            + raw_delta[1] * normal[1]
+                            + raw_delta[2] * normal[2]
+                        )
                     if (
                         normal_component > 0.0
                         and (

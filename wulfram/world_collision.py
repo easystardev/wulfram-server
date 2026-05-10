@@ -143,6 +143,24 @@ class TerrainContact:
     sector_index: int
     cell: tuple[int, int]
     normal_source: str = "unknown"
+    cbsp_split_normal: Optional[tuple[float, float, float]] = None
+    terrain_face_normal: Optional[tuple[float, float, float]] = None
+    mesh_face_normal: Optional[tuple[float, float, float]] = None
+
+
+@dataclass(frozen=True)
+class _CBSPContact:
+    position: tuple[float, float, float]
+    normal: tuple[float, float, float]
+    penetration: float
+    cbsp_split_normal: Optional[tuple[float, float, float]] = None
+    terrain_face_normal: Optional[tuple[float, float, float]] = None
+    mesh_face_normal: Optional[tuple[float, float, float]] = None
+
+    def __iter__(self):
+        yield self.position
+        yield self.normal
+        yield self.penetration
 
 
 @dataclass(frozen=True)
@@ -215,6 +233,50 @@ class TerrainGridCollision:
             normal_world = self._local_to_world_dir(normal_local, cos_h, sin_h)
             return self._orient_terrain_normal(normal_world), "entity_cbsp_split_fallback"
         return self._orient_terrain_normal(terrain_normal), "terrain_triangle"
+
+    def _contact_normal_metadata_for_model_hit(
+        self,
+        tri_world,
+        mesh_contact,
+        normal_local,
+        cos_h: float,
+        sin_h: float,
+    ) -> dict[str, tuple[float, float, float] | None]:
+        def local_normal_to_world(value):
+            if value is None:
+                return None
+            try:
+                if len(value) < 3:
+                    return None
+                local = (float(value[0]), float(value[1]), float(value[2]))
+            except (TypeError, ValueError, OverflowError):
+                return None
+            world = self._local_to_world_dir(local, cos_h, sin_h)
+            return self._orient_terrain_normal(world)
+
+        cbsp_split_normal = local_normal_to_world(
+            getattr(mesh_contact, "cbsp_split_normal", normal_local)
+        )
+        terrain_face_normal = local_normal_to_world(
+            getattr(mesh_contact, "terrain_face_normal", None)
+        )
+        if terrain_face_normal is None:
+            terrain_face_normal = _normalize3(
+                _cross3(
+                    _sub3(tri_world[1], tri_world[0]),
+                    _sub3(tri_world[2], tri_world[0]),
+                )
+            )
+            if terrain_face_normal is not None:
+                terrain_face_normal = self._orient_terrain_normal(terrain_face_normal)
+
+        return {
+            "cbsp_split_normal": cbsp_split_normal,
+            "terrain_face_normal": terrain_face_normal,
+            "mesh_face_normal": local_normal_to_world(
+                getattr(mesh_contact, "mesh_face_normal", None)
+            ),
+        }
 
     @staticmethod
     def _all_finite(values) -> bool:
@@ -455,6 +517,13 @@ class TerrainGridCollision:
                         cos_h,
                         sin_h,
                     )
+                    normal_metadata = self._contact_normal_metadata_for_model_hit(
+                        tri_world,
+                        mesh_contact,
+                        normal_local,
+                        cos_h,
+                        sin_h,
+                    )
                     contact_world = self._local_to_world_point(contact_point_local, center, cos_h, sin_h)
                     contact = TerrainContact(
                         position=contact_world,
@@ -463,6 +532,7 @@ class TerrainGridCollision:
                         sector_index=sector.index,
                         cell=(cell_x, cell_y),
                         normal_source=normal_source,
+                        **normal_metadata,
                     )
                     return contact
 
@@ -515,6 +585,13 @@ class TerrainGridCollision:
                         cos_h,
                         sin_h,
                     )
+                    normal_metadata = self._contact_normal_metadata_for_model_hit(
+                        tri_world,
+                        mesh_contact,
+                        normal_local,
+                        cos_h,
+                        sin_h,
+                    )
                     contact_world = self._local_to_world_point(contact_point_local, collision_center, cos_h, sin_h)
                     return TerrainContact(
                         position=contact_world,
@@ -523,6 +600,7 @@ class TerrainGridCollision:
                         sector_index=sector.index,
                         cell=(cell_x, cell_y),
                         normal_source=normal_source,
+                        **normal_metadata,
                     )
 
         return None
@@ -777,9 +855,16 @@ class TerrainGridCollision:
             (tri_local[1], tri_local[2]),
         )
 
-        def record_hit(hit_point, mesh_tri, hit_normal):
+        def record_hit(hit_point, mesh_tri, hit_normal, mesh_normal=None):
             penetration = self._estimate_triangle_penetration(tri_local, mesh_tri, hit_normal)
-            return (hit_point, hit_normal, penetration)
+            return _CBSPContact(
+                position=hit_point,
+                normal=hit_normal,
+                penetration=penetration,
+                cbsp_split_normal=hit_normal,
+                terrain_face_normal=tri_normal,
+                mesh_face_normal=mesh_normal,
+            )
 
         def signbits_differ(value_a: float, value_b: float) -> bool:
             return _signbit(value_a) != _signbit(value_b)
@@ -845,7 +930,7 @@ class TerrainGridCollision:
 
                 for clip_point in clip_points:
                     if self._point_in_triangle(clip_point, mesh_tri, mesh_normal):
-                        return record_hit(clip_point, mesh_tri, node_hit_normal)
+                        return record_hit(clip_point, mesh_tri, node_hit_normal, mesh_normal)
 
                 for edge_start, edge_end in tri_edges:
                     dist_start = _dot3(mesh_normal, edge_start) + mesh_plane_d
@@ -856,15 +941,15 @@ class TerrainGridCollision:
                     if hit_point is None:
                         continue
                     if self._point_in_triangle(hit_point, mesh_tri, mesh_normal):
-                        return record_hit(hit_point, mesh_tri, node_hit_normal)
+                        return record_hit(hit_point, mesh_tri, node_hit_normal, mesh_normal)
 
                 vertex_contact = self._terrain_triangle_vertex_contact(tri_local, mesh_tri, tri_normal)
                 if vertex_contact is not None:
                     hit_point, _ = vertex_contact
-                    return record_hit(hit_point, mesh_tri, node_hit_normal)
+                    return record_hit(hit_point, mesh_tri, node_hit_normal, mesh_normal)
                 hit_point = self._triangles_intersection_point(tri_local, mesh_tri)
                 if hit_point is not None:
-                    return record_hit(hit_point, mesh_tri, node_hit_normal)
+                    return record_hit(hit_point, mesh_tri, node_hit_normal, mesh_normal)
             return None
 
         def traverse(node_index: int):
