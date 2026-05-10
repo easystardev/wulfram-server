@@ -8858,6 +8858,7 @@ class WulframServer:
                 "contact_cbsp_split_normal": getattr(contact, "cbsp_split_normal", None),
                 "contact_terrain_face_normal": getattr(contact, "terrain_face_normal", None),
                 "contact_mesh_face_normal": getattr(contact, "mesh_face_normal", None),
+                "contact_entity_radial_normal": getattr(contact, "entity_radial_normal", None),
             }
 
         contact_probe_mode = (
@@ -9033,6 +9034,7 @@ class WulframServer:
                 "contact_cbsp_split_normal": getattr(contact, "cbsp_split_normal", None),
                 "contact_terrain_face_normal": getattr(contact, "terrain_face_normal", None),
                 "contact_mesh_face_normal": getattr(contact, "mesh_face_normal", None),
+                "contact_entity_radial_normal": getattr(contact, "entity_radial_normal", None),
                 "model_center": center,
                 "z_lift": z_lift_used,
             }
@@ -9137,7 +9139,56 @@ class WulframServer:
                 "decompile_face",
                 "terrain_triangle_contact",
             }
+            entity_radial_modes = {
+                "entity_radial",
+                "radial",
+                "contact_to_body",
+                "body_from_contact",
+                "decompile_context",
+                "decompile_cbsp_context",
+            }
             sampled_terrain_modes = {"terrain", "sampled_terrain", "heightfield"}
+            if raw_fallback_normal_source in entity_radial_modes:
+                radial_normal = getattr(raw_contact, "entity_radial_normal", None)
+                try:
+                    radial_normal = (
+                        float(radial_normal[0]),
+                        float(radial_normal[1]),
+                        float(radial_normal[2]),
+                    )
+                    radial_len = math.sqrt(
+                        radial_normal[0] * radial_normal[0]
+                        + radial_normal[1] * radial_normal[1]
+                        + radial_normal[2] * radial_normal[2]
+                    )
+                except (TypeError, ValueError, OverflowError, IndexError):
+                    radial_normal = None
+                    radial_len = 0.0
+                if radial_normal is not None and radial_len > 1e-8:
+                    radial_normal = (
+                        radial_normal[0] / radial_len,
+                        radial_normal[1] / radial_len,
+                        radial_normal[2] / radial_len,
+                    )
+                    if radial_normal[2] < 0.0:
+                        radial_normal = (
+                            -radial_normal[0],
+                            -radial_normal[1],
+                            -radial_normal[2],
+                        )
+                    return TerrainContact(
+                        position=raw_contact.position,
+                        normal=radial_normal,
+                        penetration=raw_contact.penetration,
+                        sector_index=raw_contact.sector_index,
+                        cell=raw_contact.cell,
+                        normal_source="entity_radial",
+                        cbsp_split_normal=getattr(raw_contact, "cbsp_split_normal", None),
+                        terrain_face_normal=getattr(raw_contact, "terrain_face_normal", None),
+                        mesh_face_normal=getattr(raw_contact, "mesh_face_normal", None),
+                        entity_radial_normal=getattr(raw_contact, "entity_radial_normal", None),
+                    )
+                return raw_contact
             if raw_fallback_normal_source in contact_face_modes:
                 face_normal = getattr(raw_contact, "terrain_face_normal", None)
                 try:
@@ -9176,6 +9227,7 @@ class WulframServer:
                         cbsp_split_normal=getattr(raw_contact, "cbsp_split_normal", None),
                         terrain_face_normal=getattr(raw_contact, "terrain_face_normal", None),
                         mesh_face_normal=getattr(raw_contact, "mesh_face_normal", None),
+                        entity_radial_normal=getattr(raw_contact, "entity_radial_normal", None),
                     )
                 if raw_fallback_normal_source not in sampled_terrain_modes:
                     return raw_contact
@@ -9203,6 +9255,7 @@ class WulframServer:
                 cbsp_split_normal=getattr(raw_contact, "cbsp_split_normal", None),
                 terrain_face_normal=getattr(raw_contact, "terrain_face_normal", None),
                 mesh_face_normal=getattr(raw_contact, "mesh_face_normal", None),
+                entity_radial_normal=getattr(raw_contact, "entity_radial_normal", None),
             )
 
         def sample_raw_origin_fallback_contact_at(pos, *, velocity=None):

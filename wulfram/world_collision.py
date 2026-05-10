@@ -146,6 +146,7 @@ class TerrainContact:
     cbsp_split_normal: Optional[tuple[float, float, float]] = None
     terrain_face_normal: Optional[tuple[float, float, float]] = None
     mesh_face_normal: Optional[tuple[float, float, float]] = None
+    entity_radial_normal: Optional[tuple[float, float, float]] = None
 
 
 @dataclass(frozen=True)
@@ -156,6 +157,7 @@ class _CBSPContact:
     cbsp_split_normal: Optional[tuple[float, float, float]] = None
     terrain_face_normal: Optional[tuple[float, float, float]] = None
     mesh_face_normal: Optional[tuple[float, float, float]] = None
+    entity_radial_normal: Optional[tuple[float, float, float]] = None
 
     def __iter__(self):
         yield self.position
@@ -191,6 +193,16 @@ class TerrainGridCollision:
         self.model_contact_normal_source = (
             "terrain"
             if normal_source in {"terrain", "face", "triangle"}
+            else "entity_radial"
+            if normal_source
+            in {
+                "entity_radial",
+                "radial",
+                "contact_to_body",
+                "body_from_contact",
+                "decompile_context",
+                "decompile_cbsp_context",
+            }
             else "mesh"
         )
         self.cell_x = terrain.cell_x
@@ -216,9 +228,21 @@ class TerrainGridCollision:
         self,
         tri_world,
         normal_local,
+        contact_point_local,
         cos_h: float,
         sin_h: float,
     ) -> tuple[tuple[float, float, float], str]:
+        if self.model_contact_normal_source == "entity_radial":
+            radial_local = (
+                -float(contact_point_local[0]),
+                -float(contact_point_local[1]),
+                -float(contact_point_local[2]),
+            )
+            radial_world = _normalize3(
+                self._local_to_world_dir(radial_local, cos_h, sin_h)
+            )
+            if radial_world is not None:
+                return self._orient_terrain_normal(radial_world), "entity_radial"
         if self.model_contact_normal_source == "mesh":
             normal_world = self._local_to_world_dir(normal_local, cos_h, sin_h)
             return self._orient_terrain_normal(normal_world), "entity_cbsp_split"
@@ -239,6 +263,7 @@ class TerrainGridCollision:
         tri_world,
         mesh_contact,
         normal_local,
+        contact_point_local,
         cos_h: float,
         sin_h: float,
     ) -> dict[str, tuple[float, float, float] | None]:
@@ -270,12 +295,27 @@ class TerrainGridCollision:
             if terrain_face_normal is not None:
                 terrain_face_normal = self._orient_terrain_normal(terrain_face_normal)
 
+        entity_radial_normal = _normalize3(
+            self._local_to_world_dir(
+                (
+                    -float(contact_point_local[0]),
+                    -float(contact_point_local[1]),
+                    -float(contact_point_local[2]),
+                ),
+                cos_h,
+                sin_h,
+            )
+        )
+        if entity_radial_normal is not None:
+            entity_radial_normal = self._orient_terrain_normal(entity_radial_normal)
+
         return {
             "cbsp_split_normal": cbsp_split_normal,
             "terrain_face_normal": terrain_face_normal,
             "mesh_face_normal": local_normal_to_world(
                 getattr(mesh_contact, "mesh_face_normal", None)
             ),
+            "entity_radial_normal": entity_radial_normal,
         }
 
     @staticmethod
@@ -514,6 +554,7 @@ class TerrainGridCollision:
                     normal_world, normal_source = self._contact_normal_for_model_hit(
                         tri_world,
                         normal_local,
+                        contact_point_local,
                         cos_h,
                         sin_h,
                     )
@@ -521,6 +562,7 @@ class TerrainGridCollision:
                         tri_world,
                         mesh_contact,
                         normal_local,
+                        contact_point_local,
                         cos_h,
                         sin_h,
                     )
@@ -582,6 +624,7 @@ class TerrainGridCollision:
                     normal_world, normal_source = self._contact_normal_for_model_hit(
                         tri_world,
                         normal_local,
+                        contact_point_local,
                         cos_h,
                         sin_h,
                     )
@@ -589,6 +632,7 @@ class TerrainGridCollision:
                         tri_world,
                         mesh_contact,
                         normal_local,
+                        contact_point_local,
                         cos_h,
                         sin_h,
                     )

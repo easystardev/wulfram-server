@@ -6152,7 +6152,7 @@ def test_model_collision_response_normal_can_probe_terrain_triangle_normal():
         grid._iter_cell_triangles = lambda cell_x, cell_y: [tri]
         grid._triangle_overlaps_aabb = lambda *args, **kwargs: True
         grid._triangle_cbsp_contact = lambda *args, **kwargs: (
-            (0.0, 0.0, 0.0),
+            (0.25, 0.0, -0.5),
             (1.0, 0.0, 0.0),
             0.1,
         )
@@ -6181,6 +6181,13 @@ def test_model_collision_response_normal_can_probe_terrain_triangle_normal():
     assert math.isclose(contact.terrain_face_normal[0], 0.0, abs_tol=1e-6), contact
     assert math.isclose(contact.terrain_face_normal[1], -math.sqrt(0.5), abs_tol=1e-6), contact
     assert math.isclose(contact.terrain_face_normal[2], math.sqrt(0.5), abs_tol=1e-6), contact
+    assert contact.entity_radial_normal is not None, contact
+    assert math.isclose(
+        math.sqrt(sum(component * component for component in contact.entity_radial_normal)),
+        1.0,
+        rel_tol=1e-6,
+        abs_tol=1e-6,
+    ), contact.entity_radial_normal
 
     terrain_grid = TerrainGridCollision(
         FlatTerrain(),
@@ -6198,6 +6205,20 @@ def test_model_collision_response_normal_can_probe_terrain_triangle_normal():
     assert math.isclose(terrain_contact.normal[2], math.sqrt(0.5), abs_tol=1e-6), terrain_contact.normal
     assert terrain_contact.cbsp_split_normal == (1.0, 0.0, 0.0), terrain_contact.cbsp_split_normal
     assert math.isclose(terrain_contact.terrain_face_normal[2], math.sqrt(0.5), abs_tol=1e-6), terrain_contact
+    radial_grid = TerrainGridCollision(
+        FlatTerrain(),
+        0.0,
+        sector_rows=1,
+        sector_cols=1,
+        model_contact_normal_source="entity_radial",
+    )
+    install_fake_grid(radial_grid)
+    radial_contact = radial_grid.test_model_collision((0.5, 0.5, 0.5), 0.0, [], make_tree(), 1.0)
+    assert radial_contact is not None
+    assert radial_contact.normal_source == "entity_radial", radial_contact.normal_source
+    assert radial_contact.entity_radial_normal is not None, radial_contact
+    for got, expected in zip(radial_contact.normal, radial_contact.entity_radial_normal):
+        assert math.isclose(got, expected, rel_tol=1e-6, abs_tol=1e-6), radial_contact
     print("test_model_collision_response_normal_can_probe_terrain_triangle_normal: PASSED")
     return True
 
