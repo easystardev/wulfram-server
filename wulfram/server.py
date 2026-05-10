@@ -8844,6 +8844,32 @@ class WulframServer:
             float(body_ang_vel[1]) if len(body_ang_vel) > 1 else 0.0,
             float(getattr(ctx, "angular_vel_yaw", 0.0) or 0.0),
         ]
+        model_contact_rotation_mode = (
+            os.environ.get("WULFRAM_ENTITY_TERRAIN_MODEL_CONTACT_ROTATION", "heading")
+            .strip()
+            .lower()
+        )
+        if model_contact_rotation_mode in {
+            "1",
+            "true",
+            "on",
+            "yes",
+            "body",
+            "matrix",
+            "spring",
+            "decompile",
+            "full",
+        }:
+            model_contact_rotation_matrix = tank_body_matrix_with_heading(
+                getattr(ctx, "spring_body_matrix", None),
+                heading,
+                fallback_roll=float((getattr(ctx, "player_pose", {}) or {}).get("roll", 0.0) or 0.0),
+                fallback_pitch=float((getattr(ctx, "player_pose", {}) or {}).get("pitch", 0.0) or 0.0),
+            )
+            model_contact_rotation_source = "body_matrix"
+        else:
+            model_contact_rotation_matrix = None
+            model_contact_rotation_source = "heading_only"
 
         def box_collision_z_lift() -> float:
             if terrain_collision_shape == "entity_box":
@@ -9076,6 +9102,7 @@ class WulframServer:
                     vertices,
                     cbsp_tree,
                     bounding_radius,
+                    rotation_matrix=model_contact_rotation_matrix,
                 )
             except Exception as exc:  # pragma: no cover - diagnostic only
                 return None, None, str(exc)
@@ -9095,6 +9122,7 @@ class WulframServer:
                             vertices,
                             cbsp_tree,
                             bounding_radius,
+                            rotation_matrix=model_contact_rotation_matrix,
                         )
                     except Exception:
                         raw_bounds_contact = None
@@ -9131,6 +9159,45 @@ class WulframServer:
         def raw_origin_contact_for_fallback(raw_contact):
             if raw_contact is None:
                 return None
+            def normalized_oriented_normal(value):
+                try:
+                    normal = (
+                        float(value[0]),
+                        float(value[1]),
+                        float(value[2]),
+                    )
+                    normal_len = math.sqrt(
+                        normal[0] * normal[0]
+                        + normal[1] * normal[1]
+                        + normal[2] * normal[2]
+                    )
+                except (TypeError, ValueError, OverflowError, IndexError):
+                    return None
+                if normal_len <= 1e-8:
+                    return None
+                normal = (
+                    normal[0] / normal_len,
+                    normal[1] / normal_len,
+                    normal[2] / normal_len,
+                )
+                if normal[2] < 0.0:
+                    normal = (-normal[0], -normal[1], -normal[2])
+                return normal
+
+            def contact_with_normal(normal, normal_source):
+                return TerrainContact(
+                    position=raw_contact.position,
+                    normal=normal,
+                    penetration=raw_contact.penetration,
+                    sector_index=raw_contact.sector_index,
+                    cell=raw_contact.cell,
+                    normal_source=normal_source,
+                    cbsp_split_normal=getattr(raw_contact, "cbsp_split_normal", None),
+                    terrain_face_normal=getattr(raw_contact, "terrain_face_normal", None),
+                    mesh_face_normal=getattr(raw_contact, "mesh_face_normal", None),
+                    entity_radial_normal=getattr(raw_contact, "entity_radial_normal", None),
+                )
+
             contact_face_modes = {
                 "face",
                 "triangle",
@@ -9147,88 +9214,88 @@ class WulframServer:
                 "decompile_context",
                 "decompile_cbsp_context",
             }
+            radial_face_blend_modes = {
+                "entity_radial_terrain_face_blend",
+                "radial_face_blend",
+                "decompile_context_face_blend",
+            }
+            radial_face_forward_up_modes = {
+                "entity_radial_terrain_face_forward_up",
+                "radial_face_forward_up",
+                "decompile_context_face_forward_up",
+            }
             sampled_terrain_modes = {"terrain", "sampled_terrain", "heightfield"}
-            if raw_fallback_normal_source in entity_radial_modes:
-                radial_normal = getattr(raw_contact, "entity_radial_normal", None)
+            if raw_fallback_normal_source in radial_face_blend_modes | radial_face_forward_up_modes:
+                radial_normal = normalized_oriented_normal(
+                    getattr(raw_contact, "entity_radial_normal", None)
+                )
+                face_normal = normalized_oriented_normal(
+                    getattr(raw_contact, "terrain_face_normal", None)
+                )
                 try:
-                    radial_normal = (
-                        float(radial_normal[0]),
-                        float(radial_normal[1]),
-                        float(radial_normal[2]),
-                    )
-                    radial_len = math.sqrt(
-                        radial_normal[0] * radial_normal[0]
-                        + radial_normal[1] * radial_normal[1]
-                        + radial_normal[2] * radial_normal[2]
-                    )
-                except (TypeError, ValueError, OverflowError, IndexError):
-                    radial_normal = None
-                    radial_len = 0.0
-                if radial_normal is not None and radial_len > 1e-8:
-                    radial_normal = (
-                        radial_normal[0] / radial_len,
-                        radial_normal[1] / radial_len,
-                        radial_normal[2] / radial_len,
-                    )
-                    if radial_normal[2] < 0.0:
-                        radial_normal = (
-                            -radial_normal[0],
-                            -radial_normal[1],
-                            -radial_normal[2],
+                    radial_weight = float(
+                        os.environ.get(
+                            "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_ENTITY_RADIAL_WEIGHT",
+                            "1.0",
                         )
-                    return TerrainContact(
-                        position=raw_contact.position,
-                        normal=radial_normal,
-                        penetration=raw_contact.penetration,
-                        sector_index=raw_contact.sector_index,
-                        cell=raw_contact.cell,
-                        normal_source="entity_radial",
-                        cbsp_split_normal=getattr(raw_contact, "cbsp_split_normal", None),
-                        terrain_face_normal=getattr(raw_contact, "terrain_face_normal", None),
-                        mesh_face_normal=getattr(raw_contact, "mesh_face_normal", None),
-                        entity_radial_normal=getattr(raw_contact, "entity_radial_normal", None),
                     )
+                except (TypeError, ValueError, OverflowError):
+                    radial_weight = 1.0
+                try:
+                    face_weight = float(
+                        os.environ.get(
+                            "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_TERRAIN_FACE_WEIGHT",
+                            "1.0",
+                        )
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    face_weight = 1.0
+                if radial_normal is not None and face_normal is not None:
+                    blend_normal = normalized_oriented_normal(
+                        (
+                            radial_normal[0] * radial_weight + face_normal[0] * face_weight,
+                            radial_normal[1] * radial_weight + face_normal[1] * face_weight,
+                            radial_normal[2] * radial_weight + face_normal[2] * face_weight,
+                        )
+                    )
+                    if (
+                        blend_normal is not None
+                        and raw_fallback_normal_source in radial_face_forward_up_modes
+                    ):
+                        right = (-math.sin(heading), math.cos(heading), 0.0)
+                        right_component = (
+                            blend_normal[0] * right[0]
+                            + blend_normal[1] * right[1]
+                            + blend_normal[2] * right[2]
+                        )
+                        blend_normal = normalized_oriented_normal(
+                            (
+                                blend_normal[0] - right[0] * right_component,
+                                blend_normal[1] - right[1] * right_component,
+                                blend_normal[2] - right[2] * right_component,
+                            )
+                        )
+                    if blend_normal is not None:
+                        normal_source = (
+                            "entity_radial_terrain_face_forward_up"
+                            if raw_fallback_normal_source in radial_face_forward_up_modes
+                            else "entity_radial_terrain_face_blend"
+                        )
+                        return contact_with_normal(blend_normal, normal_source)
+                return raw_contact
+            if raw_fallback_normal_source in entity_radial_modes:
+                radial_normal = normalized_oriented_normal(
+                    getattr(raw_contact, "entity_radial_normal", None)
+                )
+                if radial_normal is not None:
+                    return contact_with_normal(radial_normal, "entity_radial")
                 return raw_contact
             if raw_fallback_normal_source in contact_face_modes:
-                face_normal = getattr(raw_contact, "terrain_face_normal", None)
-                try:
-                    face_normal = (
-                        float(face_normal[0]),
-                        float(face_normal[1]),
-                        float(face_normal[2]),
-                    )
-                    face_len = math.sqrt(
-                        face_normal[0] * face_normal[0]
-                        + face_normal[1] * face_normal[1]
-                        + face_normal[2] * face_normal[2]
-                    )
-                except (TypeError, ValueError, OverflowError, IndexError):
-                    face_normal = None
-                    face_len = 0.0
-                if face_normal is not None and face_len > 1e-8:
-                    face_normal = (
-                        face_normal[0] / face_len,
-                        face_normal[1] / face_len,
-                        face_normal[2] / face_len,
-                    )
-                    if face_normal[2] < 0.0:
-                        face_normal = (
-                            -face_normal[0],
-                            -face_normal[1],
-                            -face_normal[2],
-                        )
-                    return TerrainContact(
-                        position=raw_contact.position,
-                        normal=face_normal,
-                        penetration=raw_contact.penetration,
-                        sector_index=raw_contact.sector_index,
-                        cell=raw_contact.cell,
-                        normal_source="terrain_triangle_contact_face",
-                        cbsp_split_normal=getattr(raw_contact, "cbsp_split_normal", None),
-                        terrain_face_normal=getattr(raw_contact, "terrain_face_normal", None),
-                        mesh_face_normal=getattr(raw_contact, "mesh_face_normal", None),
-                        entity_radial_normal=getattr(raw_contact, "entity_radial_normal", None),
-                    )
+                face_normal = normalized_oriented_normal(
+                    getattr(raw_contact, "terrain_face_normal", None)
+                )
+                if face_normal is not None:
+                    return contact_with_normal(face_normal, "terrain_triangle_contact_face")
                 if raw_fallback_normal_source not in sampled_terrain_modes:
                     return raw_contact
             if raw_fallback_normal_source not in sampled_terrain_modes:
@@ -9466,6 +9533,8 @@ class WulframServer:
                 "contact_response": contact_response,
                 "contact_timing_mode": contact_timing_mode,
                 "terrain_collision_shape": terrain_collision_shape,
+                "model_contact_rotation_source": model_contact_rotation_source,
+                "model_contact_rotation_mode": model_contact_rotation_mode,
                 "probe_enabled": True,
                 "position": pos,
                 "velocity": (vx, vy, vz),
@@ -9510,6 +9579,7 @@ class WulframServer:
                     vertices,
                     cbsp_tree,
                     bounding_radius,
+                    rotation_matrix=model_contact_rotation_matrix,
                 )
             box_center = (pos[0], pos[1], pos[2] + box_collision_z_lift())
             return self._terrain_grid_collision.test_box_collision(

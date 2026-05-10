@@ -6637,6 +6637,72 @@ def test_entity_world_collision_model_entity_origin_can_be_requested():
     return True
 
 
+def test_entity_world_collision_model_contact_can_use_body_matrix_probe():
+    """Default-off terrain model contact probing can use full body rotation."""
+    env_key = "WULFRAM_ENTITY_TERRAIN_MODEL_CONTACT_ROTATION"
+    old_env = os.environ.get(env_key)
+    os.environ[env_key] = "body"
+    calls = []
+    try:
+        def fake_model_collision(center, heading, vertices, cbsp_tree, radius, **kwargs):
+            calls.append(
+                {
+                    "center": center,
+                    "heading": heading,
+                    "rotation_matrix": kwargs.get("rotation_matrix"),
+                }
+            )
+            return None
+
+        server = WulframServer.__new__(WulframServer)
+        server._terrain_grid_collision = SimpleNamespace(
+            test_box_collision=lambda *args, **kwargs: None,
+            test_model_collision=fake_model_collision,
+        )
+        server._get_entity_world_half_extents = lambda ctx: (2.0, 2.0, 3.0)
+        server._get_entity_world_collision_model = lambda ctx: (
+            [],
+            SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=7.5)),
+            7.5,
+            3.0,
+        )
+        server._get_entity_dirty_threshold_sq = lambda ctx, half_extents: 999999.0
+
+        ctx = _fake_tank_collision_context()
+        ctx.player_heading = 0.5
+        ctx.player_pose = {"roll": 0.1, "pitch": -0.2}
+        ctx.spring_body_matrix = _matrix3_from_euler_xyz(0.1, -0.2, 0.0)
+        ctx.player_pos = (0.0, 0.0, 10.0)
+        ctx.world_collision_ref_pos = (0.0, 0.0, 10.0)
+
+        server._resolve_entity_world_collision(
+            ctx,
+            0.0,
+            0.0,
+            10.0,
+            1.0,
+            0.0,
+            0.0,
+            pre_pos=(0.0, 0.0, 10.0),
+            pre_vel=(1.0, 0.0, 0.0),
+            dt=1.0 / 30.0,
+        )
+
+        assert calls, calls
+        assert all(call["rotation_matrix"] is not None for call in calls), calls
+        assert all(len(call["rotation_matrix"]) == 9 for call in calls), calls
+        probe = ctx.debug_last_terrain_contact_probe
+        assert probe["model_contact_rotation_source"] == "body_matrix", probe
+        assert probe["model_contact_rotation_mode"] == "body", probe
+    finally:
+        if old_env is None:
+            os.environ.pop(env_key, None)
+        else:
+            os.environ[env_key] = old_env
+    print("test_entity_world_collision_model_contact_can_use_body_matrix_probe: PASSED")
+    return True
+
+
 def test_entity_world_collision_records_raw_origin_probe_without_applying_contact():
     """Default lifted misses should expose raw-origin contact evidence without changing physics."""
     old_fallback = os.environ.get("WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK")
@@ -7104,6 +7170,123 @@ def test_entity_world_collision_raw_origin_fallback_can_use_contact_face_normal(
             else:
                 os.environ[key] = value
     print("test_entity_world_collision_raw_origin_fallback_can_use_contact_face_normal: PASSED")
+    return True
+
+
+def test_entity_world_collision_raw_origin_fallback_can_blend_radial_face_forward_up():
+    """Raw-origin fallback can A/B decompile-context/terrain-face normals without side impulse."""
+    env_keys = [
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK",
+        "WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN",
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_MAX_VELOCITY_DELTA",
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_MAX_SPEED",
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_MAX_ANGULAR_DELTA",
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_NORMAL_SOURCE",
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_ENTITY_RADIAL_WEIGHT",
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_TERRAIN_FACE_WEIGHT",
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_DELTA_MODE",
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_ANGULAR_MODE",
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_CLOSING_ONLY",
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FRICTION",
+    ]
+    old_env = {key: os.environ.get(key) for key in env_keys}
+    try:
+        os.environ["WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK"] = "1"
+        os.environ.pop("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN", None)
+        os.environ["WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_MAX_VELOCITY_DELTA"] = "10.0"
+        os.environ["WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_MAX_SPEED"] = "200.0"
+        os.environ["WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_MAX_ANGULAR_DELTA"] = "0.5"
+        os.environ[
+            "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_NORMAL_SOURCE"
+        ] = "entity_radial_terrain_face_forward_up"
+        os.environ["WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_ENTITY_RADIAL_WEIGHT"] = "1.0"
+        os.environ["WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_TERRAIN_FACE_WEIGHT"] = "1.0"
+        os.environ["WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_DELTA_MODE"] = "normal"
+        os.environ["WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_ANGULAR_MODE"] = "preserve"
+        os.environ["WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_CLOSING_ONLY"] = "1"
+        os.environ["WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FRICTION"] = "0.0"
+        entity_radial_normal = (0.6, 0.8, 0.0)
+        terrain_face_normal = (0.0, 0.0, 1.0)
+        expected_normal = (0.5144957554275266, 0.0, 0.8574929257125442)
+
+        def fake_model_collision(center, *args, **kwargs):
+            if abs(center[2] - 10.0) < 1e-6:
+                return TerrainContact(
+                    position=(1.0, 2.0, 3.0),
+                    normal=(1.0, 0.0, 0.0),
+                    penetration=4.0,
+                    sector_index=2,
+                    cell=(7, 8),
+                    normal_source="entity_cbsp_split",
+                    cbsp_split_normal=(1.0, 0.0, 0.0),
+                    terrain_face_normal=terrain_face_normal,
+                    mesh_face_normal=(1.0, 0.0, 0.0),
+                    entity_radial_normal=entity_radial_normal,
+                )
+            return None
+
+        server = WulframServer.__new__(WulframServer)
+        server._terrain_grid_collision = SimpleNamespace(
+            test_box_collision=lambda *args, **kwargs: None,
+            test_model_collision=fake_model_collision,
+        )
+        server._get_entity_world_half_extents = lambda ctx: (2.0, 2.0, 3.0)
+        server._get_entity_world_collision_model = lambda ctx: (
+            [],
+            SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=7.5)),
+            7.5,
+            3.0,
+        )
+        server._get_entity_dirty_threshold_sq = lambda ctx, half_extents: 999999.0
+
+        ctx = _fake_tank_collision_context()
+        ctx.player_heading = 0.0
+        ctx.player_pos = (0.0, 0.0, 10.0)
+        ctx.world_collision_ref_pos = (0.0, 0.0, 10.0)
+        ctx.spring_body_matrix = _matrix3_from_euler_xyz(0.0, 0.0, 0.0)
+
+        server._resolve_entity_world_collision(
+            ctx,
+            0.0,
+            0.0,
+            10.0,
+            -5.0,
+            0.0,
+            -5.0,
+            pre_pos=(0.0, 0.0, 10.0),
+            pre_vel=(-5.0, 0.0, -5.0),
+            dt=1.0 / 30.0,
+        )
+
+        debug = ctx.debug_last_motion_collision
+        assert debug["kind"] == "terrain_raw_origin_fallback_contact", debug
+        assert (
+            debug["contact_normal_source"]
+            == "entity_radial_terrain_face_forward_up"
+        ), debug
+        assert debug["raw_origin_fallback_normal_source"] == (
+            "entity_radial_terrain_face_forward_up"
+        ), debug
+        assert debug["contact_entity_radial_normal"] == entity_radial_normal, debug
+        assert debug["contact_terrain_face_normal"] == terrain_face_normal, debug
+        for got, expected in zip(debug["normal"], expected_normal):
+            assert math.isclose(got, expected, abs_tol=1e-6), debug
+        assert math.isclose(debug["normal"][1], 0.0, abs_tol=1e-8), debug
+        assert debug["raw_origin_fallback_angular_preserved"] is True, debug
+        probe = ctx.debug_last_terrain_contact_probe
+        assert probe["raw_origin_contact"]["contact_normal_source"] == (
+            "entity_radial_terrain_face_forward_up"
+        ), probe
+        assert probe["raw_origin_fallback_reject"] == "", probe
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    print(
+        "test_entity_world_collision_raw_origin_fallback_can_blend_radial_face_forward_up: PASSED"
+    )
     return True
 
 
@@ -11492,11 +11675,13 @@ def main():
         test_entity_world_collision_prefers_mesh_contact_when_collision_model_exists,
         test_entity_world_collision_model_defaults_to_legacy_lift,
         test_entity_world_collision_model_entity_origin_can_be_requested,
+        test_entity_world_collision_model_contact_can_use_body_matrix_probe,
         test_entity_world_collision_records_raw_origin_probe_without_applying_contact,
         test_entity_world_collision_raw_origin_fallback_applies_guarded_pair_solver,
         test_entity_world_collision_raw_origin_fallback_clamps_solver_velocity_delta,
         test_entity_world_collision_raw_origin_fallback_can_use_terrain_normal_probe,
         test_entity_world_collision_raw_origin_fallback_can_use_contact_face_normal,
+        test_entity_world_collision_raw_origin_fallback_can_blend_radial_face_forward_up,
         test_entity_world_collision_raw_origin_fallback_can_use_closing_velocity_delta,
         test_entity_world_collision_raw_origin_fallback_can_preserve_angular_velocity,
         test_entity_world_collision_raw_origin_fallback_skips_normal_delta_when_separating,

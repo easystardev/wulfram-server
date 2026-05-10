@@ -231,6 +231,7 @@ class TerrainGridCollision:
         contact_point_local,
         cos_h: float,
         sin_h: float,
+        rotation_matrix=None,
     ) -> tuple[tuple[float, float, float], str]:
         if self.model_contact_normal_source == "entity_radial":
             radial_local = (
@@ -239,12 +240,12 @@ class TerrainGridCollision:
                 -float(contact_point_local[2]),
             )
             radial_world = _normalize3(
-                self._local_to_world_dir(radial_local, cos_h, sin_h)
+                self._local_to_world_dir(radial_local, cos_h, sin_h, rotation_matrix)
             )
             if radial_world is not None:
                 return self._orient_terrain_normal(radial_world), "entity_radial"
         if self.model_contact_normal_source == "mesh":
-            normal_world = self._local_to_world_dir(normal_local, cos_h, sin_h)
+            normal_world = self._local_to_world_dir(normal_local, cos_h, sin_h, rotation_matrix)
             return self._orient_terrain_normal(normal_world), "entity_cbsp_split"
         # The terrain-face path is a default-off rough-terrain A/B probe.
         terrain_normal = _normalize3(
@@ -266,6 +267,7 @@ class TerrainGridCollision:
         contact_point_local,
         cos_h: float,
         sin_h: float,
+        rotation_matrix=None,
     ) -> dict[str, tuple[float, float, float] | None]:
         def local_normal_to_world(value):
             if value is None:
@@ -276,7 +278,7 @@ class TerrainGridCollision:
                 local = (float(value[0]), float(value[1]), float(value[2]))
             except (TypeError, ValueError, OverflowError):
                 return None
-            world = self._local_to_world_dir(local, cos_h, sin_h)
+            world = self._local_to_world_dir(local, cos_h, sin_h, rotation_matrix)
             return self._orient_terrain_normal(world)
 
         cbsp_split_normal = local_normal_to_world(
@@ -304,6 +306,7 @@ class TerrainGridCollision:
                 ),
                 cos_h,
                 sin_h,
+                rotation_matrix,
             )
         )
         if entity_radial_normal is not None:
@@ -524,10 +527,12 @@ class TerrainGridCollision:
         vertices,
         cbsp_tree,
         bounding_radius: float,
+        rotation_matrix=None,
     ) -> Optional[TerrainContact]:
         """Test sectorized terrain triangles against an entity collision mesh."""
         if not self._all_finite((*center, heading, bounding_radius)):
             return None
+        model_matrix = self._coerce_rotation_matrix(rotation_matrix)
         aabb_min = (center[0] - bounding_radius, center[1] - bounding_radius, center[2] - bounding_radius)
         aabb_max = (center[0] + bounding_radius, center[1] + bounding_radius, center[2] + bounding_radius)
         cos_h = math.cos(heading)
@@ -539,7 +544,7 @@ class TerrainGridCollision:
                     if not self._triangle_overlaps_aabb(tri_world, aabb_min, aabb_max):
                         continue
                     tri_local = tuple(
-                        self._world_to_local_box(vertex, center, cos_h, sin_h)
+                        self._world_to_local_box(vertex, center, cos_h, sin_h, model_matrix)
                         for vertex in tri_world
                     )
                     mesh_contact = self._triangle_cbsp_contact(
@@ -557,6 +562,7 @@ class TerrainGridCollision:
                         contact_point_local,
                         cos_h,
                         sin_h,
+                        model_matrix,
                     )
                     normal_metadata = self._contact_normal_metadata_for_model_hit(
                         tri_world,
@@ -565,8 +571,15 @@ class TerrainGridCollision:
                         contact_point_local,
                         cos_h,
                         sin_h,
+                        model_matrix,
                     )
-                    contact_world = self._local_to_world_point(contact_point_local, center, cos_h, sin_h)
+                    contact_world = self._local_to_world_point(
+                        contact_point_local,
+                        center,
+                        cos_h,
+                        sin_h,
+                        model_matrix,
+                    )
                     contact = TerrainContact(
                         position=contact_world,
                         normal=normal_world,
@@ -588,10 +601,12 @@ class TerrainGridCollision:
         vertices,
         cbsp_tree,
         bounding_radius: float,
+        rotation_matrix=None,
     ) -> Optional[TerrainContact]:
         """Return the first model/terrain contact found while scanning bounds-overlapping cells."""
         if not self._all_finite((*bounds_center, *collision_center, heading, bounding_radius)):
             return None
+        model_matrix = self._coerce_rotation_matrix(rotation_matrix)
         aabb_min = (
             bounds_center[0] - bounding_radius,
             bounds_center[1] - bounding_radius,
@@ -609,7 +624,13 @@ class TerrainGridCollision:
             for cell_x, cell_y in self._iter_sector_cells(aabb_min, aabb_max, sector):
                 for tri_world in self._iter_cell_triangles(cell_x, cell_y):
                     tri_local = tuple(
-                        self._world_to_local_box(vertex, collision_center, cos_h, sin_h)
+                        self._world_to_local_box(
+                            vertex,
+                            collision_center,
+                            cos_h,
+                            sin_h,
+                            model_matrix,
+                        )
                         for vertex in tri_world
                     )
                     mesh_contact = self._triangle_cbsp_contact(
@@ -627,6 +648,7 @@ class TerrainGridCollision:
                         contact_point_local,
                         cos_h,
                         sin_h,
+                        model_matrix,
                     )
                     normal_metadata = self._contact_normal_metadata_for_model_hit(
                         tri_world,
@@ -635,8 +657,15 @@ class TerrainGridCollision:
                         contact_point_local,
                         cos_h,
                         sin_h,
+                        model_matrix,
                     )
-                    contact_world = self._local_to_world_point(contact_point_local, collision_center, cos_h, sin_h)
+                    contact_world = self._local_to_world_point(
+                        contact_point_local,
+                        collision_center,
+                        cos_h,
+                        sin_h,
+                        model_matrix,
+                    )
                     return TerrainContact(
                         position=contact_world,
                         normal=normal_world,
@@ -831,10 +860,26 @@ class TerrainGridCollision:
             yield (v00, v10, v11)
 
     @staticmethod
-    def _world_to_local_box(point, center, cos_h: float, sin_h: float):
+    def _coerce_rotation_matrix(rotation_matrix):
+        try:
+            matrix = tuple(float(v) for v in tuple(rotation_matrix or ())[:9])
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if len(matrix) != 9:
+            return None
+        return matrix
+
+    @staticmethod
+    def _world_to_local_box(point, center, cos_h: float, sin_h: float, rotation_matrix=None):
         dx = point[0] - center[0]
         dy = point[1] - center[1]
         dz = point[2] - center[2]
+        if rotation_matrix is not None:
+            return (
+                dx * rotation_matrix[0] + dy * rotation_matrix[3] + dz * rotation_matrix[6],
+                dx * rotation_matrix[1] + dy * rotation_matrix[4] + dz * rotation_matrix[7],
+                dx * rotation_matrix[2] + dy * rotation_matrix[5] + dz * rotation_matrix[8],
+            )
         return (
             dx * cos_h + dy * sin_h,
             -dx * sin_h + dy * cos_h,
@@ -842,7 +887,19 @@ class TerrainGridCollision:
         )
 
     @staticmethod
-    def _local_to_world_dir(direction, cos_h: float, sin_h: float):
+    def _local_to_world_dir(direction, cos_h: float, sin_h: float, rotation_matrix=None):
+        if rotation_matrix is not None:
+            return (
+                direction[0] * rotation_matrix[0]
+                + direction[1] * rotation_matrix[1]
+                + direction[2] * rotation_matrix[2],
+                direction[0] * rotation_matrix[3]
+                + direction[1] * rotation_matrix[4]
+                + direction[2] * rotation_matrix[5],
+                direction[0] * rotation_matrix[6]
+                + direction[1] * rotation_matrix[7]
+                + direction[2] * rotation_matrix[8],
+            )
         return (
             direction[0] * cos_h - direction[1] * sin_h,
             direction[0] * sin_h + direction[1] * cos_h,
@@ -850,7 +907,22 @@ class TerrainGridCollision:
         )
 
     @staticmethod
-    def _local_to_world_point(point, center, cos_h: float, sin_h: float):
+    def _local_to_world_point(point, center, cos_h: float, sin_h: float, rotation_matrix=None):
+        if rotation_matrix is not None:
+            return (
+                center[0]
+                + point[0] * rotation_matrix[0]
+                + point[1] * rotation_matrix[1]
+                + point[2] * rotation_matrix[2],
+                center[1]
+                + point[0] * rotation_matrix[3]
+                + point[1] * rotation_matrix[4]
+                + point[2] * rotation_matrix[5],
+                center[2]
+                + point[0] * rotation_matrix[6]
+                + point[1] * rotation_matrix[7]
+                + point[2] * rotation_matrix[8],
+            )
         return (
             center[0] + point[0] * cos_h - point[1] * sin_h,
             center[1] + point[0] * sin_h + point[1] * cos_h,
