@@ -619,11 +619,22 @@ class TerrainGridCollision:
         cbsp_tree,
         bounding_radius: float,
         rotation_matrix=None,
+        contact_selection: str = "first",
     ) -> Optional[TerrainContact]:
         """Return the first model/terrain contact found while scanning bounds-overlapping cells."""
         if not self._all_finite((*bounds_center, *collision_center, heading, bounding_radius)):
             return None
         model_matrix = self._coerce_rotation_matrix(rotation_matrix)
+        selection = str(contact_selection or "first").strip().lower()
+        collect_candidates = selection in {
+            "upward",
+            "upward_min_depth",
+            "upward_shallow",
+            "min_depth_upward",
+            "shallow_upward",
+        }
+        best_contact = None
+        best_score = None
         aabb_min = (
             bounds_center[0] - bounding_radius,
             bounds_center[1] - bounding_radius,
@@ -683,7 +694,7 @@ class TerrainGridCollision:
                         sin_h,
                         model_matrix,
                     )
-                    return TerrainContact(
+                    contact = TerrainContact(
                         position=contact_world,
                         normal=normal_world,
                         penetration=penetration,
@@ -692,8 +703,15 @@ class TerrainGridCollision:
                         normal_source=normal_source,
                         **normal_metadata,
                     )
+                    if collect_candidates:
+                        score = self._model_contact_selection_score(contact, selection)
+                        if score is not None and (best_score is None or score < best_score):
+                            best_score = score
+                            best_contact = contact
+                        continue
+                    return contact
 
-        return None
+        return best_contact
 
     def _build_sectors(self) -> tuple[TerrainSector, ...]:
         row_ranges = self._split_axis(self.max_cell_x + 1, self.sector_rows)

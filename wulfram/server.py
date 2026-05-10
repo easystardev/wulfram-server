@@ -8875,6 +8875,11 @@ class WulframServer:
             .strip()
             .lower()
         )
+        dirty_model_center_mode = (
+            os.environ.get("WULFRAM_ENTITY_TERRAIN_DIRTY_MODEL_CENTER", "lift")
+            .strip()
+            .lower()
+        )
 
         def box_collision_z_lift() -> float:
             if terrain_collision_shape == "entity_box":
@@ -10911,9 +10916,20 @@ class WulframServer:
             if collision_model is not None and terrain_collision_shape == "model":
                 dirty_contact_fn = getattr(self._terrain_grid_collision, "test_model_bounds_contact", None)
                 if callable(dirty_contact_fn):
+                    dirty_collision_center = (
+                        (anchor[0], anchor[1], anchor[2])
+                        if dirty_model_center_mode in {
+                            "raw",
+                            "entity",
+                            "origin",
+                            "decompile",
+                            "physics_state",
+                        }
+                        else (anchor[0], anchor[1], anchor[2] + z_lift)
+                    )
                     dirty_contact_args = (
                         (anchor[0], anchor[1], anchor[2]),
-                        (anchor[0], anchor[1], anchor[2] + z_lift),
+                        dirty_collision_center,
                         heading,
                         vertices,
                         cbsp_tree,
@@ -10937,7 +10953,14 @@ class WulframServer:
                     )
 
             if dirty_contact_args is not None:
-                contact = dirty_contact_fn(*dirty_contact_args)
+                if collision_model is not None and terrain_collision_shape == "model":
+                    contact = dirty_contact_fn(
+                        *dirty_contact_args,
+                        rotation_matrix=model_contact_rotation_matrix,
+                        contact_selection=model_contact_selection,
+                    )
+                else:
+                    contact = dirty_contact_fn(*dirty_contact_args)
                 if contact is not None:
                     if self._is_pathological_dirty_bounds_contact((anchor[0], anchor[1], anchor[2]), contact, bounding_radius):
                         ctx.debug_last_collision = {
@@ -10946,10 +10969,20 @@ class WulframServer:
                             "normal": contact.normal,
                             "depth": contact.penetration,
                             **contact_debug_fields(contact),
+                            "dirty_model_center_mode": dirty_model_center_mode,
+                            "dirty_bounds_center": dirty_contact_args[0],
+                            "dirty_collision_center": dirty_contact_args[1],
                             "detail": f"reference={reference_pos!r}",
                         }
                     else:
                         apply_dirty_bounds_contact(contact)
+                        ctx.debug_last_collision.update({
+                            "dirty_model_center_mode": dirty_model_center_mode,
+                            "dirty_bounds_center": dirty_contact_args[0],
+                            "dirty_collision_center": dirty_contact_args[1],
+                            "model_contact_selection": model_contact_selection,
+                        })
+                        ctx.debug_last_motion_collision = dict(ctx.debug_last_collision)
                         ctx.world_collision_ref_pos = (anchor[0], anchor[1], anchor[2])
                         return finish_result(anchor[0], anchor[1], anchor[2], vx, vy, vz)
             else:

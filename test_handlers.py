@@ -6193,6 +6193,62 @@ def test_model_collision_can_probe_upward_min_depth_selection():
     return True
 
 
+def test_model_bounds_contact_can_probe_upward_min_depth_selection():
+    """Dirty bounds model contact selection should match the clean model contact selector."""
+
+    class FlatTerrain:
+        cell_x = 1.0
+        cell_z = 1.0
+        world_w = 3.0
+        world_h = 2.0
+        num_x = 4
+        num_z = 2
+
+        @staticmethod
+        def _get_raw_height(cell_x, cell_y):
+            return 0.0
+
+    grid = TerrainGridCollision(FlatTerrain(), 0.0, sector_rows=1, sector_cols=1)
+    tri = ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0))
+    calls = []
+
+    grid._iter_aabb_sectors = lambda aabb_min, aabb_max: [SimpleNamespace(index=0)]
+    grid._iter_sector_cells = lambda aabb_min, aabb_max, sector: [(0, 0), (1, 0), (2, 0)]
+    grid._iter_cell_triangles = lambda cell_x, cell_y: [tri]
+    grid._triangle_overlaps_aabb = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("dirty bounds model contact should not use the 3d prefilter")
+    )
+
+    contacts = [
+        ((0.0, 0.0, 0.0), (0.0, 1.0, 0.0), 0.1),
+        ((0.0, 0.0, 0.0), (0.0, 0.1, 0.995), 30.0),
+        ((0.0, 0.0, 0.0), (0.0, 0.2, 0.98), 4.0),
+    ]
+
+    def fake_triangle_cbsp_contact(tri_local, vertices, cbsp_tree, bounding_radius):
+        calls.append((tri_local, bounding_radius))
+        return contacts[len(calls) - 1]
+
+    grid._triangle_cbsp_contact = fake_triangle_cbsp_contact
+
+    contact = grid.test_model_bounds_contact(
+        (0.5, 0.5, 0.5),
+        (0.5, 0.5, 0.5),
+        0.0,
+        [],
+        object(),
+        1.0,
+        contact_selection="upward_min_depth",
+    )
+    assert contact is not None
+    assert len(calls) == 3, calls
+    assert contact.cell == (2, 0), contact.cell
+    assert math.isclose(contact.penetration, 4.0, abs_tol=1e-6), contact.penetration
+    assert contact.normal[2] > 0.9, contact.normal
+    print("test_model_bounds_contact_can_probe_upward_min_depth_selection: PASSED")
+    return True
+
+
 def test_model_collision_response_normal_can_probe_terrain_triangle_normal():
     """The terrain-face response probe should be opt-in; the CBSP split normal remains default."""
 
@@ -9461,6 +9517,123 @@ def test_entity_world_collision_uses_dirty_bounds_contact_store():
     return True
 
 
+def _run_dirty_model_center_probe(dirty_model_center_mode):
+    env_keys = [
+        "WULFRAM_ENTITY_TERRAIN_COLLISION_SHAPE",
+        "WULFRAM_ENTITY_TERRAIN_DIRTY_MODEL_CENTER",
+        "WULFRAM_ENTITY_TERRAIN_MODEL_CONTACT_SELECTION",
+    ]
+    old_env = {key: os.environ.get(key) for key in env_keys}
+    try:
+        os.environ["WULFRAM_ENTITY_TERRAIN_COLLISION_SHAPE"] = "model"
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_MODEL_CONTACT_SELECTION", None)
+        if dirty_model_center_mode is None:
+            os.environ.pop("WULFRAM_ENTITY_TERRAIN_DIRTY_MODEL_CENTER", None)
+        else:
+            os.environ["WULFRAM_ENTITY_TERRAIN_DIRTY_MODEL_CENTER"] = dirty_model_center_mode
+
+        calls = []
+
+        def fake_model_bounds_contact(*args, **kwargs):
+            calls.append((args, kwargs))
+            return TerrainContact(
+                position=(10.0, 0.0, 4.0),
+                normal=(0.0, 0.0, 1.0),
+                penetration=1.5,
+                sector_index=0,
+                cell=(0, 0),
+            )
+
+        server = WulframServer.__new__(WulframServer)
+        server._terrain_grid_collision = SimpleNamespace(
+            test_model_bounds_contact=fake_model_bounds_contact,
+            raycast=lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("dirty bounds contact should resolve before raycast")
+            ),
+            test_box_collision=lambda *args, **kwargs: None,
+            test_model_collision=lambda *args, **kwargs: None,
+        )
+        server._get_entity_world_half_extents = lambda ctx: (4.0, 4.0, 4.0)
+        server._get_entity_dirty_threshold_sq = lambda ctx, half_extents: 1.0
+        server._get_entity_world_collision_model = lambda ctx: (
+            [],
+            SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=5.0)),
+            5.0,
+            3.0,
+        )
+
+        ctx = ClientContext(
+            client_id=1,
+            client_addr=("10.10.10.2", 50000),
+            session=Session(),
+            entity_id=0x14EA,
+        )
+        ctx.player_heading = 0.0
+        ctx.player_pos = (0.0, 0.0, 4.0)
+        ctx.world_collision_ref_pos = (0.0, 0.0, 4.0)
+
+        result = server._resolve_entity_world_collision(
+            ctx,
+            10.0,
+            0.0,
+            4.0,
+            1.0,
+            0.0,
+            -5.0,
+        )
+        return calls, ctx, result
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+@_legacy_contact_response_test
+def test_entity_world_collision_dirty_model_center_defaults_to_lifted_center():
+    """Dirty model bounds should preserve the current lifted collision center by default."""
+    calls, ctx, result = _run_dirty_model_center_probe(None)
+    assert calls, calls
+    args, kwargs = calls[0]
+    assert args[0] == (10.0, 0.0, 4.0), args
+    assert args[1] == (10.0, 0.0, 7.0), args
+    assert kwargs["contact_selection"] == "first", kwargs
+    assert ctx.debug_last_motion_collision["dirty_model_center_mode"] == "lift", ctx.debug_last_motion_collision
+    assert ctx.debug_last_motion_collision["dirty_collision_center"] == (10.0, 0.0, 7.0), ctx.debug_last_motion_collision
+    px, py, pz, vx, vy, vz = result
+    assert abs(px - 10.0) < 1e-6, result
+    assert abs(py) < 1e-6, result
+    assert pz > 4.0, result
+    assert abs(vx - 1.0) < 1e-6, result
+    assert abs(vy) < 1e-6, result
+    assert abs(vz) < 1e-6, result
+    print("test_entity_world_collision_dirty_model_center_defaults_to_lifted_center: PASSED")
+    return True
+
+
+@_legacy_contact_response_test
+def test_entity_world_collision_dirty_model_center_can_use_raw_center():
+    """Opt-in dirty model bounds can use the raw entity center seen in the decompile path."""
+    calls, ctx, result = _run_dirty_model_center_probe("raw")
+    assert calls, calls
+    args, kwargs = calls[0]
+    assert args[0] == (10.0, 0.0, 4.0), args
+    assert args[1] == (10.0, 0.0, 4.0), args
+    assert kwargs["contact_selection"] == "first", kwargs
+    assert ctx.debug_last_motion_collision["dirty_model_center_mode"] == "raw", ctx.debug_last_motion_collision
+    assert ctx.debug_last_motion_collision["dirty_collision_center"] == (10.0, 0.0, 4.0), ctx.debug_last_motion_collision
+    px, py, pz, vx, vy, vz = result
+    assert abs(px - 10.0) < 1e-6, result
+    assert abs(py) < 1e-6, result
+    assert pz > 4.0, result
+    assert abs(vx - 1.0) < 1e-6, result
+    assert abs(vy) < 1e-6, result
+    assert abs(vz) < 1e-6, result
+    print("test_entity_world_collision_dirty_model_center_can_use_raw_center: PASSED")
+    return True
+
+
 @_legacy_contact_response_test
 def test_entity_world_collision_dirty_bounds_store_accepts_tiny_contact():
     """Dirty bounds-phase stored contacts should apply even when penetration is below the clean-path epsilon."""
@@ -11728,6 +11901,7 @@ def main():
         test_box_collision_returns_first_contact_in_grid_order,
         test_model_collision_returns_first_contact_in_grid_order,
         test_model_collision_can_probe_upward_min_depth_selection,
+        test_model_bounds_contact_can_probe_upward_min_depth_selection,
         test_model_collision_response_normal_can_probe_terrain_triangle_normal,
         test_triangle_cbsp_contact_returns_first_leaf_hit,
         test_building_collision_skips_aabb_for_mesh_backed_building,
@@ -11775,6 +11949,8 @@ def main():
         test_entity_world_collision_uses_dirty_terrain_raycast_branch,
         test_entity_world_collision_uses_dirty_contact_before_raycast,
         test_entity_world_collision_uses_dirty_bounds_contact_store,
+        test_entity_world_collision_dirty_model_center_defaults_to_lifted_center,
+        test_entity_world_collision_dirty_model_center_can_use_raw_center,
         test_entity_world_collision_dirty_bounds_store_accepts_tiny_contact,
         test_entity_world_collision_dirty_bounds_store_uses_contact_point_radius_resolution,
         test_entity_world_collision_pathological_dirty_bounds_contact_falls_back_to_raycast,
