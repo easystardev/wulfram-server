@@ -8756,6 +8756,27 @@ class WulframServer:
         except ValueError:
             contact_iteration_limit = default_contact_iterations
         contact_iteration_limit = max(1, min(30, contact_iteration_limit))
+        contact_sweep_scan_mode = (
+            os.environ.get("WULFRAM_ENTITY_TERRAIN_CONTACT_SWEEP_SCAN", "0")
+            .strip()
+            .lower()
+        )
+        contact_sweep_scan_enabled = contact_sweep_scan_mode in {
+            "1",
+            "true",
+            "on",
+            "yes",
+            "scan",
+            "bucket",
+            "decompile",
+        }
+        try:
+            contact_sweep_scan_steps = int(
+                os.environ.get("WULFRAM_ENTITY_TERRAIN_CONTACT_SWEEP_SCAN_STEPS", "30")
+            )
+        except ValueError:
+            contact_sweep_scan_steps = 30
+        contact_sweep_scan_steps = max(1, min(30, contact_sweep_scan_steps))
         start_iterative_mode = (
             os.environ.get("WULFRAM_ENTITY_TERRAIN_START_ITERATIVE", "0").strip().lower()
         )
@@ -10060,7 +10081,95 @@ class WulframServer:
                 end_contact is None
                 or end_contact.penetration <= self._PENETRATION_SLOP_DEFAULT
             ):
-                return None
+                if not contact_sweep_scan_enabled:
+                    return None
+                prev_time = 0.0
+                found_time = None
+                found_candidate = None
+                for scan_index in range(1, contact_sweep_scan_steps + 1):
+                    scan_time = remaining_time * (
+                        float(scan_index) / float(contact_sweep_scan_steps + 1)
+                    )
+                    scan_pos, scan_vel = motion_state_at(
+                        start_pos,
+                        start_vel,
+                        acc,
+                        scan_time,
+                        remaining_time,
+                    )
+                    scan_candidate = timed_contact_candidate_at(scan_pos, scan_vel)
+                    scan_contact = scan_candidate.get("contact")
+                    if (
+                        scan_contact is not None
+                        and scan_contact.penetration > self._PENETRATION_SLOP_DEFAULT
+                    ):
+                        found_time = scan_time
+                        found_candidate = scan_candidate
+                        break
+                    prev_time = scan_time
+                if found_time is None or found_candidate is None:
+                    return None
+
+                lo = prev_time
+                hi = found_time
+                contact = found_candidate["contact"]
+                contact_candidate = found_candidate
+                iterations = 0
+                clear_count = max(0, int(round(prev_time > 0.0)))
+                contact_count = 1
+                while hi - lo > 0.0025 and iterations < 24:
+                    mid = (lo + hi) * 0.5
+                    mid_pos, mid_vel = motion_state_at(
+                        start_pos,
+                        start_vel,
+                        acc,
+                        mid,
+                        remaining_time,
+                    )
+                    mid_candidate = timed_contact_candidate_at(mid_pos, mid_vel)
+                    mid_contact = mid_candidate.get("contact")
+                    iterations += 1
+                    if (
+                        mid_contact is not None
+                        and mid_contact.penetration > self._PENETRATION_SLOP_DEFAULT
+                    ):
+                        hi = mid
+                        contact = mid_contact
+                        contact_candidate = mid_candidate
+                        contact_count += 1
+                    else:
+                        lo = mid
+                        clear_count += 1
+
+                return {
+                    "collision_time_s": hi,
+                    "contact": contact,
+                    "sweep_iterations": iterations,
+                    "sweep_clear_count": clear_count,
+                    "sweep_contact_count": contact_count,
+                    "collision_at_start": False,
+                    "contact_sweep_scan": True,
+                    "contact_sweep_scan_steps": contact_sweep_scan_steps,
+                    "contact_sweep_scan_hit_time_s": found_time,
+                    "raw_origin_fallback": bool(
+                        contact_candidate.get("raw_origin_fallback")
+                    ),
+                    "raw_origin_fallback_reject": contact_candidate.get(
+                        "raw_origin_fallback_reject"
+                    ),
+                    "raw_origin_fallback_probe_reason": contact_candidate.get(
+                        "raw_origin_fallback_probe_reason"
+                    ),
+                    "raycast_fallback": bool(
+                        contact_candidate.get("raycast_fallback")
+                    ),
+                    "raycast_fallback_reject": contact_candidate.get(
+                        "raycast_fallback_reject"
+                    ),
+                    "raycast_fallback_probe_reason": contact_candidate.get(
+                        "raycast_fallback_probe_reason"
+                    ),
+                }
 
             lo = 0.0
             hi = remaining_time
@@ -10094,6 +10203,8 @@ class WulframServer:
                 "sweep_clear_count": clear_count,
                 "sweep_contact_count": contact_count,
                 "collision_at_start": False,
+                "contact_sweep_scan": False,
+                "contact_sweep_scan_steps": contact_sweep_scan_steps,
                 "raw_origin_fallback": bool(
                     contact_candidate.get("raw_origin_fallback")
                 ),
@@ -10208,6 +10319,13 @@ class WulframServer:
                     "sweep_clear_count": timed_contact["sweep_clear_count"],
                     "sweep_contact_count": timed_contact["sweep_contact_count"],
                     "collision_at_start": timed_contact["collision_at_start"],
+                    "contact_sweep_scan": bool(timed_contact.get("contact_sweep_scan")),
+                    "contact_sweep_scan_steps": timed_contact.get(
+                        "contact_sweep_scan_steps"
+                    ),
+                    "contact_sweep_scan_hit_time_s": timed_contact.get(
+                        "contact_sweep_scan_hit_time_s"
+                    ),
                     "start_time_clamped": timed_contact.get("start_time_clamped", False),
                     "raw_origin_fallback": bool(timed_contact.get("raw_origin_fallback")),
                     "raw_origin_timed_fallback": bool(timed_contact.get("raw_origin_fallback")),
@@ -10360,6 +10478,14 @@ class WulframServer:
                 "final_remaining_time_s": remaining,
                 "contact_iteration_limit": contact_iteration_limit,
                 "contact_iteration_count": len(contact_events),
+                "contact_sweep_scan_enabled": contact_sweep_scan_enabled,
+                "contact_sweep_scan_steps": contact_sweep_scan_steps,
+                "contact_sweep_scan_event_count": sum(
+                    1 for event in contact_events if event.get("contact_sweep_scan")
+                ),
+                "contact_sweep_scan_hit_time_s": contact_events[0].get(
+                    "contact_sweep_scan_hit_time_s"
+                ),
                 "raw_origin_timed_fallback_enabled": raw_fallback_timed_enabled,
                 "raw_origin_timed_fallback_event_count": sum(
                     1 for event in contact_events if event.get("raw_origin_timed_fallback")
