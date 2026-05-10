@@ -11018,9 +11018,6 @@ class WulframServer:
                     }
                 return None
 
-            end_candidate = candidate_at(frame_dt)
-            if end_candidate is None:
-                return None
             start_candidate = candidate_at(0.0)
             if start_candidate is not None:
                 return {
@@ -11030,15 +11027,47 @@ class WulframServer:
                     "sweep_iterations": 0,
                     "sweep_clear_count": 0,
                     "sweep_contact_count": 2,
+                    "contact_sweep_scan": False,
+                    "contact_sweep_scan_steps": 0,
+                    "contact_sweep_scan_hit_time_s": None,
                     **start_candidate,
                 }
 
+            end_candidate = candidate_at(frame_dt)
+            contact_sweep_scan = False
+            contact_sweep_scan_hit_time = None
+            scan_steps_used = 0
             lo = 0.0
-            hi = frame_dt
-            best = end_candidate
+            if end_candidate is None:
+                found_time = None
+                found_candidate = None
+                prev_time = 0.0
+                scan_steps_used = max(1, int(contact_sweep_scan_steps))
+                for scan_index in range(1, scan_steps_used + 1):
+                    scan_time = frame_dt * (
+                        float(scan_index) / float(scan_steps_used + 1)
+                    )
+                    scan_candidate = candidate_at(scan_time)
+                    if scan_candidate is not None:
+                        found_time = scan_time
+                        found_candidate = scan_candidate
+                        break
+                    prev_time = scan_time
+                if found_time is None or found_candidate is None:
+                    return None
+                contact_sweep_scan = True
+                contact_sweep_scan_hit_time = found_time
+                lo = prev_time
+                hi = found_time
+                best = found_candidate
+                clear_count = max(1, int(round(prev_time > 0.0)))
+                contact_count = 1
+            else:
+                hi = frame_dt
+                best = end_candidate
+                clear_count = 1
+                contact_count = 1
             iterations = 0
-            clear_count = 1
-            contact_count = 1
             while hi - lo > 0.0025 and iterations < 24:
                 mid = (lo + hi) * 0.5
                 mid_candidate = candidate_at(mid)
@@ -11057,6 +11086,9 @@ class WulframServer:
                 "sweep_iterations": iterations,
                 "sweep_clear_count": clear_count,
                 "sweep_contact_count": contact_count,
+                "contact_sweep_scan": contact_sweep_scan,
+                "contact_sweep_scan_steps": scan_steps_used,
+                "contact_sweep_scan_hit_time_s": contact_sweep_scan_hit_time,
                 **best,
             }
 
@@ -11943,8 +11975,53 @@ class WulframServer:
                     pair_record_contact_reject=pair_contact_reject,
                     raycast_probe=raycast_probe,
                 )
-                if pair_raw_error is None and pair_contact is not None and pair_contact_reject == "":
-                    direct_pair_timing = estimate_direct_pair_record_contact_timing()
+                direct_pair_timing = estimate_direct_pair_record_contact_timing()
+                if pair_record_continue_remaining_enabled:
+                    probe_debug = getattr(ctx, "debug_last_terrain_contact_probe", None)
+                    if isinstance(probe_debug, dict):
+                        if direct_pair_timing is None:
+                            probe_debug.update({
+                                "pair_record_continue_probe_result": "no_interval_contact",
+                            })
+                        else:
+                            probe_debug.update({
+                                "pair_record_continue_probe_result": "interval_contact",
+                                "pair_record_continue_collision_time_s": direct_pair_timing.get(
+                                    "collision_time_s"
+                                ),
+                                "pair_record_continue_remaining_time_s": direct_pair_timing.get(
+                                    "remaining_time_s"
+                                ),
+                                "pair_record_continue_collision_at_start": direct_pair_timing.get(
+                                    "collision_at_start"
+                                ),
+                                "pair_record_continue_sweep_iterations": direct_pair_timing.get(
+                                    "sweep_iterations"
+                                ),
+                                "pair_record_continue_sweep_clear_count": direct_pair_timing.get(
+                                    "sweep_clear_count"
+                                ),
+                                "pair_record_continue_sweep_contact_count": direct_pair_timing.get(
+                                    "sweep_contact_count"
+                                ),
+                                "pair_record_continue_contact_sweep_scan": direct_pair_timing.get(
+                                    "contact_sweep_scan"
+                                ),
+                                "pair_record_continue_contact_sweep_scan_steps": direct_pair_timing.get(
+                                    "contact_sweep_scan_steps"
+                                ),
+                                "pair_record_continue_contact_sweep_scan_hit_time_s": direct_pair_timing.get(
+                                    "contact_sweep_scan_hit_time_s"
+                                ),
+                            })
+                if (
+                    direct_pair_timing is not None
+                    or (
+                        pair_raw_error is None
+                        and pair_contact is not None
+                        and pair_contact_reject == ""
+                    )
+                ):
                     if direct_pair_timing is not None:
                         pair_contact = direct_pair_timing["contact"]
                         pair_delta_contact = direct_pair_timing.get("delta_contact")
@@ -12010,6 +12087,15 @@ class WulframServer:
                             "sweep_contact_count": direct_pair_timing.get(
                                 "sweep_contact_count"
                             ),
+                            "contact_sweep_scan": direct_pair_timing.get(
+                                "contact_sweep_scan"
+                            ),
+                            "contact_sweep_scan_steps": direct_pair_timing.get(
+                                "contact_sweep_scan_steps"
+                            ),
+                            "contact_sweep_scan_hit_time_s": direct_pair_timing.get(
+                                "contact_sweep_scan_hit_time_s"
+                            ),
                             "collision_at_start": direct_pair_timing.get(
                                 "collision_at_start"
                             ),
@@ -12043,6 +12129,15 @@ class WulframServer:
                             ),
                             "pair_record_continue_sweep_contact_count": (
                                 direct_pair_timing.get("sweep_contact_count")
+                            ),
+                            "pair_record_continue_contact_sweep_scan": (
+                                direct_pair_timing.get("contact_sweep_scan")
+                            ),
+                            "pair_record_continue_contact_sweep_scan_steps": (
+                                direct_pair_timing.get("contact_sweep_scan_steps")
+                            ),
+                            "pair_record_continue_contact_sweep_scan_hit_time_s": (
+                                direct_pair_timing.get("contact_sweep_scan_hit_time_s")
                             ),
                             "pair_record_continue_contact_pos": (
                                 direct_pair_timing.get("pos")

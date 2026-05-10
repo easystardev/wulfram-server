@@ -7205,6 +7205,110 @@ def test_entity_world_collision_pair_record_contact_can_continue_remaining_step_
     return True
 
 
+def test_entity_world_collision_pair_record_continue_sweeps_transient_contact():
+    """Continue-remaining pair-record contact should catch a mid-step contact even when the endpoint is clear."""
+    env_keys = [
+        "WULFRAM_ENTITY_TERRAIN_CONTACT_SWEEP_SCAN_STEPS",
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_TIMED_CONTACT",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTINUE_REMAINING",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT_SELECTION",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_NORMAL_SOURCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE",
+    ]
+    old_env = {key: os.environ.get(key) for key in env_keys}
+    try:
+        os.environ["WULFRAM_ENTITY_TERRAIN_CONTACT_SWEEP_SCAN_STEPS"] = "9"
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK", None)
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT", None)
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_TIMED_CONTACT"] = "0"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTINUE_REMAINING"] = "1"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT_SELECTION"] = "upward_min_depth"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_NORMAL_SOURCE"] = "mesh"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE"] = "mesh"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE"] = "closing_velocity"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE"] = "preserve"
+
+        def fake_model_collision(center, *args, **kwargs):
+            if 0.45 <= center[0] <= 0.55:
+                return TerrainContact(
+                    position=(center[0], 0.0, -2.0),
+                    normal=(0.0, 0.0, 1.0),
+                    penetration=1.0,
+                    sector_index=2,
+                    cell=(7, 8),
+                    normal_source="entity_cbsp_split",
+                    cbsp_split_normal=(0.0, 0.0, 1.0),
+                    terrain_face_normal=(0.0, 0.0, 1.0),
+                    mesh_face_normal=(0.0, 0.0, 1.0),
+                    entity_radial_normal=(0.0, 0.0, 1.0),
+                )
+            return None
+
+        server = WulframServer.__new__(WulframServer)
+        server._terrain_grid_collision = SimpleNamespace(
+            test_box_collision=lambda *args, **kwargs: None,
+            test_model_collision=fake_model_collision,
+        )
+        server._get_entity_world_half_extents = lambda ctx: (2.0, 2.0, 3.0)
+        server._get_entity_world_collision_model = lambda ctx: (
+            [],
+            SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=7.5)),
+            7.5,
+            3.0,
+        )
+        server._get_entity_dirty_threshold_sq = lambda ctx, half_extents: 999999.0
+
+        ctx = _fake_tank_collision_context()
+        ctx.player_heading = 0.0
+        ctx.player_pos = (0.0, 0.0, 0.0)
+        ctx.world_collision_ref_pos = (0.0, 0.0, 0.0)
+        ctx.spring_body_matrix = _matrix3_from_euler_xyz(0.0, 0.0, 0.0)
+
+        px, _py, pz, _vx, _vy, vz = server._resolve_entity_world_collision(
+            ctx,
+            1.0,
+            0.0,
+            -1.0,
+            1.0,
+            0.0,
+            -1.0,
+            pre_pos=(0.0, 0.0, 0.0),
+            pre_vel=(1.0, 0.0, -1.0),
+            dt=1.0,
+        )
+
+        debug = ctx.debug_last_motion_collision
+        assert debug["kind"] == "terrain_pair_record_continued_contact", debug
+        assert debug["pair_record_continued_contact"] is True, debug
+        assert debug["pair_record_continue_contact_sweep_scan"] is True, debug
+        assert 0.44 <= debug["pair_record_continue_collision_time_s"] <= 0.46, debug
+        assert 0.54 <= debug["pair_record_continue_remaining_time_s"] <= 0.56, debug
+        event = debug["contact_events"][0]
+        assert event["contact_sweep_scan"] is True, event
+        assert event["pair_record_continued_contact"] is True, event
+        assert event["velocity_before"][2] == -1.0, event
+        assert event["velocity_after"][2] > -1.0, event
+        probe = ctx.debug_last_terrain_contact_probe
+        assert probe["pair_record_contact_reject"] == "no_raw_origin_contact", probe
+        assert probe["pair_record_continue_probe_result"] == "interval_contact", probe
+        assert probe["pair_record_continue_contact_sweep_scan"] is True, probe
+        assert px > 0.45 and pz > -1.0 and vz > -1.0, (px, pz, vz, debug)
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    print(
+        "test_entity_world_collision_pair_record_continue_sweeps_transient_contact: PASSED"
+    )
+    return True
+
+
 def test_entity_world_collision_pair_record_contact_applies_decompile_face_gated_contact():
     """Default pair-record contact should activate only on raw contacts carrying terrain-face evidence."""
     env_keys = [
@@ -12906,6 +13010,7 @@ def main():
         test_entity_world_collision_reference_pose_probe_records_pre_step_contact_when_enabled,
         test_entity_world_collision_reference_pose_pair_record_contact_can_apply_when_enabled,
         test_entity_world_collision_pair_record_contact_can_continue_remaining_step_when_enabled,
+        test_entity_world_collision_pair_record_continue_sweeps_transient_contact,
         test_entity_world_collision_pair_record_contact_applies_decompile_face_gated_contact,
         test_entity_world_collision_pair_record_contact_uses_shallow_upward_selection,
         test_entity_world_collision_raw_origin_fallback_applies_guarded_pair_solver,
