@@ -6693,6 +6693,7 @@ def test_entity_world_collision_raw_origin_fallback_applies_guarded_pair_solver(
         "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_ANGULAR_MODE",
         "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_CLOSING_ONLY",
         "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FRICTION",
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_PROJECTION_ORDER",
     ]
     old_env = {key: os.environ.get(key) for key in env_keys}
     try:
@@ -7001,6 +7002,7 @@ def test_entity_world_collision_raw_origin_fallback_can_preserve_angular_velocit
         os.environ["WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_ANGULAR_MODE"] = "preserve"
         os.environ["WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_CLOSING_ONLY"] = "1"
         os.environ["WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FRICTION"] = "0.0"
+        os.environ["WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_PROJECTION_ORDER"] = "body_minus_world"
 
         def fake_model_collision(center, *args, **kwargs):
             if abs(center[2] - 10.0) < 1e-6:
@@ -7146,7 +7148,11 @@ def test_entity_world_collision_raw_origin_fallback_skips_normal_delta_when_sepa
         debug = ctx.debug_last_motion_collision
         assert debug["kind"] == "terrain_raw_origin_fallback_contact", debug
         assert debug["raw_origin_fallback_before_normal_speed"] > 0.0, debug
-        assert debug["raw_origin_fallback_normal_delta_skip_reason"] == "separating_before_velocity", debug
+        assert debug["raw_origin_fallback_before_normal_speed_source"] == "constraint_selected_separation_speed_before", debug
+        assert debug["raw_origin_fallback_normal_delta_skip_reason"] in {
+            "separating_before_velocity",
+            "nonpositive_solver_normal_delta",
+        }, debug
         assert debug["raw_origin_fallback_velocity_delta_after_safety"] == (0.0, 0.0, 0.0), debug
         assert debug["velocity_after"] == (0.0, 0.0, 12.0), debug
     finally:
@@ -8305,6 +8311,115 @@ def test_lifted_timed_probe_can_use_guarded_raw_origin_contact():
             else:
                 os.environ[key] = value
     print("test_lifted_timed_probe_can_use_guarded_raw_origin_contact: PASSED")
+    return True
+
+
+def test_raw_origin_closing_gate_uses_solver_contact_projection():
+    """Raw fallback safety should follow the contact-point projection, not center velocity."""
+    env_keys = [
+        "WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN",
+        "WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE",
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK",
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_MIN_DEPTH",
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_MAX_DEPTH",
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_MIN_SPEED",
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_MAX_VELOCITY_DELTA",
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_MAX_SPEED",
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_MAX_ANGULAR_DELTA",
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_DELTA_MODE",
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_ANGULAR_MODE",
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_CLOSING_ONLY",
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_PROJECTION_ORDER",
+    ]
+    old_env = {key: os.environ.get(key) for key in env_keys}
+    try:
+        os.environ.pop("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN", None)
+        os.environ["WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE"] = "pair"
+        os.environ["WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK"] = "1"
+        os.environ["WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_MIN_DEPTH"] = "0.1"
+        os.environ["WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_MAX_DEPTH"] = "40.0"
+        os.environ["WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_MIN_SPEED"] = "0.0"
+        os.environ["WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_MAX_VELOCITY_DELTA"] = "20.0"
+        os.environ["WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_MAX_SPEED"] = "200.0"
+        os.environ["WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_MAX_ANGULAR_DELTA"] = "0.5"
+        os.environ["WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_DELTA_MODE"] = "normal"
+        os.environ["WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_ANGULAR_MODE"] = "preserve"
+        os.environ["WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_CLOSING_ONLY"] = "1"
+        os.environ["WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_PROJECTION_ORDER"] = "opposite_if_separating"
+
+        def fake_model_collision(model_center, *args, **kwargs):
+            if abs(model_center[2]) > 1e-6:
+                return None
+            return TerrainContact(
+                position=(0.0, 0.0, -1.0),
+                normal=(0.0, 0.0, 1.0),
+                penetration=1.0,
+                sector_index=0,
+                cell=(71, 56),
+                normal_source="raw_origin_test",
+            )
+
+        server = WulframServer.__new__(WulframServer)
+        server._terrain_grid_collision = SimpleNamespace(
+            test_box_collision=lambda *args, **kwargs: None,
+            test_model_collision=fake_model_collision,
+            test_model_bounds_contact=lambda *args, **kwargs: None,
+        )
+        server._get_entity_world_half_extents = lambda ctx: (4.0, 4.0, 4.0)
+        server._get_entity_dirty_threshold_sq = lambda ctx, half_extents: 999.0
+        server._get_entity_world_collision_model = lambda ctx: (
+            [],
+            SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=5.0)),
+            5.0,
+            3.0,
+        )
+
+        ctx = ClientContext(
+            client_id=1,
+            client_addr=("10.10.10.2", 50000),
+            session=Session(),
+            entity_id=0x14EA,
+            entity_type=int(EntityType.TANK),
+        )
+        ctx.player_heading = 0.0
+        ctx.player_pos = (0.0, 0.0, 0.0)
+        ctx.world_collision_ref_pos = (0.0, 0.0, 0.0)
+
+        _px, _py, _pz, _vx, _vy, vz = server._resolve_entity_world_collision(
+            ctx,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            2.0,
+        )
+
+        debug = ctx.debug_last_motion_collision
+        assert debug["raw_origin_fallback"] is True, debug
+        assert debug["raw_origin_fallback_closing_only"] is True, debug
+        assert debug["constraint_projection_order"] == "opposite_if_separating", debug
+        assert (
+            debug["constraint_primary_projection_speed_source"]
+            == "world_minus_body_if_body_separating"
+        ), debug
+        assert debug["raw_origin_fallback_before_center_normal_speed"] > 0.0, debug
+        assert debug["raw_origin_fallback_before_normal_speed"] < 0.0, debug
+        assert (
+            debug["raw_origin_fallback_before_normal_speed_source"]
+            == "constraint_selected_separation_speed_before"
+        ), debug
+        assert debug["raw_origin_fallback_normal_delta_projected"] is True, debug
+        assert debug["raw_origin_fallback_normal_delta_skip_reason"] == "", debug
+        assert debug["raw_origin_fallback_velocity_delta_mag_after_safety"] > 0.0, debug
+        assert vz > 2.0, (vz, debug)
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    print("test_raw_origin_closing_gate_uses_solver_contact_projection: PASSED")
     return True
 
 
@@ -11089,6 +11204,7 @@ def main():
         test_entity_origin_probe_applies_pair_solver_at_contact_time,
         test_entity_origin_probe_can_repeat_bucketed_pair_contacts,
         test_lifted_timed_probe_can_use_guarded_raw_origin_contact,
+        test_raw_origin_closing_gate_uses_solver_contact_projection,
         test_lifted_timed_probe_can_use_guarded_raycast_contact,
         test_timed_pair_sweep_scan_finds_transient_midframe_contact,
         test_collision_at_start_can_use_iterative_world_separation,

@@ -9666,6 +9666,8 @@ class WulframServer:
             )
             normal_delta_projected = False
             before_normal_speed = None
+            before_center_normal_speed = None
+            before_normal_speed_source = ""
             normal_delta_skip_reason = ""
             if raw_fallback_delta_mode in {"normal", "normal_only", "contact_normal"}:
                 normal = None
@@ -9680,11 +9682,25 @@ class WulframServer:
                 except (TypeError, ValueError, OverflowError, IndexError):
                     normal = None
                 if normal is not None:
-                    before_normal_speed = (
+                    before_center_normal_speed = (
                         before_vel[0] * normal[0]
                         + before_vel[1] * normal[1]
                         + before_vel[2] * normal[2]
                     )
+                    before_normal_speed = before_center_normal_speed
+                    before_normal_speed_source = "center_velocity"
+                    for speed_key in (
+                        "constraint_selected_separation_speed_before",
+                        "point_normal_velocity_before",
+                    ):
+                        try:
+                            candidate_speed = float(response_debug.get(speed_key))
+                        except (TypeError, ValueError, OverflowError):
+                            candidate_speed = None
+                        if candidate_speed is not None and math.isfinite(candidate_speed):
+                            before_normal_speed = candidate_speed
+                            before_normal_speed_source = speed_key
+                            break
                     normal_component = (
                         raw_delta[0] * normal[0]
                         + raw_delta[1] * normal[1]
@@ -9800,6 +9816,8 @@ class WulframServer:
                 "raw_origin_fallback_angular_mode": raw_fallback_angular_mode,
                 "raw_origin_fallback_closing_only": raw_fallback_closing_only,
                 "raw_origin_fallback_before_normal_speed": before_normal_speed,
+                "raw_origin_fallback_before_normal_speed_source": before_normal_speed_source,
+                "raw_origin_fallback_before_center_normal_speed": before_center_normal_speed,
                 "raw_origin_fallback_normal_delta_skip_reason": normal_delta_skip_reason,
                 "raw_origin_fallback_normal_delta_projected": normal_delta_projected,
                 "raw_origin_fallback_velocity_after_unclamped": raw_after_vel,
