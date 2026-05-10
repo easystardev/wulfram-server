@@ -8936,6 +8936,44 @@ class WulframServer:
                 raw_fallback_friction = max(0.0, float(raw_fallback_friction_env))
             except ValueError:
                 raw_fallback_friction = None
+        raycast_fallback_mode = (
+            os.environ.get("WULFRAM_ENTITY_TERRAIN_RAYCAST_FALLBACK", "0")
+            .strip()
+            .lower()
+        )
+        raycast_fallback_enabled = raycast_fallback_mode in {
+            "1",
+            "true",
+            "on",
+            "yes",
+            "raycast",
+            "capsule",
+            "decompile",
+        }
+        raycast_fallback_timed_mode = (
+            os.environ.get("WULFRAM_ENTITY_TERRAIN_RAYCAST_TIMED_FALLBACK", "0")
+            .strip()
+            .lower()
+        )
+        raycast_fallback_timed_enabled = raycast_fallback_enabled and raycast_fallback_timed_mode in {
+            "1",
+            "true",
+            "on",
+            "yes",
+            "timed",
+            "sweep",
+            "bucket",
+            "decompile",
+        }
+        try:
+            raycast_fallback_min_penetration = float(
+                os.environ.get(
+                    "WULFRAM_ENTITY_TERRAIN_RAYCAST_MIN_PENETRATION",
+                    str(self._PENETRATION_SLOP_DEFAULT),
+                )
+            )
+        except ValueError:
+            raycast_fallback_min_penetration = self._PENETRATION_SLOP_DEFAULT
 
         def probe_contact_fields(contact, *, center, z_lift_used):
             if contact is None:
@@ -8950,6 +8988,26 @@ class WulframServer:
                 "model_center": center,
                 "z_lift": z_lift_used,
             }
+
+        def raycast_probe_fields(probe):
+            if not isinstance(probe, dict):
+                return None
+            contact = probe.get("contact")
+            out = {
+                "enabled": probe.get("enabled"),
+                "reject": probe.get("reject"),
+                "ray_start": probe.get("ray_start"),
+                "ray_end": probe.get("ray_end"),
+                "ray_length": probe.get("ray_length"),
+                "hit_position": probe.get("hit_position"),
+                "hit_distance": probe.get("hit_distance"),
+                "contact": probe_contact_fields(
+                    contact,
+                    center=probe.get("ray_end"),
+                    z_lift_used=0.0,
+                ),
+            }
+            return {key: value for key, value in out.items() if value not in ({}, None)}
 
         def sample_raw_origin_contact_at(pos):
             if (
@@ -9061,6 +9119,139 @@ class WulframServer:
                 "reject": reject,
             }
 
+        def sample_raycast_fallback_contact_at(pos, *, reference=None, velocity=None):
+            raycast_fn_local = getattr(self._terrain_grid_collision, "raycast", None)
+            reference_candidate = (
+                finite_triplet(reference)
+                or finite_triplet(reference_pos)
+                or finite_triplet(pre_pos)
+                or finite_triplet(getattr(ctx, "world_collision_ref_pos", None))
+            )
+            position = finite_triplet(pos)
+            if not raycast_fallback_enabled:
+                return {
+                    "enabled": False,
+                    "reject": "disabled",
+                    "contact": None,
+                    "ray_start": reference_candidate,
+                    "ray_end": position,
+                }
+            if not callable(raycast_fn_local):
+                return {
+                    "enabled": True,
+                    "reject": "raycast_unavailable",
+                    "contact": None,
+                    "ray_start": reference_candidate,
+                    "ray_end": position,
+                }
+            if reference_candidate is None or position is None:
+                return {
+                    "enabled": True,
+                    "reject": "nonfinite_raycast_input",
+                    "contact": None,
+                    "ray_start": reference_candidate,
+                    "ray_end": position,
+                }
+            ray_dir = (
+                position[0] - reference_candidate[0],
+                position[1] - reference_candidate[1],
+                position[2] - reference_candidate[2],
+            )
+            ray_len = math.sqrt(
+                ray_dir[0] * ray_dir[0] +
+                ray_dir[1] * ray_dir[1] +
+                ray_dir[2] * ray_dir[2]
+            )
+            try:
+                terrain_hit = raycast_fn_local(reference_candidate, position)
+            except Exception as exc:  # pragma: no cover - diagnostic only
+                return {
+                    "enabled": True,
+                    "reject": "raycast_error",
+                    "error": str(exc),
+                    "contact": None,
+                    "ray_start": reference_candidate,
+                    "ray_end": position,
+                    "ray_length": ray_len,
+                }
+            if terrain_hit is None:
+                return {
+                    "enabled": True,
+                    "reject": "no_terrain_raycast_hit",
+                    "contact": None,
+                    "ray_start": reference_candidate,
+                    "ray_end": position,
+                    "ray_length": ray_len,
+                }
+            if ray_len <= 0.001:
+                contact_point = terrain_hit.position
+                penetration = max(float(bounding_radius), self._PENETRATION_SLOP_DEFAULT * 2.0)
+            else:
+                ray_scale = float(bounding_radius) / max(ray_len, 1e-9)
+                scaled_dir = (
+                    ray_dir[0] * ray_scale,
+                    ray_dir[1] * ray_scale,
+                    ray_dir[2] * ray_scale,
+                )
+                contact_point = (
+                    position[0] + scaled_dir[0],
+                    position[1] + scaled_dir[1],
+                    position[2] + scaled_dir[2],
+                )
+                hit_distance = float(getattr(terrain_hit, "distance", ray_len) or ray_len)
+                penetration = max(
+                    self._PENETRATION_SLOP_DEFAULT * 2.0,
+                    float(bounding_radius) - hit_distance,
+                )
+            normal = (
+                float(terrain_hit.normal[0]),
+                float(terrain_hit.normal[1]),
+                float(terrain_hit.normal[2]),
+            )
+            if not finite_values((*contact_point, *normal, penetration)):
+                return {
+                    "enabled": True,
+                    "reject": "nonfinite_raycast_contact",
+                    "contact": None,
+                    "ray_start": reference_candidate,
+                    "ray_end": position,
+                    "ray_length": ray_len,
+                    "hit_position": getattr(terrain_hit, "position", None),
+                    "hit_distance": getattr(terrain_hit, "distance", None),
+                }
+            contact = TerrainContact(
+                position=contact_point,
+                normal=normal,
+                penetration=penetration,
+                sector_index=terrain_hit.sector_index,
+                cell=terrain_hit.cell,
+                normal_source="terrain_capsule_raycast",
+            )
+            reject = ""
+            if penetration <= max(self._PENETRATION_SLOP_DEFAULT, raycast_fallback_min_penetration):
+                reject = "below_min_penetration"
+            speed_vel = velocity if velocity is not None else (vx, vy, vz)
+            try:
+                speed = math.sqrt(
+                    float(speed_vel[0]) * float(speed_vel[0])
+                    + float(speed_vel[1]) * float(speed_vel[1])
+                    + float(speed_vel[2]) * float(speed_vel[2])
+                )
+            except (TypeError, ValueError, OverflowError, IndexError):
+                speed = math.inf
+            if reject == "" and speed < raw_fallback_min_speed:
+                reject = "speed_below_min"
+            return {
+                "enabled": True,
+                "reject": reject,
+                "contact": contact,
+                "ray_start": reference_candidate,
+                "ray_end": position,
+                "ray_length": ray_len,
+                "hit_position": terrain_hit.position,
+                "hit_distance": getattr(terrain_hit, "distance", None),
+            }
+
         def update_contact_probe(
             pos,
             lifted_contact,
@@ -9070,6 +9261,7 @@ class WulframServer:
             raw_bounds_contact=None,
             raw_error=None,
             raw_fallback_reject=None,
+            raycast_probe=None,
         ):
             ctx.debug_last_terrain_contact_probe = {}
             if (
@@ -9106,6 +9298,8 @@ class WulframServer:
 
             if lifted_contact is not None:
                 probe_reason = "lifted_contact"
+            elif isinstance(raycast_probe, dict) and raycast_probe.get("contact") is not None:
+                probe_reason = "lifted_clear_raycast_contact"
             elif raw_contact is not None:
                 probe_reason = "lifted_clear_raw_origin_contact"
             elif raw_bounds_contact is not None:
@@ -9125,6 +9319,14 @@ class WulframServer:
                 "bounding_radius": bounding_radius,
                 "raw_origin_fallback_enabled": raw_fallback_enabled,
                 "raw_origin_fallback_reject": raw_fallback_reject,
+                "raycast_fallback_enabled": raycast_fallback_enabled,
+                "raycast_timed_fallback_enabled": raycast_fallback_timed_enabled,
+                "raycast_fallback_reject": (
+                    raycast_probe.get("reject")
+                    if isinstance(raycast_probe, dict)
+                    else None
+                ),
+                "raycast_fallback_probe": raycast_probe_fields(raycast_probe),
                 "lifted_contact": probe_contact_fields(
                     lifted_contact,
                     center=lifted_center,
@@ -9715,6 +9917,29 @@ class WulframServer:
                         "raw_origin_fallback": False,
                     }
                 if not raw_fallback_timed_enabled:
+                    if raycast_fallback_timed_enabled:
+                        ray_probe = sample_raycast_fallback_contact_at(
+                            pos,
+                            velocity=velocity,
+                            reference=reference_pos,
+                        )
+                        ray_contact = ray_probe.get("contact")
+                        if (
+                            ray_contact is not None
+                            and ray_probe.get("reject") == ""
+                            and ray_contact.penetration > self._PENETRATION_SLOP_DEFAULT
+                        ):
+                            return {
+                                "contact": ray_contact,
+                                "raw_origin_fallback": False,
+                                "raycast_fallback": True,
+                                "raycast_fallback_reject": "",
+                                "raycast_fallback_probe_reason": (
+                                    "timed_lifted_clear_raycast_contact"
+                                    if lifted_contact is None
+                                    else "timed_lifted_below_slop_raycast_contact"
+                                ),
+                            }
                     return {
                         "contact": lifted_contact,
                         "raw_origin_fallback": False,
@@ -9737,6 +9962,29 @@ class WulframServer:
                             else "timed_lifted_below_slop_raw_origin_contact"
                         ),
                     }
+                ray_probe = sample_raycast_fallback_contact_at(
+                    pos,
+                    velocity=velocity,
+                    reference=reference_pos,
+                )
+                ray_contact = ray_probe.get("contact")
+                if (
+                    raycast_fallback_timed_enabled
+                    and ray_contact is not None
+                    and ray_probe.get("reject") == ""
+                    and ray_contact.penetration > self._PENETRATION_SLOP_DEFAULT
+                ):
+                    return {
+                        "contact": ray_contact,
+                        "raw_origin_fallback": False,
+                        "raycast_fallback": True,
+                        "raycast_fallback_reject": "",
+                        "raycast_fallback_probe_reason": (
+                            "timed_lifted_clear_raycast_contact"
+                            if lifted_contact is None
+                            else "timed_lifted_below_slop_raycast_contact"
+                        ),
+                    }
                 return {
                     "contact": lifted_contact,
                     "raw_origin_fallback": False,
@@ -9746,6 +9994,7 @@ class WulframServer:
                         if lifted_contact is None
                         else "timed_lifted_below_slop_raw_origin_rejected"
                     ),
+                    "raycast_fallback_reject": ray_probe.get("reject"),
                 }
 
             start_candidate = timed_contact_candidate_at(start_pos, start_vel)
@@ -9898,6 +10147,23 @@ class WulframServer:
                     )
                     if not applied_raw_fallback:
                         return False
+                elif timed_contact.get("raycast_fallback"):
+                    response_debug, applied_raycast_fallback = apply_raw_origin_fallback_contact(
+                        contact
+                    )
+                    if not applied_raycast_fallback:
+                        return False
+                    if response_debug is not None:
+                        response_debug.update({
+                            "raycast_fallback": True,
+                            "terrain_raycast_fallback": True,
+                            "raycast_fallback_reject": timed_contact.get(
+                                "raycast_fallback_reject"
+                            ),
+                            "raycast_fallback_probe_reason": timed_contact.get(
+                                "raycast_fallback_probe_reason"
+                            ),
+                        })
                 else:
                     response_debug = apply_contact(contact)
                 if timed_contact.get("raw_origin_fallback") and response_debug is not None:
@@ -9932,6 +10198,14 @@ class WulframServer:
                     ),
                     "raw_origin_fallback_probe_reason": timed_contact.get(
                         "raw_origin_fallback_probe_reason"
+                    ),
+                    "raycast_fallback": bool(timed_contact.get("raycast_fallback")),
+                    "terrain_raycast_fallback": bool(timed_contact.get("raycast_fallback")),
+                    "raycast_fallback_reject": timed_contact.get(
+                        "raycast_fallback_reject"
+                    ),
+                    "raycast_fallback_probe_reason": timed_contact.get(
+                        "raycast_fallback_probe_reason"
                     ),
                     "depth": contact.penetration,
                     "normal": contact.normal,
@@ -10072,6 +10346,10 @@ class WulframServer:
                 "raw_origin_timed_fallback_event_count": sum(
                     1 for event in contact_events if event.get("raw_origin_timed_fallback")
                 ),
+                "raycast_timed_fallback_enabled": raycast_fallback_timed_enabled,
+                "raycast_timed_fallback_event_count": sum(
+                    1 for event in contact_events if event.get("terrain_raycast_fallback")
+                ),
                 "sweep_iterations": sum(event["sweep_iterations"] for event in contact_events),
                 "sweep_clear_count": sum(event["sweep_clear_count"] for event in contact_events),
                 "sweep_contact_count": sum(event["sweep_contact_count"] for event in contact_events),
@@ -10096,6 +10374,11 @@ class WulframServer:
                 )
                 raw_fallback_contact = raw_origin_contact_for_fallback(raw_contact)
                 raw_fallback_reject = raw_origin_fallback_reject_reason(raw_fallback_contact)
+                raycast_probe = sample_raycast_fallback_contact_at(
+                    (anchor[0], anchor[1], anchor[2]),
+                    velocity=(vx, vy, vz),
+                    reference=reference_pos,
+                )
                 update_contact_probe(
                     (anchor[0], anchor[1], anchor[2]),
                     contact,
@@ -10108,6 +10391,7 @@ class WulframServer:
                     raw_bounds_contact=raw_bounds_contact,
                     raw_error=raw_error,
                     raw_fallback_reject=raw_fallback_reject,
+                    raycast_probe=raycast_probe,
                 )
                 if raw_error is None and raw_fallback_contact is not None and raw_fallback_reject == "":
                     response_debug, applied_raw_fallback = apply_raw_origin_fallback_contact(raw_fallback_contact)
@@ -10135,6 +10419,42 @@ class WulframServer:
                         "raw_origin_fallback_max_angular_delta": raw_fallback_max_angular_delta,
                         "raw_origin_fallback_angular_mode": raw_fallback_angular_mode,
                         "raw_origin_fallback_closing_only": raw_fallback_closing_only,
+                        **(response_debug or {}),
+                    }
+                    ctx.debug_last_motion_collision = dict(ctx.debug_last_collision)
+                    return True
+                raycast_contact = raycast_probe.get("contact") if isinstance(raycast_probe, dict) else None
+                if (
+                    raycast_fallback_enabled
+                    and raycast_contact is not None
+                    and raycast_probe.get("reject") == ""
+                ):
+                    response_debug, applied_raycast_fallback = apply_raw_origin_fallback_contact(raycast_contact)
+                    if not applied_raycast_fallback:
+                        return False
+                    ctx.debug_last_collision = {
+                        "kind": "terrain_raycast_fallback_contact",
+                        "point": raycast_contact.position,
+                        "normal": raycast_contact.normal,
+                        "depth": raycast_contact.penetration,
+                        **contact_debug_fields(raycast_contact),
+                        "lifted_contact_missing": contact is None,
+                        "lifted_contact_depth": (
+                            None if contact is None else contact.penetration
+                        ),
+                        "raycast_fallback": True,
+                        "terrain_raycast_fallback": True,
+                        "raycast_fallback_reject": raycast_probe.get("reject"),
+                        "raycast_fallback_probe_reason": (
+                            "lifted_clear_raycast_contact"
+                            if contact is None
+                            else "lifted_below_slop_raycast_contact"
+                        ),
+                        "raycast_fallback_ray_start": raycast_probe.get("ray_start"),
+                        "raycast_fallback_ray_end": raycast_probe.get("ray_end"),
+                        "raycast_fallback_ray_length": raycast_probe.get("ray_length"),
+                        "raycast_fallback_hit_position": raycast_probe.get("hit_position"),
+                        "raycast_fallback_hit_distance": raycast_probe.get("hit_distance"),
                         **(response_debug or {}),
                     }
                     ctx.debug_last_motion_collision = dict(ctx.debug_last_collision)
