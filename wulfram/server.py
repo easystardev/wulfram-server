@@ -8880,6 +8880,19 @@ class WulframServer:
             .strip()
             .lower()
         )
+        dirty_miss_refresh_mode = (
+            os.environ.get("WULFRAM_ENTITY_TERRAIN_DIRTY_MISS_REFRESH", "1")
+            .strip()
+            .lower()
+        )
+        dirty_miss_refresh_enabled = dirty_miss_refresh_mode not in {
+            "0",
+            "false",
+            "off",
+            "no",
+            "hold",
+            "preserve",
+        }
 
         def box_collision_z_lift() -> float:
             if terrain_collision_shape == "entity_box":
@@ -9056,6 +9069,7 @@ class WulframServer:
             )
         except ValueError:
             raycast_fallback_min_penetration = self._PENETRATION_SLOP_DEFAULT
+        dirty_dispatch_debug = {}
 
         def probe_contact_fields(contact, *, center, z_lift_used):
             if contact is None:
@@ -9553,6 +9567,31 @@ class WulframServer:
                 "heading": heading,
                 "model_z_lift": z_lift,
                 "bounding_radius": bounding_radius,
+                "dirty_bounds_active": dirty_dispatch_debug.get("dirty_bounds_active"),
+                "dirty_threshold_sq": dirty_dispatch_debug.get("dirty_threshold_sq"),
+                "dirty_displacement_sq": dirty_dispatch_debug.get("dirty_displacement_sq"),
+                "dirty_reference_pos": dirty_dispatch_debug.get("dirty_reference_pos"),
+                "dirty_current_pos": dirty_dispatch_debug.get("dirty_current_pos"),
+                "dirty_miss_refresh_enabled": dirty_dispatch_debug.get(
+                    "dirty_miss_refresh_enabled"
+                ),
+                "dirty_miss_ref_action": dirty_dispatch_debug.get("dirty_miss_ref_action"),
+                "dirty_miss_reason": dirty_dispatch_debug.get("dirty_miss_reason"),
+                "dirty_model_center_mode": dirty_dispatch_debug.get("dirty_model_center_mode"),
+                "dirty_model_bounds_center": dirty_dispatch_debug.get(
+                    "dirty_model_bounds_center"
+                ),
+                "dirty_model_collision_center": dirty_dispatch_debug.get(
+                    "dirty_model_collision_center"
+                ),
+                "dirty_raycast_reject": dirty_dispatch_debug.get("dirty_raycast_reject"),
+                "dirty_raycast_start": dirty_dispatch_debug.get("dirty_raycast_start"),
+                "dirty_raycast_end": dirty_dispatch_debug.get("dirty_raycast_end"),
+                "dirty_raycast_length": dirty_dispatch_debug.get("dirty_raycast_length"),
+                "dirty_raycast_hit_position": dirty_dispatch_debug.get(
+                    "dirty_raycast_hit_position"
+                ),
+                "dirty_raycast_hit_cell": dirty_dispatch_debug.get("dirty_raycast_hit_cell"),
                 "raw_origin_fallback_enabled": raw_fallback_enabled,
                 "raw_origin_fallback_reject": raw_fallback_reject,
                 "raycast_fallback_enabled": raycast_fallback_enabled,
@@ -10910,6 +10949,15 @@ class WulframServer:
         ctx.world_collision_bounds_dirty = bool(
             callable(raycast_fn) and dirty_threshold_sq > 0.0 and displacement_sq >= dirty_threshold_sq
         )
+        dirty_dispatch_debug.update({
+            "dirty_bounds_active": bool(ctx.world_collision_bounds_dirty),
+            "dirty_threshold_sq": dirty_threshold_sq,
+            "dirty_displacement_sq": displacement_sq,
+            "dirty_reference_pos": reference_pos,
+            "dirty_current_pos": (anchor[0], anchor[1], anchor[2]),
+            "dirty_miss_refresh_enabled": dirty_miss_refresh_enabled,
+            "dirty_model_center_mode": dirty_model_center_mode,
+        })
         if ctx.world_collision_bounds_dirty:
             dirty_contact_fn = None
             dirty_contact_args = None
@@ -10935,6 +10983,10 @@ class WulframServer:
                         cbsp_tree,
                         bounding_radius,
                     )
+                    dirty_dispatch_debug.update({
+                        "dirty_model_bounds_center": dirty_contact_args[0],
+                        "dirty_model_collision_center": dirty_contact_args[1],
+                    })
             else:
                 dirty_contact_fn = getattr(self._terrain_grid_collision, "test_box_bounds_contact", None)
                 if callable(dirty_contact_fn):
@@ -10951,6 +11003,10 @@ class WulframServer:
                         heading,
                         bounding_radius,
                     )
+                    dirty_dispatch_debug.update({
+                        "dirty_model_bounds_center": dirty_contact_args[0],
+                        "dirty_model_collision_center": dirty_contact_args[1],
+                    })
 
             if dirty_contact_args is not None:
                 if collision_model is not None and terrain_collision_shape == "model":
@@ -10973,7 +11029,10 @@ class WulframServer:
                             "dirty_bounds_center": dirty_contact_args[0],
                             "dirty_collision_center": dirty_contact_args[1],
                             "detail": f"reference={reference_pos!r}",
+                            "dirty_threshold_sq": dirty_threshold_sq,
+                            "dirty_displacement_sq": displacement_sq,
                         }
+                        dirty_dispatch_debug["dirty_miss_reason"] = "dirty_bounds_filtered"
                     else:
                         apply_dirty_bounds_contact(contact)
                         ctx.debug_last_collision.update({
@@ -10981,10 +11040,14 @@ class WulframServer:
                             "dirty_bounds_center": dirty_contact_args[0],
                             "dirty_collision_center": dirty_contact_args[1],
                             "model_contact_selection": model_contact_selection,
+                            "dirty_threshold_sq": dirty_threshold_sq,
+                            "dirty_displacement_sq": displacement_sq,
                         })
                         ctx.debug_last_motion_collision = dict(ctx.debug_last_collision)
                         ctx.world_collision_ref_pos = (anchor[0], anchor[1], anchor[2])
                         return finish_result(anchor[0], anchor[1], anchor[2], vx, vy, vz)
+                else:
+                    dirty_dispatch_debug["dirty_miss_reason"] = "dirty_bounds_clear"
             else:
                 bounds_overlap_fn = getattr(self._terrain_grid_collision, "test_bounds_intersection", None)
                 if callable(bounds_overlap_fn):
@@ -11002,21 +11065,39 @@ class WulframServer:
                         if resolve_dirty_contact():
                             ctx.world_collision_ref_pos = (anchor[0], anchor[1], anchor[2])
                             return finish_result(anchor[0], anchor[1], anchor[2], vx, vy, vz)
+                        dirty_dispatch_debug[
+                            "dirty_miss_reason"
+                        ] = "dirty_bounds_overlap_clean_contact_clear"
+                    else:
+                        dirty_dispatch_debug[
+                            "dirty_miss_reason"
+                        ] = "dirty_bounds_overlap_clear"
                 elif resolve_dirty_contact():
                     ctx.world_collision_ref_pos = (anchor[0], anchor[1], anchor[2])
                     return finish_result(anchor[0], anchor[1], anchor[2], vx, vy, vz)
+                else:
+                    dirty_dispatch_debug["dirty_miss_reason"] = "dirty_clean_contact_clear"
             terrain_hit = raycast_fn(reference_pos, (anchor[0], anchor[1], anchor[2]))
+            ray_dir = (
+                anchor[0] - reference_pos[0],
+                anchor[1] - reference_pos[1],
+                anchor[2] - reference_pos[2],
+            )
+            ray_dir_len = math.sqrt(
+                ray_dir[0] * ray_dir[0] +
+                ray_dir[1] * ray_dir[1] +
+                ray_dir[2] * ray_dir[2]
+            )
+            dirty_dispatch_debug.update({
+                "dirty_raycast_start": reference_pos,
+                "dirty_raycast_end": (anchor[0], anchor[1], anchor[2]),
+                "dirty_raycast_length": ray_dir_len,
+            })
             if terrain_hit is not None:
-                ray_dir = (
-                    anchor[0] - reference_pos[0],
-                    anchor[1] - reference_pos[1],
-                    anchor[2] - reference_pos[2],
-                )
-                ray_dir_len = math.sqrt(
-                    ray_dir[0] * ray_dir[0] +
-                    ray_dir[1] * ray_dir[1] +
-                    ray_dir[2] * ray_dir[2]
-                )
+                dirty_dispatch_debug.update({
+                    "dirty_raycast_hit_position": terrain_hit.position,
+                    "dirty_raycast_hit_cell": terrain_hit.cell,
+                })
                 contact_normal = (
                     terrain_hit.normal[0],
                     terrain_hit.normal[1],
@@ -11068,16 +11149,24 @@ class WulframServer:
                     "contact_sector_index": terrain_hit.sector_index,
                     "contact_cell": terrain_hit.cell,
                     "detail": f"reference={reference_pos!r}",
+                    "dirty_threshold_sq": dirty_threshold_sq,
+                    "dirty_displacement_sq": displacement_sq,
+                    "dirty_raycast_length": ray_dir_len,
                 }
                 ctx.debug_last_motion_collision = dict(ctx.debug_last_collision)
                 ctx.world_collision_ref_pos = (anchor[0], anchor[1], anchor[2])
                 return finish_result(anchor[0], anchor[1], anchor[2], vx, vy, vz)
-            ctx.world_collision_ref_pos = (anchor[0], anchor[1], anchor[2])
+            dirty_dispatch_debug["dirty_raycast_reject"] = "no_terrain_raycast_hit"
+            if dirty_miss_refresh_enabled:
+                ctx.world_collision_ref_pos = (anchor[0], anchor[1], anchor[2])
+                dirty_dispatch_debug["dirty_miss_ref_action"] = "refreshed"
+            else:
+                dirty_dispatch_debug["dirty_miss_ref_action"] = "preserved"
             # Dirty terrain dispatch can miss when the lifted model is clear and
-            # the center-to-center ray remains above the height field. Preserve
-            # the decompile-style dirty reference refresh, but still fall through
-            # to the clean/raw-origin probe so reports can explain the miss and
-            # default-off fallback A/Bs are not hidden by the dirty branch.
+            # the center-to-center ray remains above the height field. Keep the
+            # default reference refresh, but allow an opt-in hold probe to test
+            # whether the OG path keeps the secondary spatial point long enough
+            # for a later dirty ray to span the contact.
 
         clean_contact_resolved = resolve_single_contact()
         # Keep the dirty-reference anchored to the latest clean-resolution pose.

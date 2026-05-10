@@ -10514,6 +10514,90 @@ def test_entity_world_collision_preserves_reference_on_clean_miss_until_dirty():
     return True
 
 
+def test_entity_world_collision_can_preserve_dirty_miss_reference_for_probe():
+    """The dirty-miss reference refresh is default-on but can be held for decompile A/Bs."""
+    old_refresh = os.environ.get("WULFRAM_ENTITY_TERRAIN_DIRTY_MISS_REFRESH")
+    old_fallback = os.environ.get("WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK")
+    os.environ["WULFRAM_ENTITY_TERRAIN_DIRTY_MISS_REFRESH"] = "0"
+    os.environ.pop("WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK", None)
+    try:
+        raycast_calls = []
+        model_calls = []
+
+        def fake_raycast(start, end):
+            raycast_calls.append((start, end))
+            return None
+
+        def fake_model_collision(center, *args, **kwargs):
+            model_calls.append(center)
+            return None
+
+        server = WulframServer.__new__(WulframServer)
+        server._terrain_grid_collision = SimpleNamespace(
+            test_model_bounds_contact=lambda *args, **kwargs: None,
+            raycast=fake_raycast,
+            test_box_collision=lambda *args, **kwargs: None,
+            test_model_collision=fake_model_collision,
+        )
+        server._get_entity_world_half_extents = lambda ctx: (4.0, 4.0, 4.0)
+        server._get_entity_world_collision_model = lambda ctx: (
+            [],
+            SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=5.0)),
+            5.0,
+            3.0,
+        )
+        server._get_entity_dirty_threshold_sq = lambda ctx, half_extents: 1.0
+
+        ctx = ClientContext(
+            client_id=1,
+            client_addr=("10.10.10.2", 50000),
+            session=Session(),
+            entity_id=0x14EA,
+        )
+        ctx.player_heading = 0.0
+        ctx.player_pos = (0.0, 0.0, 4.0)
+        ctx.world_collision_ref_pos = (0.0, 0.0, 4.0)
+
+        px, py, pz, vx, vy, vz = server._resolve_entity_world_collision(
+            ctx,
+            10.0,
+            0.0,
+            4.0,
+            1.0,
+            0.0,
+            0.0,
+        )
+
+        assert ctx.world_collision_bounds_dirty is True, ctx.world_collision_bounds_dirty
+        assert (px, py, pz, vx, vy, vz) == (10.0, 0.0, 4.0, 1.0, 0.0, 0.0)
+        assert ctx.world_collision_ref_pos == (0.0, 0.0, 4.0), ctx.world_collision_ref_pos
+        assert raycast_calls == [((0.0, 0.0, 4.0), (10.0, 0.0, 4.0))], raycast_calls
+        assert model_calls[0] == (10.0, 0.0, 7.0), model_calls
+        assert model_calls[1] == (10.0, 0.0, 4.0), model_calls
+        probe = ctx.debug_last_terrain_contact_probe
+        assert probe["reason"] == "lifted_clear", probe
+        assert probe["dirty_bounds_active"] is True, probe
+        assert probe["dirty_miss_refresh_enabled"] is False, probe
+        assert probe["dirty_miss_ref_action"] == "preserved", probe
+        assert probe["dirty_miss_reason"] == "dirty_bounds_clear", probe
+        assert probe["dirty_raycast_reject"] == "no_terrain_raycast_hit", probe
+        assert probe["dirty_reference_pos"] == (0.0, 0.0, 4.0), probe
+        assert probe["dirty_current_pos"] == (10.0, 0.0, 4.0), probe
+        assert probe["dirty_displacement_sq"] == 100.0, probe
+        assert probe["dirty_threshold_sq"] == 1.0, probe
+    finally:
+        if old_refresh is None:
+            os.environ.pop("WULFRAM_ENTITY_TERRAIN_DIRTY_MISS_REFRESH", None)
+        else:
+            os.environ["WULFRAM_ENTITY_TERRAIN_DIRTY_MISS_REFRESH"] = old_refresh
+        if old_fallback is None:
+            os.environ.pop("WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK", None)
+        else:
+            os.environ["WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK"] = old_fallback
+    print("test_entity_world_collision_can_preserve_dirty_miss_reference_for_probe: PASSED")
+    return True
+
+
 def test_entity_world_collision_dirty_miss_still_records_raw_origin_probe():
     """Dirty lifted misses should still expose the clean/raw-origin probe reason."""
     old_fallback = os.environ.get("WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK")
@@ -10578,6 +10662,11 @@ def test_entity_world_collision_dirty_miss_still_records_raw_origin_probe():
         assert getattr(ctx, "debug_last_motion_collision", {}) == {}
         probe = ctx.debug_last_terrain_contact_probe
         assert probe["reason"] == "lifted_clear_raw_origin_contact", probe
+        assert probe["dirty_bounds_active"] is True, probe
+        assert probe["dirty_miss_refresh_enabled"] is True, probe
+        assert probe["dirty_miss_ref_action"] == "refreshed", probe
+        assert probe["dirty_miss_reason"] == "dirty_bounds_clear", probe
+        assert probe["dirty_raycast_reject"] == "no_terrain_raycast_hit", probe
         assert probe["raw_origin_fallback_enabled"] is False, probe
         assert probe["raw_origin_fallback_reject"] == "disabled", probe
         assert probe["raw_origin_contact"]["depth"] == 2.0, probe
@@ -11969,6 +12058,7 @@ def main():
         test_entity_world_collision_uses_persistent_reference_pos_for_dirty_branch,
         test_entity_world_collision_refreshes_reference_on_clean_contact,
         test_entity_world_collision_preserves_reference_on_clean_miss_until_dirty,
+        test_entity_world_collision_can_preserve_dirty_miss_reference_for_probe,
         test_entity_world_collision_dirty_miss_still_records_raw_origin_probe,
         test_entity_world_collision_can_probe_decompile_box_shape_with_model_loaded,
         test_entity_world_collision_dirty_threshold_uses_mesh_min_half_extent,
