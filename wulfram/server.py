@@ -10042,6 +10042,15 @@ class WulframServer:
                     "raw_origin_fallback_probe_reason": contact_candidate.get(
                         "raw_origin_fallback_probe_reason"
                     ),
+                    "raycast_fallback": bool(
+                        contact_candidate.get("raycast_fallback")
+                    ),
+                    "raycast_fallback_reject": contact_candidate.get(
+                        "raycast_fallback_reject"
+                    ),
+                    "raycast_fallback_probe_reason": contact_candidate.get(
+                        "raycast_fallback_probe_reason"
+                    ),
                 }
 
             end_pos, end_vel = motion_state_at(start_pos, start_vel, acc, remaining_time, remaining_time)
@@ -10093,6 +10102,15 @@ class WulframServer:
                 ),
                 "raw_origin_fallback_probe_reason": contact_candidate.get(
                     "raw_origin_fallback_probe_reason"
+                ),
+                "raycast_fallback": bool(
+                    contact_candidate.get("raycast_fallback")
+                ),
+                "raycast_fallback_reject": contact_candidate.get(
+                    "raycast_fallback_reject"
+                ),
+                "raycast_fallback_probe_reason": contact_candidate.get(
+                    "raycast_fallback_probe_reason"
                 ),
             }
 

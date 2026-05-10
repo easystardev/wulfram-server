@@ -8308,6 +8308,110 @@ def test_lifted_timed_probe_can_use_guarded_raw_origin_contact():
     return True
 
 
+def test_lifted_timed_probe_can_use_guarded_raycast_contact():
+    """Opt-in timed raycast fallback should fill lifted sweep misses."""
+    env_keys = [
+        "WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE",
+        "WULFRAM_ENTITY_TERRAIN_CONTACT_TIMING",
+        "WULFRAM_ENTITY_TERRAIN_CONTACT_ITERATIONS",
+        "WULFRAM_ENTITY_TERRAIN_RAYCAST_FALLBACK",
+        "WULFRAM_ENTITY_TERRAIN_RAYCAST_TIMED_FALLBACK",
+        "WULFRAM_ENTITY_TERRAIN_RAYCAST_MIN_PENETRATION",
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK",
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_TIMED_FALLBACK",
+    ]
+    old_env = {key: os.environ.get(key) for key in env_keys}
+    try:
+        os.environ["WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE"] = "pair"
+        os.environ["WULFRAM_ENTITY_TERRAIN_CONTACT_TIMING"] = "probe"
+        os.environ["WULFRAM_ENTITY_TERRAIN_CONTACT_ITERATIONS"] = "1"
+        os.environ["WULFRAM_ENTITY_TERRAIN_RAYCAST_FALLBACK"] = "1"
+        os.environ["WULFRAM_ENTITY_TERRAIN_RAYCAST_TIMED_FALLBACK"] = "1"
+        os.environ["WULFRAM_ENTITY_TERRAIN_RAYCAST_MIN_PENETRATION"] = "0.001"
+        os.environ["WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK"] = "0"
+        os.environ["WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_TIMED_FALLBACK"] = "0"
+        raycast_calls = []
+
+        def fake_model_collision(*args, **kwargs):
+            return None
+
+        def fake_raycast(start, end):
+            raycast_calls.append((start, end))
+            if start[2] <= end[2]:
+                return None
+            return TerrainRaycastHit(
+                position=(0.0, 0.0, 5.0),
+                normal=(0.0, 0.0, 1.0),
+                sector_index=0,
+                cell=(71, 56),
+                distance=4.0,
+            )
+
+        server = WulframServer.__new__(WulframServer)
+        server._terrain_grid_collision = SimpleNamespace(
+            test_box_collision=lambda *args, **kwargs: None,
+            test_model_collision=fake_model_collision,
+            test_model_bounds_contact=lambda *args, **kwargs: None,
+            raycast=fake_raycast,
+        )
+        server._get_entity_world_half_extents = lambda ctx: (4.0, 4.0, 4.0)
+        server._get_entity_dirty_threshold_sq = lambda ctx, half_extents: 999.0
+        server._get_entity_world_collision_model = lambda ctx: (
+            [],
+            SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=5.0)),
+            5.0,
+            3.0,
+        )
+
+        ctx = ClientContext(
+            client_id=1,
+            client_addr=("10.10.10.2", 50000),
+            session=Session(),
+            entity_id=0x14EA,
+            entity_type=int(EntityType.TANK),
+        )
+        ctx.player_heading = 0.0
+        ctx.player_pos = (0.0, 0.0, 10.0)
+        ctx.world_collision_ref_pos = (0.0, 0.0, 10.0)
+
+        px, py, pz, vx, vy, vz = server._resolve_entity_world_collision(
+            ctx,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            -10.0,
+            pre_pos=(0.0, 0.0, 0.0),
+            pre_vel=(0.0, 0.0, -10.0),
+            dt=1.0,
+        )
+
+        debug = ctx.debug_last_motion_collision
+        assert debug["timing_response"] == "terrain_contact_pair_toi_single_step", debug
+        assert debug["raycast_timed_fallback_enabled"] is True, debug
+        assert debug["raycast_timed_fallback_event_count"] == 1, debug
+        assert debug["terrain_raycast_fallback"] is True, debug
+        assert debug["raycast_fallback_reject"] == "", debug
+        event = debug["contact_events"][0]
+        assert event["terrain_raycast_fallback"] is True, debug
+        assert event["raycast_fallback_reject"] == "", debug
+        assert event["raycast_fallback_probe_reason"] == "timed_lifted_clear_raycast_contact", debug
+        assert debug["contact_normal_source"] == "terrain_capsule_raycast", debug
+        assert debug["contact_cell"] == (71, 56), debug
+        assert pz > 0.0, (px, py, pz)
+        assert vz > -10.0, (vx, vy, vz)
+        assert raycast_calls, raycast_calls
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    print("test_lifted_timed_probe_can_use_guarded_raycast_contact: PASSED")
+    return True
+
+
 def test_collision_at_start_can_use_iterative_world_separation():
     """Collision-at-start pair records can route to the OG iterative separation branch."""
     old_origin = os.environ.get("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN")
@@ -10897,6 +11001,7 @@ def main():
         test_entity_origin_probe_applies_pair_solver_at_contact_time,
         test_entity_origin_probe_can_repeat_bucketed_pair_contacts,
         test_lifted_timed_probe_can_use_guarded_raw_origin_contact,
+        test_lifted_timed_probe_can_use_guarded_raycast_contact,
         test_collision_at_start_can_use_iterative_world_separation,
         test_entity_world_collision_falls_back_to_box_without_collision_model,
         test_entity_world_collision_uses_dirty_terrain_raycast_branch,
