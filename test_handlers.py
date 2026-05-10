@@ -6896,6 +6896,89 @@ def test_entity_world_collision_records_raw_origin_probe_without_applying_contac
     return True
 
 
+def test_entity_world_collision_reference_pose_probe_records_pre_step_contact_when_enabled():
+    """The reference-pose probe should expose pre-step raw/pair contacts without applying them."""
+    env_keys = [
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK",
+        "WULFRAM_ENTITY_TERRAIN_REFERENCE_POSE_PROBE",
+    ]
+    old_env = {key: os.environ.get(key) for key in env_keys}
+    try:
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK", None)
+        os.environ["WULFRAM_ENTITY_TERRAIN_REFERENCE_POSE_PROBE"] = "1"
+
+        def fake_model_collision(center, *args, **kwargs):
+            if (
+                abs(center[0]) < 1e-6
+                and abs(center[1]) < 1e-6
+                and abs(center[2] - 10.0) < 1e-6
+            ):
+                return TerrainContact(
+                    position=(0.0, 0.0, 6.0),
+                    normal=(0.0, 0.0, 1.0),
+                    penetration=4.0,
+                    sector_index=2,
+                    cell=(7, 8),
+                    normal_source="terrain_triangle",
+                    terrain_face_normal=(0.0, 0.0, 1.0),
+                    mesh_face_normal=(0.0, 0.0, 1.0),
+                )
+            return None
+
+        server = WulframServer.__new__(WulframServer)
+        server._terrain_grid_collision = SimpleNamespace(
+            test_box_collision=lambda *args, **kwargs: None,
+            test_model_collision=fake_model_collision,
+        )
+        server._get_entity_world_half_extents = lambda ctx: (2.0, 2.0, 3.0)
+        server._get_entity_world_collision_model = lambda ctx: (
+            [],
+            SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=7.5)),
+            7.5,
+            3.0,
+        )
+        server._get_entity_dirty_threshold_sq = lambda ctx, half_extents: 999999.0
+
+        ctx = _fake_tank_collision_context()
+        ctx.player_heading = 0.0
+        ctx.player_pos = (0.0, 0.0, 10.0)
+        ctx.world_collision_ref_pos = (0.0, 0.0, 10.0)
+
+        result = server._resolve_entity_world_collision(
+            ctx,
+            10.0,
+            0.0,
+            10.0,
+            1.0,
+            0.0,
+            0.0,
+            pre_pos=(0.0, 0.0, 10.0),
+            pre_vel=(1.0, 0.0, 0.0),
+            dt=1.0 / 30.0,
+        )
+
+        assert result == (10.0, 0.0, 10.0, 1.0, 0.0, 0.0), result
+        assert getattr(ctx, "debug_last_motion_collision", {}) == {}
+        probe = ctx.debug_last_terrain_contact_probe
+        assert probe["reference_pose_probe_enabled"] is True, probe
+        references = probe["reference_pose_contacts"]
+        assert "pre_pos" in references, references
+        pre_ref = references["pre_pos"]
+        assert pre_ref["raw_contact_any"] is True, pre_ref
+        assert pre_ref["pair_record_contact_accept"] is True, pre_ref
+        assert pre_ref["pair_record_contact"]["contact_cell"] == (7, 8), pre_ref
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    print(
+        "test_entity_world_collision_reference_pose_probe_records_pre_step_contact_when_enabled: PASSED"
+    )
+    return True
+
+
 def test_entity_world_collision_pair_record_contact_applies_decompile_face_gated_contact():
     """Default pair-record contact should activate only on raw contacts carrying terrain-face evidence."""
     env_keys = [
@@ -12596,6 +12679,7 @@ def main():
         test_entity_world_collision_model_entity_origin_can_be_requested,
         test_entity_world_collision_model_contact_can_use_body_matrix_probe,
         test_entity_world_collision_records_raw_origin_probe_without_applying_contact,
+        test_entity_world_collision_reference_pose_probe_records_pre_step_contact_when_enabled,
         test_entity_world_collision_pair_record_contact_applies_decompile_face_gated_contact,
         test_entity_world_collision_pair_record_contact_uses_shallow_upward_selection,
         test_entity_world_collision_raw_origin_fallback_applies_guarded_pair_solver,

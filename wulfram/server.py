@@ -8982,6 +8982,21 @@ class WulframServer:
             "no",
             "disabled",
         }
+        reference_pose_probe_mode = (
+            os.environ.get("WULFRAM_ENTITY_TERRAIN_REFERENCE_POSE_PROBE", "0")
+            .strip()
+            .lower()
+        )
+        reference_pose_probe_enabled = reference_pose_probe_mode in {
+            "1",
+            "true",
+            "on",
+            "yes",
+            "reference",
+            "pre",
+            "midpoint",
+            "decompile",
+        }
         raw_fallback_mode = (
             os.environ.get("WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK", "0")
             .strip()
@@ -9843,6 +9858,153 @@ class WulframServer:
                 "hit_distance": getattr(terrain_hit, "distance", None),
             }
 
+        def sample_reference_pose_contacts(pos, *, velocity=None):
+            """Telemetry-only contact probes at candidate reference poses.
+
+            The rough H180/W live split is dominated by windows where OG records a
+            rebound but the server's current lifted/raw anchor reports no contact.
+            Keep this observational: it records which nearby reference pose would
+            see the contact before any promotion path uses that pose.
+            """
+
+            current = finite_triplet(pos)
+            if current is None:
+                return {}
+            candidates = []
+            seen_positions: set[tuple[float, float, float]] = set()
+
+            def add_candidate(label, value):
+                candidate = finite_triplet(value)
+                if candidate is None:
+                    return
+                rounded = (
+                    round(candidate[0], 4),
+                    round(candidate[1], 4),
+                    round(candidate[2], 4),
+                )
+                if rounded in seen_positions:
+                    return
+                seen_positions.add(rounded)
+                candidates.append((label, candidate))
+
+            def add_midpoint(label, start, end, fraction):
+                start_pos = finite_triplet(start)
+                end_pos = finite_triplet(end)
+                if start_pos is None or end_pos is None:
+                    return
+                add_candidate(
+                    label,
+                    (
+                        start_pos[0] + (end_pos[0] - start_pos[0]) * fraction,
+                        start_pos[1] + (end_pos[1] - start_pos[1]) * fraction,
+                        start_pos[2] + (end_pos[2] - start_pos[2]) * fraction,
+                    ),
+                )
+
+            pre_step_pos = finite_triplet(pre_pos)
+            dirty_reference_pos = finite_triplet(reference_pos)
+            world_reference_pos = finite_triplet(
+                getattr(ctx, "world_collision_ref_pos", None)
+            )
+            add_candidate("current", current)
+            add_candidate("pre_pos", pre_step_pos)
+            add_candidate("dirty_reference_pos", dirty_reference_pos)
+            add_candidate("world_collision_ref_pos", world_reference_pos)
+            add_midpoint("pre_to_current_25", pre_step_pos, current, 0.25)
+            add_midpoint("pre_to_current_50", pre_step_pos, current, 0.50)
+            add_midpoint("pre_to_current_75", pre_step_pos, current, 0.75)
+            add_midpoint("dirty_reference_to_current_50", dirty_reference_pos, current, 0.50)
+
+            output = {}
+            for label, candidate in candidates:
+                lifted_contact = None
+                lifted_error = None
+                try:
+                    lifted_contact = sample_contact_at(candidate)
+                except Exception as exc:  # pragma: no cover - diagnostic only
+                    lifted_error = str(exc)
+                raw_contact, raw_bounds_contact, raw_error = sample_raw_origin_contact_at(
+                    candidate
+                )
+                raw_fallback_contact = raw_origin_contact_for_fallback(raw_contact)
+                raw_reject = raw_origin_fallback_reject_reason(
+                    raw_fallback_contact,
+                    velocity=velocity,
+                )
+                pair_probe = sample_pair_record_contact_at(
+                    candidate,
+                    velocity=velocity,
+                )
+                pair_contact = pair_probe.get("contact")
+                pair_delta_contact = pair_probe.get("delta_contact")
+                pair_reject = pair_probe.get("reject")
+                raw_center = (candidate[0], candidate[1], candidate[2])
+                lifted_center = (candidate[0], candidate[1], candidate[2] + z_lift)
+                contact_any = (
+                    lifted_contact is not None
+                    or raw_fallback_contact is not None
+                    or raw_bounds_contact is not None
+                    or pair_contact is not None
+                )
+                if (
+                    not contact_any
+                    and lifted_error is None
+                    and raw_error is None
+                    and pair_probe.get("selected_raw_error") is None
+                ):
+                    continue
+                item = {
+                    "pos": candidate,
+                    "lifted_contact": probe_contact_fields(
+                        lifted_contact,
+                        center=lifted_center,
+                        z_lift_used=z_lift,
+                    ),
+                    "lifted_error": lifted_error,
+                    "raw_origin_contact": probe_contact_fields(
+                        raw_fallback_contact,
+                        center=raw_center,
+                        z_lift_used=0.0,
+                    ),
+                    "raw_origin_bounds_contact": probe_contact_fields(
+                        raw_bounds_contact,
+                        center=raw_center,
+                        z_lift_used=0.0,
+                    ),
+                    "raw_error": raw_error,
+                    "raw_origin_fallback_reject": raw_reject,
+                    "pair_record_contact": probe_contact_fields(
+                        pair_contact,
+                        center=raw_center,
+                        z_lift_used=0.0,
+                    ),
+                    "pair_record_delta_contact": probe_contact_fields(
+                        pair_delta_contact,
+                        center=raw_center,
+                        z_lift_used=0.0,
+                    ),
+                    "pair_record_contact_reject": pair_reject,
+                    "pair_record_selected_raw_error": pair_probe.get(
+                        "selected_raw_error"
+                    ),
+                    "lifted_contact_any": lifted_contact is not None,
+                    "raw_contact_any": (
+                        raw_fallback_contact is not None
+                        or raw_bounds_contact is not None
+                    ),
+                    "pair_record_contact_any": pair_contact is not None,
+                    "pair_record_contact_accept": (
+                        pair_contact is not None and pair_reject == ""
+                    ),
+                    "contact_any": contact_any,
+                }
+                output[label] = {
+                    key: value
+                    for key, value in item.items()
+                    if value not in ({}, None)
+                }
+            return output
+
         def update_contact_probe(
             pos,
             lifted_contact,
@@ -9900,6 +10062,15 @@ class WulframServer:
                 probe_reason = "lifted_clear_raw_origin_bounds_contact"
             else:
                 probe_reason = reason
+            reference_pose_contacts = (
+                {}
+                if (
+                    not reference_pose_probe_enabled
+                    or probe_reason == "lifted_contact"
+                    or raw_error == "dirty_bounds_contact"
+                )
+                else sample_reference_pose_contacts(pos, velocity=(vx, vy, vz))
+            )
             ctx.debug_last_terrain_contact_probe = {
                 "reason": probe_reason,
                 "origin_mode": origin_mode,
@@ -9910,6 +10081,7 @@ class WulframServer:
                 "model_contact_rotation_mode": model_contact_rotation_mode,
                 "model_contact_selection": model_contact_selection,
                 "probe_enabled": True,
+                "reference_pose_probe_enabled": reference_pose_probe_enabled,
                 "position": pos,
                 "velocity": (vx, vy, vz),
                 "heading": heading,
@@ -10019,6 +10191,7 @@ class WulframServer:
                     center=raw_center,
                     z_lift_used=0.0,
                 ),
+                "reference_pose_contacts": reference_pose_contacts,
             }
 
         def sample_contact_at(pos):
