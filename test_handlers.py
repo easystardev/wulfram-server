@@ -6896,6 +6896,122 @@ def test_entity_world_collision_records_raw_origin_probe_without_applying_contac
     return True
 
 
+def test_entity_world_collision_pair_record_contact_applies_decompile_face_gated_contact():
+    """Default pair-record contact should activate only on raw contacts carrying terrain-face evidence."""
+    env_keys = [
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_NORMAL_SOURCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VELOCITY_DELTA",
+    ]
+    old_env = {key: os.environ.get(key) for key in env_keys}
+    try:
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK", None)
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT", None)
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_NORMAL_SOURCE"] = "mesh"
+        os.environ[
+            "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE"
+        ] = "entity_radial_terrain_face_forward_up"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE"] = "closing_velocity"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE"] = "preserve"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VELOCITY_DELTA"] = "3.0"
+        terrain_face_normal = (0.25, 0.0, 0.9682458365518543)
+        calls = []
+
+        def fake_model_collision(center, *args, **kwargs):
+            calls.append(center)
+            if abs(center[2] - 10.0) < 1e-6:
+                return TerrainContact(
+                    position=(1.0, 2.0, 3.0),
+                    normal=(0.0, 0.0, 1.0),
+                    penetration=4.0,
+                    sector_index=2,
+                    cell=(7, 8),
+                    normal_source="entity_cbsp_split",
+                    cbsp_split_normal=(0.0, 0.0, 1.0),
+                    terrain_face_normal=terrain_face_normal,
+                    mesh_face_normal=(0.0, 0.0, 1.0),
+                    entity_radial_normal=(0.6, 0.8, 0.0),
+                )
+            return None
+
+        server = WulframServer.__new__(WulframServer)
+        server._terrain_grid_collision = SimpleNamespace(
+            test_box_collision=lambda *args, **kwargs: None,
+            test_model_collision=fake_model_collision,
+        )
+        server._get_entity_world_half_extents = lambda ctx: (2.0, 2.0, 3.0)
+        server._get_entity_world_collision_model = lambda ctx: (
+            [],
+            SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=7.5)),
+            7.5,
+            3.0,
+        )
+        server._get_entity_dirty_threshold_sq = lambda ctx, half_extents: 999999.0
+
+        ctx = _fake_tank_collision_context()
+        ctx.player_heading = 0.0
+        ctx.player_pos = (0.0, 0.0, 10.0)
+        ctx.world_collision_ref_pos = (0.0, 0.0, 10.0)
+        ctx.spring_body_matrix = _matrix3_from_euler_xyz(0.0, 0.0, 0.0)
+
+        _px, _py, pz, _vx, _vy, vz = server._resolve_entity_world_collision(
+            ctx,
+            0.0,
+            0.0,
+            10.0,
+            0.0,
+            0.0,
+            -10.0,
+            pre_pos=(0.0, 0.0, 10.0),
+            pre_vel=(0.0, 0.0, -10.0),
+            dt=1.0 / 30.0,
+        )
+
+        debug = ctx.debug_last_motion_collision
+        assert debug["kind"] == "terrain_pair_record_contact", debug
+        assert debug["pair_record_contact"] is True, debug
+        assert debug["pair_record_contact_reject"] == "", debug
+        assert debug["pair_record_contact_normal_source"] == "mesh", debug
+        assert debug["pair_record_solver_normal_source"] == "entity_cbsp_split", debug
+        assert (
+            debug["pair_record_contact_delta_normal_source"]
+            == "entity_radial_terrain_face_forward_up"
+        ), debug
+        assert debug["pair_record_delta_normal_source"] == (
+            "entity_radial_terrain_face_forward_up"
+        ), debug
+        assert debug["pair_record_terrain_face_normal"] == terrain_face_normal, debug
+        assert debug["raw_origin_fallback_delta_mode"] == "closing_velocity", debug
+        assert debug["raw_origin_fallback_delta_normal_source"] == (
+            "entity_radial_terrain_face_forward_up"
+        ), debug
+        assert debug["raw_origin_fallback_angular_mode"] == "preserve", debug
+        assert debug["raw_origin_fallback_angular_preserved"] is True, debug
+        assert debug["raw_origin_fallback_velocity_delta_mag_after_safety"] <= 3.000001, debug
+        assert pz > 10.0 and vz > -10.0, (pz, vz)
+        probe = ctx.debug_last_terrain_contact_probe
+        assert probe["pair_record_contact_enabled"] is True, probe
+        assert probe["pair_record_contact_reject"] == "", probe
+        assert probe["pair_record_contact_delta_normal_source"] == (
+            "entity_radial_terrain_face_forward_up"
+        ), probe
+        assert probe["pair_record_contact"]["contact_terrain_face_normal"] == terrain_face_normal, probe
+        assert calls[0] == (0.0, 0.0, 13.0)
+        assert calls[1] == (0.0, 0.0, 10.0)
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    print("test_entity_world_collision_pair_record_contact_applies_decompile_face_gated_contact: PASSED")
+    return True
+
+
 def test_entity_world_collision_raw_origin_fallback_applies_guarded_pair_solver():
     """Opt-in raw-origin fallback should turn eligible lifted misses into capped contacts."""
     env_keys = [
@@ -12005,6 +12121,7 @@ def main():
         test_entity_world_collision_model_entity_origin_can_be_requested,
         test_entity_world_collision_model_contact_can_use_body_matrix_probe,
         test_entity_world_collision_records_raw_origin_probe_without_applying_contact,
+        test_entity_world_collision_pair_record_contact_applies_decompile_face_gated_contact,
         test_entity_world_collision_raw_origin_fallback_applies_guarded_pair_solver,
         test_entity_world_collision_raw_origin_fallback_clamps_solver_velocity_delta,
         test_entity_world_collision_raw_origin_fallback_can_use_terrain_normal_probe,

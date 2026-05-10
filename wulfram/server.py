@@ -9031,6 +9031,108 @@ class WulframServer:
                 raw_fallback_friction = max(0.0, float(raw_fallback_friction_env))
             except ValueError:
                 raw_fallback_friction = None
+        pair_record_contact_mode = (
+            os.environ.get("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT", "1")
+            .strip()
+            .lower()
+        )
+        pair_record_contact_enabled = pair_record_contact_mode not in {
+            "0",
+            "false",
+            "off",
+            "no",
+            "disabled",
+        }
+        try:
+            pair_record_contact_min_depth = float(
+                os.environ.get(
+                    "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MIN_DEPTH",
+                    str(self._PENETRATION_SLOP_DEFAULT),
+                )
+            )
+        except ValueError:
+            pair_record_contact_min_depth = self._PENETRATION_SLOP_DEFAULT
+        try:
+            pair_record_contact_max_depth = float(
+                os.environ.get("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_DEPTH", "8.0")
+            )
+        except ValueError:
+            pair_record_contact_max_depth = 8.0
+        try:
+            pair_record_contact_min_normal_z = float(
+                os.environ.get("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MIN_NORMAL_Z", "0.5")
+            )
+        except ValueError:
+            pair_record_contact_min_normal_z = 0.5
+        try:
+            pair_record_contact_min_face_normal_z = float(
+                os.environ.get(
+                    "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MIN_FACE_NORMAL_Z",
+                    "0.5",
+                )
+            )
+        except ValueError:
+            pair_record_contact_min_face_normal_z = 0.5
+        pair_record_contact_normal_source = (
+            os.environ.get("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_NORMAL_SOURCE", "mesh")
+            .strip()
+            .lower()
+        )
+        pair_record_contact_delta_normal_source = (
+            os.environ.get(
+                "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE",
+                "entity_radial_terrain_face_forward_up",
+            )
+            .strip()
+            .lower()
+        )
+        pair_record_contact_projection_order = os.environ.get(
+            "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PROJECTION_ORDER",
+            "opposite_if_separating",
+        )
+        pair_record_contact_delta_mode = (
+            os.environ.get(
+                "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE",
+                "closing_velocity",
+            )
+            .strip()
+            .lower()
+        )
+        pair_record_contact_angular_mode = (
+            os.environ.get("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE", "preserve")
+            .strip()
+            .lower()
+        )
+        pair_record_contact_closing_only = (
+            os.environ.get("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CLOSING_ONLY", "1")
+            .strip()
+            .lower()
+            not in {"0", "false", "off", "no", "disabled"}
+        )
+        try:
+            pair_record_contact_max_velocity_delta = float(
+                os.environ.get(
+                    "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VELOCITY_DELTA",
+                    "3.0",
+                )
+            )
+        except ValueError:
+            pair_record_contact_max_velocity_delta = 3.0
+        try:
+            pair_record_contact_max_speed = float(
+                os.environ.get("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_SPEED", "200.0")
+            )
+        except ValueError:
+            pair_record_contact_max_speed = 200.0
+        try:
+            pair_record_contact_max_angular_delta = float(
+                os.environ.get(
+                    "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_ANGULAR_DELTA",
+                    "0.5",
+                )
+            )
+        except ValueError:
+            pair_record_contact_max_angular_delta = 0.5
         raycast_fallback_mode = (
             os.environ.get("WULFRAM_ENTITY_TERRAIN_RAYCAST_FALLBACK", "0")
             .strip()
@@ -9153,11 +9255,35 @@ class WulframServer:
                         raw_bounds_contact = None
             return raw_contact, raw_bounds_contact, None
 
-        def raw_origin_fallback_reject_reason(raw_contact, *, velocity=None):
-            if not raw_fallback_enabled:
+        def raw_origin_fallback_reject_reason(
+            raw_contact,
+            *,
+            velocity=None,
+            enabled=None,
+            min_depth=None,
+            max_depth=None,
+            min_normal_z=None,
+            min_speed=None,
+        ):
+            fallback_enabled = raw_fallback_enabled if enabled is None else bool(enabled)
+            if not fallback_enabled:
                 return "disabled"
             if raw_contact is None:
                 return "no_raw_origin_contact"
+            depth_threshold = (
+                raw_fallback_min_depth if min_depth is None else float(min_depth)
+            )
+            max_depth_threshold = (
+                raw_fallback_max_depth if max_depth is None else float(max_depth)
+            )
+            normal_z_threshold = (
+                raw_fallback_min_normal_z
+                if min_normal_z is None
+                else float(min_normal_z)
+            )
+            speed_threshold = (
+                raw_fallback_min_speed if min_speed is None else float(min_speed)
+            )
             try:
                 depth = float(raw_contact.penetration)
                 normal_z = float(raw_contact.normal[2])
@@ -9171,19 +9297,20 @@ class WulframServer:
                 return "nonfinite_raw_origin_contact"
             if depth <= self._PENETRATION_SLOP_DEFAULT:
                 return "below_slop"
-            if depth < raw_fallback_min_depth:
+            if depth < depth_threshold:
                 return "below_min_depth"
-            if depth > raw_fallback_max_depth:
+            if depth > max_depth_threshold:
                 return "above_max_depth"
-            if normal_z < raw_fallback_min_normal_z:
+            if normal_z < normal_z_threshold:
                 return "normal_z_below_min"
-            if speed < raw_fallback_min_speed:
+            if speed < speed_threshold:
                 return "speed_below_min"
             return ""
 
-        def raw_origin_contact_for_fallback(raw_contact):
+        def raw_origin_contact_for_fallback(raw_contact, *, normal_source=None):
             if raw_contact is None:
                 return None
+            selected_normal_source = raw_fallback_normal_source if normal_source is None else normal_source
             def normalized_oriented_normal(value):
                 try:
                     normal = (
@@ -9250,7 +9377,7 @@ class WulframServer:
                 "decompile_context_face_forward_up",
             }
             sampled_terrain_modes = {"terrain", "sampled_terrain", "heightfield"}
-            if raw_fallback_normal_source in radial_face_blend_modes | radial_face_forward_up_modes:
+            if selected_normal_source in radial_face_blend_modes | radial_face_forward_up_modes:
                 radial_normal = normalized_oriented_normal(
                     getattr(raw_contact, "entity_radial_normal", None)
                 )
@@ -9285,7 +9412,7 @@ class WulframServer:
                     )
                     if (
                         blend_normal is not None
-                        and raw_fallback_normal_source in radial_face_forward_up_modes
+                        and selected_normal_source in radial_face_forward_up_modes
                     ):
                         right = (-math.sin(heading), math.cos(heading), 0.0)
                         right_component = (
@@ -9303,27 +9430,27 @@ class WulframServer:
                     if blend_normal is not None:
                         normal_source = (
                             "entity_radial_terrain_face_forward_up"
-                            if raw_fallback_normal_source in radial_face_forward_up_modes
+                            if selected_normal_source in radial_face_forward_up_modes
                             else "entity_radial_terrain_face_blend"
                         )
                         return contact_with_normal(blend_normal, normal_source)
                 return raw_contact
-            if raw_fallback_normal_source in entity_radial_modes:
+            if selected_normal_source in entity_radial_modes:
                 radial_normal = normalized_oriented_normal(
                     getattr(raw_contact, "entity_radial_normal", None)
                 )
                 if radial_normal is not None:
                     return contact_with_normal(radial_normal, "entity_radial")
                 return raw_contact
-            if raw_fallback_normal_source in contact_face_modes:
+            if selected_normal_source in contact_face_modes:
                 face_normal = normalized_oriented_normal(
                     getattr(raw_contact, "terrain_face_normal", None)
                 )
                 if face_normal is not None:
                     return contact_with_normal(face_normal, "terrain_triangle_contact_face")
-                if raw_fallback_normal_source not in sampled_terrain_modes:
+                if selected_normal_source not in sampled_terrain_modes:
                     return raw_contact
-            if raw_fallback_normal_source not in sampled_terrain_modes:
+            if selected_normal_source not in sampled_terrain_modes:
                 return raw_contact
             terrain = getattr(self, "terrain", None)
             if terrain is None:
@@ -9364,6 +9491,32 @@ class WulframServer:
                 "raw_error": raw_error,
                 "reject": reject,
             }
+
+        def pair_record_contact_reject_reason(contact, *, velocity=None):
+            if not pair_record_contact_enabled:
+                return "disabled"
+            if raw_fallback_enabled:
+                return "raw_origin_fallback_enabled"
+            if terrain_collision_shape != "model" or collision_model is None:
+                return "non_model_collision_shape"
+            if contact is None:
+                return "no_raw_origin_contact"
+            face_normal = getattr(contact, "terrain_face_normal", None)
+            try:
+                face_normal_z = float(face_normal[2])
+            except (TypeError, ValueError, OverflowError, IndexError):
+                return "missing_terrain_face_normal"
+            if face_normal_z < pair_record_contact_min_face_normal_z:
+                return "terrain_face_normal_z_below_min"
+            return raw_origin_fallback_reject_reason(
+                contact,
+                velocity=velocity,
+                enabled=True,
+                min_depth=pair_record_contact_min_depth,
+                max_depth=pair_record_contact_max_depth,
+                min_normal_z=pair_record_contact_min_normal_z,
+                min_speed=0.0,
+            )
 
         def sample_raycast_fallback_contact_at(pos, *, reference=None, velocity=None):
             raycast_fn_local = getattr(self._terrain_grid_collision, "raycast", None)
@@ -9507,6 +9660,9 @@ class WulframServer:
             raw_bounds_contact=None,
             raw_error=None,
             raw_fallback_reject=None,
+            pair_record_contact=None,
+            pair_record_delta_contact=None,
+            pair_record_contact_reject=None,
             raycast_probe=None,
         ):
             ctx.debug_last_terrain_contact_probe = {}
@@ -9594,6 +9750,10 @@ class WulframServer:
                 "dirty_raycast_hit_cell": dirty_dispatch_debug.get("dirty_raycast_hit_cell"),
                 "raw_origin_fallback_enabled": raw_fallback_enabled,
                 "raw_origin_fallback_reject": raw_fallback_reject,
+                "pair_record_contact_enabled": pair_record_contact_enabled,
+                "pair_record_contact_reject": pair_record_contact_reject,
+                "pair_record_contact_normal_source": pair_record_contact_normal_source,
+                "pair_record_contact_delta_normal_source": pair_record_contact_delta_normal_source,
                 "raycast_fallback_enabled": raycast_fallback_enabled,
                 "raycast_timed_fallback_enabled": raycast_fallback_timed_enabled,
                 "raycast_fallback_reject": (
@@ -9609,6 +9769,16 @@ class WulframServer:
                 ),
                 "raw_origin_contact": probe_contact_fields(
                     raw_contact,
+                    center=raw_center,
+                    z_lift_used=0.0,
+                ),
+                "pair_record_contact": probe_contact_fields(
+                    pair_record_contact,
+                    center=raw_center,
+                    z_lift_used=0.0,
+                ),
+                "pair_record_delta_contact": probe_contact_fields(
+                    pair_record_delta_contact,
                     center=raw_center,
                     z_lift_used=0.0,
                 ),
@@ -9880,16 +10050,53 @@ class WulframServer:
                 "normal_velocity_before": vel_dot,
             }
 
-        def apply_raw_origin_fallback_contact(contact):
+        def apply_raw_origin_fallback_contact(
+            contact,
+            *,
+            projection_order=None,
+            friction=None,
+            delta_mode=None,
+            delta_normal=None,
+            delta_normal_source=None,
+            angular_mode=None,
+            closing_only=None,
+            max_velocity_delta=None,
+            max_speed=None,
+            max_angular_delta=None,
+        ):
             nonlocal vx, vy, vz
+            local_projection_order = (
+                raw_fallback_projection_order
+                if projection_order is None
+                else projection_order
+            )
+            local_friction = raw_fallback_friction if friction is None else friction
+            local_delta_mode = raw_fallback_delta_mode if delta_mode is None else delta_mode
+            local_angular_mode = (
+                raw_fallback_angular_mode if angular_mode is None else angular_mode
+            )
+            local_closing_only = (
+                raw_fallback_closing_only if closing_only is None else closing_only
+            )
+            local_max_velocity_delta = (
+                raw_fallback_max_velocity_delta
+                if max_velocity_delta is None
+                else max_velocity_delta
+            )
+            local_max_speed = raw_fallback_max_speed if max_speed is None else max_speed
+            local_max_angular_delta = (
+                raw_fallback_max_angular_delta
+                if max_angular_delta is None
+                else max_angular_delta
+            )
             before_pos = (anchor[0], anchor[1], anchor[2])
             before_vel = (vx, vy, vz)
             before_ang = tuple(contact_angular_velocity)
             response_debug = apply_contact(
                 contact,
                 force_pair_solver=True,
-                projection_order_override=raw_fallback_projection_order,
-                friction_override=raw_fallback_friction,
+                projection_order_override=local_projection_order,
+                friction_override=local_friction,
             ) or {}
             raw_after_pos = (anchor[0], anchor[1], anchor[2])
             raw_after_vel = (vx, vy, vz)
@@ -9925,7 +10132,8 @@ class WulframServer:
             before_center_normal_speed = None
             before_normal_speed_source = ""
             normal_delta_skip_reason = ""
-            if raw_fallback_delta_mode in {
+            delta_projection_normal = None
+            if local_delta_mode in {
                 "normal",
                 "normal_only",
                 "contact_normal",
@@ -9937,12 +10145,15 @@ class WulframServer:
             }:
                 normal = None
                 try:
-                    normal_mag = vec_mag(contact.normal)
+                    delta_projection_normal = (
+                        delta_normal if delta_normal is not None else contact.normal
+                    )
+                    normal_mag = vec_mag(delta_projection_normal)
                     if normal_mag > 1e-9:
                         normal = (
-                            float(contact.normal[0]) / normal_mag,
-                            float(contact.normal[1]) / normal_mag,
-                            float(contact.normal[2]) / normal_mag,
+                            float(delta_projection_normal[0]) / normal_mag,
+                            float(delta_projection_normal[1]) / normal_mag,
+                            float(delta_projection_normal[2]) / normal_mag,
                         )
                 except (TypeError, ValueError, OverflowError, IndexError):
                     normal = None
@@ -9966,7 +10177,7 @@ class WulframServer:
                             before_normal_speed = candidate_speed
                             before_normal_speed_source = speed_key
                             break
-                    if raw_fallback_delta_mode in {
+                    if local_delta_mode in {
                         "closing",
                         "closing_velocity",
                         "projection_speed",
@@ -9997,7 +10208,7 @@ class WulframServer:
                     if (
                         normal_component > 0.0
                         and (
-                            not raw_fallback_closing_only
+                            not local_closing_only
                             or before_normal_speed < 0.0
                         )
                     ):
@@ -10022,11 +10233,11 @@ class WulframServer:
             raw_delta_mag = vec_mag(raw_delta)
             velocity_delta_clamped = False
             if (
-                math.isfinite(raw_fallback_max_velocity_delta)
-                and raw_fallback_max_velocity_delta > 0.0
-                and raw_delta_mag > raw_fallback_max_velocity_delta
+                math.isfinite(local_max_velocity_delta)
+                and local_max_velocity_delta > 0.0
+                and raw_delta_mag > local_max_velocity_delta
             ):
-                scale = raw_fallback_max_velocity_delta / max(raw_delta_mag, 1e-9)
+                scale = local_max_velocity_delta / max(raw_delta_mag, 1e-9)
                 safe_vel = (
                     before_vel[0] + raw_delta[0] * scale,
                     before_vel[1] + raw_delta[1] * scale,
@@ -10037,11 +10248,11 @@ class WulframServer:
             speed_clamped = False
             safe_speed = vec_mag(safe_vel)
             if (
-                math.isfinite(raw_fallback_max_speed)
-                and raw_fallback_max_speed > 0.0
-                and safe_speed > raw_fallback_max_speed
+                math.isfinite(local_max_speed)
+                and local_max_speed > 0.0
+                and safe_speed > local_max_speed
             ):
-                scale = raw_fallback_max_speed / max(safe_speed, 1e-9)
+                scale = local_max_speed / max(safe_speed, 1e-9)
                 safe_vel = (
                     safe_vel[0] * scale,
                     safe_vel[1] * scale,
@@ -10058,21 +10269,21 @@ class WulframServer:
             raw_ang_delta_mag = vec_mag(raw_ang_delta)
             angular_delta_clamped = False
             angular_delta_preserved = False
-            if raw_fallback_angular_mode in {"preserve", "none", "linear", "linear_only", "off"}:
+            if local_angular_mode in {"preserve", "none", "linear", "linear_only", "off"}:
                 safe_ang = before_ang
                 angular_delta_preserved = True
             elif (
-                raw_fallback_angular_mode == "auto"
-                and raw_fallback_delta_mode in {"normal", "normal_only", "contact_normal"}
+                local_angular_mode == "auto"
+                and local_delta_mode in {"normal", "normal_only", "contact_normal"}
             ):
                 safe_ang = before_ang
                 angular_delta_preserved = True
             elif (
-                math.isfinite(raw_fallback_max_angular_delta)
-                and raw_fallback_max_angular_delta > 0.0
-                and raw_ang_delta_mag > raw_fallback_max_angular_delta
+                math.isfinite(local_max_angular_delta)
+                and local_max_angular_delta > 0.0
+                and raw_ang_delta_mag > local_max_angular_delta
             ):
-                scale = raw_fallback_max_angular_delta / max(raw_ang_delta_mag, 1e-9)
+                scale = local_max_angular_delta / max(raw_ang_delta_mag, 1e-9)
                 safe_ang = (
                     before_ang[0] + raw_ang_delta[0] * scale,
                     before_ang[1] + raw_ang_delta[1] * scale,
@@ -10096,13 +10307,15 @@ class WulframServer:
             )
             response_debug.update({
                 "raw_origin_fallback_safety_rejected": False,
-                "raw_origin_fallback_velocity_safety_max_delta": raw_fallback_max_velocity_delta,
-                "raw_origin_fallback_velocity_safety_max_speed": raw_fallback_max_speed,
-                "raw_origin_fallback_angular_safety_max_delta": raw_fallback_max_angular_delta,
-                "raw_origin_fallback_friction_override": raw_fallback_friction,
-                "raw_origin_fallback_delta_mode": raw_fallback_delta_mode,
-                "raw_origin_fallback_angular_mode": raw_fallback_angular_mode,
-                "raw_origin_fallback_closing_only": raw_fallback_closing_only,
+                "raw_origin_fallback_velocity_safety_max_delta": local_max_velocity_delta,
+                "raw_origin_fallback_velocity_safety_max_speed": local_max_speed,
+                "raw_origin_fallback_angular_safety_max_delta": local_max_angular_delta,
+                "raw_origin_fallback_friction_override": local_friction,
+                "raw_origin_fallback_delta_mode": local_delta_mode,
+                "raw_origin_fallback_delta_normal": delta_projection_normal,
+                "raw_origin_fallback_delta_normal_source": delta_normal_source,
+                "raw_origin_fallback_angular_mode": local_angular_mode,
+                "raw_origin_fallback_closing_only": local_closing_only,
                 "raw_origin_fallback_before_normal_speed": before_normal_speed,
                 "raw_origin_fallback_before_normal_speed_source": before_normal_speed_source,
                 "raw_origin_fallback_before_center_normal_speed": before_center_normal_speed,
@@ -10828,6 +11041,15 @@ class WulframServer:
                 )
                 raw_fallback_contact = raw_origin_contact_for_fallback(raw_contact)
                 raw_fallback_reject = raw_origin_fallback_reject_reason(raw_fallback_contact)
+                pair_contact = raw_origin_contact_for_fallback(
+                    raw_contact,
+                    normal_source=pair_record_contact_normal_source,
+                )
+                pair_delta_contact = raw_origin_contact_for_fallback(
+                    raw_contact,
+                    normal_source=pair_record_contact_delta_normal_source,
+                )
+                pair_contact_reject = pair_record_contact_reject_reason(pair_contact)
                 raycast_probe = sample_raycast_fallback_contact_at(
                     (anchor[0], anchor[1], anchor[2]),
                     velocity=(vx, vy, vz),
@@ -10845,8 +11067,98 @@ class WulframServer:
                     raw_bounds_contact=raw_bounds_contact,
                     raw_error=raw_error,
                     raw_fallback_reject=raw_fallback_reject,
+                    pair_record_contact=pair_contact,
+                    pair_record_delta_contact=pair_delta_contact,
+                    pair_record_contact_reject=pair_contact_reject,
                     raycast_probe=raycast_probe,
                 )
+                if raw_error is None and pair_contact is not None and pair_contact_reject == "":
+                    response_debug, applied_pair_record_contact = apply_raw_origin_fallback_contact(
+                        pair_contact,
+                        projection_order=pair_record_contact_projection_order,
+                        delta_mode=pair_record_contact_delta_mode,
+                        delta_normal=(
+                            None
+                            if pair_delta_contact is None
+                            else pair_delta_contact.normal
+                        ),
+                        delta_normal_source=(
+                            None
+                            if pair_delta_contact is None
+                            else getattr(pair_delta_contact, "normal_source", None)
+                        ),
+                        angular_mode=pair_record_contact_angular_mode,
+                        closing_only=pair_record_contact_closing_only,
+                        max_velocity_delta=pair_record_contact_max_velocity_delta,
+                        max_speed=pair_record_contact_max_speed,
+                        max_angular_delta=pair_record_contact_max_angular_delta,
+                    )
+                    if not applied_pair_record_contact:
+                        return False
+                    ctx.debug_last_collision = {
+                        "kind": "terrain_pair_record_contact",
+                        "point": pair_contact.position,
+                        "normal": pair_contact.normal,
+                        "depth": pair_contact.penetration,
+                        **contact_debug_fields(pair_contact),
+                        "lifted_contact_missing": contact is None,
+                        "lifted_contact_depth": (
+                            None if contact is None else contact.penetration
+                        ),
+                        "pair_record_contact": True,
+                        "pair_record_contact_reason": (
+                            "lifted_clear_raw_origin_contact"
+                            if contact is None
+                            else "lifted_below_slop_raw_origin_contact"
+                        ),
+                        "pair_record_contact_reject": pair_contact_reject,
+                        "pair_record_contact_enabled": pair_record_contact_enabled,
+                        "pair_record_contact_normal_source": pair_record_contact_normal_source,
+                        "pair_record_contact_delta_normal_source": pair_record_contact_delta_normal_source,
+                        "pair_record_solver_normal_source": getattr(
+                            pair_contact,
+                            "normal_source",
+                            None,
+                        ),
+                        "pair_record_delta_normal_source": (
+                            None
+                            if pair_delta_contact is None
+                            else getattr(pair_delta_contact, "normal_source", None)
+                        ),
+                        "pair_record_delta_normal": (
+                            None if pair_delta_contact is None else pair_delta_contact.normal
+                        ),
+                        "pair_record_contact_projection_order": pair_record_contact_projection_order,
+                        "pair_record_contact_delta_mode": pair_record_contact_delta_mode,
+                        "pair_record_contact_angular_mode": pair_record_contact_angular_mode,
+                        "pair_record_contact_closing_only": pair_record_contact_closing_only,
+                        "pair_record_contact_min_depth": pair_record_contact_min_depth,
+                        "pair_record_contact_max_depth": pair_record_contact_max_depth,
+                        "pair_record_contact_min_normal_z": pair_record_contact_min_normal_z,
+                        "pair_record_contact_min_face_normal_z": pair_record_contact_min_face_normal_z,
+                        "pair_record_contact_max_velocity_delta": pair_record_contact_max_velocity_delta,
+                        "pair_record_contact_max_speed": pair_record_contact_max_speed,
+                        "pair_record_contact_max_angular_delta": pair_record_contact_max_angular_delta,
+                        "pair_record_raw_normal": getattr(raw_contact, "normal", None),
+                        "pair_record_terrain_face_normal": getattr(
+                            raw_contact,
+                            "terrain_face_normal",
+                            None,
+                        ),
+                        "pair_record_mesh_face_normal": getattr(
+                            raw_contact,
+                            "mesh_face_normal",
+                            None,
+                        ),
+                        "pair_record_entity_radial_normal": getattr(
+                            raw_contact,
+                            "entity_radial_normal",
+                            None,
+                        ),
+                        **(response_debug or {}),
+                    }
+                    ctx.debug_last_motion_collision = dict(ctx.debug_last_collision)
+                    return True
                 if raw_error is None and raw_fallback_contact is not None and raw_fallback_reject == "":
                     response_debug, applied_raw_fallback = apply_raw_origin_fallback_contact(raw_fallback_contact)
                     if not applied_raw_fallback:
