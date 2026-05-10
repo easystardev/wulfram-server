@@ -6907,6 +6907,7 @@ def test_entity_world_collision_pair_record_contact_applies_decompile_face_gated
         "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE",
         "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE",
         "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_VERTICAL_DELTA_MODE",
         "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VELOCITY_DELTA",
         "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VERTICAL_DELTA",
     ]
@@ -6922,6 +6923,7 @@ def test_entity_world_collision_pair_record_contact_applies_decompile_face_gated
         ] = "entity_radial_terrain_face_forward_up"
         os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE"] = "closing_velocity"
         os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE"] = "preserve"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_VERTICAL_DELTA_MODE"] = "scale"
         os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VELOCITY_DELTA"] = "3.0"
         os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VERTICAL_DELTA"] = "1.0"
         terrain_face_normal = (0.25, 0.0, 0.9682458365518543)
@@ -6997,6 +6999,7 @@ def test_entity_world_collision_pair_record_contact_applies_decompile_face_gated
             "entity_radial_terrain_face_forward_up"
         ), debug
         assert debug["raw_origin_fallback_angular_mode"] == "preserve", debug
+        assert debug["raw_origin_fallback_vertical_delta_mode"] == "scale", debug
         assert debug["raw_origin_fallback_angular_preserved"] is True, debug
         assert debug["raw_origin_fallback_velocity_delta_mag_after_safety"] <= 3.000001, debug
         assert debug["raw_origin_fallback_velocity_safety_max_vertical_delta"] == 1.0, debug
@@ -7035,6 +7038,7 @@ def test_entity_world_collision_pair_record_contact_uses_shallow_upward_selectio
         "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE",
         "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE",
         "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_VERTICAL_DELTA_MODE",
         "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VELOCITY_DELTA",
         "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VERTICAL_DELTA",
     ]
@@ -7050,6 +7054,7 @@ def test_entity_world_collision_pair_record_contact_uses_shallow_upward_selectio
         ] = "entity_radial_terrain_face_forward_up"
         os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE"] = "closing_velocity"
         os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE"] = "preserve"
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_VERTICAL_DELTA_MODE", None)
         os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VELOCITY_DELTA"] = "3.0"
         os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VERTICAL_DELTA"] = "1.0"
         deep_face_normal = (-0.743293, 0.0, 0.668966)
@@ -9414,6 +9419,7 @@ def test_pair_record_timed_sweep_uses_shallow_selection_when_enabled():
         "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE",
         "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE",
         "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_VERTICAL_DELTA_MODE",
         "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VELOCITY_DELTA",
         "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VERTICAL_DELTA",
         "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK",
@@ -9436,6 +9442,7 @@ def test_pair_record_timed_sweep_uses_shallow_selection_when_enabled():
         ] = "entity_radial_terrain_face_forward_up"
         os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE"] = "closing_velocity"
         os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE"] = "preserve"
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_VERTICAL_DELTA_MODE", None)
         os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VELOCITY_DELTA"] = "3.0"
         os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VERTICAL_DELTA"] = "0.0"
         os.environ.pop("WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK", None)

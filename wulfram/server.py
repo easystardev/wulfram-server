@@ -9078,6 +9078,14 @@ class WulframServer:
             .strip()
             .lower()
         )
+        raw_fallback_vertical_delta_mode = (
+            os.environ.get(
+                "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_VERTICAL_DELTA_MODE",
+                "component",
+            )
+            .strip()
+            .lower()
+        )
         raw_fallback_closing_only = (
             os.environ.get("WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_CLOSING_ONLY", "1")
             .strip()
@@ -9170,6 +9178,14 @@ class WulframServer:
         )
         pair_record_contact_angular_mode = (
             os.environ.get("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE", "preserve")
+            .strip()
+            .lower()
+        )
+        pair_record_contact_vertical_delta_mode = (
+            os.environ.get(
+                "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_VERTICAL_DELTA_MODE",
+                "component",
+            )
             .strip()
             .lower()
         )
@@ -9967,6 +9983,7 @@ class WulframServer:
                 "pair_record_contact_selection": pair_record_contact_selection,
                 "pair_record_contact_normal_source": pair_record_contact_normal_source,
                 "pair_record_contact_delta_normal_source": pair_record_contact_delta_normal_source,
+                "pair_record_contact_vertical_delta_mode": pair_record_contact_vertical_delta_mode,
                 "pair_record_contact_max_velocity_delta": pair_record_contact_max_velocity_delta,
                 "pair_record_contact_max_vertical_delta": pair_record_contact_max_vertical_delta,
                 "raycast_fallback_enabled": raycast_fallback_enabled,
@@ -10277,6 +10294,7 @@ class WulframServer:
             closing_only=None,
             max_velocity_delta=None,
             max_vertical_delta=None,
+            vertical_delta_mode=None,
             max_speed=None,
             max_angular_delta=None,
         ):
@@ -10300,6 +10318,11 @@ class WulframServer:
                 else max_velocity_delta
             )
             local_max_vertical_delta = max_vertical_delta
+            local_vertical_delta_mode = (
+                raw_fallback_vertical_delta_mode
+                if vertical_delta_mode is None
+                else vertical_delta_mode
+            )
             local_max_speed = raw_fallback_max_speed if max_speed is None else max_speed
             local_max_angular_delta = (
                 raw_fallback_max_angular_delta
@@ -10474,11 +10497,28 @@ class WulframServer:
                 ):
                     current_delta_z = safe_vel[2] - before_vel[2]
                     if current_delta_z > local_max_vertical_delta_value:
-                        safe_vel = (
-                            safe_vel[0],
-                            safe_vel[1],
-                            before_vel[2] + local_max_vertical_delta_value,
+                        current_delta = (
+                            safe_vel[0] - before_vel[0],
+                            safe_vel[1] - before_vel[1],
+                            current_delta_z,
                         )
+                        if (
+                            local_vertical_delta_mode
+                            in {"scale", "preserve_direction", "direction", "normal_scale"}
+                            and current_delta_z > 1e-9
+                        ):
+                            scale = local_max_vertical_delta_value / current_delta_z
+                            safe_vel = (
+                                before_vel[0] + current_delta[0] * scale,
+                                before_vel[1] + current_delta[1] * scale,
+                                before_vel[2] + current_delta[2] * scale,
+                            )
+                        else:
+                            safe_vel = (
+                                safe_vel[0],
+                                safe_vel[1],
+                                before_vel[2] + local_max_vertical_delta_value,
+                            )
                         vertical_delta_clamped = True
             else:
                 local_max_vertical_delta_value = None
@@ -10554,6 +10594,7 @@ class WulframServer:
                 "raw_origin_fallback_delta_normal": delta_projection_normal,
                 "raw_origin_fallback_delta_normal_source": delta_normal_source,
                 "raw_origin_fallback_angular_mode": local_angular_mode,
+                "raw_origin_fallback_vertical_delta_mode": local_vertical_delta_mode,
                 "raw_origin_fallback_closing_only": local_closing_only,
                 "raw_origin_fallback_before_normal_speed": before_normal_speed,
                 "raw_origin_fallback_before_normal_speed_source": before_normal_speed_source,
@@ -11195,6 +11236,7 @@ class WulframServer:
                             closing_only=pair_record_contact_closing_only,
                             max_velocity_delta=pair_record_contact_max_velocity_delta,
                             max_vertical_delta=pair_record_contact_max_vertical_delta,
+                            vertical_delta_mode=pair_record_contact_vertical_delta_mode,
                             max_speed=pair_record_contact_max_speed,
                             max_angular_delta=pair_record_contact_max_angular_delta,
                         )
@@ -11224,6 +11266,7 @@ class WulframServer:
                             "pair_record_contact_projection_order": pair_record_contact_projection_order,
                             "pair_record_contact_delta_mode": pair_record_contact_delta_mode,
                             "pair_record_contact_angular_mode": pair_record_contact_angular_mode,
+                            "pair_record_contact_vertical_delta_mode": pair_record_contact_vertical_delta_mode,
                             "pair_record_contact_closing_only": pair_record_contact_closing_only,
                             "pair_record_contact_max_velocity_delta": pair_record_contact_max_velocity_delta,
                             "pair_record_contact_max_vertical_delta": pair_record_contact_max_vertical_delta,
@@ -11581,6 +11624,7 @@ class WulframServer:
                         closing_only=pair_record_contact_closing_only,
                         max_velocity_delta=pair_record_contact_max_velocity_delta,
                         max_vertical_delta=pair_record_contact_max_vertical_delta,
+                        vertical_delta_mode=pair_record_contact_vertical_delta_mode,
                         max_speed=pair_record_contact_max_speed,
                         max_angular_delta=pair_record_contact_max_angular_delta,
                     )
@@ -11623,6 +11667,7 @@ class WulframServer:
                         "pair_record_contact_projection_order": pair_record_contact_projection_order,
                         "pair_record_contact_delta_mode": pair_record_contact_delta_mode,
                         "pair_record_contact_angular_mode": pair_record_contact_angular_mode,
+                        "pair_record_contact_vertical_delta_mode": pair_record_contact_vertical_delta_mode,
                         "pair_record_contact_closing_only": pair_record_contact_closing_only,
                         "pair_record_contact_min_depth": pair_record_contact_min_depth,
                         "pair_record_contact_max_depth": pair_record_contact_max_depth,
