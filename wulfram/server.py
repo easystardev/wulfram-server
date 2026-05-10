@@ -9043,6 +9043,14 @@ class WulframServer:
             "no",
             "disabled",
         }
+        pair_record_contact_selection = (
+            os.environ.get(
+                "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT_SELECTION",
+                "upward_min_depth",
+            )
+            .strip()
+            .lower()
+        )
         try:
             pair_record_contact_min_depth = float(
                 os.environ.get(
@@ -9220,7 +9228,7 @@ class WulframServer:
             }
             return {key: value for key, value in out.items() if value not in ({}, None)}
 
-        def sample_raw_origin_contact_at(pos):
+        def sample_raw_origin_contact_at(pos, *, contact_selection=None):
             if (
                 collision_model is None
                 or vertices is None
@@ -9230,6 +9238,11 @@ class WulframServer:
             ):
                 return None, None, None
             raw_center = (pos[0], pos[1], pos[2])
+            selected_contact_selection = (
+                model_contact_selection
+                if contact_selection is None
+                else str(contact_selection or "first").strip().lower()
+            )
             try:
                 raw_contact = self._terrain_grid_collision.test_model_collision(
                     raw_center,
@@ -9238,7 +9251,7 @@ class WulframServer:
                     cbsp_tree,
                     bounding_radius,
                     rotation_matrix=model_contact_rotation_matrix,
-                    contact_selection=model_contact_selection,
+                    contact_selection=selected_contact_selection,
                 )
             except Exception as exc:  # pragma: no cover - diagnostic only
                 return None, None, str(exc)
@@ -9259,6 +9272,7 @@ class WulframServer:
                             cbsp_tree,
                             bounding_radius,
                             rotation_matrix=model_contact_rotation_matrix,
+                            contact_selection=selected_contact_selection,
                         )
                     except Exception:
                         raw_bounds_contact = None
@@ -9761,6 +9775,7 @@ class WulframServer:
                 "raw_origin_fallback_reject": raw_fallback_reject,
                 "pair_record_contact_enabled": pair_record_contact_enabled,
                 "pair_record_contact_reject": pair_record_contact_reject,
+                "pair_record_contact_selection": pair_record_contact_selection,
                 "pair_record_contact_normal_source": pair_record_contact_normal_source,
                 "pair_record_contact_delta_normal_source": pair_record_contact_delta_normal_source,
                 "pair_record_contact_max_velocity_delta": pair_record_contact_max_velocity_delta,
@@ -11075,14 +11090,32 @@ class WulframServer:
                 raw_contact, raw_bounds_contact, raw_error = sample_raw_origin_contact_at(
                     (anchor[0], anchor[1], anchor[2])
                 )
+                pair_raw_contact = raw_contact
+                pair_raw_bounds_contact = raw_bounds_contact
+                pair_raw_error = raw_error
+                if (
+                    pair_record_contact_enabled
+                    and raw_error is None
+                    and pair_record_contact_selection
+                    and pair_record_contact_selection != model_contact_selection
+                ):
+                    pair_raw_contact, pair_raw_bounds_contact, pair_raw_error = (
+                        sample_raw_origin_contact_at(
+                            (anchor[0], anchor[1], anchor[2]),
+                            contact_selection=pair_record_contact_selection,
+                        )
+                    )
+                    if pair_raw_error is not None:
+                        pair_raw_contact = raw_contact
+                        pair_raw_bounds_contact = raw_bounds_contact
                 raw_fallback_contact = raw_origin_contact_for_fallback(raw_contact)
                 raw_fallback_reject = raw_origin_fallback_reject_reason(raw_fallback_contact)
                 pair_contact = raw_origin_contact_for_fallback(
-                    raw_contact,
+                    pair_raw_contact,
                     normal_source=pair_record_contact_normal_source,
                 )
                 pair_delta_contact = raw_origin_contact_for_fallback(
-                    raw_contact,
+                    pair_raw_contact,
                     normal_source=pair_record_contact_delta_normal_source,
                 )
                 pair_contact_reject = pair_record_contact_reject_reason(pair_contact)
@@ -11108,7 +11141,7 @@ class WulframServer:
                     pair_record_contact_reject=pair_contact_reject,
                     raycast_probe=raycast_probe,
                 )
-                if raw_error is None and pair_contact is not None and pair_contact_reject == "":
+                if pair_raw_error is None and pair_contact is not None and pair_contact_reject == "":
                     response_debug, applied_pair_record_contact = apply_raw_origin_fallback_contact(
                         pair_contact,
                         projection_order=pair_record_contact_projection_order,
@@ -11150,6 +11183,7 @@ class WulframServer:
                         ),
                         "pair_record_contact_reject": pair_contact_reject,
                         "pair_record_contact_enabled": pair_record_contact_enabled,
+                        "pair_record_contact_selection": pair_record_contact_selection,
                         "pair_record_contact_normal_source": pair_record_contact_normal_source,
                         "pair_record_contact_delta_normal_source": pair_record_contact_delta_normal_source,
                         "pair_record_solver_normal_source": getattr(
@@ -11178,18 +11212,23 @@ class WulframServer:
                         "pair_record_contact_max_speed": pair_record_contact_max_speed,
                         "pair_record_contact_max_angular_delta": pair_record_contact_max_angular_delta,
                         "pair_record_raw_normal": getattr(raw_contact, "normal", None),
+                        "pair_record_selected_raw_normal": getattr(
+                            pair_raw_contact,
+                            "normal",
+                            None,
+                        ),
                         "pair_record_terrain_face_normal": getattr(
-                            raw_contact,
+                            pair_raw_contact,
                             "terrain_face_normal",
                             None,
                         ),
                         "pair_record_mesh_face_normal": getattr(
-                            raw_contact,
+                            pair_raw_contact,
                             "mesh_face_normal",
                             None,
                         ),
                         "pair_record_entity_radial_normal": getattr(
-                            raw_contact,
+                            pair_raw_contact,
                             "entity_radial_normal",
                             None,
                         ),
