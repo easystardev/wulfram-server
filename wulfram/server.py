@@ -8997,6 +8997,38 @@ class WulframServer:
             "midpoint",
             "decompile",
         }
+        reference_pose_contact_response_mode = (
+            os.environ.get("WULFRAM_ENTITY_TERRAIN_REFERENCE_POSE_CONTACT", "0")
+            .strip()
+            .lower()
+        )
+        reference_pose_contact_response_enabled = (
+            reference_pose_contact_response_mode
+            in {
+                "1",
+                "true",
+                "on",
+                "yes",
+                "apply",
+                "contact",
+                "pair",
+                "response",
+                "decompile",
+            }
+        )
+        if reference_pose_contact_response_enabled:
+            reference_pose_probe_enabled = True
+        reference_pose_contact_order = tuple(
+            label.strip()
+            for label in os.environ.get(
+                "WULFRAM_ENTITY_TERRAIN_REFERENCE_POSE_CONTACT_ORDER",
+                (
+                    "pre_to_current_75,pre_to_current_50,pre_to_current_25,"
+                    "pre_pos,dirty_reference_pos,world_collision_ref_pos"
+                ),
+            ).split(",")
+            if label.strip()
+        )
         raw_fallback_mode = (
             os.environ.get("WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK", "0")
             .strip()
@@ -9290,6 +9322,26 @@ class WulframServer:
                 and "WULFRAM_ENTITY_TERRAIN_CONTACT_SWEEP_SCAN" not in os.environ
             ):
                 contact_sweep_scan_enabled = True
+        pair_record_continue_mode = (
+            os.environ.get("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTINUE_REMAINING", "0")
+            .strip()
+            .lower()
+        )
+        pair_record_continue_remaining_enabled = (
+            pair_record_contact_enabled
+            and timing_ready
+            and pair_record_continue_mode
+            in {
+                "1",
+                "true",
+                "on",
+                "yes",
+                "continue",
+                "remaining",
+                "bucket",
+                "decompile",
+            }
+        )
         raycast_fallback_mode = (
             os.environ.get("WULFRAM_ENTITY_TERRAIN_RAYCAST_FALLBACK", "0")
             .strip()
@@ -9858,18 +9910,10 @@ class WulframServer:
                 "hit_distance": getattr(terrain_hit, "distance", None),
             }
 
-        def sample_reference_pose_contacts(pos, *, velocity=None):
-            """Telemetry-only contact probes at candidate reference poses.
-
-            The rough H180/W live split is dominated by windows where OG records a
-            rebound but the server's current lifted/raw anchor reports no contact.
-            Keep this observational: it records which nearby reference pose would
-            see the contact before any promotion path uses that pose.
-            """
-
+        def reference_pose_candidates(pos):
             current = finite_triplet(pos)
             if current is None:
-                return {}
+                return []
             candidates = []
             seen_positions: set[tuple[float, float, float]] = set()
 
@@ -9914,9 +9958,13 @@ class WulframServer:
             add_midpoint("pre_to_current_50", pre_step_pos, current, 0.50)
             add_midpoint("pre_to_current_75", pre_step_pos, current, 0.75)
             add_midpoint("dirty_reference_to_current_50", dirty_reference_pos, current, 0.50)
+            return candidates
+
+        def sample_reference_pose_contacts(pos, *, velocity=None):
+            """Record contacts at decompile-style collision/reference poses."""
 
             output = {}
-            for label, candidate in candidates:
+            for label, candidate in reference_pose_candidates(pos):
                 lifted_contact = None
                 lifted_error = None
                 try:
@@ -10005,6 +10053,33 @@ class WulframServer:
                 }
             return output
 
+        def select_reference_pose_pair_record_contact(pos, *, velocity=None):
+            if not reference_pose_contact_response_enabled:
+                return None
+            if not pair_record_contact_enabled:
+                return None
+            candidates = dict(reference_pose_candidates(pos))
+            for label in reference_pose_contact_order:
+                candidate = candidates.get(label)
+                if candidate is None:
+                    continue
+                pair_probe = sample_pair_record_contact_at(candidate, velocity=velocity)
+                pair_contact = pair_probe.get("contact")
+                if (
+                    pair_probe.get("selected_raw_error") is None
+                    and pair_contact is not None
+                    and pair_probe.get("reject") == ""
+                    and pair_contact.penetration > self._PENETRATION_SLOP_DEFAULT
+                ):
+                    return {
+                        "label": label,
+                        "pos": candidate,
+                        "probe": pair_probe,
+                        "contact": pair_contact,
+                        "delta_contact": pair_probe.get("delta_contact"),
+                    }
+            return None
+
         def update_contact_probe(
             pos,
             lifted_contact,
@@ -10082,6 +10157,10 @@ class WulframServer:
                 "model_contact_selection": model_contact_selection,
                 "probe_enabled": True,
                 "reference_pose_probe_enabled": reference_pose_probe_enabled,
+                "reference_pose_contact_response_enabled": (
+                    reference_pose_contact_response_enabled
+                ),
+                "reference_pose_contact_order": reference_pose_contact_order,
                 "position": pos,
                 "velocity": (vx, vy, vz),
                 "heading": heading,
@@ -10895,6 +10974,81 @@ class WulframServer:
                 (endpoint_vel_for_timing[2] - pre_vel[2]) / frame_dt,
             )
             return acc
+
+        def estimate_direct_pair_record_contact_timing():
+            if not pair_record_continue_remaining_enabled:
+                return None
+            frame_dt = max(0.0, float(dt))
+            if frame_dt <= 0.0:
+                return None
+            acc = timing_acceleration()
+
+            def candidate_at(elapsed_s):
+                pos, velocity = motion_state_at(
+                    tuple(pre_pos),
+                    tuple(pre_vel),
+                    acc,
+                    elapsed_s,
+                    frame_dt,
+                )
+                pair_probe = sample_pair_record_contact_at(pos, velocity=velocity)
+                pair_contact = pair_probe.get("contact")
+                if (
+                    pair_probe.get("selected_raw_error") is None
+                    and pair_contact is not None
+                    and pair_probe.get("reject") == ""
+                    and pair_contact.penetration > self._PENETRATION_SLOP_DEFAULT
+                ):
+                    return {
+                        "pos": pos,
+                        "velocity": velocity,
+                        "probe": pair_probe,
+                        "contact": pair_contact,
+                        "delta_contact": pair_probe.get("delta_contact"),
+                    }
+                return None
+
+            end_candidate = candidate_at(frame_dt)
+            if end_candidate is None:
+                return None
+            start_candidate = candidate_at(0.0)
+            if start_candidate is not None:
+                return {
+                    "collision_time_s": 0.0,
+                    "remaining_time_s": frame_dt,
+                    "collision_at_start": True,
+                    "sweep_iterations": 0,
+                    "sweep_clear_count": 0,
+                    "sweep_contact_count": 2,
+                    **start_candidate,
+                }
+
+            lo = 0.0
+            hi = frame_dt
+            best = end_candidate
+            iterations = 0
+            clear_count = 1
+            contact_count = 1
+            while hi - lo > 0.0025 and iterations < 24:
+                mid = (lo + hi) * 0.5
+                mid_candidate = candidate_at(mid)
+                iterations += 1
+                if mid_candidate is None:
+                    lo = mid
+                    clear_count += 1
+                else:
+                    hi = mid
+                    best = mid_candidate
+                    contact_count += 1
+            return {
+                "collision_time_s": hi,
+                "remaining_time_s": max(0.0, frame_dt - hi),
+                "collision_at_start": False,
+                "sweep_iterations": iterations,
+                "sweep_clear_count": clear_count,
+                "sweep_contact_count": contact_count,
+                **best,
+            }
 
         def estimate_timed_contact_from(start_pos, start_vel, acc, remaining_time):
             if not timed_pair_response:
@@ -11720,6 +11874,7 @@ class WulframServer:
             return True
 
         def resolve_single_contact():
+            nonlocal vx, vy, vz
             if timed_pair_response and resolve_timed_pair_contact():
                 return True
             contact = sample_contact()
@@ -11779,6 +11934,14 @@ class WulframServer:
                     raycast_probe=raycast_probe,
                 )
                 if pair_raw_error is None and pair_contact is not None and pair_contact_reject == "":
+                    direct_pair_timing = estimate_direct_pair_record_contact_timing()
+                    if direct_pair_timing is not None:
+                        pair_contact = direct_pair_timing["contact"]
+                        pair_delta_contact = direct_pair_timing.get("delta_contact")
+                        contact_pos = direct_pair_timing["pos"]
+                        contact_vel = direct_pair_timing["velocity"]
+                        anchor[0], anchor[1], anchor[2] = contact_pos
+                        vx, vy, vz = contact_vel
                     response_debug, applied_pair_record_contact = apply_raw_origin_fallback_contact(
                         pair_contact,
                         projection_order=pair_record_contact_projection_order,
@@ -11803,8 +11966,91 @@ class WulframServer:
                     )
                     if not applied_pair_record_contact:
                         return False
+                    if direct_pair_timing is not None:
+                        response_debug = dict(response_debug or {})
+                        post_contact_pos = (anchor[0], anchor[1], anchor[2])
+                        post_contact_vel = (vx, vy, vz)
+                        remaining_after_contact = float(
+                            direct_pair_timing.get("remaining_time_s") or 0.0
+                        )
+                        if remaining_after_contact > 0.0:
+                            final_pos, final_vel = motion_state_at(
+                                post_contact_pos,
+                                post_contact_vel,
+                                timing_acceleration(),
+                                remaining_after_contact,
+                                remaining_after_contact,
+                            )
+                            anchor[0], anchor[1], anchor[2] = final_pos
+                            vx, vy, vz = final_vel
+                        direct_event_debug = {
+                            "iteration": 1,
+                            "collision_time_s": direct_pair_timing.get(
+                                "collision_time_s"
+                            ),
+                            "remaining_time_s": direct_pair_timing.get(
+                                "remaining_time_s"
+                            ),
+                            "sweep_iterations": direct_pair_timing.get(
+                                "sweep_iterations"
+                            ),
+                            "sweep_clear_count": direct_pair_timing.get(
+                                "sweep_clear_count"
+                            ),
+                            "sweep_contact_count": direct_pair_timing.get(
+                                "sweep_contact_count"
+                            ),
+                            "collision_at_start": direct_pair_timing.get(
+                                "collision_at_start"
+                            ),
+                            "pair_record_contact": True,
+                            "pair_record_continued_contact": True,
+                            "point": pair_contact.position,
+                            "normal": pair_contact.normal,
+                            "depth": pair_contact.penetration,
+                            **contact_debug_fields(pair_contact),
+                            **response_debug,
+                        }
+                        response_debug.update({
+                            "pair_record_continued_contact": True,
+                            "pair_record_continue_remaining_enabled": (
+                                pair_record_continue_remaining_enabled
+                            ),
+                            "pair_record_continue_collision_time_s": (
+                                direct_pair_timing.get("collision_time_s")
+                            ),
+                            "pair_record_continue_remaining_time_s": (
+                                direct_pair_timing.get("remaining_time_s")
+                            ),
+                            "pair_record_continue_collision_at_start": (
+                                direct_pair_timing.get("collision_at_start")
+                            ),
+                            "pair_record_continue_sweep_iterations": (
+                                direct_pair_timing.get("sweep_iterations")
+                            ),
+                            "pair_record_continue_sweep_clear_count": (
+                                direct_pair_timing.get("sweep_clear_count")
+                            ),
+                            "pair_record_continue_sweep_contact_count": (
+                                direct_pair_timing.get("sweep_contact_count")
+                            ),
+                            "pair_record_continue_contact_pos": (
+                                direct_pair_timing.get("pos")
+                            ),
+                            "pair_record_continue_contact_vel_before": (
+                                direct_pair_timing.get("velocity")
+                            ),
+                            "pair_record_continue_post_contact_pos": post_contact_pos,
+                            "pair_record_continue_post_contact_vel": post_contact_vel,
+                            "velocity_after": (vx, vy, vz),
+                            "contact_events": [direct_event_debug],
+                        })
                     ctx.debug_last_collision = {
-                        "kind": "terrain_pair_record_contact",
+                        "kind": (
+                            "terrain_pair_record_continued_contact"
+                            if direct_pair_timing is not None
+                            else "terrain_pair_record_contact"
+                        ),
                         "point": pair_contact.position,
                         "normal": pair_contact.normal,
                         "depth": pair_contact.penetration,
@@ -11868,6 +12114,135 @@ class WulframServer:
                         ),
                         "pair_record_entity_radial_normal": getattr(
                             pair_raw_contact,
+                            "entity_radial_normal",
+                            None,
+                        ),
+                        **(response_debug or {}),
+                    }
+                    ctx.debug_last_motion_collision = dict(ctx.debug_last_collision)
+                    return True
+                reference_pair = select_reference_pose_pair_record_contact(
+                    (anchor[0], anchor[1], anchor[2]),
+                    velocity=(vx, vy, vz),
+                )
+                if reference_pair is not None:
+                    reference_pair_contact = reference_pair["contact"]
+                    reference_pair_delta_contact = reference_pair.get("delta_contact")
+                    response_debug, applied_reference_pair_contact = (
+                        apply_raw_origin_fallback_contact(
+                            reference_pair_contact,
+                            projection_order=pair_record_contact_projection_order,
+                            delta_mode=pair_record_contact_delta_mode,
+                            delta_normal=(
+                                None
+                                if reference_pair_delta_contact is None
+                                else reference_pair_delta_contact.normal
+                            ),
+                            delta_normal_source=(
+                                None
+                                if reference_pair_delta_contact is None
+                                else getattr(
+                                    reference_pair_delta_contact,
+                                    "normal_source",
+                                    None,
+                                )
+                            ),
+                            angular_mode=pair_record_contact_angular_mode,
+                            closing_only=pair_record_contact_closing_only,
+                            max_velocity_delta=pair_record_contact_max_velocity_delta,
+                            max_vertical_delta=pair_record_contact_max_vertical_delta,
+                            vertical_delta_mode=pair_record_contact_vertical_delta_mode,
+                            max_speed=pair_record_contact_max_speed,
+                            max_angular_delta=pair_record_contact_max_angular_delta,
+                        )
+                    )
+                    if not applied_reference_pair_contact:
+                        return False
+                    reference_pair_probe = reference_pair.get("probe") or {}
+                    reference_raw_contact = reference_pair_probe.get("raw_contact")
+                    reference_selected_raw_contact = reference_pair_probe.get(
+                        "selected_raw_contact"
+                    )
+                    ctx.debug_last_collision = {
+                        "kind": "terrain_reference_pose_pair_record_contact",
+                        "point": reference_pair_contact.position,
+                        "normal": reference_pair_contact.normal,
+                        "depth": reference_pair_contact.penetration,
+                        **contact_debug_fields(reference_pair_contact),
+                        "lifted_contact_missing": contact is None,
+                        "lifted_contact_depth": (
+                            None if contact is None else contact.penetration
+                        ),
+                        "reference_pose_pair_record_contact": True,
+                        "reference_pose_contact_response_enabled": (
+                            reference_pose_contact_response_enabled
+                        ),
+                        "reference_pose_contact_label": reference_pair["label"],
+                        "reference_pose_contact_pos": reference_pair["pos"],
+                        "reference_pose_current_pair_reject": pair_contact_reject,
+                        "pair_record_contact": True,
+                        "pair_record_contact_reason": (
+                            "reference_pose_pair_record_contact"
+                        ),
+                        "pair_record_contact_reject": "",
+                        "pair_record_contact_enabled": pair_record_contact_enabled,
+                        "pair_record_contact_selection": pair_record_contact_selection,
+                        "pair_record_contact_normal_source": pair_record_contact_normal_source,
+                        "pair_record_contact_delta_normal_source": pair_record_contact_delta_normal_source,
+                        "pair_record_solver_normal_source": getattr(
+                            reference_pair_contact,
+                            "normal_source",
+                            None,
+                        ),
+                        "pair_record_delta_normal_source": (
+                            None
+                            if reference_pair_delta_contact is None
+                            else getattr(
+                                reference_pair_delta_contact,
+                                "normal_source",
+                                None,
+                            )
+                        ),
+                        "pair_record_delta_normal": (
+                            None
+                            if reference_pair_delta_contact is None
+                            else reference_pair_delta_contact.normal
+                        ),
+                        "pair_record_contact_projection_order": pair_record_contact_projection_order,
+                        "pair_record_contact_delta_mode": pair_record_contact_delta_mode,
+                        "pair_record_contact_angular_mode": pair_record_contact_angular_mode,
+                        "pair_record_contact_vertical_delta_mode": pair_record_contact_vertical_delta_mode,
+                        "pair_record_contact_closing_only": pair_record_contact_closing_only,
+                        "pair_record_contact_min_depth": pair_record_contact_min_depth,
+                        "pair_record_contact_max_depth": pair_record_contact_max_depth,
+                        "pair_record_contact_min_normal_z": pair_record_contact_min_normal_z,
+                        "pair_record_contact_min_face_normal_z": pair_record_contact_min_face_normal_z,
+                        "pair_record_contact_max_velocity_delta": pair_record_contact_max_velocity_delta,
+                        "pair_record_contact_max_vertical_delta": pair_record_contact_max_vertical_delta,
+                        "pair_record_contact_max_speed": pair_record_contact_max_speed,
+                        "pair_record_contact_max_angular_delta": pair_record_contact_max_angular_delta,
+                        "pair_record_raw_normal": getattr(
+                            reference_raw_contact,
+                            "normal",
+                            None,
+                        ),
+                        "pair_record_selected_raw_normal": getattr(
+                            reference_selected_raw_contact,
+                            "normal",
+                            None,
+                        ),
+                        "pair_record_terrain_face_normal": getattr(
+                            reference_selected_raw_contact,
+                            "terrain_face_normal",
+                            None,
+                        ),
+                        "pair_record_mesh_face_normal": getattr(
+                            reference_selected_raw_contact,
+                            "mesh_face_normal",
+                            None,
+                        ),
+                        "pair_record_entity_radial_normal": getattr(
+                            reference_selected_raw_contact,
                             "entity_radial_normal",
                             None,
                         ),
