@@ -8880,6 +8880,30 @@ class WulframServer:
             .strip()
             .lower()
         )
+        dirty_bounds_box_fallback_mode = (
+            os.environ.get("WULFRAM_ENTITY_TERRAIN_DIRTY_BOUNDS_BOX_FALLBACK", "0")
+            .strip()
+            .lower()
+        )
+        dirty_bounds_box_fallback_enabled = dirty_bounds_box_fallback_mode in {
+            "1",
+            "true",
+            "on",
+            "yes",
+            "box",
+            "aabb",
+            "decompile",
+        }
+        dirty_bounds_box_shape = (
+            os.environ.get("WULFRAM_ENTITY_TERRAIN_DIRTY_BOUNDS_BOX_SHAPE", "inertia")
+            .strip()
+            .lower()
+        )
+        dirty_bounds_box_center_mode = (
+            os.environ.get("WULFRAM_ENTITY_TERRAIN_DIRTY_BOUNDS_BOX_CENTER", "raw")
+            .strip()
+            .lower()
+        )
         dirty_miss_refresh_mode = (
             os.environ.get("WULFRAM_ENTITY_TERRAIN_DIRTY_MISS_REFRESH", "1")
             .strip()
@@ -8898,6 +8922,44 @@ class WulframServer:
             if terrain_collision_shape == "entity_box":
                 return 0.0
             return z_lift if collision_model is not None else half_extents[2]
+
+        def dirty_bounds_box_half_extents():
+            if dirty_bounds_box_shape in {
+                "radius",
+                "radius_cube",
+                "bounding_radius",
+                "sphere_aabb",
+                "decompile_radius",
+            }:
+                return (
+                    (bounding_radius, bounding_radius, bounding_radius),
+                    "bounding_radius",
+                )
+            if dirty_bounds_box_shape in {
+                "fallback",
+                "fallback_half_extents",
+                "tank",
+                "tank_radius",
+                "legacy",
+            }:
+                return half_extents, "fallback_half_extents"
+            return inertia_half_extents, "inertia_half_extents"
+
+        def dirty_bounds_box_center():
+            if dirty_bounds_box_center_mode in {
+                "lift",
+                "lifted",
+                "model",
+                "collision",
+                "z_lift",
+            }:
+                z_offset = box_collision_z_lift()
+                center_mode = "lift"
+            else:
+                z_offset = 0.0
+                center_mode = "raw"
+            center = (anchor[0], anchor[1], anchor[2] + z_offset)
+            return center, center_mode, z_offset
 
         def contact_debug_fields(contact):
             return {
@@ -9853,6 +9915,42 @@ class WulframServer:
                 ),
                 "dirty_model_collision_center": dirty_dispatch_debug.get(
                     "dirty_model_collision_center"
+                ),
+                "dirty_bounds_box_fallback_enabled": dirty_dispatch_debug.get(
+                    "dirty_bounds_box_fallback_enabled"
+                ),
+                "dirty_bounds_box_fallback_attempted": dirty_dispatch_debug.get(
+                    "dirty_bounds_box_fallback_attempted"
+                ),
+                "dirty_bounds_box_fallback_applied": dirty_dispatch_debug.get(
+                    "dirty_bounds_box_fallback_applied"
+                ),
+                "dirty_bounds_box_shape": dirty_dispatch_debug.get(
+                    "dirty_bounds_box_shape"
+                ),
+                "dirty_bounds_box_half_extents_source": dirty_dispatch_debug.get(
+                    "dirty_bounds_box_half_extents_source"
+                ),
+                "dirty_bounds_box_half_extents": dirty_dispatch_debug.get(
+                    "dirty_bounds_box_half_extents"
+                ),
+                "dirty_bounds_box_center_mode": dirty_dispatch_debug.get(
+                    "dirty_bounds_box_center_mode"
+                ),
+                "dirty_bounds_box_z_offset": dirty_dispatch_debug.get(
+                    "dirty_bounds_box_z_offset"
+                ),
+                "dirty_bounds_box_bounds_center": dirty_dispatch_debug.get(
+                    "dirty_bounds_box_bounds_center"
+                ),
+                "dirty_bounds_box_collision_center": dirty_dispatch_debug.get(
+                    "dirty_bounds_box_collision_center"
+                ),
+                "dirty_bounds_box_contact": dirty_dispatch_debug.get(
+                    "dirty_bounds_box_contact"
+                ),
+                "dirty_bounds_box_reject": dirty_dispatch_debug.get(
+                    "dirty_bounds_box_reject"
                 ),
                 "dirty_raycast_reject": dirty_dispatch_debug.get("dirty_raycast_reject"),
                 "dirty_raycast_start": dirty_dispatch_debug.get("dirty_raycast_start"),
@@ -11669,10 +11767,14 @@ class WulframServer:
             "dirty_current_pos": (anchor[0], anchor[1], anchor[2]),
             "dirty_miss_refresh_enabled": dirty_miss_refresh_enabled,
             "dirty_model_center_mode": dirty_model_center_mode,
+            "dirty_bounds_box_fallback_enabled": dirty_bounds_box_fallback_enabled,
+            "dirty_bounds_box_shape": dirty_bounds_box_shape,
+            "dirty_bounds_box_center_mode": dirty_bounds_box_center_mode,
         })
         if ctx.world_collision_bounds_dirty:
             dirty_contact_fn = None
             dirty_contact_args = None
+            dirty_contact_source = None
             if collision_model is not None and terrain_collision_shape == "model":
                 dirty_contact_fn = getattr(self._terrain_grid_collision, "test_model_bounds_contact", None)
                 if callable(dirty_contact_fn):
@@ -11699,6 +11801,7 @@ class WulframServer:
                         "dirty_model_bounds_center": dirty_contact_args[0],
                         "dirty_model_collision_center": dirty_contact_args[1],
                     })
+                    dirty_contact_source = "model_bounds"
             else:
                 dirty_contact_fn = getattr(self._terrain_grid_collision, "test_box_bounds_contact", None)
                 if callable(dirty_contact_fn):
@@ -11719,6 +11822,7 @@ class WulframServer:
                         "dirty_model_bounds_center": dirty_contact_args[0],
                         "dirty_model_collision_center": dirty_contact_args[1],
                     })
+                    dirty_contact_source = "box_bounds"
 
             if dirty_contact_args is not None:
                 if collision_model is not None and terrain_collision_shape == "model":
@@ -11729,6 +11833,63 @@ class WulframServer:
                     )
                 else:
                     contact = dirty_contact_fn(*dirty_contact_args)
+                if (
+                    contact is None
+                    and dirty_contact_source == "model_bounds"
+                    and dirty_bounds_box_fallback_enabled
+                ):
+                    box_contact_fn = getattr(
+                        self._terrain_grid_collision,
+                        "test_box_bounds_contact",
+                        None,
+                    )
+                    dirty_dispatch_debug["dirty_bounds_box_fallback_attempted"] = True
+                    if callable(box_contact_fn):
+                        box_half_extents, box_half_extents_source = (
+                            dirty_bounds_box_half_extents()
+                        )
+                        box_center, box_center_mode, box_z_offset = (
+                            dirty_bounds_box_center()
+                        )
+                        box_args = (
+                            (anchor[0], anchor[1], anchor[2]),
+                            box_center,
+                            box_half_extents,
+                            heading,
+                            bounding_radius,
+                        )
+                        dirty_dispatch_debug.update({
+                            "dirty_bounds_box_half_extents_source": (
+                                box_half_extents_source
+                            ),
+                            "dirty_bounds_box_half_extents": box_half_extents,
+                            "dirty_bounds_box_center_mode": box_center_mode,
+                            "dirty_bounds_box_z_offset": box_z_offset,
+                            "dirty_bounds_box_bounds_center": box_args[0],
+                            "dirty_bounds_box_collision_center": box_args[1],
+                        })
+                        contact = box_contact_fn(*box_args)
+                        if contact is not None:
+                            dirty_contact_source = "box_bounds_fallback"
+                            dirty_contact_args = box_args
+                            dirty_dispatch_debug[
+                                "dirty_bounds_box_fallback_applied"
+                            ] = True
+                            dirty_dispatch_debug[
+                                "dirty_bounds_box_contact"
+                            ] = probe_contact_fields(
+                                contact,
+                                center=box_center,
+                                z_lift_used=box_z_offset,
+                            )
+                        else:
+                            dirty_dispatch_debug[
+                                "dirty_bounds_box_reject"
+                            ] = "no_box_bounds_contact"
+                    else:
+                        dirty_dispatch_debug[
+                            "dirty_bounds_box_reject"
+                        ] = "no_box_bounds_contact_fn"
                 if contact is not None:
                     if self._is_pathological_dirty_bounds_contact((anchor[0], anchor[1], anchor[2]), contact, bounding_radius):
                         ctx.debug_last_collision = {
@@ -11740,6 +11901,33 @@ class WulframServer:
                             "dirty_model_center_mode": dirty_model_center_mode,
                             "dirty_bounds_center": dirty_contact_args[0],
                             "dirty_collision_center": dirty_contact_args[1],
+                            "dirty_bounds_contact_source": dirty_contact_source,
+                            "dirty_bounds_box_fallback_enabled": (
+                                dirty_bounds_box_fallback_enabled
+                            ),
+                            "dirty_bounds_box_fallback_attempted": (
+                                dirty_dispatch_debug.get(
+                                    "dirty_bounds_box_fallback_attempted"
+                                )
+                            ),
+                            "dirty_bounds_box_fallback_applied": (
+                                dirty_dispatch_debug.get(
+                                    "dirty_bounds_box_fallback_applied"
+                                )
+                            ),
+                            "dirty_bounds_box_shape": dirty_dispatch_debug.get(
+                                "dirty_bounds_box_shape"
+                            ),
+                            "dirty_bounds_box_half_extents_source": (
+                                dirty_dispatch_debug.get(
+                                    "dirty_bounds_box_half_extents_source"
+                                )
+                            ),
+                            "dirty_bounds_box_center_mode": (
+                                dirty_dispatch_debug.get(
+                                    "dirty_bounds_box_center_mode"
+                                )
+                            ),
                             "detail": f"reference={reference_pos!r}",
                             "dirty_threshold_sq": dirty_threshold_sq,
                             "dirty_displacement_sq": displacement_sq,
@@ -11751,15 +11939,53 @@ class WulframServer:
                             "dirty_model_center_mode": dirty_model_center_mode,
                             "dirty_bounds_center": dirty_contact_args[0],
                             "dirty_collision_center": dirty_contact_args[1],
+                            "dirty_bounds_contact_source": dirty_contact_source,
+                            "dirty_bounds_box_fallback_enabled": (
+                                dirty_bounds_box_fallback_enabled
+                            ),
+                            "dirty_bounds_box_fallback_attempted": (
+                                dirty_dispatch_debug.get(
+                                    "dirty_bounds_box_fallback_attempted"
+                                )
+                            ),
+                            "dirty_bounds_box_fallback_applied": (
+                                dirty_dispatch_debug.get(
+                                    "dirty_bounds_box_fallback_applied"
+                                )
+                            ),
+                            "dirty_bounds_box_shape": dirty_dispatch_debug.get(
+                                "dirty_bounds_box_shape"
+                            ),
+                            "dirty_bounds_box_half_extents_source": (
+                                dirty_dispatch_debug.get(
+                                    "dirty_bounds_box_half_extents_source"
+                                )
+                            ),
+                            "dirty_bounds_box_center_mode": (
+                                dirty_dispatch_debug.get(
+                                    "dirty_bounds_box_center_mode"
+                                )
+                            ),
                             "model_contact_selection": model_contact_selection,
                             "dirty_threshold_sq": dirty_threshold_sq,
                             "dirty_displacement_sq": displacement_sq,
                         })
                         ctx.debug_last_motion_collision = dict(ctx.debug_last_collision)
+                        update_contact_probe(
+                            (anchor[0], anchor[1], anchor[2]),
+                            None,
+                            reason=f"{dirty_contact_source}_contact",
+                            raw_error="dirty_bounds_contact",
+                        )
                         ctx.world_collision_ref_pos = (anchor[0], anchor[1], anchor[2])
                         return finish_result(anchor[0], anchor[1], anchor[2], vx, vy, vz)
                 else:
-                    dirty_dispatch_debug["dirty_miss_reason"] = "dirty_bounds_clear"
+                    if dirty_dispatch_debug.get("dirty_bounds_box_reject"):
+                        dirty_dispatch_debug[
+                            "dirty_miss_reason"
+                        ] = "dirty_bounds_clear_box_clear"
+                    else:
+                        dirty_dispatch_debug["dirty_miss_reason"] = "dirty_bounds_clear"
             else:
                 bounds_overlap_fn = getattr(self._terrain_grid_collision, "test_bounds_intersection", None)
                 if callable(bounds_overlap_fn):

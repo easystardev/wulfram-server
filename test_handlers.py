@@ -11070,6 +11070,199 @@ def test_entity_world_collision_dirty_miss_still_records_raw_origin_probe():
     return True
 
 
+def test_entity_world_collision_dirty_model_clear_skips_box_fallback_by_default():
+    """A model-bounds miss must not silently switch to the box dirty phase without the probe env."""
+    env_keys = [
+        "WULFRAM_ENTITY_TERRAIN_COLLISION_SHAPE",
+        "WULFRAM_ENTITY_TERRAIN_DIRTY_BOUNDS_BOX_FALLBACK",
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK",
+    ]
+    old_env = {key: os.environ.get(key) for key in env_keys}
+    try:
+        os.environ["WULFRAM_ENTITY_TERRAIN_COLLISION_SHAPE"] = "model"
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_DIRTY_BOUNDS_BOX_FALLBACK", None)
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK", None)
+        raycast_calls = []
+        box_bounds_calls = []
+
+        def fake_raycast(start, end):
+            raycast_calls.append((start, end))
+            return None
+
+        def fake_box_bounds_contact(*args, **kwargs):
+            box_bounds_calls.append((args, kwargs))
+            return TerrainContact(
+                position=(10.0, 0.0, 4.0),
+                normal=(0.0, 0.0, 1.0),
+                penetration=1.5,
+                sector_index=0,
+                cell=(0, 0),
+            )
+
+        server = WulframServer.__new__(WulframServer)
+        server._terrain_grid_collision = SimpleNamespace(
+            test_model_bounds_contact=lambda *args, **kwargs: None,
+            test_box_bounds_contact=fake_box_bounds_contact,
+            raycast=fake_raycast,
+            test_model_collision=lambda *args, **kwargs: None,
+            test_box_collision=lambda *args, **kwargs: None,
+        )
+        server._get_entity_world_half_extents = lambda ctx: (4.0, 4.0, 4.0)
+        server._get_entity_world_collision_model = lambda ctx: (
+            [],
+            SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=5.0)),
+            5.0,
+            3.0,
+        )
+        server._get_entity_dirty_threshold_sq = lambda ctx, half_extents: 1.0
+
+        ctx = ClientContext(
+            client_id=1,
+            client_addr=("10.10.10.2", 50000),
+            session=Session(),
+            entity_id=0x14EA,
+        )
+        ctx.player_heading = 0.0
+        ctx.player_pos = (0.0, 0.0, 4.0)
+        ctx.world_collision_ref_pos = (0.0, 0.0, 4.0)
+
+        result = server._resolve_entity_world_collision(
+            ctx,
+            10.0,
+            0.0,
+            4.0,
+            1.0,
+            0.0,
+            0.0,
+        )
+
+        assert result == (10.0, 0.0, 4.0, 1.0, 0.0, 0.0), result
+        assert box_bounds_calls == [], box_bounds_calls
+        assert raycast_calls == [((0.0, 0.0, 4.0), (10.0, 0.0, 4.0))], raycast_calls
+        probe = ctx.debug_last_terrain_contact_probe
+        assert probe["dirty_bounds_box_fallback_enabled"] is False, probe
+        assert "dirty_bounds_box_fallback_attempted" not in probe or probe[
+            "dirty_bounds_box_fallback_attempted"
+        ] is None, probe
+        assert probe["dirty_miss_reason"] == "dirty_bounds_clear", probe
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    print("test_entity_world_collision_dirty_model_clear_skips_box_fallback_by_default: PASSED")
+    return True
+
+
+@_legacy_contact_response_test
+def test_entity_world_collision_dirty_model_clear_can_use_box_fallback():
+    """Opt-in rough-terrain probe can test the decompile-style box dirty phase after model bounds miss."""
+    env_keys = [
+        "WULFRAM_ENTITY_TERRAIN_COLLISION_SHAPE",
+        "WULFRAM_ENTITY_TERRAIN_DIRTY_BOUNDS_BOX_FALLBACK",
+        "WULFRAM_ENTITY_TERRAIN_DIRTY_BOUNDS_BOX_SHAPE",
+        "WULFRAM_ENTITY_TERRAIN_DIRTY_BOUNDS_BOX_CENTER",
+    ]
+    old_env = {key: os.environ.get(key) for key in env_keys}
+    try:
+        os.environ["WULFRAM_ENTITY_TERRAIN_COLLISION_SHAPE"] = "model"
+        os.environ["WULFRAM_ENTITY_TERRAIN_DIRTY_BOUNDS_BOX_FALLBACK"] = "1"
+        os.environ["WULFRAM_ENTITY_TERRAIN_DIRTY_BOUNDS_BOX_SHAPE"] = "inertia"
+        os.environ["WULFRAM_ENTITY_TERRAIN_DIRTY_BOUNDS_BOX_CENTER"] = "raw"
+        raycast_calls = []
+        model_bounds_calls = []
+        box_bounds_calls = []
+
+        def fake_raycast(start, end):
+            raycast_calls.append((start, end))
+            return None
+
+        def fake_model_bounds_contact(*args, **kwargs):
+            model_bounds_calls.append((args, kwargs))
+            return None
+
+        def fake_box_bounds_contact(*args, **kwargs):
+            box_bounds_calls.append((args, kwargs))
+            return TerrainContact(
+                position=(10.0, 0.0, 4.0),
+                normal=(0.0, 0.0, 1.0),
+                penetration=1.5,
+                sector_index=0,
+                cell=(0, 0),
+                normal_source="terrain_box_sat",
+            )
+
+        server = WulframServer.__new__(WulframServer)
+        server._terrain_grid_collision = SimpleNamespace(
+            test_model_bounds_contact=fake_model_bounds_contact,
+            test_box_bounds_contact=fake_box_bounds_contact,
+            raycast=fake_raycast,
+            test_model_collision=lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("clean model contact should not run after dirty fallback")
+            ),
+            test_box_collision=lambda *args, **kwargs: None,
+        )
+        server._get_entity_world_half_extents = lambda ctx: (4.0, 4.0, 4.0)
+        server._get_entity_world_collision_model = lambda ctx: (
+            [],
+            SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=5.0)),
+            5.0,
+            3.0,
+        )
+        server._get_entity_dirty_threshold_sq = lambda ctx, half_extents: 1.0
+
+        ctx = ClientContext(
+            client_id=1,
+            client_addr=("10.10.10.2", 50000),
+            session=Session(),
+            entity_id=0x14EA,
+        )
+        ctx.player_heading = 0.0
+        ctx.player_pos = (0.0, 0.0, 4.0)
+        ctx.world_collision_ref_pos = (0.0, 0.0, 4.0)
+
+        px, py, pz, vx, vy, vz = server._resolve_entity_world_collision(
+            ctx,
+            10.0,
+            0.0,
+            4.0,
+            1.0,
+            0.0,
+            -5.0,
+        )
+
+        assert model_bounds_calls, model_bounds_calls
+        assert box_bounds_calls, box_bounds_calls
+        args, kwargs = box_bounds_calls[0]
+        assert args == ((10.0, 0.0, 4.0), (10.0, 0.0, 4.0), (4.0, 4.0, 4.0), 0.0, 5.0), args
+        assert kwargs == {}, kwargs
+        assert raycast_calls == [], raycast_calls
+        assert abs(px - 10.0) < 1e-6, (px, py, pz, vx, vy, vz)
+        assert abs(py) < 1e-6, (px, py, pz, vx, vy, vz)
+        assert pz > 5.0, (px, py, pz, vx, vy, vz)
+        assert abs(vx - 1.0) < 1e-6, (px, py, pz, vx, vy, vz)
+        assert abs(vy) < 1e-6, (px, py, pz, vx, vy, vz)
+        assert abs(vz) < 1e-6, (px, py, pz, vx, vy, vz)
+        debug = ctx.debug_last_motion_collision
+        assert debug["kind"] == "terrain_dirty_bounds", debug
+        assert debug["dirty_bounds_contact_source"] == "box_bounds_fallback", debug
+        assert debug["dirty_bounds_box_fallback_applied"] is True, debug
+        assert debug["dirty_bounds_box_half_extents_source"] == "inertia_half_extents", debug
+        probe = ctx.debug_last_terrain_contact_probe
+        assert probe["reason"] == "box_bounds_fallback_contact", probe
+        assert probe["dirty_bounds_box_fallback_applied"] is True, probe
+        assert probe["dirty_bounds_box_contact"]["contact_normal_source"] == "terrain_box_sat", probe
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    print("test_entity_world_collision_dirty_model_clear_can_use_box_fallback: PASSED")
+    return True
+
+
 def test_entity_world_collision_can_probe_decompile_box_shape_with_model_loaded():
     """The rough-terrain A/B can use the decompile terrain-vs-entity hull path instead of model CBSP."""
     old_shape = os.environ.get("WULFRAM_ENTITY_TERRAIN_COLLISION_SHAPE")
@@ -12454,6 +12647,8 @@ def main():
         test_entity_world_collision_preserves_reference_on_clean_miss_until_dirty,
         test_entity_world_collision_can_preserve_dirty_miss_reference_for_probe,
         test_entity_world_collision_dirty_miss_still_records_raw_origin_probe,
+        test_entity_world_collision_dirty_model_clear_skips_box_fallback_by_default,
+        test_entity_world_collision_dirty_model_clear_can_use_box_fallback,
         test_entity_world_collision_can_probe_decompile_box_shape_with_model_loaded,
         test_entity_world_collision_dirty_threshold_uses_mesh_min_half_extent,
         test_entity_world_collision_dirty_raycast_uses_contact_separation,
