@@ -8822,12 +8822,33 @@ class WulframServer:
             )
             z_lift = half_extents[2]
             inertia_half_extents = half_extents
+        terrain_collision_shape = (
+            os.environ.get("WULFRAM_ENTITY_TERRAIN_COLLISION_SHAPE", "model")
+            .strip()
+            .lower()
+        )
+        if terrain_collision_shape in {"box", "obb", "hull", "aabb", "decompile"}:
+            terrain_collision_shape = "box"
+        elif terrain_collision_shape in {
+            "entity_box",
+            "raw_box",
+            "origin_box",
+            "decompile_entity",
+        }:
+            terrain_collision_shape = "entity_box"
+        else:
+            terrain_collision_shape = "model"
         body_ang_vel = getattr(ctx, "spring_body_ang_vel", (0.0, 0.0)) or (0.0, 0.0)
         contact_angular_velocity = [
             float(body_ang_vel[0]) if len(body_ang_vel) > 0 else 0.0,
             float(body_ang_vel[1]) if len(body_ang_vel) > 1 else 0.0,
             float(getattr(ctx, "angular_vel_yaw", 0.0) or 0.0),
         ]
+
+        def box_collision_z_lift() -> float:
+            if terrain_collision_shape == "entity_box":
+                return 0.0
+            return z_lift if collision_model is not None else half_extents[2]
 
         def contact_debug_fields(contact):
             return {
@@ -9391,6 +9412,7 @@ class WulframServer:
                 "origin_mode": origin_mode,
                 "contact_response": contact_response,
                 "contact_timing_mode": contact_timing_mode,
+                "terrain_collision_shape": terrain_collision_shape,
                 "probe_enabled": True,
                 "position": pos,
                 "velocity": (vx, vy, vz),
@@ -9427,7 +9449,7 @@ class WulframServer:
         def sample_contact_at(pos):
             if not finite_values((*pos, heading)):
                 return None
-            if collision_model is not None:
+            if collision_model is not None and terrain_collision_shape == "model":
                 model_center = (pos[0], pos[1], pos[2] + z_lift)
                 return self._terrain_grid_collision.test_model_collision(
                     model_center,
@@ -9436,10 +9458,10 @@ class WulframServer:
                     cbsp_tree,
                     bounding_radius,
                 )
-            box_center = (pos[0], pos[1], pos[2] + half_extents[2])
+            box_center = (pos[0], pos[1], pos[2] + box_collision_z_lift())
             return self._terrain_grid_collision.test_box_collision(
                 box_center,
-                half_extents,
+                inertia_half_extents,
                 heading,
             )
 
@@ -9960,6 +9982,7 @@ class WulframServer:
                     "point": contact.position,
                     "normal": contact.normal,
                     "depth": contact.penetration,
+                    "terrain_collision_shape": terrain_collision_shape,
                     **contact_debug_fields(contact),
                     "detail": f"reference={reference_pos!r}",
                     **(response_debug or {}),
@@ -9992,6 +10015,7 @@ class WulframServer:
                 "point": contact.position,
                 "normal": contact.normal,
                 "depth": contact.penetration,
+                "terrain_collision_shape": terrain_collision_shape,
                 **contact_debug_fields(contact),
             }
             ctx.debug_last_collision = {
@@ -9999,6 +10023,7 @@ class WulframServer:
                 "point": contact.position,
                 "normal": contact.normal,
                 "depth": contact.penetration,
+                "terrain_collision_shape": terrain_collision_shape,
                 **contact_debug_fields(contact),
                 "detail": f"reference={reference_pos!r}",
                 **response_debug,
@@ -10575,6 +10600,7 @@ class WulframServer:
                 "point": contact.position,
                 "normal": contact.normal,
                 "depth": contact.penetration,
+                "terrain_collision_shape": terrain_collision_shape,
                 **contact_debug_fields(contact),
                 "timing_response": (
                     "terrain_contact_pair_toi_single_step"
@@ -10724,6 +10750,7 @@ class WulframServer:
                 "point": contact.position,
                 "normal": contact.normal,
                 "depth": contact.penetration,
+                "terrain_collision_shape": terrain_collision_shape,
                 **contact_debug_fields(contact),
                 **(response_debug or {}),
             }
@@ -10750,7 +10777,7 @@ class WulframServer:
         if ctx.world_collision_bounds_dirty:
             dirty_contact_fn = None
             dirty_contact_args = None
-            if collision_model is not None:
+            if collision_model is not None and terrain_collision_shape == "model":
                 dirty_contact_fn = getattr(self._terrain_grid_collision, "test_model_bounds_contact", None)
                 if callable(dirty_contact_fn):
                     dirty_contact_args = (
@@ -10764,10 +10791,16 @@ class WulframServer:
             else:
                 dirty_contact_fn = getattr(self._terrain_grid_collision, "test_box_bounds_contact", None)
                 if callable(dirty_contact_fn):
+                    box_z_lift = box_collision_z_lift()
+                    box_center = (
+                        anchor[0],
+                        anchor[1],
+                        anchor[2] + box_z_lift,
+                    )
                     dirty_contact_args = (
-                        (anchor[0], anchor[1], anchor[2]),
-                        (anchor[0], anchor[1], anchor[2] + half_extents[2]),
-                        half_extents,
+                        box_center,
+                        box_center,
+                        inertia_half_extents,
                         heading,
                         bounding_radius,
                     )

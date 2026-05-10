@@ -10149,6 +10149,92 @@ def test_entity_world_collision_dirty_miss_still_records_raw_origin_probe():
     return True
 
 
+def test_entity_world_collision_can_probe_decompile_box_shape_with_model_loaded():
+    """The rough-terrain A/B can use the decompile terrain-vs-entity hull path instead of model CBSP."""
+    old_shape = os.environ.get("WULFRAM_ENTITY_TERRAIN_COLLISION_SHAPE")
+    try:
+        os.environ["WULFRAM_ENTITY_TERRAIN_COLLISION_SHAPE"] = "box"
+        model_calls = []
+        box_calls = []
+
+        def fake_model_collision(center, *args, **kwargs):
+            model_calls.append(center)
+            return TerrainContact(
+                position=(0.0, 0.0, 5.0),
+                normal=(0.0, 0.0, 1.0),
+                penetration=1.0,
+                sector_index=0,
+                cell=(0, 0),
+                normal_source="model_should_not_be_used",
+            )
+
+        def fake_box_collision(center, half_extents, heading):
+            box_calls.append((center, half_extents, heading))
+            return TerrainContact(
+                position=(0.0, 0.0, 4.5),
+                normal=(0.0, 0.0, 1.0),
+                penetration=0.1,
+                sector_index=0,
+                cell=(0, 0),
+                normal_source="terrain_box_sat",
+            )
+
+        server = WulframServer.__new__(WulframServer)
+        server._terrain_grid_collision = SimpleNamespace(
+            test_model_bounds_contact=lambda *args, **kwargs: None,
+            test_model_collision=fake_model_collision,
+            test_box_bounds_contact=lambda *args, **kwargs: None,
+            test_box_collision=fake_box_collision,
+            raycast=lambda *args, **kwargs: None,
+        )
+        server._get_entity_world_half_extents = lambda ctx: (4.0, 4.0, 4.0)
+        server._get_entity_world_collision_model = lambda ctx: (
+            [
+                SimpleNamespace(x=-6.0, y=-7.0, z=-2.0),
+                SimpleNamespace(x=6.0, y=7.0, z=2.0),
+            ],
+            SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=9.0)),
+            9.0,
+            2.0,
+        )
+        server._get_entity_dirty_threshold_sq = lambda ctx, half_extents: 10000.0
+
+        ctx = ClientContext(
+            client_id=1,
+            client_addr=("10.10.10.2", 50000),
+            session=Session(team_id=1),
+            entity_id=0x14EA,
+        )
+        ctx.player_heading = 0.0
+        ctx.player_pos = (0.0, 0.0, 2.0)
+        ctx.world_collision_ref_pos = (0.0, 0.0, 2.0)
+
+        px, py, pz, vx, vy, vz = server._resolve_entity_world_collision(
+            ctx,
+            0.0,
+            0.0,
+            2.0,
+            0.0,
+            0.0,
+            -1.0,
+        )
+
+        assert model_calls == [], model_calls
+        assert box_calls == [((0.0, 0.0, 4.0), (6.0, 7.0, 2.0), 0.0)], box_calls
+        assert pz > 2.0, (px, py, pz, vx, vy, vz)
+        debug = ctx.debug_last_motion_collision
+        assert debug["kind"] == "terrain_clean_contact", debug
+        assert debug["terrain_collision_shape"] == "box", debug
+        assert debug["contact_normal_source"] == "terrain_box_sat", debug
+    finally:
+        if old_shape is None:
+            os.environ.pop("WULFRAM_ENTITY_TERRAIN_COLLISION_SHAPE", None)
+        else:
+            os.environ["WULFRAM_ENTITY_TERRAIN_COLLISION_SHAPE"] = old_shape
+    print("test_entity_world_collision_can_probe_decompile_box_shape_with_model_loaded: PASSED")
+    return True
+
+
 def test_entity_world_collision_dirty_threshold_uses_mesh_min_half_extent():
     """Dirty threshold should use the assigned collision mesh min half-extent, including Z, per the decompile."""
     server = WulframServer.__new__(WulframServer)
@@ -11437,6 +11523,7 @@ def main():
         test_entity_world_collision_refreshes_reference_on_clean_contact,
         test_entity_world_collision_preserves_reference_on_clean_miss_until_dirty,
         test_entity_world_collision_dirty_miss_still_records_raw_origin_probe,
+        test_entity_world_collision_can_probe_decompile_box_shape_with_model_loaded,
         test_entity_world_collision_dirty_threshold_uses_mesh_min_half_extent,
         test_entity_world_collision_dirty_raycast_uses_contact_separation,
         test_entity_world_collision_dirty_raycast_uses_decompile_degenerate_threshold,
