@@ -7221,14 +7221,12 @@ def test_entity_world_collision_pair_record_contact_applies_decompile_face_gated
         os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_TIMED_CONTACT"] = "0"
         os.environ.pop("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT_SELECTION", None)
         os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_NORMAL_SOURCE"] = "mesh"
-        os.environ[
-            "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE"
-        ] = "entity_radial_terrain_face_forward_up"
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE", None)
         os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE"] = "closing_velocity"
         os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE"] = "preserve"
-        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_VERTICAL_DELTA_MODE"] = "scale"
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_VERTICAL_DELTA_MODE", None)
         os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VELOCITY_DELTA"] = "3.0"
-        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VERTICAL_DELTA"] = "1.0"
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VERTICAL_DELTA", None)
         terrain_face_normal = (0.25, 0.0, 0.9682458365518543)
         calls = []
 
@@ -7291,15 +7289,15 @@ def test_entity_world_collision_pair_record_contact_applies_decompile_face_gated
         assert debug["pair_record_solver_normal_source"] == "entity_cbsp_split", debug
         assert (
             debug["pair_record_contact_delta_normal_source"]
-            == "entity_radial_terrain_face_forward_up"
+            == "entity_radial_terrain_face_blend"
         ), debug
         assert debug["pair_record_delta_normal_source"] == (
-            "entity_radial_terrain_face_forward_up"
+            "entity_radial_terrain_face_blend"
         ), debug
         assert debug["pair_record_terrain_face_normal"] == terrain_face_normal, debug
         assert debug["raw_origin_fallback_delta_mode"] == "closing_velocity", debug
         assert debug["raw_origin_fallback_delta_normal_source"] == (
-            "entity_radial_terrain_face_forward_up"
+            "entity_radial_terrain_face_blend"
         ), debug
         assert debug["raw_origin_fallback_angular_mode"] == "preserve", debug
         assert debug["raw_origin_fallback_vertical_delta_mode"] == "scale", debug
@@ -7313,7 +7311,7 @@ def test_entity_world_collision_pair_record_contact_applies_decompile_face_gated
         assert probe["pair_record_contact_reject"] == "", probe
         assert probe["pair_record_contact_selection"] == "upward_min_depth", probe
         assert probe["pair_record_contact_delta_normal_source"] == (
-            "entity_radial_terrain_face_forward_up"
+            "entity_radial_terrain_face_blend"
         ), probe
         assert probe["pair_record_contact_max_vertical_delta"] == 1.0, probe
         assert probe["pair_record_contact"]["contact_terrain_face_normal"] == terrain_face_normal, probe

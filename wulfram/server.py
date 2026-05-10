@@ -9206,7 +9206,7 @@ class WulframServer:
         pair_record_contact_delta_normal_source = (
             os.environ.get(
                 "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE",
-                "entity_radial_terrain_face_forward_up",
+                "entity_radial_terrain_face_blend",
             )
             .strip()
             .lower()
@@ -9231,7 +9231,7 @@ class WulframServer:
         pair_record_contact_vertical_delta_mode = (
             os.environ.get(
                 "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_VERTICAL_DELTA_MODE",
-                "component",
+                "scale",
             )
             .strip()
             .lower()
@@ -9255,11 +9255,11 @@ class WulframServer:
             pair_record_contact_max_vertical_delta = float(
                 os.environ.get(
                     "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VERTICAL_DELTA",
-                    "0.0",
+                    "1.0",
                 )
             )
         except ValueError:
-            pair_record_contact_max_vertical_delta = 0.0
+            pair_record_contact_max_vertical_delta = 1.0
         try:
             pair_record_contact_max_speed = float(
                 os.environ.get("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_SPEED", "200.0")
