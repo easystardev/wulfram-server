@@ -6961,6 +6961,12 @@ def test_entity_world_collision_reference_pose_probe_records_pre_step_contact_wh
         assert getattr(ctx, "debug_last_motion_collision", {}) == {}
         probe = ctx.debug_last_terrain_contact_probe
         assert probe["reference_pose_probe_enabled"] is True, probe
+        assert probe["pre_step_pos"] == (0.0, 0.0, 10.0), probe
+        assert probe["pre_step_vel"] == (1.0, 0.0, 0.0), probe
+        assert abs(probe["step_dt"] - (1.0 / 30.0)) < 1e-9, probe
+        assert probe["timing_ready"] is True, probe
+        assert probe["pair_record_timed_contact_enabled"] is False, probe
+        assert probe["pair_record_continue_remaining_enabled"] is False, probe
         references = probe["reference_pose_contacts"]
         assert "pre_pos" in references, references
         pre_ref = references["pre_pos"]
