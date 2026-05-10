@@ -539,6 +539,10 @@ class ControlServer:
             return self._cmd_projectiles(args)
         elif cmd == 'buildings' or cmd == 'bld':
             return self._cmd_buildings(args)
+        elif cmd == 'building_events' or cmd == 'bevents':
+            return self._cmd_building_events(args)
+        elif cmd == 'building_damage' or cmd == 'bdmg':
+            return self._cmd_building_damage(args)
         elif cmd == 'input' or cmd == 'inp':
             return self._cmd_input(args)
         elif cmd == 'move' or cmd == 'mv':
@@ -600,6 +604,8 @@ class ControlServer:
   players / pl [json]    - Show all connected players' positions and headings
   projectiles / proj [json] - Dump live in-flight projectile state for divergence probes
   buildings / bld [json] - Dump static building, supply-pad, and turret state
+  building_events / bevents [json] - Dump recent dynamic building lifecycle events
+  building_damage / bdmg <oid> <hp|destroy> - Damage/destroy a building for demo gates
   jump / jj [secs] [c<id>] - Pulse opt-in server-side jumpjet action
   help                   - Show this help
   quit                   - Disconnect
@@ -2134,6 +2140,69 @@ Examples:
                 f"pos=({x:.1f},{y:.1f},{z:.1f}) hp={hp_text}{flag_text}"
             )
         return "\n".join(lines)
+
+    def _cmd_building_events(self, args: list) -> str:
+        """Dump recent dynamic building lifecycle evidence for demo gates."""
+        import json as _json
+        import time as _time
+
+        if not self.server:
+            return "Error: No server reference"
+
+        json_mode = bool(args) and args[0].lower() == "json"
+        events = list(getattr(self.server, "_building_lifecycle_events", []) or [])
+        if json_mode:
+            return _json.dumps(events, indent=2)
+        if not events:
+            return "No building lifecycle events"
+        now = _time.time()
+        lines = []
+        for event in events[-12:]:
+            age = max(0.0, now - float(event.get("time", now) or now))
+            action = str(event.get("action") or "?")
+            oid = int(event.get("oid", 0) or 0)
+            source = str(event.get("source") or "")
+            old_hp = event.get("old_health")
+            new_hp = event.get("new_health", event.get("health"))
+            hp_text = f" hp={old_hp:.0f}->{new_hp:.0f}" if old_hp is not None and new_hp is not None else ""
+            removed = " removed" if event.get("removed") else ""
+            lines.append(f"{age:.1f}s oid={oid} {action}{hp_text} source={source}{removed}")
+        return "\n".join(lines)
+
+    def _cmd_building_damage(self, args: list) -> str:
+        """Apply absolute HP damage to a building and emit lifecycle evidence."""
+        import json as _json
+
+        if not self.server:
+            return "Error: No server reference"
+        if len(args) < 2:
+            return "Usage: building_damage <oid> <hp|destroy>"
+        try:
+            oid = int(args[0], 0)
+        except ValueError:
+            return f"Invalid building oid: {args[0]}"
+
+        health = getattr(self.server, "_building_health", {}) or {}
+        max_health = getattr(self.server, "_building_max_health", {}) or {}
+        if str(args[1]).lower() in ("destroy", "kill", "all"):
+            damage = float(health.get(oid, max_health.get(oid, 0.0)) or 0.0)
+        else:
+            try:
+                damage = float(args[1])
+            except ValueError:
+                return f"Invalid building damage: {args[1]}"
+            if 0.0 < damage <= 1.0:
+                damage *= float(max_health.get(oid, 0.0) or 0.0)
+        method = getattr(self.server, "_apply_building_damage_amount", None)
+        if not callable(method):
+            return "Error: Server does not expose building damage"
+        event = method(
+            oid,
+            damage,
+            source="control:building_damage",
+            remove_dynamic_on_destroy=True,
+        )
+        return _json.dumps(event, indent=2)
 
     def _cmd_projectiles(self, args: list) -> str:
         """Dump in-flight projectile state across all clients.

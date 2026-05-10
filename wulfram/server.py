@@ -600,6 +600,7 @@ class WulframServer:
         self._dynamic_building_ids: set[int] = set()
         self._dynamic_building_sources: dict[int, dict[str, Any]] = {}
         self._build_uplink_command_events: list[dict[str, Any]] = []
+        self._building_lifecycle_events: list[dict[str, Any]] = []
         self._uplink_ships: dict[int, dict[str, Any]] = {}
         self._static_world_raycast_root: Optional[_StaticWorldRayNode] = None
         self._building_collision = BuildingCollisionAssets()
@@ -2692,6 +2693,135 @@ class WulframServer:
         self._dynamic_building_next_oid = oid + 1
         return oid
 
+    def _remember_building_lifecycle_event(self, event: dict[str, Any]) -> dict[str, Any]:
+        events = getattr(self, "_building_lifecycle_events", None)
+        if events is None:
+            events = []
+            self._building_lifecycle_events = events
+        events.append(event)
+        del events[:-100]
+        return event
+
+    def _building_lifecycle_base_event(self, oid: int, action: str) -> dict[str, Any]:
+        building = self._building_entities.get(oid)
+        entity_type = int(getattr(building, "entity_type", -1) or -1) if building else -1
+        try:
+            entity_type_name = EntityType(entity_type).name
+        except ValueError:
+            entity_type_name = str(entity_type)
+        max_health = float(self._building_max_health.get(oid, 0.0) or 0.0)
+        health = float(self._building_health.get(oid, 0.0) or 0.0)
+        return {
+            "time": time.time(),
+            "action": action,
+            "oid": int(oid),
+            "entity_type": entity_type,
+            "entity_type_name": entity_type_name,
+            "team_id": int(getattr(building, "team_id", 0) or 0) if building else 0,
+            "pos": [round(float(v), 5) for v in building.pos] if building else None,
+            "health": health,
+            "max_health": max_health,
+            "health_pct": round((health / max_health * 100.0), 3) if max_health > 0.0 else None,
+            "dynamic": int(oid) in getattr(self, "_dynamic_building_ids", set()),
+            "dynamic_source": getattr(self, "_dynamic_building_sources", {}).get(int(oid), {}) or {},
+        }
+
+    def _broadcast_building_delete(
+        self,
+        oid: int,
+        *,
+        prefer_tcp: bool = True,
+        participants: tuple[ClientContext, ...] | None = None,
+    ) -> int:
+        packet = build_delete_object(get_ticks(), [int(oid)], with_effects=True)
+        sent = 0
+        for target in self._snapshot_in_game_clients():
+            if participants is not None and not self._combat_observer_packets_allowed_for_client(target, *participants):
+                continue
+            if self._send_packet_to_client(target, packet, prefer_tcp=prefer_tcp):
+                target.known_entity_ids.discard(int(oid))
+                sent += 1
+        return sent
+
+    def _remove_dynamic_building_record(self, oid: int) -> None:
+        building = self._building_entities.get(oid)
+        source = self._dynamic_building_sources.get(oid, {}) or {}
+        team_id = int(getattr(building, "team_id", 0) or 0) if building else 0
+        slot = source.get("slot")
+        ship = self._uplink_ships.get(team_id) if team_id else None
+        if ship is not None and slot is not None:
+            cargo = list(ship.get("cargo", [40, 40, 40, 40]))
+            try:
+                slot_index = int(slot)
+            except (TypeError, ValueError):
+                slot_index = -1
+            if 0 <= slot_index < len(cargo):
+                cargo[slot_index] = 40
+                ship["cargo"] = cargo
+                self._broadcast_uplink_ship_info(ship)
+        self._building_entities.pop(oid, None)
+        self._building_health.pop(oid, None)
+        self._building_max_health.pop(oid, None)
+        self._dynamic_building_ids.discard(oid)
+        self._dynamic_building_sources.pop(oid, None)
+        self._rebuild_static_world_raycast_index()
+
+    def _apply_building_damage_amount(
+        self,
+        oid: int,
+        damage: float,
+        *,
+        source: str,
+        remove_dynamic_on_destroy: bool = True,
+        delete_participants: tuple[ClientContext, ...] | None = None,
+    ) -> dict[str, Any]:
+        """Apply absolute building HP damage and record demo/audit evidence."""
+        oid = int(oid)
+        if oid not in self._building_entities:
+            return {"ok": False, "error": "unknown building", "oid": oid}
+        if oid not in self._building_health:
+            return {"ok": False, "error": "building has no health", "oid": oid}
+        try:
+            damage = float(damage)
+        except (TypeError, ValueError):
+            damage = 0.0
+        if not math.isfinite(damage) or damage <= 0.0:
+            return {"ok": False, "error": "damage must be positive", "oid": oid}
+
+        old_hp = float(self._building_health.get(oid, 0.0) or 0.0)
+        if old_hp <= 0.0:
+            event = self._building_lifecycle_base_event(oid, "damage_ignored")
+            event.update({"ok": False, "source": source, "reason": "already_destroyed"})
+            self._remember_building_lifecycle_event(event)
+            return event
+
+        new_hp = max(0.0, old_hp - damage)
+        self._building_health[oid] = new_hp
+        event = self._building_lifecycle_base_event(oid, "destroy" if new_hp <= 0.0 else "damage")
+        event.update(
+            {
+                "ok": True,
+                "source": source,
+                "damage": damage,
+                "old_health": old_hp,
+                "new_health": new_hp,
+                "destroyed": new_hp <= 0.0,
+                "delete_sent": 0,
+                "removed": False,
+            }
+        )
+        if new_hp <= 0.0:
+            event["delete_sent"] = self._broadcast_building_delete(
+                oid,
+                prefer_tcp=True,
+                participants=delete_participants,
+            )
+            if remove_dynamic_on_destroy and oid in self._dynamic_building_ids:
+                self._remove_dynamic_building_record(oid)
+                event["removed"] = True
+        self._remember_building_lifecycle_event(event)
+        return event
+
     def _choose_dynamic_building_pos(self, ctx: ClientContext, slot: int) -> tuple[float, float, float]:
         heading = float(getattr(ctx, "player_heading", 0.0) or 0.0)
         base = tuple(float(v) for v in (getattr(ctx, "player_pos", None) or (2600.0, 3040.0, 5.0)))
@@ -2843,6 +2973,15 @@ class WulframServer:
             f"[BUILD-UPLINK] created oid={oid} type={event['entity_type_name']} "
             f"team={team_id} pos=({x:.1f},{y:.1f},{z:.1f}) targets={sent}"
         )
+        lifecycle = self._building_lifecycle_base_event(oid, "create")
+        lifecycle.update(
+            {
+                "ok": sent > 0,
+                "source": "uplink_build",
+                "replication_targets": sent,
+            }
+        )
+        self._remember_building_lifecycle_event(lifecycle)
         return event
 
     def _delete_dynamic_building_from_uplink(
@@ -2869,11 +3008,7 @@ class WulframServer:
         if not candidates:
             return {"ok": False, "error": "no matching dynamic building"}
         oid = candidates[-1]
-        self._building_entities.pop(oid, None)
-        self._building_health.pop(oid, None)
-        self._building_max_health.pop(oid, None)
-        self._dynamic_building_ids.discard(oid)
-        self._dynamic_building_sources.pop(oid, None)
+        lifecycle = self._building_lifecycle_base_event(oid, "delete")
         ship = self._uplink_ships.get(team_id)
         if ship is not None and slot is not None:
             cargo = list(ship.get("cargo", [40, 40, 40, 40]))
@@ -2885,13 +3020,17 @@ class WulframServer:
                 cargo[slot_index] = 40
             ship["cargo"] = cargo
             self._broadcast_uplink_ship_info(ship)
-        self._rebuild_static_world_raycast_index()
-        packet = build_delete_object(get_ticks(), [oid], with_effects=True)
-        sent = 0
-        for target in self._snapshot_in_game_clients():
-            if self._send_packet_to_client(target, packet, prefer_tcp=False):
-                target.known_entity_ids.discard(oid)
-                sent += 1
+        sent = self._broadcast_building_delete(oid, prefer_tcp=False)
+        self._remove_dynamic_building_record(oid)
+        lifecycle.update(
+            {
+                "ok": sent > 0,
+                "source": "uplink_delete",
+                "delete_sent": sent,
+                "removed": True,
+            }
+        )
+        self._remember_building_lifecycle_event(lifecycle)
         return {"ok": sent > 0, "oid": oid, "replication_targets": sent}
 
     def _get_or_create_uplink_ship(self, ctx: ClientContext, team_id: int) -> dict[str, Any]:
@@ -14366,18 +14505,26 @@ class WulframServer:
             EntityType.FLAK_SHELL: 20.0,
         }
         damage = _PROJECTILE_BUILDING_DAMAGE.get(proj.entity_type, 50.0)
-        old_hp = self._building_health[building_oid]
-        self._building_health[building_oid] = max(0.0, old_hp - damage)
-        new_hp = self._building_health[building_oid]
-
-        building = self._building_entities.get(building_oid)
-        btype_name = building.entity_type.name if building else "UNKNOWN"
-        max_hp = self._building_max_health.get(building_oid, 1.0)
-        pct = (new_hp / max_hp * 100) if max_hp > 0 else 0
-
         attacker_name = attacker.session.username or f"Player{attacker.client_id}"
-        print(f"[BUILDING] {attacker_name} hit {btype_name} oid={building_oid} "
-              f"for {damage:.0f} dmg ({old_hp:.0f} -> {new_hp:.0f} / {max_hp:.0f}, {pct:.0f}%)")
+        event = self._apply_building_damage_amount(
+            int(building_oid),
+            damage,
+            source=f"projectile:{int(getattr(proj, 'entity_id', 0) or 0)}:{attacker_name}",
+            remove_dynamic_on_destroy=True,
+            delete_participants=(attacker,),
+        )
+        if not event.get("ok"):
+            return
+        old_hp = float(event.get("old_health", 0.0) or 0.0)
+        new_hp = float(event.get("new_health", 0.0) or 0.0)
+        max_hp = float(event.get("max_health", 1.0) or 1.0)
+        pct = (new_hp / max_hp * 100) if max_hp > 0 else 0.0
+        btype_name = str(event.get("entity_type_name") or "UNKNOWN")
+
+        print(
+            f"[BUILDING] {attacker_name} hit {btype_name} oid={building_oid} "
+            f"for {damage:.0f} dmg ({old_hp:.0f} -> {new_hp:.0f} / {max_hp:.0f}, {pct:.0f}%)"
+        )
 
         # Building destroyed
         if new_hp <= 0:
@@ -14385,14 +14532,6 @@ class WulframServer:
             # Track building kill
             attacker.kills += 1
             self._broadcast_player_stats(attacker, participants=(attacker,))
-
-            # DELETE_OBJECT for building with explosion effects
-            tick = self._get_network_tick(attacker)
-            del_pkt = build_delete_object(tick, [building_oid], with_effects=True)
-            for client in self._snapshot_in_game_clients():
-                if not self._combat_observer_packets_allowed_for_client(client, attacker):
-                    continue
-                self._send_packet_to_client(client, del_pkt, prefer_tcp=True)
             # Chat notification
             from .packets import build_chat_message
             msg = f"DESTROYED! {attacker_name} leveled a {btype_name}!"

@@ -12753,6 +12753,7 @@ def _minimal_build_uplink_server(ctx: ClientContext) -> WulframServer:
     server._dynamic_building_sources = {}
     server._dynamic_building_next_oid = 30000
     server._build_uplink_command_events = []
+    server._building_lifecycle_events = []
     server._uplink_ships = {}
     server._terrain_ground_z_at = lambda _x, _y: 4.0
     server._rebuild_static_world_raycast_index = lambda: None
@@ -12831,6 +12832,49 @@ def test_build_uplink_command_creates_dynamic_building():
     assert any(payload and payload[0] == 0x0E for payload, _addr in server.udp_handler.sent), server.udp_handler.sent
     assert any(payload and payload[0] == 0x2D for payload, _addr in server.udp_handler.sent), server.udp_handler.sent
     print("test_build_uplink_command_creates_dynamic_building: PASSED")
+    return True
+
+
+def test_dynamic_building_damage_control_destroys_and_records_delete():
+    """Demo lifecycle gate should have explicit damage, destroy, and delete evidence."""
+    ctx = _in_game_context()
+    server = _minimal_build_uplink_server(ctx)
+    packet = b"\x20\x00\x44\x00\x00" + _comm_request_body('build 29002 "Power Cell" 0')
+    event = server._handle_comm_message_request(
+        ctx,
+        packet,
+        transport="udp",
+        body=packet[5:],
+        addr=ctx.session.udp_addr,
+        sequence=0x44,
+    )
+    oid = int(event["result"]["oid"])
+
+    control = ControlServer(port=0)
+    control.server = server
+
+    first = json.loads(control._cmd_building_damage([str(oid), "250"]))
+    assert first["ok"] is True, first
+    assert first["action"] == "damage", first
+    assert first["old_health"] == 2000.0, first
+    assert first["new_health"] == 1750.0, first
+    assert oid in server._building_entities, first
+
+    destroyed = json.loads(control._cmd_building_damage([str(oid), "destroy"]))
+    assert destroyed["ok"] is True, destroyed
+    assert destroyed["action"] == "destroy", destroyed
+    assert destroyed["new_health"] == 0.0, destroyed
+    assert destroyed["delete_sent"] == 1, destroyed
+    assert destroyed["removed"] is True, destroyed
+    assert oid not in server._building_entities, destroyed
+    assert oid not in server._dynamic_building_ids, destroyed
+    assert server._uplink_ships[2]["cargo"][0] == 40, server._uplink_ships[2]
+    assert any(payload and payload[0] == 0x15 and oid.to_bytes(4, "big") in payload for payload, _addr in server.udp_handler.sent), server.udp_handler.sent
+
+    lifecycle = json.loads(control._cmd_building_events(["json"]))
+    actions = [item.get("action") for item in lifecycle if int(item.get("oid", 0) or 0) == oid]
+    assert actions == ["create", "damage", "destroy"], lifecycle
+    print("test_dynamic_building_damage_control_destroys_and_records_delete: PASSED")
     return True
 
 
@@ -13102,6 +13146,7 @@ def main():
         test_energy_control_sets_absolute_or_fractional_energy,
         test_comm_message_request_decodes_og_type2_build_command,
         test_build_uplink_command_creates_dynamic_building,
+        test_dynamic_building_damage_control_destroys_and_records_delete,
         test_uplink_mvp_bootstrap_sends_minimal_status_packets,
         test_buildings_json_exposes_playable_slice_observability,
     ]
