@@ -8870,6 +8870,11 @@ class WulframServer:
         else:
             model_contact_rotation_matrix = None
             model_contact_rotation_source = "heading_only"
+        model_contact_selection = (
+            os.environ.get("WULFRAM_ENTITY_TERRAIN_MODEL_CONTACT_SELECTION", "first")
+            .strip()
+            .lower()
+        )
 
         def box_collision_z_lift() -> float:
             if terrain_collision_shape == "entity_box":
@@ -9103,6 +9108,7 @@ class WulframServer:
                     cbsp_tree,
                     bounding_radius,
                     rotation_matrix=model_contact_rotation_matrix,
+                    contact_selection=model_contact_selection,
                 )
             except Exception as exc:  # pragma: no cover - diagnostic only
                 return None, None, str(exc)
@@ -9535,6 +9541,7 @@ class WulframServer:
                 "terrain_collision_shape": terrain_collision_shape,
                 "model_contact_rotation_source": model_contact_rotation_source,
                 "model_contact_rotation_mode": model_contact_rotation_mode,
+                "model_contact_selection": model_contact_selection,
                 "probe_enabled": True,
                 "position": pos,
                 "velocity": (vx, vy, vz),
@@ -9580,6 +9587,7 @@ class WulframServer:
                     cbsp_tree,
                     bounding_radius,
                     rotation_matrix=model_contact_rotation_matrix,
+                    contact_selection=model_contact_selection,
                 )
             box_center = (pos[0], pos[1], pos[2] + box_collision_z_lift())
             return self._terrain_grid_collision.test_box_collision(

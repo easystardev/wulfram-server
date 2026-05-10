@@ -6129,6 +6129,70 @@ def test_model_collision_returns_first_contact_in_grid_order():
     return True
 
 
+def test_model_collision_can_probe_upward_min_depth_selection():
+    """Default-off contact selection can skip side splits and choose a shallow upward hit."""
+
+    class FlatTerrain:
+        cell_x = 1.0
+        cell_z = 1.0
+        world_w = 3.0
+        world_h = 2.0
+        num_x = 4
+        num_z = 2
+
+        @staticmethod
+        def _get_raw_height(cell_x, cell_y):
+            return 0.0
+
+    grid = TerrainGridCollision(FlatTerrain(), 0.0, sector_rows=1, sector_cols=1)
+    tri = ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0))
+    calls = []
+
+    grid._iter_aabb_sectors = lambda aabb_min, aabb_max: [SimpleNamespace(index=0)]
+    grid._iter_sector_cells = lambda aabb_min, aabb_max, sector: [(0, 0), (1, 0), (2, 0)]
+    grid._iter_cell_triangles = lambda cell_x, cell_y: [tri]
+    grid._triangle_overlaps_aabb = lambda *args, **kwargs: True
+
+    contacts = [
+        ((0.0, 0.0, 0.0), (0.0, 1.0, 0.0), 0.1),
+        ((0.0, 0.0, 0.0), (0.0, 0.1, 0.995), 30.0),
+        ((0.0, 0.0, 0.0), (0.0, 0.2, 0.98), 4.0),
+    ]
+
+    def fake_triangle_cbsp_contact(tri_local, vertices, cbsp_tree, bounding_radius):
+        calls.append((tri_local, bounding_radius))
+        return contacts[len(calls) - 1]
+
+    grid._triangle_cbsp_contact = fake_triangle_cbsp_contact
+
+    contact = grid.test_model_collision(
+        (0.5, 0.5, 0.5),
+        0.0,
+        [],
+        CBSPTree(nodes=[CBSPTreeNode(
+            radius=1.0,
+            half_extent_x=1.0,
+            half_extent_y=1.0,
+            half_extent_z=1.0,
+            center=Vec3(0.0, 0.0, 0.0),
+            triangles=[],
+            split_normal=Vec3(1.0, 0.0, 0.0),
+            split_plane_d=0.0,
+            child_neg=-1,
+            child_pos=-1,
+        )]),
+        1.0,
+        contact_selection="upward_min_depth",
+    )
+    assert contact is not None
+    assert len(calls) == 3, calls
+    assert contact.cell == (2, 0), contact.cell
+    assert math.isclose(contact.penetration, 4.0, abs_tol=1e-6), contact.penetration
+    assert contact.normal[2] > 0.9, contact.normal
+    print("test_model_collision_can_probe_upward_min_depth_selection: PASSED")
+    return True
+
+
 def test_model_collision_response_normal_can_probe_terrain_triangle_normal():
     """The terrain-face response probe should be opt-in; the CBSP split normal remains default."""
 
@@ -11663,6 +11727,7 @@ def main():
         test_triangle_cbsp_contact_uses_entity_bounding_radius_for_plane_reject,
         test_box_collision_returns_first_contact_in_grid_order,
         test_model_collision_returns_first_contact_in_grid_order,
+        test_model_collision_can_probe_upward_min_depth_selection,
         test_model_collision_response_normal_can_probe_terrain_triangle_normal,
         test_triangle_cbsp_contact_returns_first_leaf_hit,
         test_building_collision_skips_aabb_for_mesh_backed_building,

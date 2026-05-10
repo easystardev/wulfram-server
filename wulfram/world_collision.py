@@ -528,11 +528,22 @@ class TerrainGridCollision:
         cbsp_tree,
         bounding_radius: float,
         rotation_matrix=None,
+        contact_selection: str = "first",
     ) -> Optional[TerrainContact]:
         """Test sectorized terrain triangles against an entity collision mesh."""
         if not self._all_finite((*center, heading, bounding_radius)):
             return None
         model_matrix = self._coerce_rotation_matrix(rotation_matrix)
+        selection = str(contact_selection or "first").strip().lower()
+        collect_candidates = selection in {
+            "upward",
+            "upward_min_depth",
+            "upward_shallow",
+            "min_depth_upward",
+            "shallow_upward",
+        }
+        best_contact = None
+        best_score = None
         aabb_min = (center[0] - bounding_radius, center[1] - bounding_radius, center[2] - bounding_radius)
         aabb_max = (center[0] + bounding_radius, center[1] + bounding_radius, center[2] + bounding_radius)
         cos_h = math.cos(heading)
@@ -589,9 +600,15 @@ class TerrainGridCollision:
                         normal_source=normal_source,
                         **normal_metadata,
                     )
+                    if collect_candidates:
+                        score = self._model_contact_selection_score(contact, selection)
+                        if score is not None and (best_score is None or score < best_score):
+                            best_score = score
+                            best_contact = contact
+                        continue
                     return contact
 
-        return None
+        return best_contact
 
     def test_model_bounds_contact(
         self,
@@ -868,6 +885,21 @@ class TerrainGridCollision:
         if len(matrix) != 9:
             return None
         return matrix
+
+    @staticmethod
+    def _model_contact_selection_score(contact: TerrainContact, selection: str):
+        try:
+            normal_z = float(contact.normal[2])
+            penetration = float(contact.penetration)
+        except (TypeError, ValueError, OverflowError, IndexError):
+            return None
+        if not math.isfinite(normal_z) or not math.isfinite(penetration):
+            return None
+        if "upward" in selection and normal_z < 0.5:
+            return None
+        if "min_depth" in selection or "shallow" in selection or selection == "upward":
+            return (penetration, -normal_z)
+        return (-normal_z, penetration)
 
     @staticmethod
     def _world_to_local_box(point, center, cos_h: float, sin_h: float, rotation_matrix=None):
