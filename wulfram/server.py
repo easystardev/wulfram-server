@@ -9150,6 +9150,53 @@ class WulframServer:
             )
         except ValueError:
             pair_record_contact_max_angular_delta = 0.5
+        pair_record_timed_contact_mode = (
+            os.environ.get("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_TIMED_CONTACT", "0")
+            .strip()
+            .lower()
+        )
+        pair_record_timed_contact_enabled = (
+            pair_record_contact_enabled
+            and timing_ready
+            and pair_record_timed_contact_mode
+            not in {"0", "false", "off", "no", "disabled"}
+            and contact_timing_mode
+            in {
+                "auto",
+                "1",
+                "true",
+                "on",
+                "pair",
+                "solver",
+                "sweep",
+                "toi",
+                "probe",
+                "bucket",
+                "loop",
+            }
+        )
+        pair_record_timed_sweep_mode = (
+            os.environ.get("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_TIMED_SWEEP", "1")
+            .strip()
+            .lower()
+        )
+        pair_record_timed_sweep_enabled = (
+            pair_record_timed_contact_enabled
+            and pair_record_timed_sweep_mode
+            not in {"0", "false", "off", "no", "disabled"}
+        )
+        if pair_record_timed_contact_enabled:
+            timed_pair_response = True
+            if (
+                contact_timing_mode == "auto"
+                and "WULFRAM_ENTITY_TERRAIN_CONTACT_ITERATIONS" not in os.environ
+            ):
+                contact_iteration_limit = 1
+            if (
+                pair_record_timed_sweep_enabled
+                and "WULFRAM_ENTITY_TERRAIN_CONTACT_SWEEP_SCAN" not in os.environ
+            ):
+                contact_sweep_scan_enabled = True
         raycast_fallback_mode = (
             os.environ.get("WULFRAM_ENTITY_TERRAIN_RAYCAST_FALLBACK", "0")
             .strip()
@@ -9540,6 +9587,50 @@ class WulframServer:
                 min_normal_z=pair_record_contact_min_normal_z,
                 min_speed=0.0,
             )
+
+        def sample_pair_record_contact_at(pos, *, velocity=None):
+            raw_contact, raw_bounds_contact, raw_error = sample_raw_origin_contact_at(pos)
+            pair_raw_contact = raw_contact
+            pair_raw_bounds_contact = raw_bounds_contact
+            pair_raw_error = raw_error
+            if (
+                raw_error is None
+                and pair_record_contact_selection
+                and pair_record_contact_selection != model_contact_selection
+            ):
+                pair_raw_contact, pair_raw_bounds_contact, pair_raw_error = (
+                    sample_raw_origin_contact_at(
+                        pos,
+                        contact_selection=pair_record_contact_selection,
+                    )
+                )
+                if pair_raw_error is not None:
+                    pair_raw_contact = raw_contact
+                    pair_raw_bounds_contact = raw_bounds_contact
+                    pair_raw_error = raw_error
+            pair_contact = raw_origin_contact_for_fallback(
+                pair_raw_contact,
+                normal_source=pair_record_contact_normal_source,
+            )
+            pair_delta_contact = raw_origin_contact_for_fallback(
+                pair_raw_contact,
+                normal_source=pair_record_contact_delta_normal_source,
+            )
+            reject = pair_record_contact_reject_reason(
+                pair_contact,
+                velocity=velocity,
+            )
+            return {
+                "contact": pair_contact,
+                "delta_contact": pair_delta_contact,
+                "raw_contact": raw_contact,
+                "raw_bounds_contact": raw_bounds_contact,
+                "raw_error": raw_error,
+                "selected_raw_contact": pair_raw_contact,
+                "selected_raw_bounds_contact": pair_raw_bounds_contact,
+                "selected_raw_error": pair_raw_error,
+                "reject": reject,
+            }
 
         def sample_raycast_fallback_contact_at(pos, *, reference=None, velocity=None):
             raycast_fn_local = getattr(self._terrain_grid_collision, "raycast", None)
@@ -10510,6 +10601,50 @@ class WulframServer:
                         "contact": lifted_contact,
                         "raw_origin_fallback": False,
                     }
+                pair_probe = None
+                if pair_record_timed_contact_enabled:
+                    pair_probe = sample_pair_record_contact_at(pos, velocity=velocity)
+                    pair_contact = pair_probe.get("contact")
+                    pair_delta_contact = pair_probe.get("delta_contact")
+                    if (
+                        pair_probe.get("selected_raw_error") is None
+                        and pair_contact is not None
+                        and pair_probe.get("reject") == ""
+                        and pair_contact.penetration > self._PENETRATION_SLOP_DEFAULT
+                    ):
+                        return {
+                            "contact": pair_contact,
+                            "raw_origin_fallback": False,
+                            "pair_record_contact": True,
+                            "pair_record_timed_contact": True,
+                            "pair_record_contact_reject": "",
+                            "pair_record_contact_reason": (
+                                "timed_lifted_clear_pair_record_contact"
+                                if lifted_contact is None
+                                else "timed_lifted_below_slop_pair_record_contact"
+                            ),
+                            "pair_record_contact_selection": pair_record_contact_selection,
+                            "pair_record_delta_normal": (
+                                None
+                                if pair_delta_contact is None
+                                else pair_delta_contact.normal
+                            ),
+                            "pair_record_delta_normal_source": (
+                                None
+                                if pair_delta_contact is None
+                                else getattr(pair_delta_contact, "normal_source", None)
+                            ),
+                            "pair_record_raw_normal": getattr(
+                                pair_probe.get("raw_contact"),
+                                "normal",
+                                None,
+                            ),
+                            "pair_record_selected_raw_normal": getattr(
+                                pair_probe.get("selected_raw_contact"),
+                                "normal",
+                                None,
+                            ),
+                        }
                 if not raw_fallback_timed_enabled:
                     if raycast_fallback_timed_enabled:
                         ray_probe = sample_raycast_fallback_contact_at(
@@ -10537,6 +10672,18 @@ class WulframServer:
                     return {
                         "contact": lifted_contact,
                         "raw_origin_fallback": False,
+                        "pair_record_contact_reject": (
+                            None if pair_probe is None else pair_probe.get("reject")
+                        ),
+                        "pair_record_contact_reason": (
+                            None
+                            if pair_probe is None
+                            else (
+                                "timed_lifted_clear_pair_record_rejected"
+                                if lifted_contact is None
+                                else "timed_lifted_below_slop_pair_record_rejected"
+                            )
+                        ),
                     }
                 raw_probe = sample_raw_origin_fallback_contact_at(pos, velocity=velocity)
                 raw_contact = raw_probe.get("contact")
@@ -10587,6 +10734,18 @@ class WulframServer:
                         "timed_lifted_clear_raw_origin_rejected"
                         if lifted_contact is None
                         else "timed_lifted_below_slop_raw_origin_rejected"
+                    ),
+                    "pair_record_contact_reject": (
+                        None if pair_probe is None else pair_probe.get("reject")
+                    ),
+                    "pair_record_contact_reason": (
+                        None
+                        if pair_probe is None
+                        else (
+                            "timed_lifted_clear_pair_record_rejected"
+                            if lifted_contact is None
+                            else "timed_lifted_below_slop_pair_record_rejected"
+                        )
                     ),
                     "raycast_fallback_reject": ray_probe.get("reject"),
                 }
@@ -10644,6 +10803,33 @@ class WulframServer:
                     ),
                     "raycast_fallback_probe_reason": contact_candidate.get(
                         "raycast_fallback_probe_reason"
+                    ),
+                    "pair_record_contact": bool(
+                        contact_candidate.get("pair_record_contact")
+                    ),
+                    "pair_record_timed_contact": bool(
+                        contact_candidate.get("pair_record_timed_contact")
+                    ),
+                    "pair_record_contact_reject": contact_candidate.get(
+                        "pair_record_contact_reject"
+                    ),
+                    "pair_record_contact_reason": contact_candidate.get(
+                        "pair_record_contact_reason"
+                    ),
+                    "pair_record_contact_selection": contact_candidate.get(
+                        "pair_record_contact_selection"
+                    ),
+                    "pair_record_delta_normal": contact_candidate.get(
+                        "pair_record_delta_normal"
+                    ),
+                    "pair_record_delta_normal_source": contact_candidate.get(
+                        "pair_record_delta_normal_source"
+                    ),
+                    "pair_record_raw_normal": contact_candidate.get(
+                        "pair_record_raw_normal"
+                    ),
+                    "pair_record_selected_raw_normal": contact_candidate.get(
+                        "pair_record_selected_raw_normal"
                     ),
                 }
 
@@ -10742,6 +10928,33 @@ class WulframServer:
                     "raycast_fallback_probe_reason": contact_candidate.get(
                         "raycast_fallback_probe_reason"
                     ),
+                    "pair_record_contact": bool(
+                        contact_candidate.get("pair_record_contact")
+                    ),
+                    "pair_record_timed_contact": bool(
+                        contact_candidate.get("pair_record_timed_contact")
+                    ),
+                    "pair_record_contact_reject": contact_candidate.get(
+                        "pair_record_contact_reject"
+                    ),
+                    "pair_record_contact_reason": contact_candidate.get(
+                        "pair_record_contact_reason"
+                    ),
+                    "pair_record_contact_selection": contact_candidate.get(
+                        "pair_record_contact_selection"
+                    ),
+                    "pair_record_delta_normal": contact_candidate.get(
+                        "pair_record_delta_normal"
+                    ),
+                    "pair_record_delta_normal_source": contact_candidate.get(
+                        "pair_record_delta_normal_source"
+                    ),
+                    "pair_record_raw_normal": contact_candidate.get(
+                        "pair_record_raw_normal"
+                    ),
+                    "pair_record_selected_raw_normal": contact_candidate.get(
+                        "pair_record_selected_raw_normal"
+                    ),
                 }
 
             lo = 0.0
@@ -10796,6 +11009,33 @@ class WulframServer:
                 "raycast_fallback_probe_reason": contact_candidate.get(
                     "raycast_fallback_probe_reason"
                 ),
+                "pair_record_contact": bool(
+                    contact_candidate.get("pair_record_contact")
+                ),
+                "pair_record_timed_contact": bool(
+                    contact_candidate.get("pair_record_timed_contact")
+                ),
+                "pair_record_contact_reject": contact_candidate.get(
+                    "pair_record_contact_reject"
+                ),
+                "pair_record_contact_reason": contact_candidate.get(
+                    "pair_record_contact_reason"
+                ),
+                "pair_record_contact_selection": contact_candidate.get(
+                    "pair_record_contact_selection"
+                ),
+                "pair_record_delta_normal": contact_candidate.get(
+                    "pair_record_delta_normal"
+                ),
+                "pair_record_delta_normal_source": contact_candidate.get(
+                    "pair_record_delta_normal_source"
+                ),
+                "pair_record_raw_normal": contact_candidate.get(
+                    "pair_record_raw_normal"
+                ),
+                "pair_record_selected_raw_normal": contact_candidate.get(
+                    "pair_record_selected_raw_normal"
+                ),
             }
 
         def resolve_timed_pair_contact():
@@ -10843,6 +11083,61 @@ class WulframServer:
                 vx, vy, vz = contact_vel
                 if timed_contact["collision_at_start"] and start_iterative_enabled:
                     response_debug = apply_iterative_start_contact(contact)
+                elif timed_contact.get("pair_record_contact"):
+                    response_debug, applied_pair_record_contact = (
+                        apply_raw_origin_fallback_contact(
+                            contact,
+                            projection_order=pair_record_contact_projection_order,
+                            delta_mode=pair_record_contact_delta_mode,
+                            delta_normal=timed_contact.get("pair_record_delta_normal"),
+                            delta_normal_source=timed_contact.get(
+                                "pair_record_delta_normal_source"
+                            ),
+                            angular_mode=pair_record_contact_angular_mode,
+                            closing_only=pair_record_contact_closing_only,
+                            max_velocity_delta=pair_record_contact_max_velocity_delta,
+                            max_vertical_delta=pair_record_contact_max_vertical_delta,
+                            max_speed=pair_record_contact_max_speed,
+                            max_angular_delta=pair_record_contact_max_angular_delta,
+                        )
+                    )
+                    if not applied_pair_record_contact:
+                        return False
+                    if response_debug is not None:
+                        response_debug.update({
+                            "pair_record_contact": True,
+                            "pair_record_timed_contact": True,
+                            "pair_record_contact_reason": timed_contact.get(
+                                "pair_record_contact_reason"
+                            ),
+                            "pair_record_contact_reject": timed_contact.get(
+                                "pair_record_contact_reject"
+                            ),
+                            "pair_record_contact_enabled": pair_record_contact_enabled,
+                            "pair_record_contact_selection": pair_record_contact_selection,
+                            "pair_record_contact_normal_source": pair_record_contact_normal_source,
+                            "pair_record_contact_delta_normal_source": pair_record_contact_delta_normal_source,
+                            "pair_record_delta_normal": timed_contact.get(
+                                "pair_record_delta_normal"
+                            ),
+                            "pair_record_delta_normal_source": timed_contact.get(
+                                "pair_record_delta_normal_source"
+                            ),
+                            "pair_record_contact_projection_order": pair_record_contact_projection_order,
+                            "pair_record_contact_delta_mode": pair_record_contact_delta_mode,
+                            "pair_record_contact_angular_mode": pair_record_contact_angular_mode,
+                            "pair_record_contact_closing_only": pair_record_contact_closing_only,
+                            "pair_record_contact_max_velocity_delta": pair_record_contact_max_velocity_delta,
+                            "pair_record_contact_max_vertical_delta": pair_record_contact_max_vertical_delta,
+                            "pair_record_contact_max_speed": pair_record_contact_max_speed,
+                            "pair_record_contact_max_angular_delta": pair_record_contact_max_angular_delta,
+                            "pair_record_raw_normal": timed_contact.get(
+                                "pair_record_raw_normal"
+                            ),
+                            "pair_record_selected_raw_normal": timed_contact.get(
+                                "pair_record_selected_raw_normal"
+                            ),
+                        })
                 elif timed_contact.get("raw_origin_fallback"):
                     response_debug, applied_raw_fallback = apply_raw_origin_fallback_contact(
                         contact
@@ -10915,6 +11210,25 @@ class WulframServer:
                     ),
                     "raycast_fallback_probe_reason": timed_contact.get(
                         "raycast_fallback_probe_reason"
+                    ),
+                    "pair_record_contact": bool(timed_contact.get("pair_record_contact")),
+                    "pair_record_timed_contact": bool(
+                        timed_contact.get("pair_record_timed_contact")
+                    ),
+                    "pair_record_contact_reject": timed_contact.get(
+                        "pair_record_contact_reject"
+                    ),
+                    "pair_record_contact_reason": timed_contact.get(
+                        "pair_record_contact_reason"
+                    ),
+                    "pair_record_contact_selection": timed_contact.get(
+                        "pair_record_contact_selection"
+                    ),
+                    "pair_record_delta_normal": timed_contact.get(
+                        "pair_record_delta_normal"
+                    ),
+                    "pair_record_delta_normal_source": timed_contact.get(
+                        "pair_record_delta_normal_source"
                     ),
                     "depth": contact.penetration,
                     "normal": contact.normal,
@@ -11035,7 +11349,11 @@ class WulframServer:
             remaining = max(0.0, frame_dt - elapsed)
 
             ctx.debug_last_collision = {
-                "kind": "terrain_clean_contact",
+                "kind": (
+                    "terrain_pair_record_timed_contact"
+                    if contact_events[0].get("pair_record_timed_contact")
+                    else "terrain_clean_contact"
+                ),
                 "point": contact.position,
                 "normal": contact.normal,
                 "depth": contact.penetration,
@@ -11063,6 +11381,11 @@ class WulframServer:
                 "raw_origin_timed_fallback_enabled": raw_fallback_timed_enabled,
                 "raw_origin_timed_fallback_event_count": sum(
                     1 for event in contact_events if event.get("raw_origin_timed_fallback")
+                ),
+                "pair_record_timed_contact_enabled": pair_record_timed_contact_enabled,
+                "pair_record_timed_sweep_enabled": pair_record_timed_sweep_enabled,
+                "pair_record_timed_contact_event_count": sum(
+                    1 for event in contact_events if event.get("pair_record_timed_contact")
                 ),
                 "raycast_timed_fallback_enabled": raycast_fallback_timed_enabled,
                 "raycast_timed_fallback_event_count": sum(
