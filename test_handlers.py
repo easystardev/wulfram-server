@@ -11502,10 +11502,15 @@ def test_entity_world_collision_dirty_model_clear_skips_box_fallback_by_default(
         os.environ.pop("WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK", None)
         raycast_calls = []
         box_bounds_calls = []
+        bounds_overlap_calls = []
 
         def fake_raycast(start, end):
             raycast_calls.append((start, end))
             return None
+
+        def fake_bounds_overlap(aabb_min, aabb_max):
+            bounds_overlap_calls.append((aabb_min, aabb_max))
+            return True
 
         def fake_box_bounds_contact(*args, **kwargs):
             box_bounds_calls.append((args, kwargs))
@@ -11520,6 +11525,7 @@ def test_entity_world_collision_dirty_model_clear_skips_box_fallback_by_default(
         server = WulframServer.__new__(WulframServer)
         server._terrain_grid_collision = SimpleNamespace(
             test_model_bounds_contact=lambda *args, **kwargs: None,
+            test_bounds_intersection=fake_bounds_overlap,
             test_box_bounds_contact=fake_box_bounds_contact,
             raycast=fake_raycast,
             test_model_collision=lambda *args, **kwargs: None,
@@ -11556,8 +11562,12 @@ def test_entity_world_collision_dirty_model_clear_skips_box_fallback_by_default(
 
         assert result == (10.0, 0.0, 4.0, 1.0, 0.0, 0.0), result
         assert box_bounds_calls == [], box_bounds_calls
+        assert bounds_overlap_calls == [((5.0, -5.0, -1.0), (15.0, 5.0, 9.0))], bounds_overlap_calls
         assert raycast_calls == [((0.0, 0.0, 4.0), (10.0, 0.0, 4.0))], raycast_calls
         probe = ctx.debug_last_terrain_contact_probe
+        assert probe["dirty_bounds_aabb_min"] == (5.0, -5.0, -1.0), probe
+        assert probe["dirty_bounds_aabb_max"] == (15.0, 5.0, 9.0), probe
+        assert probe["dirty_bounds_xy_overlap"] is True, probe
         assert probe["dirty_bounds_box_fallback_enabled"] is False, probe
         assert "dirty_bounds_box_fallback_attempted" not in probe or probe[
             "dirty_bounds_box_fallback_attempted"

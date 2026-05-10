@@ -10186,6 +10186,18 @@ class WulframServer:
                 "dirty_model_collision_center": dirty_dispatch_debug.get(
                     "dirty_model_collision_center"
                 ),
+                "dirty_bounds_aabb_min": dirty_dispatch_debug.get(
+                    "dirty_bounds_aabb_min"
+                ),
+                "dirty_bounds_aabb_max": dirty_dispatch_debug.get(
+                    "dirty_bounds_aabb_max"
+                ),
+                "dirty_bounds_xy_overlap": dirty_dispatch_debug.get(
+                    "dirty_bounds_xy_overlap"
+                ),
+                "dirty_bounds_xy_overlap_error": dirty_dispatch_debug.get(
+                    "dirty_bounds_xy_overlap_error"
+                ),
                 "dirty_bounds_box_fallback_enabled": dirty_dispatch_debug.get(
                     "dirty_bounds_box_fallback_enabled"
                 ),
@@ -12469,6 +12481,38 @@ class WulframServer:
             "dirty_bounds_box_shape": dirty_bounds_box_shape,
             "dirty_bounds_box_center_mode": dirty_bounds_box_center_mode,
         })
+        dirty_bounds_overlap_fn = getattr(
+            self._terrain_grid_collision,
+            "test_bounds_intersection",
+            None,
+        )
+        dirty_aabb_min = None
+        dirty_aabb_max = None
+        dirty_bounds_xy_overlap = None
+        if ctx.world_collision_bounds_dirty and callable(dirty_bounds_overlap_fn):
+            dirty_aabb_min = (
+                anchor[0] - bounding_radius,
+                anchor[1] - bounding_radius,
+                anchor[2] - bounding_radius,
+            )
+            dirty_aabb_max = (
+                anchor[0] + bounding_radius,
+                anchor[1] + bounding_radius,
+                anchor[2] + bounding_radius,
+            )
+            try:
+                dirty_bounds_xy_overlap = bool(
+                    dirty_bounds_overlap_fn(dirty_aabb_min, dirty_aabb_max)
+                )
+            except Exception as exc:
+                dirty_dispatch_debug["dirty_bounds_xy_overlap_error"] = str(exc)
+                if collision_model is None or terrain_collision_shape != "model":
+                    raise
+            dirty_dispatch_debug.update({
+                "dirty_bounds_aabb_min": dirty_aabb_min,
+                "dirty_bounds_aabb_max": dirty_aabb_max,
+                "dirty_bounds_xy_overlap": dirty_bounds_xy_overlap,
+            })
         if ctx.world_collision_bounds_dirty:
             dirty_contact_fn = None
             dirty_contact_args = None
@@ -12685,19 +12729,8 @@ class WulframServer:
                     else:
                         dirty_dispatch_debug["dirty_miss_reason"] = "dirty_bounds_clear"
             else:
-                bounds_overlap_fn = getattr(self._terrain_grid_collision, "test_bounds_intersection", None)
-                if callable(bounds_overlap_fn):
-                    dirty_aabb_min = (
-                        anchor[0] - bounding_radius,
-                        anchor[1] - bounding_radius,
-                        anchor[2] - bounding_radius,
-                    )
-                    dirty_aabb_max = (
-                        anchor[0] + bounding_radius,
-                        anchor[1] + bounding_radius,
-                        anchor[2] + bounding_radius,
-                    )
-                    if bounds_overlap_fn(dirty_aabb_min, dirty_aabb_max):
+                if callable(dirty_bounds_overlap_fn):
+                    if dirty_bounds_xy_overlap:
                         if resolve_dirty_contact():
                             ctx.world_collision_ref_pos = (anchor[0], anchor[1], anchor[2])
                             return finish_result(anchor[0], anchor[1], anchor[2], vx, vy, vz)
