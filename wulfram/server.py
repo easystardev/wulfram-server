@@ -107,7 +107,7 @@ from .packets import (
     FX_IMPACT_BUILDING, FX_IMPACT_TERRAIN,
     get_behavior_tank_spring_local_offsets,
 )
-from . import handlers
+from . import handlers, build_uplink, building_lifecycle, config as server_config
 from .pktlog import PacketLog
 
 class WulframServer:
@@ -119,21 +119,7 @@ class WulframServer:
     """
 
     def __init__(self, host: str = None, port: int = 2627):
-        # Load .env file if present (written by mp_server.ps1 for detached mode)
-        env_file = Path(__file__).parent.parent / ".env"
-        if env_file.exists():
-            for line in env_file.read_text().splitlines():
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    key, _, val = line.partition("=")
-                    os.environ.setdefault(key.strip(), val.strip())
-        self.host = host or os.environ.get("WULFRAM_BIND_ADDR", "0.0.0.0")
-        # Address to advertise to clients for UDP (e.g. when binding 0.0.0.0)
-        self.public_addr = os.environ.get("WULFRAM_PUBLIC_ADDR", self.host)
-        try:
-            self.port = int(os.environ.get("WULFRAM_PORT", str(port)))
-        except ValueError:
-            self.port = port
+        server_config.configure_core_server(self, host, port)
         self.logger = PacketLogger()
         self.udp_handler: Optional[UDPHandler] = None
         self.running = False
@@ -146,24 +132,11 @@ class WulframServer:
         self.clients: Dict[int, ClientContext] = {}
         self.clients_lock = threading.Lock()
         self.next_client_id = 1
-        # Match wulf-forge default player/entity ID space (config.toml uses 1337).
-        # Very low IDs can collide with implicit client/map assumptions.
-        try:
-            self.next_entity_id = int(os.environ.get("WULFRAM_START_ENTITY_ID", "1337"))
-        except ValueError:
-            self.next_entity_id = 1337
-        if self.next_entity_id <= 0:
-            self.next_entity_id = 1337
 
         # UDP address to client mapping for packet routing
         self.udp_addr_to_client: Dict[tuple, ClientContext] = {}
         # Session key to client mapping for deterministic UDP binding
         self.session_key_to_client: Dict[str, ClientContext] = {}
-
-        # Coordinate system config (defaults to z-up).
-        self.up_axis = os.environ.get("WULFRAM_UP_AXIS", "z").lower()
-        if self.up_axis not in ("y", "z"):
-            self.up_axis = "z"
         spawn_height_env = os.environ.get("WULFRAM_SPAWN_HEIGHT")
         try:
             # Default to ground-height spawn to avoid immediate fall-damage overlays.
@@ -864,9 +837,13 @@ class WulframServer:
         # Experimental auxiliary heartbeat/correction path. UPDATE_ARRAY remains
         # the canonical gameplay stream for vitals and entity replication.
         self.heartbeat_view_update = os.environ.get("WULFRAM_HEARTBEAT_VIEW_UPDATE", "0") == "1"
-        # Jump jets are a custom extension, not part of the OG Tank controller.
-        # Keep them opt-in so default server motion stays clone-focused.
-        self.jump_jets_enabled = os.environ.get("WULFRAM_JUMP_JETS", "0") == "1"
+        # Jump jets are a custom extension driven by OG slot 4. Keep the env
+        # override, but make the playable clone default match the promoted
+        # Crossroads demo slice.
+        self.jump_jets_enabled = os.environ.get("WULFRAM_JUMP_JETS", "1") == "1"
+        self.jump_jet_direction = os.environ.get("WULFRAM_JUMP_JET_DIRECTION", "body").strip().lower()
+        if self.jump_jet_direction not in ("body", "world"):
+            self.jump_jet_direction = "body"
         self.jump_jet_correction_burst_count = max(
             0,
             int(os.environ.get("WULFRAM_JUMP_JET_CORRECTION_BURST", "12")),
@@ -874,6 +851,42 @@ class WulframServer:
         self.jump_jet_correction_burst_interval = max(
             0.01,
             float(os.environ.get("WULFRAM_JUMP_JET_CORRECTION_INTERVAL", "0.05")),
+        )
+        self.jump_jet_collision_guard = (
+            os.environ.get("WULFRAM_JUMP_JET_COLLISION_GUARD", "1")
+            .strip()
+            .lower()
+            not in ("0", "false", "off", "no")
+        )
+        self.jump_jet_collision_guard_xy = max(
+            0.0,
+            float(os.environ.get("WULFRAM_JUMP_JET_COLLISION_GUARD_XY", "1.0")),
+        )
+        self.jump_jet_collision_guard_zpop = max(
+            0.0,
+            float(os.environ.get("WULFRAM_JUMP_JET_COLLISION_GUARD_ZPOP", "2.0")),
+        )
+        self.jump_jet_landing_clearance = max(
+            0.0,
+            float(os.environ.get("WULFRAM_JUMP_JET_LANDING_CLEARANCE", "1.85")),
+        )
+        self.tank_terrain_projection_guard = (
+            os.environ.get("WULFRAM_TANK_TERRAIN_PROJECTION_GUARD", "1")
+            .strip()
+            .lower()
+            not in ("0", "false", "off", "no")
+        )
+        self.tank_terrain_projection_guard_xy = max(
+            0.0,
+            float(os.environ.get("WULFRAM_TANK_TERRAIN_PROJECTION_GUARD_XY", "1.0")),
+        )
+        self.tank_terrain_projection_guard_zpop = max(
+            0.0,
+            float(os.environ.get("WULFRAM_TANK_TERRAIN_PROJECTION_GUARD_ZPOP", "2.0")),
+        )
+        self.tank_terrain_projection_guard_min_clearance = max(
+            0.0,
+            float(os.environ.get("WULFRAM_TANK_TERRAIN_PROJECTION_GUARD_MIN_CLEARANCE", "0.0")),
         )
 
         print(
@@ -905,7 +918,13 @@ class WulframServer:
             f"force_default_spawn={int(self.force_default_spawn_pos)} "
             f"default_spawn={self.default_flat_spawn_pos} "
             f"heartbeat_view={int(self.heartbeat_view_update)} jump_jets={int(self.jump_jets_enabled)} "
+            f"jump_dir={self.jump_jet_direction} "
             f"jump_corr={self.jump_jet_correction_burst_count}@{self.jump_jet_correction_burst_interval:.2f}s "
+            f"jump_land_guard={int(self.jump_jet_collision_guard)}:{self.jump_jet_collision_guard_xy:.1f}/"
+            f"{self.jump_jet_collision_guard_zpop:.1f}/{self.jump_jet_landing_clearance:.2f} "
+            f"tank_proj_guard={int(self.tank_terrain_projection_guard)}:"
+            f"{self.tank_terrain_projection_guard_xy:.1f}/{self.tank_terrain_projection_guard_zpop:.1f}/"
+            f"{self.tank_terrain_projection_guard_min_clearance:.1f} "
             f"terrain_collision_override={int(self.terrain_collision_with_ground_override)} "
             f"inactivity_timeout={self.inactivity_timeout:.1f}s"
         )
@@ -1079,7 +1098,54 @@ class WulframServer:
             self.remote_og_movement_input_delay = 0.20
         if self.remote_og_movement_input_delay < 0.0:
             self.remote_og_movement_input_delay = 0.0
+        self.remote_og_movement_input_selection = (
+            os.environ.get(
+                "WULFRAM_REMOTE_OG_MOVEMENT_INPUT_SELECTION",
+                "latest_before_target",
+            )
+            .strip()
+            .lower()
+        )
+        if self.remote_og_movement_input_selection in {
+            "",
+            "default",
+            "before",
+            "before_target",
+            "latest_before",
+            "latest_before_target",
+            "floor",
+        }:
+            self.remote_og_movement_input_selection = "latest_before_target"
+        elif self.remote_og_movement_input_selection in {
+            "nearest",
+            "nearest_to_target",
+            "closest",
+            "closest_to_target",
+        }:
+            self.remote_og_movement_input_selection = "nearest_to_target"
+        else:
+            self.remote_og_movement_input_selection = "latest_before_target"
         print(f"[CONFIG] remote_og_movement_input_delay={self.remote_og_movement_input_delay:.2f}s")
+        print(
+            "[CONFIG] remote_og_movement_input_selection="
+            f"{self.remote_og_movement_input_selection}"
+        )
+        tick_probe_mode = (
+            os.environ.get("WULFRAM_REMOTE_OG_MOVEMENT_INPUT_TICK_PROBE", "0")
+            .strip()
+            .lower()
+        )
+        self.remote_og_movement_input_tick_probe = tick_probe_mode in {
+            "1",
+            "true",
+            "on",
+            "yes",
+            "probe",
+            "tick",
+            "client_tick",
+        }
+        if self.remote_og_movement_input_tick_probe:
+            print("[CONFIG] remote_og_movement_input_tick_probe=1")
         # Aim/movement configuration (shared across clients)
         # Slot-integrated aim is sensitive to noisy axis samples; keep opt-in.
         self.use_slot_aim = os.environ.get("WULFRAM_USE_SLOT_AIM", "0") == "1"
@@ -2528,203 +2594,27 @@ class WulframServer:
         return sent
 
     def _decode_comm_message_request_body(self, body: bytes) -> dict[str, Any]:
-        """Decode the body shared by TCP and reliable-UDP COMM_MESSAGE_REQUEST.
-
-        Decompile-backed OG uplink commands write:
-          u16 message_type, u16 flags_or_target, string command
-
-        Python chat uses the same leading fields with different message types,
-        so this decoder stays generic and lets the caller decide semantics.
-        """
-        decoded: dict[str, Any] = {
-            "ok": False,
-            "message_type": None,
-            "flags_or_target": None,
-            "text": "",
-            "body_hex": body.hex(),
-        }
-        if len(body) < 6:
-            decoded["error"] = f"body too short: {len(body)}"
-            return decoded
-        try:
-            message_type = struct.unpack_from(">H", body, 0)[0]
-            flags_or_target = struct.unpack_from(">H", body, 2)[0]
-            text, offset = handlers.decode_lp_string(body, 4)
-        except (struct.error, ValueError) as exc:
-            decoded["error"] = str(exc)
-            return decoded
-        decoded.update(
-            {
-                "ok": True,
-                "message_type": message_type,
-                "flags_or_target": flags_or_target,
-                "text": text,
-                "end_offset": offset,
-                "trailing_hex": body[offset:].hex() if offset < len(body) else "",
-            }
-        )
-        return decoded
+        return build_uplink.decode_comm_message_request_body(body)
 
     def _parse_build_uplink_command(self, text: str) -> dict[str, Any]:
-        """Parse OG type-2 starship/uplink text commands."""
-        import shlex
-
-        result: dict[str, Any] = {"ok": False, "text": text, "action": ""}
-        try:
-            parts = shlex.split(text or "")
-        except ValueError as exc:
-            result["error"] = f"shlex: {exc}"
-            return result
-        if not parts:
-            result["error"] = "empty command"
-            return result
-        action = parts[0].lower()
-        result["action"] = action
-        result["parts"] = parts
-
-        def _parse_int(value: str, field: str) -> int | None:
-            try:
-                return int(value, 0)
-            except (TypeError, ValueError):
-                result["error"] = f"invalid {field}: {value!r}"
-                return None
-
-        if action in ("build", "delete"):
-            if len(parts) < 4:
-                result["error"] = f"{action} requires ship_oid, entity name, and slot"
-                return result
-            ship_oid = _parse_int(parts[1], "ship_oid")
-            slot = _parse_int(parts[3], "slot")
-            if ship_oid is None or slot is None:
-                return result
-            entity_type = self._build_uplink_entity_type_from_name(parts[2])
-            result.update(
-                {
-                    "ok": entity_type is not None,
-                    "ship_oid": ship_oid,
-                    "entity_name": parts[2],
-                    "entity_type": entity_type,
-                    "slot": slot,
-                }
-            )
-            if entity_type is None:
-                result["error"] = f"unsupported build entity: {parts[2]!r}"
-            return result
-
-        if action == "move":
-            if len(parts) < 3:
-                result["error"] = "move requires ship_oid and cell"
-                return result
-            ship_oid = _parse_int(parts[1], "ship_oid")
-            if ship_oid is None:
-                return result
-            result.update({"ok": True, "ship_oid": ship_oid, "cell": parts[2]})
-            return result
-
-        if action == "bomb":
-            if len(parts) < 2:
-                result["error"] = "bomb requires ship_oid"
-                return result
-            ship_oid = _parse_int(parts[1], "ship_oid")
-            if ship_oid is None:
-                return result
-            result.update({"ok": True, "ship_oid": ship_oid})
-            return result
-
-        if action == "set":
-            if len(parts) < 4:
-                result["error"] = "set requires ship_oid, field, and value"
-                return result
-            ship_oid = _parse_int(parts[1], "ship_oid")
-            value = _parse_int(parts[3], "value")
-            if ship_oid is None or value is None:
-                return result
-            result.update({"ok": True, "ship_oid": ship_oid, "field": parts[2], "value": value})
-            return result
-
-        result["error"] = f"unsupported action: {action!r}"
-        return result
+        return build_uplink.parse_command(self, text)
 
     @staticmethod
     def _build_uplink_entity_type_from_name(name: str) -> Optional[int]:
-        key = "".join(ch for ch in str(name or "").lower() if ch.isalnum())
-        aliases = {
-            "repair": EntityType.REPAIR_BUILDING,
-            "repairbuilding": EntityType.REPAIR_BUILDING,
-            "repairpad": EntityType.REPAIR_BUILDING,
-            "fuel": EntityType.FUEL_BUILDING,
-            "fuelbuilding": EntityType.FUEL_BUILDING,
-            "refuel": EntityType.FUEL_BUILDING,
-            "refuelpad": EntityType.FUEL_BUILDING,
-            "energy": EntityType.ENERGY_BUILDING,
-            "energybuilding": EntityType.ENERGY_BUILDING,
-            "energypad": EntityType.ENERGY_BUILDING,
-            "powercell": EntityType.ENERGY_BUILDING,
-            "gun": EntityType.GUN_TURRET,
-            "turret": EntityType.GUN_TURRET,
-            "gunturret": EntityType.GUN_TURRET,
-            "gunbuilding": EntityType.GUN_TURRET,
-        }
-        value = aliases.get(key)
-        return int(value) if value is not None else None
+        return build_uplink.entity_type_from_name(name)
 
     @staticmethod
     def _building_max_health_for_type(entity_type: int) -> float:
-        max_health = {
-            EntityType.GUN_TURRET: 1200.0,
-            EntityType.LAUNCHER: 1200.0,
-            EntityType.SENSOR_BUILDING: 1200.0,
-            EntityType.FUEL_BUILDING: 2000.0,
-            EntityType.REPAIR_BUILDING: 2000.0,
-            EntityType.ENERGY_BUILDING: 2000.0,
-            EntityType.PAD: 5000.0,
-            EntityType.DARK_LIGHT: 800.0,
-        }
-        try:
-            key = EntityType(int(entity_type))
-        except ValueError:
-            key = int(entity_type)
-        return float(max_health.get(key, 2000.0))
+        return build_uplink.building_max_health_for_type(entity_type)
 
     def _allocate_dynamic_building_oid(self) -> int:
-        oid = int(getattr(self, "_dynamic_building_next_oid", 30000) or 30000)
-        while oid in self._building_entities or oid in self._dynamic_building_ids:
-            oid += 1
-        self._dynamic_building_next_oid = oid + 1
-        return oid
+        return build_uplink.allocate_dynamic_building_oid(self)
 
     def _remember_building_lifecycle_event(self, event: dict[str, Any]) -> dict[str, Any]:
-        events = getattr(self, "_building_lifecycle_events", None)
-        if events is None:
-            events = []
-            self._building_lifecycle_events = events
-        events.append(event)
-        del events[:-100]
-        return event
+        return building_lifecycle.remember_event(self, event)
 
     def _building_lifecycle_base_event(self, oid: int, action: str) -> dict[str, Any]:
-        building = self._building_entities.get(oid)
-        entity_type = int(getattr(building, "entity_type", -1) or -1) if building else -1
-        try:
-            entity_type_name = EntityType(entity_type).name
-        except ValueError:
-            entity_type_name = str(entity_type)
-        max_health = float(self._building_max_health.get(oid, 0.0) or 0.0)
-        health = float(self._building_health.get(oid, 0.0) or 0.0)
-        return {
-            "time": time.time(),
-            "action": action,
-            "oid": int(oid),
-            "entity_type": entity_type,
-            "entity_type_name": entity_type_name,
-            "team_id": int(getattr(building, "team_id", 0) or 0) if building else 0,
-            "pos": [round(float(v), 5) for v in building.pos] if building else None,
-            "health": health,
-            "max_health": max_health,
-            "health_pct": round((health / max_health * 100.0), 3) if max_health > 0.0 else None,
-            "dynamic": int(oid) in getattr(self, "_dynamic_building_ids", set()),
-            "dynamic_source": getattr(self, "_dynamic_building_sources", {}).get(int(oid), {}) or {},
-        }
+        return building_lifecycle.base_event(self, oid, action)
 
     def _broadcast_building_delete(
         self,
@@ -2733,38 +2623,15 @@ class WulframServer:
         prefer_tcp: bool = True,
         participants: tuple[ClientContext, ...] | None = None,
     ) -> int:
-        packet = build_delete_object(get_ticks(), [int(oid)], with_effects=True)
-        sent = 0
-        for target in self._snapshot_in_game_clients():
-            if participants is not None and not self._combat_observer_packets_allowed_for_client(target, *participants):
-                continue
-            if self._send_packet_to_client(target, packet, prefer_tcp=prefer_tcp):
-                target.known_entity_ids.discard(int(oid))
-                sent += 1
-        return sent
+        return building_lifecycle.broadcast_delete(
+            self,
+            oid,
+            prefer_tcp=prefer_tcp,
+            participants=participants,
+        )
 
     def _remove_dynamic_building_record(self, oid: int) -> None:
-        building = self._building_entities.get(oid)
-        source = self._dynamic_building_sources.get(oid, {}) or {}
-        team_id = int(getattr(building, "team_id", 0) or 0) if building else 0
-        slot = source.get("slot")
-        ship = self._uplink_ships.get(team_id) if team_id else None
-        if ship is not None and slot is not None:
-            cargo = list(ship.get("cargo", [40, 40, 40, 40]))
-            try:
-                slot_index = int(slot)
-            except (TypeError, ValueError):
-                slot_index = -1
-            if 0 <= slot_index < len(cargo):
-                cargo[slot_index] = 40
-                ship["cargo"] = cargo
-                self._broadcast_uplink_ship_info(ship)
-        self._building_entities.pop(oid, None)
-        self._building_health.pop(oid, None)
-        self._building_max_health.pop(oid, None)
-        self._dynamic_building_ids.discard(oid)
-        self._dynamic_building_sources.pop(oid, None)
-        self._rebuild_static_world_raycast_index()
+        building_lifecycle.remove_dynamic_record(self, oid)
 
     def _apply_building_damage_amount(
         self,
@@ -2775,65 +2642,17 @@ class WulframServer:
         remove_dynamic_on_destroy: bool = True,
         delete_participants: tuple[ClientContext, ...] | None = None,
     ) -> dict[str, Any]:
-        """Apply absolute building HP damage and record demo/audit evidence."""
-        oid = int(oid)
-        if oid not in self._building_entities:
-            return {"ok": False, "error": "unknown building", "oid": oid}
-        if oid not in self._building_health:
-            return {"ok": False, "error": "building has no health", "oid": oid}
-        try:
-            damage = float(damage)
-        except (TypeError, ValueError):
-            damage = 0.0
-        if not math.isfinite(damage) or damage <= 0.0:
-            return {"ok": False, "error": "damage must be positive", "oid": oid}
-
-        old_hp = float(self._building_health.get(oid, 0.0) or 0.0)
-        if old_hp <= 0.0:
-            event = self._building_lifecycle_base_event(oid, "damage_ignored")
-            event.update({"ok": False, "source": source, "reason": "already_destroyed"})
-            self._remember_building_lifecycle_event(event)
-            return event
-
-        new_hp = max(0.0, old_hp - damage)
-        self._building_health[oid] = new_hp
-        event = self._building_lifecycle_base_event(oid, "destroy" if new_hp <= 0.0 else "damage")
-        event.update(
-            {
-                "ok": True,
-                "source": source,
-                "damage": damage,
-                "old_health": old_hp,
-                "new_health": new_hp,
-                "destroyed": new_hp <= 0.0,
-                "delete_sent": 0,
-                "removed": False,
-            }
+        return building_lifecycle.apply_damage_amount(
+            self,
+            oid,
+            damage,
+            source=source,
+            remove_dynamic_on_destroy=remove_dynamic_on_destroy,
+            delete_participants=delete_participants,
         )
-        if new_hp <= 0.0:
-            event["delete_sent"] = self._broadcast_building_delete(
-                oid,
-                prefer_tcp=True,
-                participants=delete_participants,
-            )
-            if remove_dynamic_on_destroy and oid in self._dynamic_building_ids:
-                self._remove_dynamic_building_record(oid)
-                event["removed"] = True
-        self._remember_building_lifecycle_event(event)
-        return event
 
     def _choose_dynamic_building_pos(self, ctx: ClientContext, slot: int) -> tuple[float, float, float]:
-        heading = float(getattr(ctx, "player_heading", 0.0) or 0.0)
-        base = tuple(float(v) for v in (getattr(ctx, "player_pos", None) or (2600.0, 3040.0, 5.0)))
-        distance = 35.0 + max(0, int(slot)) * 12.0
-        x = base[0] + math.cos(heading) * distance
-        y = base[1] + math.sin(heading) * distance
-        ground_z = self._terrain_ground_z_at(x, y)
-        if ground_z is None or not math.isfinite(float(ground_z)):
-            z = base[2]
-        else:
-            z = float(ground_z)
-        return (x, y, z)
+        return build_uplink.choose_dynamic_building_pos(self, ctx, slot)
 
     def _send_dynamic_entity_definition(
         self,
@@ -2846,45 +2665,16 @@ class WulframServer:
         heading: float = 0.0,
         is_static: bool = True,
     ) -> bool:
-        if not target_ctx.session or not target_ctx.session.translation_ack_received:
-            return False
-        tick = self._get_network_tick(target_ctx)
-        include_local_state, ls = self._get_update_array_local_state_for_viewer(target_ctx)
-        local_state_kwargs = dict(ls)
-        local_state_kwargs.setdefault("health", self._get_health_value(target_ctx))
-        local_state_kwargs.setdefault("fuel", self._get_energy_value(target_ctx))
-        payload = build_update_array_create_tank(
-            tick=tick,
+        return build_uplink.send_dynamic_entity_definition(
+            self,
+            target_ctx,
             entity_id=entity_id,
             entity_type=entity_type,
-            team=team_id,
-            pos=self._to_client_pos(pos),
-            behavior_type=team_id,
-            include_health=include_local_state,
-            include_entity_vitals=False,
-            is_manned=False,
+            team_id=team_id,
+            pos=pos,
+            heading=heading,
             is_static=is_static,
-            rot=(0.0, 0.0, float(heading)),
-            **local_state_kwargs,
         )
-        sent = self._send_packet_to_client(target_ctx, payload, prefer_tcp=False)
-        if sent:
-            target_ctx.known_entity_ids.add(entity_id)
-            if self.pktlog.enabled:
-                self.pktlog.log(
-                    client_id=target_ctx.client_id,
-                    label="DYNAMIC_ENTITY_CREATE",
-                    tick=tick,
-                    payload=payload,
-                    transport="UDP",
-                    entity_count=1,
-                    entity_ids=(entity_id,),
-                    mask_bits=(0b1011,),
-                    has_local_state=include_local_state,
-                    health=self._get_health_value(target_ctx) if include_local_state else -1.0,
-                    extra=f"type={entity_type} team={team_id}",
-                )
-        return sent
 
     def _broadcast_dynamic_entity_definition(
         self,
@@ -2896,261 +2686,47 @@ class WulframServer:
         heading: float = 0.0,
         is_static: bool = True,
     ) -> int:
-        sent = 0
-        for target in self._snapshot_in_game_clients():
-            if self._send_dynamic_entity_definition(
-                target,
-                entity_id=entity_id,
-                entity_type=entity_type,
-                team_id=team_id,
-                pos=pos,
-                heading=heading,
-                is_static=is_static,
-            ):
-                sent += 1
-        return sent
+        return build_uplink.broadcast_dynamic_entity_definition(
+            self,
+            entity_id=entity_id,
+            entity_type=entity_type,
+            team_id=team_id,
+            pos=pos,
+            heading=heading,
+            is_static=is_static,
+        )
 
     def _create_dynamic_building_from_uplink(
         self,
         ctx: ClientContext,
         command: dict[str, Any],
     ) -> dict[str, Any]:
-        entity_type = int(command["entity_type"])
-        team_id = int(ctx.session.team_id or 1)
-        slot = int(command.get("slot", 0) or 0)
-        oid = self._allocate_dynamic_building_oid()
-        x, y, z = self._choose_dynamic_building_pos(ctx, slot)
-        heading = float(getattr(ctx, "player_heading", 0.0) or 0.0)
-        building = BuildingEntity(
-            x=x,
-            y=y,
-            z=z,
-            entity_type=entity_type,
-            team_id=team_id,
-            heading=heading,
-        )
-        max_hp = self._building_max_health_for_type(entity_type)
-        self._building_entities[oid] = building
-        self._building_health[oid] = max_hp
-        self._building_max_health[oid] = max_hp
-        self._dynamic_building_ids.add(oid)
-        source = {
-            "client_id": ctx.client_id,
-            "player_entity_id": ctx.session.entity_id or ctx.entity_id,
-            "ship_oid": command.get("ship_oid"),
-            "slot": slot,
-            "command": command,
-            "created_at": time.time(),
-        }
-        self._dynamic_building_sources[oid] = source
-        ship = self._uplink_ships.get(team_id) or self._get_or_create_uplink_ship(ctx, team_id)
-        cargo = list(ship.get("cargo", [40, 40, 40, 40]))
-        if 0 <= slot < len(cargo):
-            cargo[slot] = entity_type
-        ship["cargo"] = cargo
-        ship["last_build_oid"] = oid
-        self._broadcast_uplink_ship_info(ship)
-        self._rebuild_static_world_raycast_index()
-        sent = self._broadcast_dynamic_entity_definition(
-            entity_id=oid,
-            entity_type=entity_type,
-            team_id=team_id,
-            pos=building.pos,
-            heading=heading,
-            is_static=True,
-        )
-        event = {
-            "ok": sent > 0,
-            "oid": oid,
-            "entity_type": entity_type,
-            "entity_type_name": getattr(EntityType(entity_type), "name", str(entity_type)),
-            "team_id": team_id,
-            "pos": [round(float(v), 5) for v in building.pos],
-            "health": max_hp,
-            "replication_targets": sent,
-        }
-        print(
-            f"[BUILD-UPLINK] created oid={oid} type={event['entity_type_name']} "
-            f"team={team_id} pos=({x:.1f},{y:.1f},{z:.1f}) targets={sent}"
-        )
-        lifecycle = self._building_lifecycle_base_event(oid, "create")
-        lifecycle.update(
-            {
-                "ok": sent > 0,
-                "source": "uplink_build",
-                "replication_targets": sent,
-            }
-        )
-        self._remember_building_lifecycle_event(lifecycle)
-        return event
+        return build_uplink.create_dynamic_building_from_uplink(self, ctx, command)
 
     def _delete_dynamic_building_from_uplink(
         self,
         ctx: ClientContext,
         command: dict[str, Any],
     ) -> dict[str, Any]:
-        entity_type = int(command.get("entity_type", -1) or -1)
-        team_id = int(ctx.session.team_id or 1)
-        slot = command.get("slot")
-        candidates = []
-        for oid in sorted(self._dynamic_building_ids):
-            building = self._building_entities.get(oid)
-            if not building:
-                continue
-            source = self._dynamic_building_sources.get(oid, {})
-            if entity_type >= 0 and int(building.entity_type) != entity_type:
-                continue
-            if int(building.team_id) != team_id:
-                continue
-            if slot is not None and source.get("slot") != slot:
-                continue
-            candidates.append(oid)
-        if not candidates:
-            return {"ok": False, "error": "no matching dynamic building"}
-        oid = candidates[-1]
-        lifecycle = self._building_lifecycle_base_event(oid, "delete")
-        ship = self._uplink_ships.get(team_id)
-        if ship is not None and slot is not None:
-            cargo = list(ship.get("cargo", [40, 40, 40, 40]))
-            try:
-                slot_index = int(slot)
-            except (TypeError, ValueError):
-                slot_index = -1
-            if 0 <= slot_index < len(cargo):
-                cargo[slot_index] = 40
-            ship["cargo"] = cargo
-            self._broadcast_uplink_ship_info(ship)
-        sent = self._broadcast_building_delete(oid, prefer_tcp=False)
-        self._remove_dynamic_building_record(oid)
-        lifecycle.update(
-            {
-                "ok": sent > 0,
-                "source": "uplink_delete",
-                "delete_sent": sent,
-                "removed": True,
-            }
-        )
-        self._remember_building_lifecycle_event(lifecycle)
-        return {"ok": sent > 0, "oid": oid, "replication_targets": sent}
+        return build_uplink.delete_dynamic_building_from_uplink(self, ctx, command)
 
     def _get_or_create_uplink_ship(self, ctx: ClientContext, team_id: int) -> dict[str, Any]:
-        ship = self._uplink_ships.get(team_id)
-        if ship is not None:
-            return ship
-        base_pos = tuple(float(v) for v in (ctx.player_pos or (2600.0, 3040.0, 5.0)))
-        try:
-            offset_x = float(os.environ.get("WULFRAM_UPLINK_SHIP_OFFSET_X", "-450.0"))
-            offset_y = float(os.environ.get("WULFRAM_UPLINK_SHIP_OFFSET_Y", "0.0"))
-            offset_z = float(os.environ.get("WULFRAM_UPLINK_SHIP_OFFSET_Z", "12.0"))
-        except ValueError:
-            offset_x = -450.0
-            offset_y = 0.0
-            offset_z = 12.0
-        x = base_pos[0] + offset_x
-        y = base_pos[1] + offset_y
-        ground_z = self._terrain_ground_z_at(x, y)
-        z = (float(ground_z) + offset_z) if ground_z is not None else base_pos[2] + offset_z
-        try:
-            base_oid = int(os.environ.get("WULFRAM_UPLINK_SHIP_BASE_OID", "29000"), 0)
-        except ValueError:
-            base_oid = 29000
-        ship = {
-            "oid": base_oid + int(team_id),
-            "team_id": team_id,
-            "name": f"Team {team_id} Supply Ship",
-            "pos": (x, y, z),
-            "heading": 0.0,
-            "cargo": [40, 40, 40, 40],
-            "cargo_times": [0, 0, 0, 0],
-            "build_mode": 3,
-            "shield_pct": 100,
-            "status_template": 0,
-        }
-        self._uplink_ships[team_id] = ship
-        return ship
+        return build_uplink.get_or_create_uplink_ship(self, ctx, team_id)
 
     def _build_uplink_ship_info_packet(self, ship: dict[str, Any]) -> bytes:
-        return build_supply_ship_info(
-            int(ship["oid"]),
-            shield_pct=int(ship.get("shield_pct", 100) or 100),
-            status_template=int(ship.get("status_template", 0) or 0),
-            cargo_slots=list(ship.get("cargo", [40, 40, 40, 40])),
-            cargo_times=list(ship.get("cargo_times", [0, 0, 0, 0])),
-            build_mode=int(ship.get("build_mode", 3) or 3),
-        )
+        return build_uplink.build_uplink_ship_info_packet(ship)
 
     def _send_uplink_ship_info(self, ctx: ClientContext, ship: dict[str, Any]) -> bool:
-        return self._send_packet_to_client(ctx, self._build_uplink_ship_info_packet(ship), prefer_tcp=True)
+        return build_uplink.send_uplink_ship_info(self, ctx, ship)
 
     def _broadcast_uplink_ship_info(self, ship: dict[str, Any]) -> int:
-        sent = 0
-        for target in self._snapshot_in_game_clients():
-            if self._send_uplink_ship_info(target, ship):
-                sent += 1
-        return sent
+        return build_uplink.broadcast_uplink_ship_info(self, ship)
 
     def _send_existing_build_uplink_entities(self, ctx: ClientContext) -> int:
-        sent = 0
-        for team_id, ship in sorted(self._uplink_ships.items(), key=lambda item: int(item[0])):
-            if self._send_dynamic_entity_definition(
-                ctx,
-                entity_id=int(ship["oid"]),
-                entity_type=int(EntityType.SUPPLY_SHIP),
-                team_id=int(team_id),
-                pos=ship["pos"],
-                heading=float(ship.get("heading", 0.0) or 0.0),
-                is_static=True,
-            ):
-                sent += 1
-        for oid in sorted(self._dynamic_building_ids):
-            building = self._building_entities.get(oid)
-            if not building:
-                continue
-            if self._send_dynamic_entity_definition(
-                ctx,
-                entity_id=int(oid),
-                entity_type=int(building.entity_type),
-                team_id=int(building.team_id),
-                pos=building.pos,
-                heading=float(getattr(building, "heading", 0.0) or 0.0),
-                is_static=True,
-            ):
-                sent += 1
-        return sent
+        return build_uplink.send_existing_build_uplink_entities(self, ctx)
 
     def _ensure_uplink_mvp_state(self, ctx: ClientContext) -> None:
-        """Default-off bootstrap for the OG uplink/build MVP probe."""
-        if not getattr(self, "build_uplink_mvp", False):
-            return
-        if getattr(ctx, "uplink_mvp_bootstrap_sent", False):
-            return
-        if not ctx.session or not ctx.session.in_game or not ctx.session.translation_ack_received:
-            return
-        team_id = int(ctx.session.team_id or 1)
-        player_oid = int(ctx.session.entity_id or ctx.entity_id)
-        ship = self._get_or_create_uplink_ship(ctx, team_id)
-        packets = (
-            # ADD_TO_ROSTER creates the local PlayerEntry, but the decompile shows
-            # UPDATE_STATS is the path that writes g_player_team.  The uplink UI
-            # uses that global to find the team supply ship.
-            build_update_stats_team_first(player_id=player_oid, entity_id=player_oid, team_id=team_id),
-            build_ship_status(int(ship["oid"]), team_id, str(ship["name"])),
-            self._build_uplink_ship_info_packet(ship),
-            build_carrying_info(player_oid, cargo_type=0, has_uplink=True, cargo_count=0),
-            # State 3 is the decompile-labeled "in use" uplink state.
-            build_uplink_info(team_id, player_oid, 3),
-        )
-        sent = 0
-        for payload in packets:
-            if self._send_packet_to_client(ctx, payload, prefer_tcp=True):
-                sent += 1
-        dynamic_sent = self._send_existing_build_uplink_entities(ctx)
-        ctx.uplink_mvp_bootstrap_sent = sent == len(packets) and dynamic_sent > 0
-        print(
-            f"[BUILD-UPLINK] bootstrap client={ctx.client_id} team={team_id} "
-            f"ship={ship['oid']} player={player_oid} packets={sent}/{len(packets)} "
-            f"dynamic_entities={dynamic_sent}"
-        )
+        build_uplink.ensure_uplink_mvp_state(self, ctx)
 
     def _handle_comm_message_request(
         self,
@@ -3162,62 +2738,15 @@ class WulframServer:
         addr: Optional[tuple] = None,
         sequence: Optional[int] = None,
     ) -> dict[str, Any]:
-        decoded = self._decode_comm_message_request_body(body)
-        event: dict[str, Any] = {
-            "time": time.time(),
-            "transport": transport,
-            "client_id": getattr(ctx, "client_id", None),
-            "addr": list(addr) if addr else None,
-            "sequence": sequence,
-            "raw_hex": packet.hex(),
-            "decoded": decoded,
-            "handled": False,
-            "mvp_enabled": bool(getattr(self, "build_uplink_mvp", False)),
-        }
-        if ctx is not None:
-            ctx.comm_message_request_count = int(getattr(ctx, "comm_message_request_count", 0) or 0) + 1
-            ctx.last_comm_message_request = event
-        if not decoded.get("ok"):
-            return event
-
-        text = str(decoded.get("text") or "")
-        msg_type = int(decoded.get("message_type") or 0)
-        if msg_type != 2:
-            return event
-
-        command = self._parse_build_uplink_command(text)
-        event["build_uplink_command"] = command
-        event["handled"] = True
-        if ctx is not None:
-            ctx.build_uplink_command_count = int(getattr(ctx, "build_uplink_command_count", 0) or 0) + 1
-            ctx.last_build_uplink_command = event
-        if not getattr(self, "build_uplink_mvp", False):
-            event["result"] = {"ok": False, "error": "WULFRAM_BUILD_UPLINK_MVP disabled"}
-        elif ctx is None:
-            event["result"] = {"ok": False, "error": "unknown client"}
-        elif not command.get("ok"):
-            event["result"] = {"ok": False, "error": command.get("error", "parse failed")}
-        elif command.get("action") == "build":
-            event["result"] = self._create_dynamic_building_from_uplink(ctx, command)
-        elif command.get("action") == "delete":
-            event["result"] = self._delete_dynamic_building_from_uplink(ctx, command)
-        elif command.get("action") == "set":
-            team_id = int(ctx.session.team_id or 1)
-            ship = self._uplink_ships.get(team_id)
-            if ship is not None and str(command.get("field", "")).lower() == "build_mode":
-                ship["build_mode"] = int(command.get("value", 2) or 2)
-                self._broadcast_uplink_ship_info(ship)
-            event["result"] = {"ok": True, "noted": True}
-        else:
-            event["result"] = {"ok": True, "noted": True}
-
-        self._build_uplink_command_events.append(event)
-        del self._build_uplink_command_events[:-100]
-        print(
-            f"[BUILD-UPLINK] c{getattr(ctx, 'client_id', '?')} {transport} "
-            f"type=2 text={text!r} result={event.get('result')}"
+        return build_uplink.handle_comm_message_request(
+            self,
+            ctx,
+            packet,
+            transport=transport,
+            body=body,
+            addr=addr,
+            sequence=sequence,
         )
-        return event
 
     def _handle_tcp_comm_message_request(self, ctx: ClientContext, packet: bytes) -> dict[str, Any]:
         return self._handle_comm_message_request(
@@ -5659,6 +5188,12 @@ class WulframServer:
             # Phase 3: Team Select / Game Loop
             self._game_loop(ctx)
 
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError) as e:
+            phase_name = ctx.session.phase.name if ctx.session.phase else "UNKNOWN"
+            print(
+                f"[SERVER] Client {ctx.client_id} disconnected during "
+                f"{phase_name}: {e}"
+            )
         except Exception as e:
             print(f"[SERVER] Client {ctx.client_id} error: {e}")
             import traceback
@@ -7054,6 +6589,35 @@ class WulframServer:
 
         if heading is None:
             heading = ctx.player_heading
+        try:
+            base_pos = (
+                float(ctx.player_pos[0]),
+                float(ctx.player_pos[1]),
+                float(ctx.player_pos[2]),
+            )
+            base_vel = (
+                float(ctx.player_vel[0]),
+                float(ctx.player_vel[1]),
+                float(ctx.player_vel[2]),
+            )
+            heading = float(heading)
+        except (TypeError, ValueError, OverflowError, IndexError):
+            ctx.debug_last_spring_state = {
+                "source": "Spring_update_world_state",
+                "invalid_state": True,
+                "invalid_reason": "non_numeric_pose",
+            }
+            return (0.0, 0.0, 1.0), 1.0
+        if not all(math.isfinite(value) for value in (*base_pos, *base_vel, heading)):
+            ctx.debug_last_spring_state = {
+                "source": "Spring_update_world_state",
+                "invalid_state": True,
+                "invalid_reason": "nonfinite_pose",
+                "position": base_pos,
+                "velocity": base_vel,
+                "heading": heading,
+            }
+            return (0.0, 0.0, 1.0), 1.0
 
         local_offsets = tank_suspension_local_sample_offsets(
             longitudinal=self._TANK_RADIUS * 0.85,
@@ -7107,9 +6671,9 @@ class WulframServer:
             yaw_velocity = 0.0
 
         for (local_x, local_y), (dx, dy, dz) in zip(local_offsets, offsets):
-            sx = ctx.player_pos[0] + dx
-            sy = ctx.player_pos[1] + dy
-            sz = ctx.player_pos[2] + dz
+            sx = base_pos[0] + dx
+            sy = base_pos[1] + dy
+            sz = base_pos[2] + dz
             sample_height_normal = getattr(self.terrain, "sample_height_normal", None)
             if callable(sample_height_normal):
                 raw_ground_z, sample_up = sample_height_normal(sx, sy)
@@ -7128,8 +6692,8 @@ class WulframServer:
             sum_up_z += sample_up[2]
             sum_clearance += clearance
             point_velocity = rigid_body_point_velocity(
-                ctx.player_pos,
-                ctx.player_vel,
+                base_pos,
+                base_vel,
                 (roll_velocity, pitch_velocity, yaw_velocity),
                 (sx, sy, sz),
                 rotation_matrix=body_matrix,
@@ -7499,6 +7063,41 @@ class WulframServer:
             except Exception:
                 pass
 
+    def _jump_jet_direction_vector(
+        self,
+        ctx: ClientContext,
+        *,
+        vertical_idx: int,
+    ) -> tuple[float, float, float]:
+        """Return the world-space direction for a jumpjet impulse."""
+        world_up = (0.0, 0.0, 1.0) if vertical_idx == 2 else (0.0, 1.0, 0.0)
+        if (
+            getattr(self, "jump_jet_direction", "body") != "body"
+            or vertical_idx != 2
+            or ctx.entity_type != EntityType.TANK
+        ):
+            return world_up
+
+        try:
+            matrix = tank_body_matrix_with_heading(
+                getattr(ctx, "spring_body_matrix", None),
+                float(getattr(ctx, "player_heading", 0.0) or 0.0),
+                fallback_roll=float((getattr(ctx, "player_pose", {}) or {}).get("roll", 0.0) or 0.0),
+                fallback_pitch=float((getattr(ctx, "player_pose", {}) or {}).get("pitch", 0.0) or 0.0),
+            )
+            body_up = (float(matrix[2]), float(matrix[5]), float(matrix[8]))
+        except (TypeError, ValueError, IndexError):
+            return world_up
+
+        mag_sq = body_up[0] * body_up[0] + body_up[1] * body_up[1] + body_up[2] * body_up[2]
+        if not math.isfinite(mag_sq) or mag_sq <= 1e-10:
+            return world_up
+        inv_mag = 1.0 / math.sqrt(mag_sq)
+        direction = (body_up[0] * inv_mag, body_up[1] * inv_mag, body_up[2] * inv_mag)
+        if direction[2] <= 0.05:
+            return world_up
+        return direction
+
     def _apply_jump_jets_fixed_step(
         self,
         ctx: ClientContext,
@@ -7507,7 +7106,9 @@ class WulframServer:
         jumpjet_input: float,
         current_altitude: float,
         current_vel_up: float,
-    ) -> tuple[float, bool, float]:
+        direction: tuple[float, float, float],
+        vertical_idx: int,
+    ) -> tuple[bool, float, tuple[float, float, float]]:
         """Apply opt-in custom jump jets in the deterministic movement frame."""
         ctx.jump_cooldown_remaining = max(
             0.0,
@@ -7520,6 +7121,7 @@ class WulframServer:
 
         impulse = 0.0
         fired = False
+        impulse_vector = (0.0, 0.0, 0.0)
         cfg = JUMP_JET_CONFIGS.get(ctx.entity_type) if getattr(self, "jump_jets_enabled", False) else None
         if cfg is not None and ctx.jump_spawn_lockout <= 0.0:
             rising_edge = ctx.jump_prev_thrust_input < 0.5 and jumpjet_input >= 0.5
@@ -7530,7 +7132,12 @@ class WulframServer:
                 and ctx.player_energy >= cfg.fuel_cost
             ):
                 impulse = cfg.impulse
-                current_vel_up += impulse
+                impulse_vector = (
+                    impulse * direction[0],
+                    impulse * direction[1],
+                    impulse * direction[2],
+                )
+                current_vel_up += impulse_vector[vertical_idx]
                 ctx.jump_cooldown_remaining = cfg.cooldown
                 fired = True
                 if cfg.fuel_cost > 0.0:
@@ -7539,7 +7146,7 @@ class WulframServer:
                 self._on_jump_jet_triggered(ctx, player_id, impulse, current_vel_up)
 
         ctx.jump_prev_thrust_input = jumpjet_input
-        return current_vel_up, fired, impulse
+        return fired, impulse, impulse_vector
 
     def _record_client_weapon_fire(
         self,
@@ -7667,27 +7274,195 @@ class WulframServer:
     ) -> tuple[float, float, str]:
         """Replay remote OG movement slots at the phase the local client applies."""
         delay = max(0.0, float(delay_s))
+        now = time.monotonic()
+        debug = {
+            "delay_s": delay,
+            "current_fwd": float(current_fwd),
+            "current_strafe": float(current_strafe),
+            "target_age_s": delay,
+        }
         if delay <= 0.0:
+            ctx.debug_last_movement_input_selection = {
+                **debug,
+                "source": "current_slots",
+                "history_len": len(getattr(ctx, "movement_input_history", []) or []),
+                "selected_age_s": 0.0,
+            }
             return float(current_fwd), float(current_strafe), "current_slots"
         history = getattr(ctx, "movement_input_history", None)
         if not history:
+            ctx.debug_last_movement_input_selection = {
+                **debug,
+                "source": "current_slots_no_history",
+                "history_len": 0,
+                "selected_age_s": 0.0,
+            }
             return float(current_fwd), float(current_strafe), "current_slots_no_history"
 
-        target_time = time.monotonic() - delay
-        selected = None
-        for entry in reversed(history):
+        def build_tick_probe() -> dict:
+            if not getattr(self, "remote_og_movement_input_tick_probe", False):
+                return {}
+            try:
+                server_tick_now = int(get_ticks()) & 0xFFFFFFFF
+            except (TypeError, ValueError, OverflowError):
+                server_tick_now = 0
+            tick_offset = getattr(ctx, "tick_offset", None)
+            current_client_tick = int(getattr(ctx, "last_client_tick", 0) or 0)
+            if tick_offset is not None:
+                try:
+                    current_client_tick = (
+                        server_tick_now + int(tick_offset)
+                    ) & 0xFFFFFFFF
+                except (TypeError, ValueError, OverflowError):
+                    current_client_tick = int(
+                        getattr(ctx, "last_client_tick", 0) or 0
+                    )
+            if current_client_tick <= 0:
+                return {
+                    "tick_probe_enabled": True,
+                    "tick_probe_reject": "no_current_client_tick",
+                    "tick_probe_server_tick": server_tick_now,
+                    "tick_probe_tick_offset": tick_offset,
+                    "tick_probe_last_client_tick": int(
+                        getattr(ctx, "last_client_tick", 0) or 0
+                    ),
+                }
+            delay_ms = max(0, int(round(delay * 1000.0)))
+            target_client_tick = (current_client_tick - delay_ms) & 0xFFFFFFFF
+
+            def entry_tick(entry) -> int | None:
+                try:
+                    tick = int(entry.get("client_tick", 0) or 0)
+                except (TypeError, ValueError, AttributeError, OverflowError):
+                    return None
+                return tick if tick > 0 else None
+
+            before = None
+            nearest = None
+            nearest_abs_delta = None
+            for entry in reversed(history):
+                tick = entry_tick(entry)
+                if tick is None:
+                    continue
+                delta_ms = self._tick_delta_signed(tick, target_client_tick)
+                abs_delta = abs(delta_ms)
+                if nearest_abs_delta is None or abs_delta < nearest_abs_delta:
+                    nearest = entry
+                    nearest_abs_delta = abs_delta
+                if before is None and delta_ms <= 0:
+                    before = entry
+            latest = history[-1] if history else {}
+            latest_tick = entry_tick(latest) if isinstance(latest, dict) else None
+
+            def fields(prefix: str, entry) -> dict:
+                tick = entry_tick(entry) if isinstance(entry, dict) else None
+                if tick is None:
+                    return {f"{prefix}_found": False}
+                delta_ms = self._tick_delta_signed(tick, target_client_tick)
+                return {
+                    f"{prefix}_found": True,
+                    f"{prefix}_client_tick": tick,
+                    f"{prefix}_target_error_ms": delta_ms,
+                    f"{prefix}_abs_target_error_ms": abs(delta_ms),
+                    f"{prefix}_future_of_target": delta_ms > 0,
+                    f"{prefix}_fwd": float(entry.get("fwd", 0.0)),
+                    f"{prefix}_strafe": float(entry.get("strafe", 0.0)),
+                }
+
+            out = {
+                "tick_probe_enabled": True,
+                "tick_probe_reject": "",
+                "tick_probe_server_tick": server_tick_now,
+                "tick_probe_tick_offset": tick_offset,
+                "tick_probe_current_client_tick": current_client_tick,
+                "tick_probe_last_client_tick": int(
+                    getattr(ctx, "last_client_tick", 0) or 0
+                ),
+                "tick_probe_delay_ms": delay_ms,
+                "tick_probe_target_client_tick": target_client_tick,
+                "tick_probe_latest_client_tick": latest_tick,
+            }
+            out.update(fields("tick_probe_before", before))
+            out.update(fields("tick_probe_nearest", nearest))
+            return out
+
+        tick_probe = build_tick_probe()
+        target_time = now - delay
+        selection_policy = getattr(
+            self,
+            "remote_og_movement_input_selection",
+            "latest_before_target",
+        )
+        if selection_policy not in {"latest_before_target", "nearest_to_target"}:
+            selection_policy = "latest_before_target"
+        before = None
+        after = None
+        nearest = None
+        nearest_error = None
+        for entry in history:
             try:
                 sample_time = float(entry.get("time", 0.0))
             except (TypeError, ValueError, AttributeError):
                 continue
+            error = abs(sample_time - target_time)
+            if nearest_error is None or error < nearest_error:
+                nearest = entry
+                nearest_error = error
             if sample_time <= target_time:
-                selected = entry
-                break
+                before = entry
+            elif after is None:
+                after = entry
+
+        def movement_time_probe_fields(prefix: str, entry) -> dict:
+            if not isinstance(entry, dict):
+                return {f"{prefix}_found": False}
+            try:
+                sample_time = float(entry.get("time", 0.0))
+            except (TypeError, ValueError, AttributeError):
+                return {f"{prefix}_found": False}
+            target_error = sample_time - target_time
+            return {
+                f"{prefix}_found": True,
+                f"{prefix}_age_s": (now - sample_time) if sample_time > 0.0 else None,
+                f"{prefix}_target_error_s": target_error,
+                f"{prefix}_abs_target_error_s": abs(target_error),
+                f"{prefix}_future_of_target": target_error > 0.0,
+                f"{prefix}_fwd": float(entry.get("fwd", 0.0)),
+                f"{prefix}_strafe": float(entry.get("strafe", 0.0)),
+                f"{prefix}_client_tick": int(entry.get("client_tick", 0) or 0),
+            }
+
+        selected = None
+        if selection_policy == "nearest_to_target":
+            selected = nearest
+        else:
+            selected = before
 
         if selected is None:
             # The first nonzero packet can arrive before OG local physics has
             # consumed the key event. Hold neutral during that short replay
             # window instead of advancing the server early.
+            latest = history[-1] if history else {}
+            latest_time = 0.0
+            try:
+                latest_time = float(latest.get("time", 0.0))
+            except (TypeError, ValueError, AttributeError):
+                latest_time = 0.0
+            ctx.debug_last_movement_input_selection = {
+                **debug,
+                **tick_probe,
+                **movement_time_probe_fields("time_probe_before", before),
+                **movement_time_probe_fields("time_probe_after", after),
+                **movement_time_probe_fields("time_probe_nearest", nearest),
+                "source": "delayed_remote_og_pre_history_zero",
+                "selection_policy": selection_policy,
+                "history_len": len(history),
+                "target_time": target_time,
+                "latest_age_s": (now - latest_time) if latest_time > 0.0 else None,
+                "latest_fwd": float(latest.get("fwd", 0.0)) if isinstance(latest, dict) else 0.0,
+                "latest_strafe": float(latest.get("strafe", 0.0)) if isinstance(latest, dict) else 0.0,
+                "latest_client_tick": int(latest.get("client_tick", 0) or 0) if isinstance(latest, dict) else 0,
+            }
             return 0.0, 0.0, "delayed_remote_og_pre_history_zero"
 
         try:
@@ -7698,6 +7473,71 @@ class WulframServer:
             strafe = float(selected.get("strafe", 0.0))
         except (TypeError, ValueError, AttributeError):
             strafe = 0.0
+        selected_time = 0.0
+        try:
+            selected_time = float(selected.get("time", 0.0))
+        except (TypeError, ValueError, AttributeError):
+            selected_time = 0.0
+        selected_interval_end_time = None
+        if selected is before and isinstance(after, dict):
+            try:
+                selected_interval_end_time = float(after.get("time", 0.0))
+            except (TypeError, ValueError, AttributeError):
+                selected_interval_end_time = None
+        latest = history[-1] if history else {}
+        latest_time = 0.0
+        try:
+            latest_time = float(latest.get("time", 0.0))
+        except (TypeError, ValueError, AttributeError):
+            latest_time = 0.0
+        ctx.debug_last_movement_input_selection = {
+            **debug,
+            **tick_probe,
+            **movement_time_probe_fields("time_probe_before", before),
+            **movement_time_probe_fields("time_probe_after", after),
+            **movement_time_probe_fields("time_probe_nearest", nearest),
+            "source": "delayed_remote_og_action_history",
+            "selection_policy": selection_policy,
+            "history_len": len(history),
+            "target_time": target_time,
+            "selected_age_s": (now - selected_time) if selected_time > 0.0 else None,
+            "selected_target_error_s": (
+                selected_time - target_time if selected_time > 0.0 else None
+            ),
+            "selected_abs_target_error_s": (
+                abs(selected_time - target_time) if selected_time > 0.0 else None
+            ),
+            "selected_future_of_target": (
+                selected_time > target_time if selected_time > 0.0 else None
+            ),
+            "selected_fwd": fwd,
+            "selected_strafe": strafe,
+            "selected_client_tick": int(selected.get("client_tick", 0) or 0),
+            "selected_interval_end_age_s": (
+                (now - selected_interval_end_time)
+                if selected_interval_end_time is not None
+                and selected_interval_end_time > 0.0
+                else None
+            ),
+            "selected_interval_end_target_error_s": (
+                (selected_interval_end_time - target_time)
+                if selected_interval_end_time is not None
+                else None
+            ),
+            "selected_interval_contains_target": (
+                selected_time <= target_time
+                and (
+                    selected_interval_end_time is None
+                    or target_time < selected_interval_end_time
+                )
+                if selected_time > 0.0
+                else None
+            ),
+            "latest_age_s": (now - latest_time) if latest_time > 0.0 else None,
+            "latest_fwd": float(latest.get("fwd", 0.0)) if isinstance(latest, dict) else 0.0,
+            "latest_strafe": float(latest.get("strafe", 0.0)) if isinstance(latest, dict) else 0.0,
+            "latest_client_tick": int(latest.get("client_tick", 0) or 0) if isinstance(latest, dict) else 0,
+        }
         return fwd, strafe, "delayed_remote_og_action_history"
 
     def _maybe_promote_remote_full_local_state(self, ctx: ClientContext, *, reason: str) -> bool:
@@ -8099,24 +7939,36 @@ class WulframServer:
         tank_ground_contact_damp = 0.0
 
         jumpjet_input = self._get_jumpjet_input(ctx)
+        jump_jet_direction = self._jump_jet_direction_vector(ctx, vertical_idx=vertical_idx)
+        jump_jet_velocity_delta = (0.0, 0.0, 0.0)
         if vertical_idx == 2:
             jump_altitude = ctx.player_pos[2] - ground_level if ground_level is not None else ctx.player_pos[2]
-            vel_z, jump_jet_fired, jump_jet_impulse = self._apply_jump_jets_fixed_step(
+            jump_jet_fired, jump_jet_impulse, jump_jet_velocity_delta = self._apply_jump_jets_fixed_step(
                 ctx,
                 dt=dt,
                 jumpjet_input=jumpjet_input,
                 current_altitude=jump_altitude,
                 current_vel_up=vel_z,
+                direction=jump_jet_direction,
+                vertical_idx=vertical_idx,
             )
+            vel_x += jump_jet_velocity_delta[0]
+            vel_y += jump_jet_velocity_delta[1]
+            vel_z += jump_jet_velocity_delta[2]
         else:
             jump_altitude = ctx.player_pos[1] - ground_level if ground_level is not None else ctx.player_pos[1]
-            vel_y, jump_jet_fired, jump_jet_impulse = self._apply_jump_jets_fixed_step(
+            jump_jet_fired, jump_jet_impulse, jump_jet_velocity_delta = self._apply_jump_jets_fixed_step(
                 ctx,
                 dt=dt,
                 jumpjet_input=jumpjet_input,
                 current_altitude=jump_altitude,
                 current_vel_up=vel_y,
+                direction=jump_jet_direction,
+                vertical_idx=vertical_idx,
             )
+            vel_x += jump_jet_velocity_delta[0]
+            vel_y += jump_jet_velocity_delta[1]
+            vel_z += jump_jet_velocity_delta[2]
 
         gravity_impulse = (0.0, 0.0, 0.0)
         suspension_impulse = (0.0, 0.0, 0.0)
@@ -8311,6 +8163,8 @@ class WulframServer:
         ctx.debug_last_collision = {}
         ctx.debug_last_motion_collision = {}
         ctx.debug_last_terrain_contact_probe = {}
+        jump_jet_collision_guard_debug = {}
+        tank_terrain_projection_guard_debug = {}
         ctx.rigid_body_target_pos = (new_x, new_y, new_z)
         ctx.rigid_body_target_rot = (
             float((getattr(ctx, "player_pose", {}) or {}).get("roll", 0.0) or 0.0),
@@ -8322,6 +8176,8 @@ class WulframServer:
         )
 
         # Decompile-shaped terrain/world contact pass before static blockers.
+        pre_world_collision_pos = (new_x, new_y, new_z)
+        pre_world_collision_vel = (new_vel_x, new_vel_y, new_vel_z)
         ctx._world_collision_step_pre_pos = pre_pos
         ctx._world_collision_step_pre_vel = pre_vel
         ctx._world_collision_step_dt = dt
@@ -8337,6 +8193,145 @@ class WulframServer:
             ):
                 if hasattr(ctx, attr_name):
                     delattr(ctx, attr_name)
+
+        if (
+            self.up_axis == "z"
+            and ctx.entity_type == EntityType.TANK
+            and not use_ground_override
+            and getattr(self, "jump_jet_collision_guard", True)
+            and float(getattr(ctx, "jump_cooldown_remaining", 0.0) or 0.0) > 0.0
+        ):
+            raw_world_collision_pos = (new_x, new_y, new_z)
+            raw_world_collision_vel = (new_vel_x, new_vel_y, new_vel_z)
+            collision_dx = raw_world_collision_pos[0] - pre_world_collision_pos[0]
+            collision_dy = raw_world_collision_pos[1] - pre_world_collision_pos[1]
+            collision_xy = math.sqrt(collision_dx * collision_dx + collision_dy * collision_dy)
+            collision_z_pop = raw_world_collision_pos[2] - pre_world_collision_pos[2]
+            max_xy = float(getattr(self, "jump_jet_collision_guard_xy", 1.0) or 0.0)
+            max_z_pop = float(getattr(self, "jump_jet_collision_guard_zpop", 2.0) or 0.0)
+            guard_applies = (
+                (max_xy > 0.0 and collision_xy > max_xy)
+                or (max_z_pop > 0.0 and collision_z_pop > max_z_pop)
+            )
+            if guard_applies:
+                if self.terrain is not None:
+                    landing_ground = self._terrain_physics_ground_z_at(
+                        pre_world_collision_pos[0],
+                        pre_world_collision_pos[1],
+                    )
+                else:
+                    landing_ground = ground_level
+                landing_clearance = float(
+                    getattr(self, "jump_jet_landing_clearance", 1.85) or 0.0
+                )
+                landing_floor = float(landing_ground) + max(0.0, landing_clearance)
+                landing_floor_applied = pre_world_collision_pos[2] < landing_floor
+                new_x = pre_world_collision_pos[0]
+                new_y = pre_world_collision_pos[1]
+                new_z = landing_floor if landing_floor_applied else pre_world_collision_pos[2]
+                new_vel_x = pre_world_collision_vel[0]
+                new_vel_y = pre_world_collision_vel[1]
+                new_vel_z = (
+                    max(0.0, pre_world_collision_vel[2])
+                    if landing_floor_applied
+                    else pre_world_collision_vel[2]
+                )
+                ctx.world_collision_ref_pos = (new_x, new_y, new_z)
+                ctx.world_collision_bounds_dirty = False
+                jump_jet_collision_guard_debug = {
+                    "applied": True,
+                    "reason": "jumpjet_large_world_collision_projection",
+                    "collision_xy": collision_xy,
+                    "collision_z_pop": collision_z_pop,
+                    "max_xy": max_xy,
+                    "max_z_pop": max_z_pop,
+                    "landing_ground": landing_ground,
+                    "landing_floor": landing_floor,
+                    "landing_floor_applied": landing_floor_applied,
+                    "pre_world_collision_pos": pre_world_collision_pos,
+                    "pre_world_collision_vel": pre_world_collision_vel,
+                    "raw_world_collision_pos": raw_world_collision_pos,
+                    "raw_world_collision_vel": raw_world_collision_vel,
+                    "guarded_pos": (new_x, new_y, new_z),
+                    "guarded_vel": (new_vel_x, new_vel_y, new_vel_z),
+                    "raw_motion_collision": dict(getattr(ctx, "debug_last_motion_collision", {}) or {}),
+                }
+            elif collision_xy > 0.0 or collision_z_pop > 0.0:
+                jump_jet_collision_guard_debug = {
+                    "applied": False,
+                    "collision_xy": collision_xy,
+                    "collision_z_pop": collision_z_pop,
+                    "max_xy": max_xy,
+                    "max_z_pop": max_z_pop,
+                }
+
+        if (
+            self.up_axis == "z"
+            and ctx.entity_type == EntityType.TANK
+            and not use_ground_override
+            and getattr(self, "tank_terrain_projection_guard", False)
+            and float(getattr(ctx, "jump_cooldown_remaining", 0.0) or 0.0) <= 0.0
+        ):
+            raw_world_collision_pos = (new_x, new_y, new_z)
+            raw_world_collision_vel = (new_vel_x, new_vel_y, new_vel_z)
+            collision_dx = raw_world_collision_pos[0] - pre_world_collision_pos[0]
+            collision_dy = raw_world_collision_pos[1] - pre_world_collision_pos[1]
+            collision_xy = math.sqrt(collision_dx * collision_dx + collision_dy * collision_dy)
+            collision_z_pop = raw_world_collision_pos[2] - pre_world_collision_pos[2]
+            max_xy = float(getattr(self, "tank_terrain_projection_guard_xy", 1.0) or 0.0)
+            max_z_pop = float(getattr(self, "tank_terrain_projection_guard_zpop", 2.0) or 0.0)
+            if self.terrain is not None:
+                projection_ground = self._terrain_physics_ground_z_at(
+                    pre_world_collision_pos[0],
+                    pre_world_collision_pos[1],
+                )
+            else:
+                projection_ground = ground_level
+            projection_clearance = pre_world_collision_pos[2] - float(projection_ground)
+            min_clearance = float(
+                getattr(self, "tank_terrain_projection_guard_min_clearance", 0.5) or 0.0
+            )
+            guard_applies = (
+                projection_clearance >= min_clearance
+                and (
+                    (max_xy > 0.0 and collision_xy > max_xy)
+                    or (max_z_pop > 0.0 and collision_z_pop > max_z_pop)
+                )
+            )
+            if guard_applies:
+                new_x, new_y, new_z = pre_world_collision_pos
+                new_vel_x, new_vel_y, new_vel_z = pre_world_collision_vel
+                ctx.world_collision_ref_pos = (new_x, new_y, new_z)
+                ctx.world_collision_bounds_dirty = False
+                tank_terrain_projection_guard_debug = {
+                    "applied": True,
+                    "reason": "tank_large_terrain_projection_while_clear",
+                    "collision_xy": collision_xy,
+                    "collision_z_pop": collision_z_pop,
+                    "max_xy": max_xy,
+                    "max_z_pop": max_z_pop,
+                    "projection_ground": projection_ground,
+                    "projection_clearance": projection_clearance,
+                    "min_clearance": min_clearance,
+                    "pre_world_collision_pos": pre_world_collision_pos,
+                    "pre_world_collision_vel": pre_world_collision_vel,
+                    "raw_world_collision_pos": raw_world_collision_pos,
+                    "raw_world_collision_vel": raw_world_collision_vel,
+                    "guarded_pos": (new_x, new_y, new_z),
+                    "guarded_vel": (new_vel_x, new_vel_y, new_vel_z),
+                    "raw_motion_collision": dict(getattr(ctx, "debug_last_motion_collision", {}) or {}),
+                }
+            elif collision_xy > 0.0 or collision_z_pop > 0.0:
+                tank_terrain_projection_guard_debug = {
+                    "applied": False,
+                    "collision_xy": collision_xy,
+                    "collision_z_pop": collision_z_pop,
+                    "max_xy": max_xy,
+                    "max_z_pop": max_z_pop,
+                    "projection_ground": projection_ground,
+                    "projection_clearance": projection_clearance,
+                    "min_clearance": min_clearance,
+                }
 
         # Building AABB collision (matching client-side)
         new_x, new_y, new_vel_x, new_vel_y = self._check_building_collisions(
@@ -8397,6 +8392,9 @@ class WulframServer:
             "raw_strafe_input_current": raw_strafe_input,
             "movement_input_source": movement_input_source,
             "movement_input_delay_s": movement_input_delay_s,
+            "movement_input_selection": dict(
+                getattr(ctx, "debug_last_movement_input_selection", {}) or {}
+            ),
             "thrust_input": (
                 self._normalize_behavior_axis_value(
                     ctx,
@@ -8448,6 +8446,9 @@ class WulframServer:
             "terrain_ground_level": terrain_ground_level,
             "jump_jet_fired": jump_jet_fired,
             "jump_jet_impulse": jump_jet_impulse,
+            "jump_jet_direction": jump_jet_direction,
+            "jump_jet_direction_mode": getattr(self, "jump_jet_direction", "body"),
+            "jump_jet_velocity_delta": jump_jet_velocity_delta,
             "jump_jet_altitude": jump_altitude,
             "jump_cooldown_remaining": ctx.jump_cooldown_remaining,
             "jump_spawn_lockout": ctx.jump_spawn_lockout,
@@ -8558,6 +8559,8 @@ class WulframServer:
             "world_collision_ref_pos": getattr(ctx, "world_collision_ref_pos", None),
             "world_collision_bounds_dirty": bool(getattr(ctx, "world_collision_bounds_dirty", False)),
             "motion_collision": dict(getattr(ctx, "debug_last_motion_collision", {}) or {}),
+            "jump_jet_collision_guard": jump_jet_collision_guard_debug,
+            "tank_terrain_projection_guard": tank_terrain_projection_guard_debug,
             "terrain_contact_probe": dict(getattr(ctx, "debug_last_terrain_contact_probe", {}) or {}),
             "pos": ctx.player_pos,
             "vel": ctx.player_vel,
@@ -8856,11 +8859,34 @@ class WulframServer:
         contact_response = (
             os.environ.get("WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE", "auto").strip().lower()
         )
+        ctx_entity_type = getattr(ctx, "entity_type", EntityType.TANK)
+        if not isinstance(ctx_entity_type, EntityType):
+            try:
+                ctx_entity_type = EntityType(int(ctx_entity_type))
+            except (TypeError, ValueError):
+                ctx_entity_type = EntityType.TANK
+        tank_clean_pair_solver_enabled = (
+            os.environ.get("WULFRAM_TANK_CLEAN_TERRAIN_PAIR_SOLVER", "1")
+            .strip()
+            .lower()
+            not in {"0", "false", "off", "no", "disabled", "legacy"}
+        )
+        try:
+            tank_clean_pair_solver_max_depth = float(
+                os.environ.get("WULFRAM_TANK_CLEAN_TERRAIN_MAX_DEPTH", "10.0")
+            )
+        except ValueError:
+            tank_clean_pair_solver_max_depth = 10.0
         pair_solver_response = (
             contact_response in {"pair", "solver", "constraint"}
             or (
                 contact_response == "auto"
                 and origin_mode in {"entity", "origin", "raw"}
+            )
+            or (
+                contact_response == "auto"
+                and ctx_entity_type == EntityType.TANK
+                and tank_clean_pair_solver_enabled
             )
         )
         contact_timing_mode = (
@@ -9056,6 +9082,70 @@ class WulframServer:
             "hold",
             "preserve",
         }
+        dirty_reference_pair_probe_mode = (
+            os.environ.get("WULFRAM_ENTITY_TERRAIN_DIRTY_REFERENCE_PAIR_PROBE", "0")
+            .strip()
+            .lower()
+        )
+        dirty_reference_pair_probe_enabled = dirty_reference_pair_probe_mode in {
+            "1",
+            "true",
+            "on",
+            "yes",
+            "probe",
+            "reference",
+            "dirty_reference",
+            "decompile",
+        }
+        dirty_reference_pair_response_mode = (
+            os.environ.get("WULFRAM_ENTITY_TERRAIN_DIRTY_REFERENCE_PAIR_RESPONSE", "0")
+            .strip()
+            .lower()
+        )
+        dirty_reference_pair_response_enabled = dirty_reference_pair_response_mode in {
+            "1",
+            "true",
+            "on",
+            "yes",
+            "probe",
+            "apply",
+            "contact",
+            "response",
+            "decompile",
+        }
+        dirty_reference_pair_response_apply_enabled = (
+            dirty_reference_pair_response_enabled
+            and dirty_reference_pair_response_mode
+            in {"apply", "contact", "response", "decompile"}
+        )
+        try:
+            dirty_reference_pair_response_max_distance = float(
+                os.environ.get(
+                    "WULFRAM_ENTITY_TERRAIN_DIRTY_REFERENCE_PAIR_RESPONSE_MAX_DISTANCE",
+                    "0",
+                )
+            )
+        except (TypeError, ValueError):
+            dirty_reference_pair_response_max_distance = 0.0
+        if dirty_reference_pair_response_max_distance < 0.0:
+            dirty_reference_pair_response_max_distance = 0.0
+        if dirty_reference_pair_response_enabled:
+            dirty_reference_pair_probe_enabled = True
+        dirty_bounds_safe_response_mode = (
+            os.environ.get("WULFRAM_ENTITY_TERRAIN_DIRTY_BOUNDS_SAFE_RESPONSE", "0")
+            .strip()
+            .lower()
+        )
+        dirty_bounds_safe_response_enabled = dirty_bounds_safe_response_mode in {
+            "1",
+            "true",
+            "on",
+            "yes",
+            "safe",
+            "safety",
+            "limited",
+            "decompile",
+        }
 
         def box_collision_z_lift() -> float:
             if terrain_collision_shape == "entity_box":
@@ -9109,6 +9199,21 @@ class WulframServer:
                 "contact_terrain_face_normal": getattr(contact, "terrain_face_normal", None),
                 "contact_mesh_face_normal": getattr(contact, "mesh_face_normal", None),
                 "contact_entity_radial_normal": getattr(contact, "entity_radial_normal", None),
+                "contact_cbsp_store_normal0": getattr(contact, "cbsp_store_normal0", None),
+                "contact_cbsp_store_normal1": getattr(contact, "cbsp_store_normal1", None),
+                "contact_cbsp_record_hit_source": getattr(contact, "cbsp_record_hit_source", None),
+                "contact_cbsp_mesh_triangle_indices": getattr(contact, "cbsp_mesh_triangle_indices", None),
+                "contact_cbsp_guess7_order": getattr(contact, "cbsp_guess7_order", None),
+                "contact_cbsp_guess7_terms": getattr(contact, "cbsp_guess7_terms", None),
+                "contact_cbsp_edge_hit_kind": getattr(contact, "cbsp_edge_hit_kind", None),
+                "contact_cbsp_edge_t": getattr(contact, "cbsp_edge_t", None),
+                "contact_cbsp_node_index": getattr(contact, "cbsp_node_index", None),
+                "contact_cbsp_node_depth": getattr(contact, "cbsp_node_depth", None),
+                "contact_cbsp_node_mesh_normal_angle_deg": getattr(
+                    contact,
+                    "cbsp_node_mesh_normal_angle_deg",
+                    None,
+                ),
             }
 
         contact_probe_mode = (
@@ -9157,6 +9262,40 @@ class WulframServer:
         )
         if reference_pose_contact_response_enabled:
             reference_pose_probe_enabled = True
+        reference_pose_pair_response_mode = (
+            os.environ.get("WULFRAM_ENTITY_TERRAIN_REFERENCE_POSE_PAIR_RESPONSE", "0")
+            .strip()
+            .lower()
+        )
+        reference_pose_pair_response_enabled = reference_pose_pair_response_mode in {
+            "1",
+            "true",
+            "on",
+            "yes",
+            "probe",
+            "apply",
+            "contact",
+            "response",
+            "decompile",
+        }
+        reference_pose_pair_response_apply_enabled = (
+            reference_pose_pair_response_enabled
+            and reference_pose_pair_response_mode
+            in {"apply", "contact", "response", "decompile"}
+        )
+        try:
+            reference_pose_pair_response_max_distance = float(
+                os.environ.get(
+                    "WULFRAM_ENTITY_TERRAIN_REFERENCE_POSE_PAIR_RESPONSE_MAX_DISTANCE",
+                    "0",
+                )
+            )
+        except (TypeError, ValueError):
+            reference_pose_pair_response_max_distance = 0.0
+        if reference_pose_pair_response_max_distance < 0.0:
+            reference_pose_pair_response_max_distance = 0.0
+        if reference_pose_pair_response_enabled:
+            reference_pose_probe_enabled = True
         reference_pose_contact_order = tuple(
             label.strip()
             for label in os.environ.get(
@@ -9168,11 +9307,8 @@ class WulframServer:
             ).split(",")
             if label.strip()
         )
-        raw_fallback_mode = (
-            os.environ.get("WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK", "0")
-            .strip()
-            .lower()
-        )
+        raw_fallback_env = os.environ.get("WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK")
+        raw_fallback_mode = (raw_fallback_env if raw_fallback_env is not None else "0").strip().lower()
         raw_fallback_enabled = raw_fallback_mode in {
             "1",
             "true",
@@ -9287,6 +9423,159 @@ class WulframServer:
                 raw_fallback_friction = max(0.0, float(raw_fallback_friction_env))
             except ValueError:
                 raw_fallback_friction = None
+        tank_raw_fallback_env = os.environ.get("WULFRAM_TANK_RAW_ORIGIN_FALLBACK")
+        tank_raw_fallback_mode = (
+            tank_raw_fallback_env if tank_raw_fallback_env is not None else "1"
+        ).strip().lower()
+        tank_raw_fallback_auto_enabled = (
+            ctx_entity_type == EntityType.TANK
+            and contact_response == "auto"
+            and origin_mode not in {"entity", "origin", "raw"}
+            and raw_fallback_env is None
+            and tank_raw_fallback_mode
+            not in {"0", "false", "off", "no", "disabled", "legacy"}
+        )
+        tank_raw_fallback_normal_source = (
+            os.environ.get("WULFRAM_TANK_RAW_ORIGIN_NORMAL_SOURCE", "terrain_face")
+            .strip()
+            .lower()
+        )
+        tank_raw_fallback_delta_normal_mode = (
+            os.environ.get("WULFRAM_TANK_RAW_ORIGIN_DELTA_NORMAL", "horizontal_face")
+            .strip()
+            .lower()
+        )
+        try:
+            tank_raw_fallback_min_depth = float(
+                os.environ.get("WULFRAM_TANK_RAW_ORIGIN_MIN_DEPTH", "2.0")
+            )
+        except ValueError:
+            tank_raw_fallback_min_depth = 2.0
+        try:
+            tank_raw_fallback_max_depth = float(
+                os.environ.get("WULFRAM_TANK_RAW_ORIGIN_MAX_DEPTH", "10.0")
+            )
+        except ValueError:
+            tank_raw_fallback_max_depth = 10.0
+        try:
+            tank_raw_fallback_min_normal_z = float(
+                os.environ.get("WULFRAM_TANK_RAW_ORIGIN_MIN_NORMAL_Z", "0.4")
+            )
+        except ValueError:
+            tank_raw_fallback_min_normal_z = 0.4
+        try:
+            tank_raw_fallback_min_face_normal_z = float(
+                os.environ.get("WULFRAM_TANK_RAW_ORIGIN_MIN_FACE_NORMAL_Z", "0.4")
+            )
+        except ValueError:
+            tank_raw_fallback_min_face_normal_z = 0.4
+        try:
+            tank_raw_fallback_min_speed = float(
+                os.environ.get("WULFRAM_TANK_RAW_ORIGIN_MIN_SPEED", "5.0")
+            )
+        except ValueError:
+            tank_raw_fallback_min_speed = 5.0
+        try:
+            tank_raw_fallback_max_velocity_delta = float(
+                os.environ.get("WULFRAM_TANK_RAW_ORIGIN_MAX_VELOCITY_DELTA", "18.0")
+            )
+        except ValueError:
+            tank_raw_fallback_max_velocity_delta = 18.0
+        try:
+            tank_raw_fallback_max_vertical_delta = float(
+                os.environ.get("WULFRAM_TANK_RAW_ORIGIN_MAX_VERTICAL_DELTA", "8.0")
+            )
+        except ValueError:
+            tank_raw_fallback_max_vertical_delta = 8.0
+        try:
+            tank_raw_fallback_max_speed = float(
+                os.environ.get("WULFRAM_TANK_RAW_ORIGIN_MAX_SPEED", "200.0")
+            )
+        except ValueError:
+            tank_raw_fallback_max_speed = 200.0
+        try:
+            tank_raw_fallback_max_angular_delta = float(
+                os.environ.get("WULFRAM_TANK_RAW_ORIGIN_MAX_ANGULAR_DELTA", "0.0")
+            )
+        except ValueError:
+            tank_raw_fallback_max_angular_delta = 0.0
+        tank_raw_fallback_projection_order = os.environ.get(
+            "WULFRAM_TANK_RAW_ORIGIN_PROJECTION_ORDER",
+            "opposite_if_separating",
+        )
+        tank_raw_fallback_delta_mode = (
+            os.environ.get("WULFRAM_TANK_RAW_ORIGIN_DELTA_MODE", "closing_velocity")
+            .strip()
+            .lower()
+        )
+        tank_raw_fallback_angular_mode = (
+            os.environ.get("WULFRAM_TANK_RAW_ORIGIN_ANGULAR_MODE", "preserve")
+            .strip()
+            .lower()
+        )
+        tank_raw_fallback_vertical_delta_mode = (
+            os.environ.get("WULFRAM_TANK_RAW_ORIGIN_VERTICAL_DELTA_MODE", "component")
+            .strip()
+            .lower()
+        )
+        tank_raw_fallback_closing_only = (
+            os.environ.get("WULFRAM_TANK_RAW_ORIGIN_CLOSING_ONLY", "1")
+            .strip()
+            .lower()
+            not in {"0", "false", "off", "no", "disabled"}
+        )
+        tank_clean_face_fallback_mode = (
+            os.environ.get("WULFRAM_TANK_CLEAN_TERRAIN_FACE_FALLBACK", "1")
+            .strip()
+            .lower()
+        )
+        tank_clean_face_fallback_enabled = (
+            ctx_entity_type == EntityType.TANK
+            and contact_response == "auto"
+            and origin_mode not in {"entity", "origin", "raw"}
+            and tank_clean_face_fallback_mode
+            not in {"0", "false", "off", "no", "disabled", "legacy"}
+        )
+        tank_face_fallback_latch_enabled = (
+            os.environ.get("WULFRAM_TANK_FACE_FALLBACK_LATCH", "0")
+            .strip()
+            .lower()
+            not in {"0", "false", "off", "no", "disabled", "legacy"}
+        )
+        tank_clean_face_fallback_delta_mode = (
+            os.environ.get(
+                "WULFRAM_TANK_CLEAN_TERRAIN_FACE_FALLBACK_DELTA_MODE",
+                "center_closing_velocity",
+            )
+            .strip()
+            .lower()
+        )
+        tank_clean_face_fallback_delta_normal_mode = (
+            os.environ.get(
+                "WULFRAM_TANK_CLEAN_TERRAIN_FACE_FALLBACK_DELTA_NORMAL",
+                "horizontal_face",
+            )
+            .strip()
+            .lower()
+        )
+        try:
+            tank_clean_face_fallback_max_contact_normal_z = float(
+                os.environ.get(
+                    "WULFRAM_TANK_CLEAN_TERRAIN_FACE_FALLBACK_MAX_CONTACT_NORMAL_Z",
+                    "0.2",
+                )
+            )
+        except ValueError:
+            tank_clean_face_fallback_max_contact_normal_z = 0.2
+        try:
+            tank_clean_face_fallback_min_face_normal_z = float(
+                os.environ.get(
+                    "WULFRAM_TANK_CLEAN_TERRAIN_FACE_FALLBACK_MIN_FACE_NORMAL_Z",
+                    str(tank_raw_fallback_min_face_normal_z),
+                )
+            )
+        except ValueError:
+            tank_clean_face_fallback_min_face_normal_z = tank_raw_fallback_min_face_normal_z
         pair_record_contact_mode = (
             os.environ.get("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT", "1")
             .strip()
@@ -9307,6 +9596,28 @@ class WulframServer:
             .strip()
             .lower()
         )
+        pair_record_bounds_sat_mode = (
+            os.environ.get("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_BOUNDS_SAT", "0")
+            .strip()
+            .lower()
+        )
+        pair_record_bounds_sat_enabled = pair_record_bounds_sat_mode in {
+            "1",
+            "true",
+            "on",
+            "yes",
+            "probe",
+            "report",
+            "readonly",
+            "apply",
+            "contact",
+            "decompile",
+        }
+        pair_record_bounds_sat_apply_enabled = (
+            pair_record_bounds_sat_enabled
+            and pair_record_bounds_sat_mode
+            in {"1", "true", "on", "yes", "apply", "contact", "decompile"}
+        )
         try:
             pair_record_contact_min_depth = float(
                 os.environ.get(
@@ -9318,10 +9629,10 @@ class WulframServer:
             pair_record_contact_min_depth = self._PENETRATION_SLOP_DEFAULT
         try:
             pair_record_contact_max_depth = float(
-                os.environ.get("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_DEPTH", "8.0")
+                os.environ.get("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_DEPTH", "10.0")
             )
         except ValueError:
-            pair_record_contact_max_depth = 8.0
+            pair_record_contact_max_depth = 10.0
         try:
             pair_record_contact_min_normal_z = float(
                 os.environ.get("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MIN_NORMAL_Z", "0.5")
@@ -9332,11 +9643,11 @@ class WulframServer:
             pair_record_contact_min_face_normal_z = float(
                 os.environ.get(
                     "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MIN_FACE_NORMAL_Z",
-                    "0.5",
+                    "0.4",
                 )
             )
         except ValueError:
-            pair_record_contact_min_face_normal_z = 0.5
+            pair_record_contact_min_face_normal_z = 0.4
         pair_record_contact_normal_source = (
             os.environ.get("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_NORMAL_SOURCE", "mesh")
             .strip()
@@ -9354,10 +9665,40 @@ class WulframServer:
             "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PROJECTION_ORDER",
             "opposite_if_separating",
         )
+        pair_record_contact_response_profile = (
+            os.environ.get(
+                "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_RESPONSE_PROFILE",
+                "safety_limited",
+            )
+            .strip()
+            .lower()
+        )
+        if pair_record_contact_response_profile in {
+            "",
+            "default",
+            "safe",
+            "safety",
+            "safety_limited",
+            "limited",
+        }:
+            pair_record_contact_response_profile = "safety_limited"
+        pair_record_decompile_linear_solver = (
+            pair_record_contact_response_profile
+            in {
+                "decompile_linear_solver",
+                "decompile_solver_linear",
+                "raw_solver_linear",
+                "solver_linear",
+            }
+        )
         pair_record_contact_delta_mode = (
             os.environ.get(
                 "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE",
-                "closing_velocity",
+                (
+                    "solver_vector"
+                    if pair_record_decompile_linear_solver
+                    else "closing_velocity"
+                ),
             )
             .strip()
             .lower()
@@ -9385,7 +9726,7 @@ class WulframServer:
             pair_record_contact_max_velocity_delta = float(
                 os.environ.get(
                     "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VELOCITY_DELTA",
-                    "3.0",
+                    "0.0" if pair_record_decompile_linear_solver else "3.0",
                 )
             )
         except ValueError:
@@ -9394,7 +9735,7 @@ class WulframServer:
             pair_record_contact_max_vertical_delta = float(
                 os.environ.get(
                     "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VERTICAL_DELTA",
-                    "1.0",
+                    "0.0" if pair_record_decompile_linear_solver else "1.0",
                 )
             )
         except ValueError:
@@ -9414,6 +9755,55 @@ class WulframServer:
             )
         except ValueError:
             pair_record_contact_max_angular_delta = 0.5
+        pair_record_cached_contact_mode = (
+            os.environ.get("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CACHE_CONTACT", "0")
+            .strip()
+            .lower()
+        )
+        pair_record_cached_contact_enabled = (
+            pair_record_contact_enabled
+            and pair_record_cached_contact_mode
+            in {"1", "true", "on", "yes", "cache", "cached", "decompile"}
+        )
+        try:
+            pair_record_cached_contact_max_age_steps = int(
+                os.environ.get(
+                    "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CACHE_MAX_AGE_STEPS",
+                    "8",
+                )
+            )
+        except ValueError:
+            pair_record_cached_contact_max_age_steps = 8
+        pair_record_cached_contact_max_age_steps = max(
+            1,
+            min(60, pair_record_cached_contact_max_age_steps),
+        )
+        try:
+            pair_record_cached_contact_max_distance = float(
+                os.environ.get(
+                    "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CACHE_MAX_DISTANCE",
+                    "6.0",
+                )
+            )
+        except ValueError:
+            pair_record_cached_contact_max_distance = 6.0
+        try:
+            pair_record_cached_contact_max_ref_distance = float(
+                os.environ.get(
+                    "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CACHE_MAX_REF_DISTANCE",
+                    "8.0",
+                )
+            )
+        except ValueError:
+            pair_record_cached_contact_max_ref_distance = 8.0
+        try:
+            pair_record_cache_step = (
+                int(getattr(ctx, "terrain_pair_record_contact_cache_step", 0) or 0)
+                + 1
+            )
+        except (TypeError, ValueError, OverflowError):
+            pair_record_cache_step = 1
+        ctx.terrain_pair_record_contact_cache_step = pair_record_cache_step
         pair_record_timed_contact_mode = (
             os.environ.get("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_TIMED_CONTACT", "0")
             .strip()
@@ -9481,6 +9871,319 @@ class WulframServer:
                 "decompile",
             }
         )
+        pair_record_schedule_probe_mode = (
+            os.environ.get("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_SCHEDULE_PROBE", "0")
+            .strip()
+            .lower()
+        )
+        pair_record_schedule_probe_enabled = (
+            pair_record_continue_remaining_enabled
+            or (
+                pair_record_contact_enabled
+                and timing_ready
+                and pair_record_schedule_probe_mode
+                in {
+                    "1",
+                    "true",
+                    "on",
+                    "yes",
+                    "probe",
+                    "schedule",
+                    "timing",
+                    "bucket",
+                    "decompile",
+                }
+            )
+        )
+        pair_record_spatial_ref_schedule_probe_mode = (
+            os.environ.get(
+                "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_SPATIAL_REF_SCHEDULE_PROBE",
+                "0",
+            )
+            .strip()
+            .lower()
+        )
+        pair_record_spatial_ref_schedule_probe_enabled = (
+            pair_record_contact_enabled
+            and timing_ready
+            and pair_record_spatial_ref_schedule_probe_mode
+            in {
+                "1",
+                "true",
+                "on",
+                "yes",
+                "probe",
+                "spatial",
+                "reference",
+                "decompile",
+            }
+        )
+        pair_record_schedule_response_probe_mode = (
+            os.environ.get(
+                "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_SCHEDULE_RESPONSE_PROBE",
+                "0",
+            )
+            .strip()
+            .lower()
+        )
+        pair_record_schedule_response_probe_enabled = (
+            pair_record_schedule_probe_enabled
+            and pair_record_schedule_response_probe_mode
+            in {
+                "1",
+                "true",
+                "on",
+                "yes",
+                "probe",
+                "response",
+                "schedule_response",
+                "decompile",
+            }
+        )
+        pair_record_deferred_prestep_mode = (
+            os.environ.get(
+                "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DEFERRED_PRESTEP",
+                "0",
+            )
+            .strip()
+            .lower()
+        )
+        pair_record_deferred_prestep_enabled = (
+            pair_record_contact_enabled
+            and timing_ready
+            and pair_record_deferred_prestep_mode
+            in {
+                "1",
+                "true",
+                "on",
+                "yes",
+                "pre",
+                "prestep",
+                "deferred",
+                "decompile",
+            }
+        )
+        pair_record_deferred_prestep_probe_mode = (
+            os.environ.get(
+                "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DEFERRED_PRESTEP_PROBE",
+                "0",
+            )
+            .strip()
+            .lower()
+        )
+        pair_record_deferred_prestep_probe_enabled = (
+            pair_record_contact_enabled
+            and timing_ready
+            and pair_record_deferred_prestep_probe_mode
+            in {
+                "1",
+                "true",
+                "on",
+                "yes",
+                "probe",
+                "pre",
+                "prestep",
+                "decompile",
+            }
+        )
+        try:
+            pair_record_deferred_prestep_max_distance = float(
+                os.environ.get(
+                    "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DEFERRED_PRESTEP_MAX_DISTANCE",
+                    "3.0",
+                )
+            )
+        except ValueError:
+            pair_record_deferred_prestep_max_distance = 3.0
+        if not math.isfinite(pair_record_deferred_prestep_max_distance):
+            pair_record_deferred_prestep_max_distance = 3.0
+        pair_record_phase_lookahead_mode = (
+            os.environ.get(
+                "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_LOOKAHEAD",
+                "0",
+            )
+            .strip()
+            .lower()
+        )
+        pair_record_phase_lookahead_enabled = (
+            pair_record_contact_enabled
+            and timing_ready
+            and pair_record_phase_lookahead_mode
+            in {
+                "1",
+                "true",
+                "on",
+                "yes",
+                "probe",
+                "apply",
+                "queue",
+                "queued",
+                "schedule",
+                "defer",
+                "deferred",
+                "contact",
+                "lookahead",
+                "phase",
+                "decompile",
+            }
+        )
+        pair_record_phase_lookahead_apply_enabled = (
+            pair_record_phase_lookahead_enabled
+            and pair_record_phase_lookahead_mode
+            in {
+                "apply",
+                "contact",
+                "response",
+                "resolve",
+                "decompile",
+            }
+        )
+        pair_record_phase_lookahead_queue_enabled = (
+            pair_record_phase_lookahead_enabled
+            and pair_record_phase_lookahead_mode
+            in {"queue", "queued", "schedule", "defer", "deferred"}
+        )
+        try:
+            pair_record_phase_lookahead_max_time = float(
+                os.environ.get(
+                    "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_LOOKAHEAD_MAX_TIME",
+                    "0.12",
+                )
+            )
+        except ValueError:
+            pair_record_phase_lookahead_max_time = 0.12
+        if not math.isfinite(pair_record_phase_lookahead_max_time):
+            pair_record_phase_lookahead_max_time = 0.12
+        pair_record_phase_lookahead_max_time = max(
+            0.0,
+            min(0.5, pair_record_phase_lookahead_max_time),
+        )
+        try:
+            pair_record_phase_lookahead_steps = int(
+                os.environ.get(
+                    "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_LOOKAHEAD_STEPS",
+                    "12",
+                )
+            )
+        except ValueError:
+            pair_record_phase_lookahead_steps = 12
+        pair_record_phase_lookahead_steps = max(
+            1,
+            min(60, pair_record_phase_lookahead_steps),
+        )
+        try:
+            pair_record_phase_lookahead_max_distance = float(
+                os.environ.get(
+                    "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_LOOKAHEAD_MAX_DISTANCE",
+                    "3.0",
+                )
+            )
+        except ValueError:
+            pair_record_phase_lookahead_max_distance = 3.0
+        if not math.isfinite(pair_record_phase_lookahead_max_distance):
+            pair_record_phase_lookahead_max_distance = 3.0
+        pair_record_phase_lookahead_max_distance = max(
+            0.0,
+            pair_record_phase_lookahead_max_distance,
+        )
+        pair_record_phase_lookahead_accel_mode = (
+            os.environ.get(
+                "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_LOOKAHEAD_ACCEL",
+                "constant_velocity",
+            )
+            .strip()
+            .lower()
+        )
+        pair_record_phase_backtrack_mode = (
+            os.environ.get(
+                "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_BACKTRACK",
+                "0",
+            )
+            .strip()
+            .lower()
+        )
+        pair_record_phase_backtrack_enabled = (
+            pair_record_contact_enabled
+            and timing_ready
+            and pair_record_phase_backtrack_mode
+            in {
+                "1",
+                "true",
+                "on",
+                "yes",
+                "probe",
+                "apply",
+                "response",
+                "resolve",
+                "backtrack",
+                "phase",
+                "decompile",
+            }
+        )
+        pair_record_phase_backtrack_apply_enabled = (
+            pair_record_phase_backtrack_enabled
+            and pair_record_phase_backtrack_mode
+            in {"apply", "response", "resolve", "contact"}
+        )
+        try:
+            pair_record_phase_backtrack_max_time = float(
+                os.environ.get(
+                    "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_BACKTRACK_MAX_TIME",
+                    "0.18",
+                )
+            )
+        except ValueError:
+            pair_record_phase_backtrack_max_time = 0.18
+        if not math.isfinite(pair_record_phase_backtrack_max_time):
+            pair_record_phase_backtrack_max_time = 0.18
+        pair_record_phase_backtrack_max_time = max(
+            0.0,
+            min(0.5, pair_record_phase_backtrack_max_time),
+        )
+        try:
+            pair_record_phase_backtrack_steps = int(
+                os.environ.get(
+                    "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_BACKTRACK_STEPS",
+                    "12",
+                )
+            )
+        except ValueError:
+            pair_record_phase_backtrack_steps = 12
+        pair_record_phase_backtrack_steps = max(
+            1,
+            min(60, pair_record_phase_backtrack_steps),
+        )
+        try:
+            pair_record_phase_backtrack_max_distance = float(
+                os.environ.get(
+                    "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_BACKTRACK_MAX_DISTANCE",
+                    "4.0",
+                )
+            )
+        except ValueError:
+            pair_record_phase_backtrack_max_distance = 4.0
+        if not math.isfinite(pair_record_phase_backtrack_max_distance):
+            pair_record_phase_backtrack_max_distance = 4.0
+        pair_record_phase_backtrack_max_distance = max(
+            0.0,
+            pair_record_phase_backtrack_max_distance,
+        )
+        pair_record_phase_backtrack_accel_mode = (
+            os.environ.get(
+                "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_BACKTRACK_ACCEL",
+                "constant_velocity",
+            )
+            .strip()
+            .lower()
+        )
+        pair_record_phase_backtrack_source = (
+            os.environ.get(
+                "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_BACKTRACK_SOURCE",
+                "pre",
+            )
+            .strip()
+            .lower()
+        )
         raycast_fallback_mode = (
             os.environ.get("WULFRAM_ENTITY_TERRAIN_RAYCAST_FALLBACK", "0")
             .strip()
@@ -9535,6 +10238,21 @@ class WulframServer:
                 "contact_terrain_face_normal": getattr(contact, "terrain_face_normal", None),
                 "contact_mesh_face_normal": getattr(contact, "mesh_face_normal", None),
                 "contact_entity_radial_normal": getattr(contact, "entity_radial_normal", None),
+                "contact_cbsp_store_normal0": getattr(contact, "cbsp_store_normal0", None),
+                "contact_cbsp_store_normal1": getattr(contact, "cbsp_store_normal1", None),
+                "contact_cbsp_record_hit_source": getattr(contact, "cbsp_record_hit_source", None),
+                "contact_cbsp_mesh_triangle_indices": getattr(contact, "cbsp_mesh_triangle_indices", None),
+                "contact_cbsp_guess7_order": getattr(contact, "cbsp_guess7_order", None),
+                "contact_cbsp_guess7_terms": getattr(contact, "cbsp_guess7_terms", None),
+                "contact_cbsp_edge_hit_kind": getattr(contact, "cbsp_edge_hit_kind", None),
+                "contact_cbsp_edge_t": getattr(contact, "cbsp_edge_t", None),
+                "contact_cbsp_node_index": getattr(contact, "cbsp_node_index", None),
+                "contact_cbsp_node_depth": getattr(contact, "cbsp_node_depth", None),
+                "contact_cbsp_node_mesh_normal_angle_deg": getattr(
+                    contact,
+                    "cbsp_node_mesh_normal_angle_deg",
+                    None,
+                ),
                 "model_center": center,
                 "z_lift": z_lift_used,
             }
@@ -9601,6 +10319,29 @@ class WulframServer:
                             heading,
                             vertices,
                             cbsp_tree,
+                            bounding_radius,
+                            rotation_matrix=model_contact_rotation_matrix,
+                            contact_selection=selected_contact_selection,
+                        )
+                    except Exception:
+                        raw_bounds_contact = None
+            if (
+                raw_contact is None
+                and raw_bounds_contact is None
+                and pair_record_bounds_sat_enabled
+            ):
+                bounds_sat_probe = getattr(
+                    self._terrain_grid_collision,
+                    "test_box_bounds_contact",
+                    None,
+                )
+                if callable(bounds_sat_probe):
+                    try:
+                        raw_bounds_contact = bounds_sat_probe(
+                            raw_center,
+                            raw_center,
+                            inertia_half_extents,
+                            heading,
                             bounding_radius,
                             rotation_matrix=model_contact_rotation_matrix,
                             contact_selection=selected_contact_selection,
@@ -9831,11 +10572,187 @@ class WulframServer:
                 entity_radial_normal=getattr(raw_contact, "entity_radial_normal", None),
             )
 
-        def sample_raw_origin_fallback_contact_at(pos, *, velocity=None):
-            raw_contact, raw_bounds_contact, raw_error = sample_raw_origin_contact_at(pos)
-            fallback_contact = raw_origin_contact_for_fallback(raw_contact)
+        def tank_raw_origin_fallback_enabled_for(raw_contact) -> bool:
+            if not tank_raw_fallback_auto_enabled or raw_contact is None:
+                return False
+            face_normal = getattr(raw_contact, "terrain_face_normal", None)
+            try:
+                return float(face_normal[2]) >= tank_raw_fallback_min_face_normal_z
+            except (TypeError, ValueError, OverflowError, IndexError):
+                return False
+
+        def raw_origin_fallback_probe_for(raw_contact, *, velocity=None):
+            tank_auto_raw = tank_raw_origin_fallback_enabled_for(raw_contact)
+            fallback_contact = raw_origin_contact_for_fallback(
+                raw_contact,
+                normal_source=(
+                    tank_raw_fallback_normal_source
+                    if tank_auto_raw and not raw_fallback_enabled
+                    else None
+                ),
+            )
             reject = raw_origin_fallback_reject_reason(
                 fallback_contact,
+                velocity=velocity,
+                enabled=(raw_fallback_enabled or tank_auto_raw),
+                min_depth=(
+                    tank_raw_fallback_min_depth
+                    if tank_auto_raw and not raw_fallback_enabled
+                    else None
+                ),
+                max_depth=(
+                    tank_raw_fallback_max_depth
+                    if tank_auto_raw and not raw_fallback_enabled
+                    else None
+                ),
+                min_normal_z=(
+                    tank_raw_fallback_min_normal_z
+                    if tank_auto_raw and not raw_fallback_enabled
+                    else None
+                ),
+                min_speed=(
+                    tank_raw_fallback_min_speed
+                    if tank_auto_raw and not raw_fallback_enabled
+                    else None
+                ),
+            )
+            return fallback_contact, reject, tank_auto_raw
+
+        def tank_clean_face_fallback_contact_for(contact):
+            if not tank_clean_face_fallback_enabled:
+                return None, "disabled"
+            if contact is None:
+                return None, "no_contact"
+            try:
+                depth = float(contact.penetration)
+                normal_z = float(contact.normal[2])
+                face_normal = getattr(contact, "terrain_face_normal", None)
+                face_normal_z = float(face_normal[2])
+            except (TypeError, ValueError, OverflowError, IndexError):
+                return None, "nonfinite_contact"
+            if depth <= self._PENETRATION_SLOP_DEFAULT:
+                return None, "below_slop"
+            if (
+                tank_clean_pair_solver_max_depth > 0.0
+                and depth > tank_clean_pair_solver_max_depth
+            ):
+                return None, "above_max_depth"
+            if normal_z > tank_clean_face_fallback_max_contact_normal_z:
+                return None, "contact_normal_z_above_max"
+            if face_normal_z < tank_clean_face_fallback_min_face_normal_z:
+                return None, "terrain_face_normal_z_below_min"
+            face_contact = raw_origin_contact_for_fallback(
+                contact,
+                normal_source=tank_raw_fallback_normal_source,
+            )
+            if face_contact is None:
+                return None, "missing_face_contact"
+            try:
+                face_contact_normal_z = float(face_contact.normal[2])
+            except (TypeError, ValueError, OverflowError, IndexError):
+                return None, "nonfinite_face_contact"
+            if face_contact_normal_z < tank_raw_fallback_min_normal_z:
+                return None, "face_contact_normal_z_below_min"
+            return face_contact, ""
+
+        def tank_face_fallback_delta_normal_for(contact, mode):
+            normal = getattr(contact, "normal", None)
+            source = getattr(contact, "normal_source", None)
+            if mode not in {"horizontal", "horizontal_face", "xy", "flat"}:
+                return normal, source
+            try:
+                nx = float(normal[0])
+                ny = float(normal[1])
+            except (TypeError, ValueError, OverflowError, IndexError):
+                return normal, source
+            mag_xy = math.sqrt(nx * nx + ny * ny)
+            if not math.isfinite(mag_xy) or mag_xy <= 1e-9:
+                return normal, source
+            return (
+                (nx / mag_xy, ny / mag_xy, 0.0),
+                f"{source}_horizontal" if source else "horizontal_face",
+            )
+
+        def tank_clean_face_fallback_delta_normal_for(contact):
+            return tank_face_fallback_delta_normal_for(
+                contact,
+                tank_clean_face_fallback_delta_normal_mode,
+            )
+
+        def tank_raw_fallback_delta_normal_for(contact):
+            return tank_face_fallback_delta_normal_for(
+                contact,
+                tank_raw_fallback_delta_normal_mode,
+            )
+
+        def tank_face_fallback_latch_key(contact):
+            if not tank_face_fallback_latch_enabled or contact is None:
+                return None
+            try:
+                cell = tuple(int(round(float(value))) for value in contact.cell)
+            except (TypeError, ValueError, OverflowError):
+                cell = None
+            try:
+                normal = tuple(round(float(value), 2) for value in contact.normal[:3])
+            except (TypeError, ValueError, OverflowError, IndexError):
+                return None
+            return (cell, normal)
+
+        def tank_face_fallback_latch_matches(contact) -> bool:
+            key = tank_face_fallback_latch_key(contact)
+            if key is None:
+                return False
+            latch = getattr(ctx, "tank_face_fallback_latch", None)
+            return isinstance(latch, dict) and latch.get("key") == key
+
+        def tank_face_fallback_latch_record(contact, *, source: str) -> None:
+            key = tank_face_fallback_latch_key(contact)
+            if key is None:
+                return
+            try:
+                depth = float(contact.penetration)
+            except (TypeError, ValueError, OverflowError):
+                depth = None
+            ctx.tank_face_fallback_latch = {
+                "key": key,
+                "source": source,
+                "depth": depth,
+                "cell": getattr(contact, "cell", None),
+                "normal": contact.normal,
+            }
+
+        def tank_face_fallback_latch_clear(reason: str) -> None:
+            if getattr(ctx, "tank_face_fallback_latch", None) is not None:
+                ctx.tank_face_fallback_latch = {
+                    "cleared": True,
+                    "reason": reason,
+                }
+
+        def tank_face_fallback_latched_debug(contact, *, kind: str) -> dict:
+            return {
+                "kind": kind,
+                "point": contact.position,
+                "normal": contact.normal,
+                "depth": contact.penetration,
+                "terrain_collision_shape": terrain_collision_shape,
+                **contact_debug_fields(contact),
+                "tank_face_fallback_latched": True,
+                "tank_face_fallback_latch": getattr(
+                    ctx,
+                    "tank_face_fallback_latch",
+                    None,
+                ),
+                "velocity_before": (vx, vy, vz),
+                "velocity_after": (vx, vy, vz),
+                "angular_velocity_before": tuple(contact_angular_velocity),
+                "angular_velocity_after": tuple(contact_angular_velocity),
+                "response": "terrain_face_fallback_latched",
+            }
+
+        def sample_raw_origin_fallback_contact_at(pos, *, velocity=None):
+            raw_contact, raw_bounds_contact, raw_error = sample_raw_origin_contact_at(pos)
+            fallback_contact, reject, tank_auto_raw = raw_origin_fallback_probe_for(
+                raw_contact,
                 velocity=velocity,
             )
             return {
@@ -9844,6 +10761,7 @@ class WulframServer:
                 "raw_bounds_contact": raw_bounds_contact,
                 "raw_error": raw_error,
                 "reject": reject,
+                "tank_raw_origin_fallback": tank_auto_raw,
             }
 
         def pair_record_contact_reject_reason(contact, *, velocity=None):
@@ -9892,12 +10810,15 @@ class WulframServer:
                     pair_raw_contact = raw_contact
                     pair_raw_bounds_contact = raw_bounds_contact
                     pair_raw_error = raw_error
+            pair_contact_source = pair_raw_contact
+            if pair_contact_source is None and pair_record_bounds_sat_apply_enabled:
+                pair_contact_source = pair_raw_bounds_contact
             pair_contact = raw_origin_contact_for_fallback(
-                pair_raw_contact,
+                pair_contact_source,
                 normal_source=pair_record_contact_normal_source,
             )
             pair_delta_contact = raw_origin_contact_for_fallback(
-                pair_raw_contact,
+                pair_contact_source,
                 normal_source=pair_record_contact_delta_normal_source,
             )
             reject = pair_record_contact_reject_reason(
@@ -9912,8 +10833,254 @@ class WulframServer:
                 "raw_error": raw_error,
                 "selected_raw_contact": pair_raw_contact,
                 "selected_raw_bounds_contact": pair_raw_bounds_contact,
+                "selected_pair_contact_source": (
+                    getattr(pair_contact_source, "normal_source", None)
+                    if pair_contact_source is not None
+                    else None
+                ),
                 "selected_raw_error": pair_raw_error,
                 "reject": reject,
+            }
+
+        def record_dirty_reference_pair_probe():
+            if not dirty_reference_pair_probe_enabled:
+                return None
+            dirty_dispatch_debug["dirty_reference_pair_probe_enabled"] = True
+            probe = {
+                "enabled": True,
+                "dirty_bounds_active": bool(
+                    dirty_dispatch_debug.get("dirty_bounds_active")
+                ),
+                "dirty_bounds_xy_overlap": dirty_dispatch_debug.get(
+                    "dirty_bounds_xy_overlap"
+                ),
+            }
+            dirty_dispatch_debug["dirty_reference_pair_probe"] = probe
+            if not pair_record_contact_enabled:
+                probe["reject"] = "pair_record_contact_disabled"
+                return None
+            if not dirty_dispatch_debug.get("dirty_bounds_active"):
+                probe["reject"] = "dirty_bounds_inactive"
+                return None
+            if dirty_dispatch_debug.get("dirty_bounds_xy_overlap") is not True:
+                probe["reject"] = "dirty_bounds_no_xy_overlap"
+                return None
+
+            current_pos = finite_triplet((anchor[0], anchor[1], anchor[2]))
+            reference = finite_triplet(reference_pos)
+            candidates = []
+            seen = set()
+
+            def add_candidate(label, pos):
+                candidate = finite_triplet(pos)
+                if candidate is None:
+                    return
+                key = (
+                    round(candidate[0], 4),
+                    round(candidate[1], 4),
+                    round(candidate[2], 4),
+                )
+                if key in seen:
+                    return
+                seen.add(key)
+                candidates.append((label, candidate))
+
+            add_candidate("dirty_reference_pos", reference)
+            if reference is not None and current_pos is not None:
+                add_candidate(
+                    "dirty_midpoint_pos",
+                    (
+                        reference[0] + (current_pos[0] - reference[0]) * 0.5,
+                        reference[1] + (current_pos[1] - reference[1]) * 0.5,
+                        reference[2] + (current_pos[2] - reference[2]) * 0.5,
+                    ),
+                )
+            add_candidate("dirty_current_pos", current_pos)
+
+            results = {}
+            accept_labels = []
+            accepted_pairs = []
+            for label, candidate in candidates:
+                pair_probe = sample_pair_record_contact_at(
+                    candidate,
+                    velocity=(vx, vy, vz),
+                )
+                pair_contact = pair_probe.get("contact")
+                pair_delta_contact = pair_probe.get("delta_contact")
+                reject = pair_probe.get("reject")
+                accepted = pair_contact is not None and reject == ""
+                if accepted:
+                    accept_labels.append(label)
+                    accepted_pairs.append({
+                        "label": label,
+                        "pos": candidate,
+                        "velocity": (vx, vy, vz),
+                        "probe": pair_probe,
+                        "contact": pair_contact,
+                        "delta_contact": pair_delta_contact,
+                    })
+                item = {
+                    "pos": candidate,
+                    "reject": reject,
+                    "selected_raw_error": pair_probe.get("selected_raw_error"),
+                    "contact": probe_contact_fields(
+                        pair_contact,
+                        center=candidate,
+                        z_lift_used=0.0,
+                    ),
+                    "delta_contact": probe_contact_fields(
+                        pair_delta_contact,
+                        center=candidate,
+                        z_lift_used=0.0,
+                    ),
+                    "accepted": accepted,
+                }
+                results[label] = {
+                    key: value
+                    for key, value in item.items()
+                    if value not in ({}, None)
+                }
+            probe.update({
+                "reject": "" if accept_labels else "no_pair_record_contact",
+                "accept_labels": accept_labels,
+                "selected_label": accepted_pairs[0]["label"] if accepted_pairs else None,
+                "results": results,
+            })
+            return accepted_pairs[0] if accepted_pairs else None
+
+        def record_pair_record_contact_cache(
+            contact,
+            *,
+            delta_contact=None,
+            pos=None,
+            velocity=None,
+            source: str,
+        ) -> None:
+            if not pair_record_cached_contact_enabled or contact is None:
+                return
+            ctx.terrain_pair_record_contact_cache = {
+                "contact": contact,
+                "delta_contact": delta_contact,
+                "pos": finite_triplet(pos) or (anchor[0], anchor[1], anchor[2]),
+                "velocity": finite_triplet(velocity) or (vx, vy, vz),
+                "reference_pos": finite_triplet(reference_pos),
+                "step": pair_record_cache_step,
+                "source": source,
+            }
+
+        def cached_pair_record_contact_probe(pos, *, velocity=None):
+            if not pair_record_cached_contact_enabled:
+                return {
+                    "contact": None,
+                    "delta_contact": None,
+                    "reject": "disabled",
+                    "cache": None,
+                }
+            cache = getattr(ctx, "terrain_pair_record_contact_cache", None)
+            if not isinstance(cache, dict):
+                return {
+                    "contact": None,
+                    "delta_contact": None,
+                    "reject": "no_cached_pair_record_contact",
+                    "cache": None,
+                }
+            contact = cache.get("contact")
+            if contact is None:
+                return {
+                    "contact": None,
+                    "delta_contact": None,
+                    "reject": "no_cached_pair_record_contact",
+                    "cache": cache,
+                }
+            try:
+                cache_step = int(cache.get("step", 0) or 0)
+            except (TypeError, ValueError, OverflowError):
+                cache_step = 0
+            age_steps = max(0, pair_record_cache_step - cache_step)
+            if age_steps > pair_record_cached_contact_max_age_steps:
+                return {
+                    "contact": None,
+                    "delta_contact": None,
+                    "reject": "cached_pair_record_contact_too_old",
+                    "age_steps": age_steps,
+                    "cache": cache,
+                }
+            current = finite_triplet(pos)
+            cached_pos = finite_triplet(cache.get("pos"))
+            if current is None or cached_pos is None:
+                return {
+                    "contact": None,
+                    "delta_contact": None,
+                    "reject": "cached_pair_record_contact_nonfinite_pos",
+                    "age_steps": age_steps,
+                    "cache": cache,
+                }
+            distance = math.sqrt(
+                (current[0] - cached_pos[0]) * (current[0] - cached_pos[0])
+                + (current[1] - cached_pos[1]) * (current[1] - cached_pos[1])
+                + (current[2] - cached_pos[2]) * (current[2] - cached_pos[2])
+            )
+            if distance > pair_record_cached_contact_max_distance:
+                return {
+                    "contact": None,
+                    "delta_contact": None,
+                    "reject": "cached_pair_record_contact_too_far",
+                    "age_steps": age_steps,
+                    "distance": distance,
+                    "cache": cache,
+                }
+            cached_ref = finite_triplet(cache.get("reference_pos"))
+            current_ref = finite_triplet(reference_pos)
+            ref_distance = None
+            if cached_ref is not None and current_ref is not None:
+                ref_distance = math.sqrt(
+                    (current_ref[0] - cached_ref[0])
+                    * (current_ref[0] - cached_ref[0])
+                    + (current_ref[1] - cached_ref[1])
+                    * (current_ref[1] - cached_ref[1])
+                    + (current_ref[2] - cached_ref[2])
+                    * (current_ref[2] - cached_ref[2])
+                )
+                if ref_distance > pair_record_cached_contact_max_ref_distance:
+                    return {
+                        "contact": None,
+                        "delta_contact": None,
+                        "reject": "cached_pair_record_reference_too_far",
+                        "age_steps": age_steps,
+                        "distance": distance,
+                        "reference_distance": ref_distance,
+                        "cache": cache,
+                    }
+            reject = pair_record_contact_reject_reason(contact, velocity=velocity)
+            if reject:
+                return {
+                    "contact": None,
+                    "delta_contact": cache.get("delta_contact"),
+                    "reject": f"cached_pair_record_{reject}",
+                    "age_steps": age_steps,
+                    "distance": distance,
+                    "reference_distance": ref_distance,
+                    "cache": cache,
+                }
+            if contact.penetration <= self._PENETRATION_SLOP_DEFAULT:
+                return {
+                    "contact": None,
+                    "delta_contact": cache.get("delta_contact"),
+                    "reject": "cached_pair_record_below_slop",
+                    "age_steps": age_steps,
+                    "distance": distance,
+                    "reference_distance": ref_distance,
+                    "cache": cache,
+                }
+            return {
+                "contact": contact,
+                "delta_contact": cache.get("delta_contact"),
+                "reject": "",
+                "age_steps": age_steps,
+                "distance": distance,
+                "reference_distance": ref_distance,
+                "source": cache.get("source"),
+                "cache": cache,
             }
 
         def sample_raycast_fallback_contact_at(pos, *, reference=None, velocity=None):
@@ -10099,11 +11266,80 @@ class WulframServer:
             add_midpoint("dirty_reference_to_current_50", dirty_reference_pos, current, 0.50)
             return candidates
 
+        def reference_pose_candidate_velocity(label, candidate, *, fallback=None):
+            current_vel = finite_triplet((vx, vy, vz))
+            fallback_vel = finite_triplet(fallback) or current_vel
+            start_vel = finite_triplet(pre_vel)
+            if current_vel is None:
+                return None, None, "nonfinite_current_velocity"
+            if start_vel is None:
+                return fallback_vel, None, "fallback_no_prestep_velocity"
+
+            def lerp_velocity(fraction, source):
+                fraction = max(0.0, min(1.0, float(fraction)))
+                return (
+                    start_vel[0] + (current_vel[0] - start_vel[0]) * fraction,
+                    start_vel[1] + (current_vel[1] - start_vel[1]) * fraction,
+                    start_vel[2] + (current_vel[2] - start_vel[2]) * fraction,
+                ), fraction, source
+
+            if label == "pre_pos":
+                return start_vel, 0.0, "pre_step_velocity"
+            if label == "current":
+                return current_vel, 1.0, "current_velocity"
+            if label.startswith("pre_to_current_"):
+                try:
+                    fraction = float(label.rsplit("_", 1)[-1])
+                    if fraction > 1.0:
+                        fraction /= 100.0
+                    return lerp_velocity(fraction, "pre_to_current_fraction")
+                except ValueError:
+                    pass
+            if label == "dirty_reference_to_current_50":
+                return lerp_velocity(0.5, "dirty_reference_to_current_fraction")
+
+            start_pos = finite_triplet(pre_pos)
+            end_pos = finite_triplet((anchor[0], anchor[1], anchor[2]))
+            candidate_pos = finite_triplet(candidate)
+            if start_pos is not None and end_pos is not None and candidate_pos is not None:
+                step_delta = (
+                    end_pos[0] - start_pos[0],
+                    end_pos[1] - start_pos[1],
+                    end_pos[2] - start_pos[2],
+                )
+                step_len_sq = (
+                    step_delta[0] * step_delta[0]
+                    + step_delta[1] * step_delta[1]
+                    + step_delta[2] * step_delta[2]
+                )
+                if step_len_sq > 1e-8:
+                    raw_fraction = (
+                        (candidate_pos[0] - start_pos[0]) * step_delta[0]
+                        + (candidate_pos[1] - start_pos[1]) * step_delta[1]
+                        + (candidate_pos[2] - start_pos[2]) * step_delta[2]
+                    ) / step_len_sq
+                    return lerp_velocity(
+                        raw_fraction,
+                        (
+                            "projected_step_fraction"
+                            if 0.0 <= raw_fraction <= 1.0
+                            else "projected_step_fraction_clamped"
+                        ),
+                    )
+            return fallback_vel, None, "fallback_velocity"
+
         def sample_reference_pose_contacts(pos, *, velocity=None):
             """Record contacts at decompile-style collision/reference poses."""
 
             output = {}
             for label, candidate in reference_pose_candidates(pos):
+                candidate_velocity, velocity_fraction, velocity_source = (
+                    reference_pose_candidate_velocity(
+                        label,
+                        candidate,
+                        fallback=velocity,
+                    )
+                )
                 lifted_contact = None
                 lifted_error = None
                 try:
@@ -10113,14 +11349,13 @@ class WulframServer:
                 raw_contact, raw_bounds_contact, raw_error = sample_raw_origin_contact_at(
                     candidate
                 )
-                raw_fallback_contact = raw_origin_contact_for_fallback(raw_contact)
-                raw_reject = raw_origin_fallback_reject_reason(
-                    raw_fallback_contact,
-                    velocity=velocity,
+                raw_fallback_contact, raw_reject, raw_tank_auto = raw_origin_fallback_probe_for(
+                    raw_contact,
+                    velocity=candidate_velocity,
                 )
                 pair_probe = sample_pair_record_contact_at(
                     candidate,
-                    velocity=velocity,
+                    velocity=candidate_velocity,
                 )
                 pair_contact = pair_probe.get("contact")
                 pair_delta_contact = pair_probe.get("delta_contact")
@@ -10142,6 +11377,9 @@ class WulframServer:
                     continue
                 item = {
                     "pos": candidate,
+                    "velocity": candidate_velocity,
+                    "velocity_fraction": velocity_fraction,
+                    "velocity_source": velocity_source,
                     "lifted_contact": probe_contact_fields(
                         lifted_contact,
                         center=lifted_center,
@@ -10160,6 +11398,7 @@ class WulframServer:
                     ),
                     "raw_error": raw_error,
                     "raw_origin_fallback_reject": raw_reject,
+                    "tank_raw_origin_fallback": raw_tank_auto,
                     "pair_record_contact": probe_contact_fields(
                         pair_contact,
                         center=raw_center,
@@ -10193,16 +11432,43 @@ class WulframServer:
             return output
 
         def select_reference_pose_pair_record_contact(pos, *, velocity=None):
-            if not reference_pose_contact_response_enabled:
+            if not (
+                reference_pose_contact_response_enabled
+                or reference_pose_pair_response_enabled
+            ):
                 return None
             if not pair_record_contact_enabled:
                 return None
+            current_pos = finite_triplet(pos)
             candidates = dict(reference_pose_candidates(pos))
             for label in reference_pose_contact_order:
                 candidate = candidates.get(label)
                 if candidate is None:
                     continue
-                pair_probe = sample_pair_record_contact_at(candidate, velocity=velocity)
+                if (
+                    reference_pose_pair_response_enabled
+                    and reference_pose_pair_response_max_distance > 0.0
+                    and current_pos is not None
+                ):
+                    dx = candidate[0] - current_pos[0]
+                    dy = candidate[1] - current_pos[1]
+                    dz = candidate[2] - current_pos[2]
+                    if (
+                        math.sqrt(dx * dx + dy * dy + dz * dz)
+                        > reference_pose_pair_response_max_distance
+                    ):
+                        continue
+                candidate_velocity, velocity_fraction, velocity_source = (
+                    reference_pose_candidate_velocity(
+                        label,
+                        candidate,
+                        fallback=velocity,
+                    )
+                )
+                pair_probe = sample_pair_record_contact_at(
+                    candidate,
+                    velocity=candidate_velocity,
+                )
                 pair_contact = pair_probe.get("contact")
                 if (
                     pair_probe.get("selected_raw_error") is None
@@ -10213,6 +11479,9 @@ class WulframServer:
                     return {
                         "label": label,
                         "pos": candidate,
+                        "velocity": candidate_velocity,
+                        "velocity_fraction": velocity_fraction,
+                        "velocity_source": velocity_source,
                         "probe": pair_probe,
                         "contact": pair_contact,
                         "delta_contact": pair_probe.get("delta_contact"),
@@ -10228,6 +11497,7 @@ class WulframServer:
             raw_bounds_contact=None,
             raw_error=None,
             raw_fallback_reject=None,
+            tank_raw_origin_fallback=False,
             pair_record_contact=None,
             pair_record_delta_contact=None,
             pair_record_contact_reject=None,
@@ -10299,6 +11569,15 @@ class WulframServer:
                 "reference_pose_contact_response_enabled": (
                     reference_pose_contact_response_enabled
                 ),
+                "reference_pose_pair_response_enabled": (
+                    reference_pose_pair_response_enabled
+                ),
+                "reference_pose_pair_response_apply_enabled": (
+                    reference_pose_pair_response_apply_enabled
+                ),
+                "reference_pose_pair_response": dirty_dispatch_debug.get(
+                    "reference_pose_pair_response"
+                ),
                 "reference_pose_contact_order": reference_pose_contact_order,
                 "position": pos,
                 "velocity": (vx, vy, vz),
@@ -10349,6 +11628,10 @@ class WulframServer:
                 "dirty_bounds_box_shape": dirty_dispatch_debug.get(
                     "dirty_bounds_box_shape"
                 ),
+                "dirty_bounds_safe_response_enabled": dirty_dispatch_debug.get(
+                    "dirty_bounds_safe_response_enabled",
+                    dirty_bounds_safe_response_enabled,
+                ),
                 "dirty_bounds_box_half_extents_source": dirty_dispatch_debug.get(
                     "dirty_bounds_box_half_extents_source"
                 ),
@@ -10373,6 +11656,30 @@ class WulframServer:
                 "dirty_bounds_box_reject": dirty_dispatch_debug.get(
                     "dirty_bounds_box_reject"
                 ),
+                "dirty_reference_pair_probe_enabled": (
+                    dirty_dispatch_debug.get(
+                        "dirty_reference_pair_probe_enabled",
+                        dirty_reference_pair_probe_enabled,
+                    )
+                ),
+                "dirty_reference_pair_probe": dirty_dispatch_debug.get(
+                    "dirty_reference_pair_probe"
+                ),
+                "dirty_reference_pair_response_enabled": (
+                    dirty_dispatch_debug.get(
+                        "dirty_reference_pair_response_enabled",
+                        dirty_reference_pair_response_enabled,
+                    )
+                ),
+                "dirty_reference_pair_response_apply_enabled": (
+                    dirty_dispatch_debug.get(
+                        "dirty_reference_pair_response_apply_enabled",
+                        dirty_reference_pair_response_apply_enabled,
+                    )
+                ),
+                "dirty_reference_pair_response": dirty_dispatch_debug.get(
+                    "dirty_reference_pair_response"
+                ),
                 "dirty_raycast_reject": dirty_dispatch_debug.get("dirty_raycast_reject"),
                 "dirty_raycast_start": dirty_dispatch_debug.get("dirty_raycast_start"),
                 "dirty_raycast_end": dirty_dispatch_debug.get("dirty_raycast_end"),
@@ -10381,9 +11688,19 @@ class WulframServer:
                     "dirty_raycast_hit_position"
                 ),
                 "dirty_raycast_hit_cell": dirty_dispatch_debug.get("dirty_raycast_hit_cell"),
-                "raw_origin_fallback_enabled": raw_fallback_enabled,
+                "raw_origin_fallback_enabled": bool(
+                    raw_fallback_enabled or tank_raw_origin_fallback
+                ),
+                "tank_raw_origin_fallback": bool(tank_raw_origin_fallback),
                 "raw_origin_fallback_reject": raw_fallback_reject,
                 "pair_record_contact_enabled": pair_record_contact_enabled,
+                "pair_record_bounds_sat_enabled": pair_record_bounds_sat_enabled,
+                "pair_record_bounds_sat_apply_enabled": (
+                    pair_record_bounds_sat_apply_enabled
+                ),
+                "pair_record_contact_response_profile": (
+                    pair_record_contact_response_profile
+                ),
                 "pair_record_contact_reject": pair_record_contact_reject,
                 "pair_record_contact_selection": pair_record_contact_selection,
                 "pair_record_contact_normal_source": pair_record_contact_normal_source,
@@ -10391,9 +11708,81 @@ class WulframServer:
                 "pair_record_contact_vertical_delta_mode": pair_record_contact_vertical_delta_mode,
                 "pair_record_contact_max_velocity_delta": pair_record_contact_max_velocity_delta,
                 "pair_record_contact_max_vertical_delta": pair_record_contact_max_vertical_delta,
+                "pair_record_cached_contact_enabled": pair_record_cached_contact_enabled,
+                "pair_record_cached_contact_max_age_steps": (
+                    pair_record_cached_contact_max_age_steps
+                ),
+                "pair_record_cached_contact_max_distance": (
+                    pair_record_cached_contact_max_distance
+                ),
+                "pair_record_cached_contact_max_ref_distance": (
+                    pair_record_cached_contact_max_ref_distance
+                ),
                 "pair_record_timed_contact_enabled": pair_record_timed_contact_enabled,
                 "pair_record_timed_sweep_enabled": pair_record_timed_sweep_enabled,
+                "pair_record_schedule_probe_enabled": pair_record_schedule_probe_enabled,
+                "pair_record_spatial_ref_schedule_probe_enabled": (
+                    pair_record_spatial_ref_schedule_probe_enabled
+                ),
+                "pair_record_schedule_response_probe_enabled": (
+                    pair_record_schedule_response_probe_enabled
+                ),
                 "pair_record_continue_remaining_enabled": pair_record_continue_remaining_enabled,
+                "pair_record_deferred_prestep_enabled": (
+                    pair_record_deferred_prestep_enabled
+                ),
+                "pair_record_deferred_prestep_probe_enabled": (
+                    pair_record_deferred_prestep_probe_enabled
+                ),
+                "pair_record_deferred_prestep_max_distance": (
+                    pair_record_deferred_prestep_max_distance
+                ),
+                "pair_record_phase_lookahead_enabled": (
+                    pair_record_phase_lookahead_enabled
+                ),
+                "pair_record_phase_lookahead_apply_enabled": (
+                    pair_record_phase_lookahead_apply_enabled
+                ),
+                "pair_record_phase_lookahead_queue_enabled": (
+                    pair_record_phase_lookahead_queue_enabled
+                ),
+                "pair_record_phase_lookahead_mode": pair_record_phase_lookahead_mode,
+                "pair_record_phase_lookahead_max_time_s": (
+                    pair_record_phase_lookahead_max_time
+                ),
+                "pair_record_phase_lookahead_steps": (
+                    pair_record_phase_lookahead_steps
+                ),
+                "pair_record_phase_lookahead_max_distance": (
+                    pair_record_phase_lookahead_max_distance
+                ),
+                "pair_record_phase_lookahead_accel_mode": (
+                    pair_record_phase_lookahead_accel_mode
+                ),
+                "pair_record_phase_backtrack_enabled": (
+                    pair_record_phase_backtrack_enabled
+                ),
+                "pair_record_phase_backtrack_apply_enabled": (
+                    pair_record_phase_backtrack_apply_enabled
+                ),
+                "pair_record_phase_backtrack_mode": (
+                    pair_record_phase_backtrack_mode
+                ),
+                "pair_record_phase_backtrack_max_time_s": (
+                    pair_record_phase_backtrack_max_time
+                ),
+                "pair_record_phase_backtrack_steps": (
+                    pair_record_phase_backtrack_steps
+                ),
+                "pair_record_phase_backtrack_max_distance": (
+                    pair_record_phase_backtrack_max_distance
+                ),
+                "pair_record_phase_backtrack_accel_mode": (
+                    pair_record_phase_backtrack_accel_mode
+                ),
+                "pair_record_phase_backtrack_source": (
+                    pair_record_phase_backtrack_source
+                ),
                 "timed_pair_response": timed_pair_response,
                 "timing_ready": timing_ready,
                 "contact_sweep_scan_enabled": contact_sweep_scan_enabled,
@@ -10498,6 +11887,22 @@ class WulframServer:
                 entity_type,
                 self._ENTITY_COLLISION_DEFAULT,
             )
+            projection_order = projection_order_override
+            if projection_order is None:
+                projection_order = os.environ.get("WULFRAM_ENTITY_TERRAIN_PROJECTION_ORDER")
+            if (
+                projection_order is None
+                and entity_type == EntityType.TANK
+                and tank_clean_pair_solver_enabled
+                and contact_response == "auto"
+                and origin_mode not in {"entity", "origin", "raw"}
+            ):
+                projection_order = os.environ.get(
+                    "WULFRAM_TANK_CLEAN_TERRAIN_PROJECTION_ORDER",
+                    "opposite_if_separating",
+                )
+            if projection_order is None:
+                projection_order = "body_minus_world"
             constraint_kwargs = dict(
                 position=(anchor[0], anchor[1], anchor[2]),
                 velocity=(vx, vy, vz),
@@ -10523,14 +11928,7 @@ class WulframServer:
                     "constraint",
                 ),
                 restitution_fraction=restitution_fraction,
-                projection_order=(
-                    projection_order_override
-                    if projection_order_override is not None
-                    else os.environ.get(
-                        "WULFRAM_ENTITY_TERRAIN_PROJECTION_ORDER",
-                        "body_minus_world",
-                    )
-                ),
+                projection_order=projection_order,
             )
             contact_rotation_frame = os.environ.get(
                 "WULFRAM_ENTITY_CONTACT_ROTATION_FRAME",
@@ -10569,6 +11967,25 @@ class WulframServer:
                     )
                 except ValueError:
                     constraint_kwargs["inactive_retest_bias"] = 0.1
+            static_target_mode = os.environ.get(
+                "WULFRAM_ENTITY_TERRAIN_STATIC_TARGET_SEPARATION",
+                "0",
+            ).strip().lower()
+            if static_target_mode in {
+                "1",
+                "true",
+                "on",
+                "yes",
+                "decompile",
+                "static",
+                "target",
+            }:
+                constraint_kwargs["target_separation"] = (
+                    self._get_static_separation_from_contact(
+                        (anchor[0], anchor[1], anchor[2]),
+                        contact.position,
+                    )
+                )
             result = solve_static_terrain_constraint(**constraint_kwargs)
             if not finite_values((*result.position, *result.velocity, *result.angular_velocity)):
                 return {
@@ -10668,6 +12085,25 @@ class WulframServer:
         ):
             nonlocal vx, vy, vz
             if pair_solver_response or force_pair_solver:
+                if (
+                    not force_pair_solver
+                    and contact_response == "auto"
+                    and ctx_entity_type == EntityType.TANK
+                    and tank_clean_pair_solver_enabled
+                    and origin_mode not in {"entity", "origin", "raw"}
+                    and tank_clean_pair_solver_max_depth > 0.0
+                    and float(contact.penetration) > tank_clean_pair_solver_max_depth
+                ):
+                    return {
+                        "response": "terrain_contact_constraint_solver_depth_rejected",
+                        "terrain_contact_depth_rejected": True,
+                        "terrain_contact_depth": float(contact.penetration),
+                        "terrain_contact_max_depth": tank_clean_pair_solver_max_depth,
+                        "velocity_before": (vx, vy, vz),
+                        "velocity_after": (vx, vy, vz),
+                        "angular_velocity_before": tuple(contact_angular_velocity),
+                        "angular_velocity_after": tuple(contact_angular_velocity),
+                    }
                 return apply_pair_solver_contact(
                     contact,
                     projection_order_override=projection_order_override,
@@ -10780,6 +12216,10 @@ class WulframServer:
                 raw_after_vel[1] - before_vel[1],
                 raw_after_vel[2] - before_vel[2],
             )
+            solver_velocity_delta_unprojected = raw_delta
+            solver_velocity_delta_mag_unprojected = vec_mag(
+                solver_velocity_delta_unprojected
+            )
             normal_delta_projected = False
             before_normal_speed = None
             before_center_normal_speed = None
@@ -10795,6 +12235,9 @@ class WulframServer:
                 "projection_speed",
                 "target_speed",
                 "decompile_projection",
+                "center_closing",
+                "center_closing_velocity",
+                "center_projection_speed",
             }:
                 normal = None
                 try:
@@ -10818,24 +12261,32 @@ class WulframServer:
                     )
                     before_normal_speed = before_center_normal_speed
                     before_normal_speed_source = "center_velocity"
-                    for speed_key in (
-                        "constraint_selected_separation_speed_before",
-                        "point_normal_velocity_before",
-                    ):
-                        try:
-                            candidate_speed = float(response_debug.get(speed_key))
-                        except (TypeError, ValueError, OverflowError):
-                            candidate_speed = None
-                        if candidate_speed is not None and math.isfinite(candidate_speed):
-                            before_normal_speed = candidate_speed
-                            before_normal_speed_source = speed_key
-                            break
+                    if local_delta_mode not in {
+                        "center_closing",
+                        "center_closing_velocity",
+                        "center_projection_speed",
+                    }:
+                        for speed_key in (
+                            "constraint_selected_separation_speed_before",
+                            "point_normal_velocity_before",
+                        ):
+                            try:
+                                candidate_speed = float(response_debug.get(speed_key))
+                            except (TypeError, ValueError, OverflowError):
+                                candidate_speed = None
+                            if candidate_speed is not None and math.isfinite(candidate_speed):
+                                before_normal_speed = candidate_speed
+                                before_normal_speed_source = speed_key
+                                break
                     if local_delta_mode in {
                         "closing",
                         "closing_velocity",
                         "projection_speed",
                         "target_speed",
                         "decompile_projection",
+                        "center_closing",
+                        "center_closing_velocity",
+                        "center_projection_speed",
                     }:
                         try:
                             target_separation_speed = float(
@@ -10876,7 +12327,9 @@ class WulframServer:
                             before_vel[2] + raw_delta[2],
                         )
                     else:
-                        if normal_component <= 0.0:
+                        if local_closing_only and before_normal_speed >= 0.0:
+                            normal_delta_skip_reason = "separating_before_velocity"
+                        elif normal_component <= 0.0:
                             normal_delta_skip_reason = "nonpositive_solver_normal_delta"
                         else:
                             normal_delta_skip_reason = "separating_before_velocity"
@@ -10957,7 +12410,9 @@ class WulframServer:
                 raw_after_ang[1] - before_ang[1],
                 raw_after_ang[2] - before_ang[2],
             )
+            solver_angular_delta_unprojected = raw_ang_delta
             raw_ang_delta_mag = vec_mag(raw_ang_delta)
+            solver_angular_delta_mag_unprojected = raw_ang_delta_mag
             angular_delta_clamped = False
             angular_delta_preserved = False
             if local_angular_mode in {"preserve", "none", "linear", "linear_only", "off"}:
@@ -11015,12 +12470,24 @@ class WulframServer:
                 "raw_origin_fallback_normal_delta_skip_reason": normal_delta_skip_reason,
                 "raw_origin_fallback_normal_delta_projected": normal_delta_projected,
                 "raw_origin_fallback_velocity_after_unclamped": raw_after_vel,
+                "raw_origin_fallback_solver_velocity_delta_unprojected": (
+                    solver_velocity_delta_unprojected
+                ),
+                "raw_origin_fallback_solver_velocity_delta_mag_unprojected": (
+                    solver_velocity_delta_mag_unprojected
+                ),
                 "raw_origin_fallback_velocity_delta_unclamped": raw_delta,
                 "raw_origin_fallback_velocity_delta_mag_unclamped": raw_delta_mag,
                 "raw_origin_fallback_velocity_delta_clamped": velocity_delta_clamped,
                 "raw_origin_fallback_vertical_delta_clamped": vertical_delta_clamped,
                 "raw_origin_fallback_speed_clamped": speed_clamped,
                 "raw_origin_fallback_angular_velocity_after_unclamped": raw_after_ang,
+                "raw_origin_fallback_solver_angular_delta_unprojected": (
+                    solver_angular_delta_unprojected
+                ),
+                "raw_origin_fallback_solver_angular_delta_mag_unprojected": (
+                    solver_angular_delta_mag_unprojected
+                ),
                 "raw_origin_fallback_angular_delta_unclamped": raw_ang_delta,
                 "raw_origin_fallback_angular_delta_mag_unclamped": raw_ang_delta_mag,
                 "raw_origin_fallback_angular_delta_clamped": angular_delta_clamped,
@@ -11034,6 +12501,442 @@ class WulframServer:
                 "angular_delta": final_ang_delta,
             })
             return response_debug, True
+
+        def resolve_reference_pose_pair_response(reference_pair):
+            nonlocal vx, vy, vz
+            if not reference_pose_pair_response_enabled:
+                return False
+            response_record = {
+                "enabled": True,
+                "apply_enabled": reference_pose_pair_response_apply_enabled,
+            }
+            dirty_dispatch_debug["reference_pose_pair_response"] = response_record
+            if not isinstance(reference_pair, dict):
+                response_record["reject"] = "no_reference_pose_pair_contact"
+                return False
+            contact = reference_pair.get("contact")
+            if contact is None:
+                response_record["reject"] = "no_reference_pose_pair_contact"
+                return False
+
+            current_pos = (anchor[0], anchor[1], anchor[2])
+            current_vel = (vx, vy, vz)
+            current_ang = tuple(contact_angular_velocity)
+            pair_pos = finite_triplet(reference_pair.get("pos")) or current_pos
+            pair_vel = finite_triplet(reference_pair.get("velocity")) or current_vel
+            pair_delta_contact = reference_pair.get("delta_contact")
+            pair_dx = pair_pos[0] - current_pos[0]
+            pair_dy = pair_pos[1] - current_pos[1]
+            pair_dz = pair_pos[2] - current_pos[2]
+            pair_current_xy_distance = math.sqrt(pair_dx * pair_dx + pair_dy * pair_dy)
+            pair_current_distance = math.sqrt(
+                pair_dx * pair_dx + pair_dy * pair_dy + pair_dz * pair_dz
+            )
+            response_record.update({
+                "max_distance": reference_pose_pair_response_max_distance,
+                "current_pos": current_pos,
+                "current_distance": pair_current_distance,
+                "current_xy_distance": pair_current_xy_distance,
+                "current_z_delta": pair_dz,
+            })
+            if (
+                reference_pose_pair_response_max_distance > 0.0
+                and pair_current_distance
+                > reference_pose_pair_response_max_distance
+            ):
+                response_record["reject"] = "reference_pose_pair_response_too_far"
+                response_record["applied"] = False
+                response_record["label"] = reference_pair.get("label")
+                response_record["pos"] = pair_pos
+                response_record["velocity_before"] = pair_vel
+                response_record["velocity_fraction"] = reference_pair.get(
+                    "velocity_fraction"
+                )
+                response_record["velocity_source"] = reference_pair.get(
+                    "velocity_source"
+                )
+                return False
+            saved_body_ang_vel = getattr(ctx, "spring_body_ang_vel", None)
+            saved_yaw = getattr(ctx, "angular_vel_yaw", None)
+            saved_last_interp_tick = getattr(ctx, "rigid_body_last_interp_tick", None)
+            response_debug = {}
+            applied = False
+            post_contact_pos = None
+            post_contact_vel = None
+            post_contact_ang = None
+            try:
+                anchor[0], anchor[1], anchor[2] = pair_pos
+                vx, vy, vz = pair_vel
+                response_debug, applied = apply_raw_origin_fallback_contact(
+                    contact,
+                    projection_order=pair_record_contact_projection_order,
+                    delta_mode=pair_record_contact_delta_mode,
+                    delta_normal=(
+                        None
+                        if pair_delta_contact is None
+                        else pair_delta_contact.normal
+                    ),
+                    delta_normal_source=(
+                        None
+                        if pair_delta_contact is None
+                        else getattr(pair_delta_contact, "normal_source", None)
+                    ),
+                    angular_mode=pair_record_contact_angular_mode,
+                    closing_only=pair_record_contact_closing_only,
+                    max_velocity_delta=pair_record_contact_max_velocity_delta,
+                    max_vertical_delta=pair_record_contact_max_vertical_delta,
+                    vertical_delta_mode=pair_record_contact_vertical_delta_mode,
+                    max_speed=pair_record_contact_max_speed,
+                    max_angular_delta=pair_record_contact_max_angular_delta,
+                    friction=0.0,
+                )
+                post_contact_pos = (anchor[0], anchor[1], anchor[2])
+                post_contact_vel = (vx, vy, vz)
+                post_contact_ang = tuple(contact_angular_velocity)
+            finally:
+                anchor[0], anchor[1], anchor[2] = current_pos
+                vx, vy, vz = current_vel
+                contact_angular_velocity[0], contact_angular_velocity[1], contact_angular_velocity[2] = current_ang
+                ctx.spring_body_ang_vel = saved_body_ang_vel
+                ctx.angular_vel_yaw = saved_yaw
+                ctx.rigid_body_last_interp_tick = saved_last_interp_tick
+
+            velocity_delta = None
+            angular_delta = None
+            if post_contact_vel is not None:
+                velocity_delta = (
+                    post_contact_vel[0] - pair_vel[0],
+                    post_contact_vel[1] - pair_vel[1],
+                    post_contact_vel[2] - pair_vel[2],
+                )
+            if post_contact_ang is not None:
+                angular_delta = (
+                    post_contact_ang[0] - current_ang[0],
+                    post_contact_ang[1] - current_ang[1],
+                    post_contact_ang[2] - current_ang[2],
+                )
+            response_record.update({
+                "reject": "" if applied else "response_not_applied",
+                "applied": applied,
+                "label": reference_pair.get("label"),
+                "pos": pair_pos,
+                "velocity_before": pair_vel,
+                "velocity_fraction": reference_pair.get("velocity_fraction"),
+                "velocity_source": reference_pair.get("velocity_source"),
+                "post_contact_pos": post_contact_pos,
+                "post_contact_vel": post_contact_vel,
+                "post_contact_ang": post_contact_ang,
+                "velocity_delta": velocity_delta,
+                "angular_delta": angular_delta,
+                "preserved_position": True,
+                "contact": probe_contact_fields(
+                    contact,
+                    center=pair_pos,
+                    z_lift_used=0.0,
+                ),
+            })
+            for key in (
+                "response",
+                "target_separation",
+                "constraint_selected_separation_speed_before",
+                "point_normal_velocity_before",
+                "raw_origin_fallback_velocity_delta_clamped",
+                "raw_origin_fallback_vertical_delta_clamped",
+                "raw_origin_fallback_angular_preserved",
+                "raw_origin_fallback_delta_mode",
+                "raw_origin_fallback_delta_normal",
+                "raw_origin_fallback_delta_normal_source",
+                "raw_origin_fallback_velocity_after_unclamped",
+                "raw_origin_fallback_velocity_delta_unclamped",
+                "raw_origin_fallback_velocity_delta_after_safety",
+                "raw_origin_fallback_angular_velocity_after_unclamped",
+                "raw_origin_fallback_angular_delta_after_safety",
+            ):
+                if key in response_debug:
+                    response_record[key] = response_debug.get(key)
+            if not applied or not reference_pose_pair_response_apply_enabled:
+                return False
+
+            final_vel = (
+                current_vel[0] + (velocity_delta[0] if velocity_delta else 0.0),
+                current_vel[1] + (velocity_delta[1] if velocity_delta else 0.0),
+                current_vel[2] + (velocity_delta[2] if velocity_delta else 0.0),
+            )
+            if not finite_values((*current_pos, *final_vel)):
+                response_record["reject"] = "nonfinite_final_state"
+                response_record["applied"] = False
+                return False
+            vx, vy, vz = final_vel
+            if post_contact_ang is not None:
+                contact_angular_velocity[0], contact_angular_velocity[1], contact_angular_velocity[2] = post_contact_ang
+                ctx.spring_body_ang_vel = (
+                    contact_angular_velocity[0],
+                    contact_angular_velocity[1],
+                )
+                ctx.angular_vel_yaw = contact_angular_velocity[2]
+            response_record["final_vel"] = final_vel
+            response_record["applied_to_current_state"] = True
+            response_debug = dict(response_debug or {})
+            response_debug.update({
+                "reference_pose_pair_response": True,
+                "reference_pose_pair_response_label": reference_pair.get("label"),
+                "reference_pose_pair_response_pos": pair_pos,
+                "reference_pose_pair_response_preserved_position": True,
+                "reference_pose_pair_response_max_distance": (
+                    reference_pose_pair_response_max_distance
+                ),
+                "reference_pose_pair_response_current_distance": (
+                    pair_current_distance
+                ),
+                "reference_pose_pair_response_current_xy_distance": (
+                    pair_current_xy_distance
+                ),
+                "reference_pose_pair_response_current_z_delta": pair_dz,
+                "reference_pose_pair_response_velocity_delta": velocity_delta,
+                "reference_pose_pair_response_final_vel": final_vel,
+                "reference_pose_pair_response_velocity_fraction": (
+                    reference_pair.get("velocity_fraction")
+                ),
+                "reference_pose_pair_response_velocity_source": (
+                    reference_pair.get("velocity_source")
+                ),
+                "velocity_before": current_vel,
+                "velocity_after": final_vel,
+            })
+            ctx.debug_last_collision = {
+                "kind": "terrain_reference_pose_pair_response",
+                "point": contact.position,
+                "normal": contact.normal,
+                "depth": contact.penetration,
+                **contact_debug_fields(contact),
+                "pair_record_contact": True,
+                "pair_record_contact_reason": "reference_pose_pair_response",
+                "pair_record_contact_reject": "",
+                "pair_record_contact_enabled": pair_record_contact_enabled,
+                "pair_record_contact_response_profile": (
+                    pair_record_contact_response_profile
+                ),
+                "pair_record_contact_selection": pair_record_contact_selection,
+                "pair_record_contact_normal_source": pair_record_contact_normal_source,
+                "pair_record_contact_delta_normal_source": (
+                    pair_record_contact_delta_normal_source
+                ),
+                **response_debug,
+            }
+            ctx.debug_last_motion_collision = dict(ctx.debug_last_collision)
+            return True
+
+        def resolve_dirty_reference_pair_response(reference_pair):
+            nonlocal vx, vy, vz
+            if not dirty_reference_pair_response_enabled:
+                return False
+            response_record = {
+                "enabled": True,
+                "apply_enabled": dirty_reference_pair_response_apply_enabled,
+            }
+            dirty_dispatch_debug["dirty_reference_pair_response"] = response_record
+            if not isinstance(reference_pair, dict):
+                response_record["reject"] = "no_dirty_reference_pair_contact"
+                return False
+            contact = reference_pair.get("contact")
+            if contact is None:
+                response_record["reject"] = "no_dirty_reference_pair_contact"
+                return False
+
+            current_pos = (anchor[0], anchor[1], anchor[2])
+            current_vel = (vx, vy, vz)
+            current_ang = tuple(contact_angular_velocity)
+            pair_pos = finite_triplet(reference_pair.get("pos")) or current_pos
+            pair_vel = finite_triplet(reference_pair.get("velocity")) or current_vel
+            pair_delta_contact = reference_pair.get("delta_contact")
+            pair_dx = pair_pos[0] - current_pos[0]
+            pair_dy = pair_pos[1] - current_pos[1]
+            pair_dz = pair_pos[2] - current_pos[2]
+            pair_current_xy_distance = math.sqrt(pair_dx * pair_dx + pair_dy * pair_dy)
+            pair_current_distance = math.sqrt(
+                pair_dx * pair_dx + pair_dy * pair_dy + pair_dz * pair_dz
+            )
+            response_record.update({
+                "max_distance": dirty_reference_pair_response_max_distance,
+                "current_pos": current_pos,
+                "current_distance": pair_current_distance,
+                "current_xy_distance": pair_current_xy_distance,
+                "current_z_delta": pair_dz,
+            })
+            if (
+                dirty_reference_pair_response_max_distance > 0.0
+                and pair_current_distance
+                > dirty_reference_pair_response_max_distance
+            ):
+                response_record["reject"] = (
+                    "dirty_reference_pair_response_too_far"
+                )
+                response_record["applied"] = False
+                response_record["label"] = reference_pair.get("label")
+                response_record["pos"] = pair_pos
+                response_record["velocity_before"] = pair_vel
+                return False
+            saved_body_ang_vel = getattr(ctx, "spring_body_ang_vel", None)
+            saved_yaw = getattr(ctx, "angular_vel_yaw", None)
+            saved_last_interp_tick = getattr(ctx, "rigid_body_last_interp_tick", None)
+            response_debug = {}
+            applied = False
+            post_contact_pos = None
+            post_contact_vel = None
+            post_contact_ang = None
+            try:
+                anchor[0], anchor[1], anchor[2] = pair_pos
+                vx, vy, vz = pair_vel
+                response_debug, applied = apply_raw_origin_fallback_contact(
+                    contact,
+                    projection_order=pair_record_contact_projection_order,
+                    delta_mode=pair_record_contact_delta_mode,
+                    delta_normal=(
+                        None
+                        if pair_delta_contact is None
+                        else pair_delta_contact.normal
+                    ),
+                    delta_normal_source=(
+                        None
+                        if pair_delta_contact is None
+                        else getattr(pair_delta_contact, "normal_source", None)
+                    ),
+                    angular_mode=pair_record_contact_angular_mode,
+                    closing_only=pair_record_contact_closing_only,
+                    max_velocity_delta=pair_record_contact_max_velocity_delta,
+                    max_vertical_delta=pair_record_contact_max_vertical_delta,
+                    vertical_delta_mode=pair_record_contact_vertical_delta_mode,
+                    max_speed=pair_record_contact_max_speed,
+                    max_angular_delta=pair_record_contact_max_angular_delta,
+                    friction=0.0,
+                )
+                post_contact_pos = (anchor[0], anchor[1], anchor[2])
+                post_contact_vel = (vx, vy, vz)
+                post_contact_ang = tuple(contact_angular_velocity)
+            finally:
+                anchor[0], anchor[1], anchor[2] = current_pos
+                vx, vy, vz = current_vel
+                contact_angular_velocity[0], contact_angular_velocity[1], contact_angular_velocity[2] = current_ang
+                ctx.spring_body_ang_vel = saved_body_ang_vel
+                ctx.angular_vel_yaw = saved_yaw
+                ctx.rigid_body_last_interp_tick = saved_last_interp_tick
+
+            velocity_delta = None
+            angular_delta = None
+            if post_contact_vel is not None:
+                velocity_delta = (
+                    post_contact_vel[0] - pair_vel[0],
+                    post_contact_vel[1] - pair_vel[1],
+                    post_contact_vel[2] - pair_vel[2],
+                )
+            if post_contact_ang is not None:
+                angular_delta = (
+                    post_contact_ang[0] - current_ang[0],
+                    post_contact_ang[1] - current_ang[1],
+                    post_contact_ang[2] - current_ang[2],
+                )
+            response_record.update({
+                "reject": "" if applied else "response_not_applied",
+                "applied": applied,
+                "label": reference_pair.get("label"),
+                "pos": pair_pos,
+                "velocity_before": pair_vel,
+                "post_contact_pos": post_contact_pos,
+                "post_contact_vel": post_contact_vel,
+                "post_contact_ang": post_contact_ang,
+                "velocity_delta": velocity_delta,
+                "angular_delta": angular_delta,
+                "preserved_position": True,
+                "contact": probe_contact_fields(
+                    contact,
+                    center=pair_pos,
+                    z_lift_used=0.0,
+                ),
+            })
+            for key in (
+                "response",
+                "target_separation",
+                "constraint_selected_separation_speed_before",
+                "point_normal_velocity_before",
+                "raw_origin_fallback_velocity_delta_clamped",
+                "raw_origin_fallback_vertical_delta_clamped",
+                "raw_origin_fallback_angular_preserved",
+                "raw_origin_fallback_delta_mode",
+                "raw_origin_fallback_delta_normal",
+                "raw_origin_fallback_delta_normal_source",
+                "raw_origin_fallback_velocity_after_unclamped",
+                "raw_origin_fallback_velocity_delta_unclamped",
+                "raw_origin_fallback_velocity_delta_after_safety",
+                "raw_origin_fallback_angular_velocity_after_unclamped",
+                "raw_origin_fallback_angular_delta_after_safety",
+            ):
+                if key in response_debug:
+                    response_record[key] = response_debug.get(key)
+            if not applied or not dirty_reference_pair_response_apply_enabled:
+                return False
+
+            final_vel = (
+                current_vel[0] + (velocity_delta[0] if velocity_delta else 0.0),
+                current_vel[1] + (velocity_delta[1] if velocity_delta else 0.0),
+                current_vel[2] + (velocity_delta[2] if velocity_delta else 0.0),
+            )
+            if not finite_values((*current_pos, *final_vel)):
+                response_record["reject"] = "nonfinite_final_state"
+                response_record["applied"] = False
+                return False
+            vx, vy, vz = final_vel
+            if post_contact_ang is not None:
+                contact_angular_velocity[0], contact_angular_velocity[1], contact_angular_velocity[2] = post_contact_ang
+                ctx.spring_body_ang_vel = (
+                    contact_angular_velocity[0],
+                    contact_angular_velocity[1],
+                )
+                ctx.angular_vel_yaw = contact_angular_velocity[2]
+            response_record["final_vel"] = final_vel
+            response_record["applied_to_current_state"] = True
+            response_debug = dict(response_debug or {})
+            response_debug.update({
+                "dirty_reference_pair_response": True,
+                "dirty_reference_pair_response_label": reference_pair.get("label"),
+                "dirty_reference_pair_response_pos": pair_pos,
+                "dirty_reference_pair_response_preserved_position": True,
+                "dirty_reference_pair_response_max_distance": (
+                    dirty_reference_pair_response_max_distance
+                ),
+                "dirty_reference_pair_response_current_distance": (
+                    pair_current_distance
+                ),
+                "dirty_reference_pair_response_current_xy_distance": (
+                    pair_current_xy_distance
+                ),
+                "dirty_reference_pair_response_current_z_delta": pair_dz,
+                "dirty_reference_pair_response_velocity_delta": velocity_delta,
+                "dirty_reference_pair_response_final_vel": final_vel,
+                "velocity_before": current_vel,
+                "velocity_after": final_vel,
+            })
+            ctx.debug_last_collision = {
+                "kind": "terrain_dirty_reference_pair_response",
+                "point": contact.position,
+                "normal": contact.normal,
+                "depth": contact.penetration,
+                **contact_debug_fields(contact),
+                "pair_record_contact": True,
+                "pair_record_contact_reason": "dirty_reference_pair_response",
+                "pair_record_contact_reject": "",
+                "pair_record_contact_enabled": pair_record_contact_enabled,
+                "pair_record_contact_response_profile": (
+                    pair_record_contact_response_profile
+                ),
+                "pair_record_contact_selection": pair_record_contact_selection,
+                "pair_record_contact_normal_source": pair_record_contact_normal_source,
+                "pair_record_contact_delta_normal_source": (
+                    pair_record_contact_delta_normal_source
+                ),
+                **response_debug,
+            }
+            ctx.debug_last_motion_collision = dict(ctx.debug_last_collision)
+            return True
 
         def apply_iterative_start_contact(contact):
             before_pos = (anchor[0], anchor[1], anchor[2])
@@ -11057,6 +12960,49 @@ class WulframServer:
 
         def apply_dirty_bounds_contact(contact):
             nonlocal vx, vy, vz
+            if pair_solver_response and dirty_bounds_safe_response_enabled:
+                response_debug, applied_dirty_safety = apply_raw_origin_fallback_contact(
+                    contact,
+                    projection_order=pair_record_contact_projection_order,
+                    delta_mode=pair_record_contact_delta_mode,
+                    delta_normal=contact.normal,
+                    delta_normal_source=getattr(contact, "normal_source", None),
+                    angular_mode=pair_record_contact_angular_mode,
+                    closing_only=pair_record_contact_closing_only,
+                    max_velocity_delta=pair_record_contact_max_velocity_delta,
+                    max_vertical_delta=pair_record_contact_max_vertical_delta,
+                    vertical_delta_mode=pair_record_contact_vertical_delta_mode,
+                    max_speed=pair_record_contact_max_speed,
+                    max_angular_delta=pair_record_contact_max_angular_delta,
+                    friction=0.0,
+                )
+                ctx.debug_last_collision = {
+                    "kind": (
+                        "terrain_dirty_bounds_safety_limited"
+                        if applied_dirty_safety
+                        else "terrain_dirty_bounds_safety_rejected"
+                    ),
+                    "point": contact.position,
+                    "normal": contact.normal,
+                    "depth": contact.penetration,
+                    "terrain_collision_shape": terrain_collision_shape,
+                    **contact_debug_fields(contact),
+                    "dirty_bounds_safe_response": True,
+                    "dirty_bounds_safe_response_enabled": (
+                        dirty_bounds_safe_response_enabled
+                    ),
+                    "dirty_bounds_safe_response_applied": applied_dirty_safety,
+                    "dirty_bounds_safe_response_profile": (
+                        pair_record_contact_response_profile
+                    ),
+                    "dirty_bounds_safe_response_source": (
+                        dirty_dispatch_debug.get("dirty_bounds_contact_source")
+                    ),
+                    "detail": f"reference={reference_pos!r}",
+                    **(response_debug or {}),
+                }
+                ctx.debug_last_motion_collision = dict(ctx.debug_last_collision)
+                return
             if pair_solver_response:
                 response_debug = apply_pair_solver_contact(contact)
                 ctx.debug_last_collision = {
@@ -11137,7 +13083,7 @@ class WulframServer:
             return acc
 
         def estimate_direct_pair_record_contact_timing():
-            if not pair_record_continue_remaining_enabled:
+            if not pair_record_schedule_probe_enabled:
                 return None
             frame_dt = max(0.0, float(dt))
             if frame_dt <= 0.0:
@@ -11241,6 +13187,903 @@ class WulframServer:
                 "contact_sweep_scan_steps": scan_steps_used,
                 "contact_sweep_scan_hit_time_s": contact_sweep_scan_hit_time,
                 **best,
+            }
+
+        def estimate_spatial_ref_pair_record_contact_timing():
+            if not pair_record_spatial_ref_schedule_probe_enabled:
+                return None
+            frame_dt = max(0.0, float(dt))
+            if frame_dt <= 0.0:
+                return {
+                    "probe_result": "invalid_step_dt",
+                    "step_dt_s": frame_dt,
+                }
+            start_pos = (
+                finite_triplet(reference_pos)
+                or finite_triplet(getattr(ctx, "world_collision_ref_pos", None))
+            )
+            end_pos = finite_triplet((anchor[0], anchor[1], anchor[2]))
+            start_vel = finite_triplet(pre_vel) or finite_triplet((vx, vy, vz))
+            end_vel = finite_triplet((vx, vy, vz))
+            if (
+                start_pos is None
+                or end_pos is None
+                or start_vel is None
+                or end_vel is None
+            ):
+                return {
+                    "probe_result": "nonfinite_spatial_ref_state",
+                    "step_dt_s": frame_dt,
+                    "ref_pos": start_pos,
+                    "current_pos": end_pos,
+                }
+            dx = end_pos[0] - start_pos[0]
+            dy = end_pos[1] - start_pos[1]
+            dz = end_pos[2] - start_pos[2]
+            ref_distance = math.sqrt(dx * dx + dy * dy + dz * dz)
+            ref_xy_distance = math.sqrt(dx * dx + dy * dy)
+            acc = (
+                (end_vel[0] - start_vel[0]) / frame_dt,
+                (end_vel[1] - start_vel[1]) / frame_dt,
+                (end_vel[2] - start_vel[2]) / frame_dt,
+            )
+
+            def candidate_at(elapsed_s):
+                pos, velocity = motion_state_at(
+                    start_pos,
+                    start_vel,
+                    acc,
+                    elapsed_s,
+                    frame_dt,
+                )
+                pair_probe = sample_pair_record_contact_at(pos, velocity=velocity)
+                pair_contact = pair_probe.get("contact")
+                if (
+                    pair_probe.get("selected_raw_error") is None
+                    and pair_contact is not None
+                    and pair_probe.get("reject") == ""
+                    and pair_contact.penetration > self._PENETRATION_SLOP_DEFAULT
+                ):
+                    return {
+                        "pos": pos,
+                        "velocity": velocity,
+                        "probe": pair_probe,
+                        "contact": pair_contact,
+                        "delta_contact": pair_probe.get("delta_contact"),
+                    }
+                return None
+
+            base = {
+                "probe_result": "no_interval_contact",
+                "step_dt_s": frame_dt,
+                "ref_pos": start_pos,
+                "current_pos": end_pos,
+                "ref_to_current_distance": ref_distance,
+                "ref_to_current_xy_distance": ref_xy_distance,
+                "ref_to_current_z_delta": dz,
+                "start_velocity": start_vel,
+                "end_velocity": end_vel,
+            }
+            start_candidate = candidate_at(0.0)
+            if start_candidate is not None:
+                base.update({
+                    "probe_result": "interval_contact",
+                    "collision_time_s": 0.0,
+                    "remaining_time_s": frame_dt,
+                    "collision_at_start": True,
+                    "sweep_iterations": 0,
+                    "sweep_clear_count": 0,
+                    "sweep_contact_count": 2,
+                    "contact_sweep_scan": False,
+                    "contact_sweep_scan_steps": 0,
+                    "contact_sweep_scan_hit_time_s": None,
+                    **start_candidate,
+                })
+                return base
+
+            end_candidate = candidate_at(frame_dt)
+            contact_sweep_scan = False
+            contact_sweep_scan_hit_time = None
+            scan_steps_used = 0
+            lo = 0.0
+            if end_candidate is None:
+                found_time = None
+                found_candidate = None
+                prev_time = 0.0
+                scan_steps_used = max(1, int(contact_sweep_scan_steps))
+                for scan_index in range(1, scan_steps_used + 1):
+                    scan_time = frame_dt * (
+                        float(scan_index) / float(scan_steps_used + 1)
+                    )
+                    scan_candidate = candidate_at(scan_time)
+                    if scan_candidate is not None:
+                        found_time = scan_time
+                        found_candidate = scan_candidate
+                        break
+                    prev_time = scan_time
+                if found_time is None or found_candidate is None:
+                    return base
+                contact_sweep_scan = True
+                contact_sweep_scan_hit_time = found_time
+                lo = prev_time
+                hi = found_time
+                best = found_candidate
+                clear_count = max(1, int(round(prev_time > 0.0)))
+                contact_count = 1
+            else:
+                hi = frame_dt
+                best = end_candidate
+                clear_count = 1
+                contact_count = 1
+            iterations = 0
+            while hi - lo > 0.0025 and iterations < 24:
+                mid = (lo + hi) * 0.5
+                mid_candidate = candidate_at(mid)
+                iterations += 1
+                if mid_candidate is None:
+                    lo = mid
+                    clear_count += 1
+                else:
+                    hi = mid
+                    best = mid_candidate
+                    contact_count += 1
+            base.update({
+                "probe_result": "interval_contact",
+                "collision_time_s": hi,
+                "remaining_time_s": max(0.0, frame_dt - hi),
+                "collision_at_start": False,
+                "sweep_iterations": iterations,
+                "sweep_clear_count": clear_count,
+                "sweep_contact_count": contact_count,
+                "contact_sweep_scan": contact_sweep_scan,
+                "contact_sweep_scan_steps": scan_steps_used,
+                "contact_sweep_scan_hit_time_s": contact_sweep_scan_hit_time,
+                **best,
+            })
+            return base
+
+        def probe_direct_pair_record_contact_response(pair_timing):
+            nonlocal vx, vy, vz
+            if not pair_record_schedule_response_probe_enabled:
+                return {}
+            if pair_timing is None:
+                return {
+                    "pair_record_schedule_response_probe_enabled": True,
+                    "pair_record_schedule_response_probe_result": (
+                        "no_interval_contact"
+                    ),
+                }
+            saved_pos = (anchor[0], anchor[1], anchor[2])
+            saved_vel = (vx, vy, vz)
+            saved_ang = tuple(contact_angular_velocity)
+            saved_body_ang_vel = getattr(ctx, "spring_body_ang_vel", None)
+            saved_yaw = getattr(ctx, "angular_vel_yaw", None)
+            saved_last_interp_tick = getattr(ctx, "rigid_body_last_interp_tick", None)
+            response_debug = {}
+            applied = False
+            post_contact_pos = None
+            post_contact_vel = None
+            endpoint_pos = None
+            endpoint_vel = None
+            try:
+                anchor[0], anchor[1], anchor[2] = pair_timing["pos"]
+                vx, vy, vz = pair_timing["velocity"]
+                response_debug, applied = apply_raw_origin_fallback_contact(
+                    pair_timing["contact"],
+                    projection_order=pair_record_contact_projection_order,
+                    delta_mode=pair_record_contact_delta_mode,
+                    delta_normal=(
+                        None
+                        if pair_timing.get("delta_contact") is None
+                        else pair_timing["delta_contact"].normal
+                    ),
+                    delta_normal_source=(
+                        None
+                        if pair_timing.get("delta_contact") is None
+                        else getattr(
+                            pair_timing["delta_contact"],
+                            "normal_source",
+                            None,
+                        )
+                    ),
+                    angular_mode=pair_record_contact_angular_mode,
+                    closing_only=pair_record_contact_closing_only,
+                    max_velocity_delta=pair_record_contact_max_velocity_delta,
+                    max_vertical_delta=pair_record_contact_max_vertical_delta,
+                    vertical_delta_mode=pair_record_contact_vertical_delta_mode,
+                    max_speed=pair_record_contact_max_speed,
+                    max_angular_delta=pair_record_contact_max_angular_delta,
+                )
+                post_contact_pos = (anchor[0], anchor[1], anchor[2])
+                post_contact_vel = (vx, vy, vz)
+                remaining_after_contact = max(
+                    0.0,
+                    float(pair_timing.get("remaining_time_s") or 0.0),
+                )
+                if applied and remaining_after_contact > 0.0:
+                    endpoint_pos, endpoint_vel = motion_state_at(
+                        post_contact_pos,
+                        post_contact_vel,
+                        timing_acceleration(),
+                        remaining_after_contact,
+                        remaining_after_contact,
+                    )
+            finally:
+                anchor[0], anchor[1], anchor[2] = saved_pos
+                vx, vy, vz = saved_vel
+                contact_angular_velocity[0], contact_angular_velocity[1], contact_angular_velocity[2] = saved_ang
+                ctx.spring_body_ang_vel = saved_body_ang_vel
+                ctx.angular_vel_yaw = saved_yaw
+                ctx.rigid_body_last_interp_tick = saved_last_interp_tick
+
+            response_debug = dict(response_debug or {})
+            result = {
+                "pair_record_schedule_response_probe_enabled": True,
+                "pair_record_schedule_response_probe_result": (
+                    "applied" if applied else "not_applied"
+                ),
+                "pair_record_schedule_response_probe_applied": applied,
+                "pair_record_schedule_response_probe_remaining_time_s": (
+                    pair_timing.get("remaining_time_s")
+                ),
+                "pair_record_schedule_response_probe_contact_pos": (
+                    pair_timing.get("pos")
+                ),
+                "pair_record_schedule_response_probe_vel_before": (
+                    pair_timing.get("velocity")
+                ),
+                "pair_record_schedule_response_probe_post_contact_pos": (
+                    post_contact_pos
+                ),
+                "pair_record_schedule_response_probe_post_contact_vel": (
+                    post_contact_vel
+                ),
+                "pair_record_schedule_response_probe_endpoint_pos": endpoint_pos,
+                "pair_record_schedule_response_probe_endpoint_vel": endpoint_vel,
+            }
+            response_fields = (
+                "response",
+                "target_separation",
+                "constraint_selected_separation_speed_before",
+                "point_normal_velocity_before",
+                "raw_origin_fallback_safety_rejected",
+                "raw_origin_fallback_delta_mode",
+                "raw_origin_fallback_delta_normal",
+                "raw_origin_fallback_delta_normal_source",
+                "raw_origin_fallback_angular_mode",
+                "raw_origin_fallback_vertical_delta_mode",
+                "raw_origin_fallback_closing_only",
+                "raw_origin_fallback_before_normal_speed",
+                "raw_origin_fallback_before_normal_speed_source",
+                "raw_origin_fallback_before_center_normal_speed",
+                "raw_origin_fallback_normal_delta_skip_reason",
+                "raw_origin_fallback_normal_delta_projected",
+                "raw_origin_fallback_velocity_after_unclamped",
+                "raw_origin_fallback_solver_velocity_delta_unprojected",
+                "raw_origin_fallback_solver_velocity_delta_mag_unprojected",
+                "raw_origin_fallback_velocity_delta_unclamped",
+                "raw_origin_fallback_velocity_delta_mag_unclamped",
+                "raw_origin_fallback_velocity_delta_clamped",
+                "raw_origin_fallback_vertical_delta_clamped",
+                "raw_origin_fallback_speed_clamped",
+                "raw_origin_fallback_angular_velocity_after_unclamped",
+                "raw_origin_fallback_solver_angular_delta_unprojected",
+                "raw_origin_fallback_solver_angular_delta_mag_unprojected",
+                "raw_origin_fallback_angular_delta_unclamped",
+                "raw_origin_fallback_angular_delta_mag_unclamped",
+                "raw_origin_fallback_angular_delta_clamped",
+                "raw_origin_fallback_angular_preserved",
+                "raw_origin_fallback_velocity_delta_after_safety",
+                "raw_origin_fallback_velocity_delta_mag_after_safety",
+                "raw_origin_fallback_angular_delta_after_safety",
+                "raw_origin_fallback_angular_delta_mag_after_safety",
+                "velocity_after",
+                "angular_velocity_after",
+                "angular_delta",
+            )
+            for key in response_fields:
+                if key not in response_debug:
+                    continue
+                suffix = (
+                    key[len("raw_origin_fallback_") :]
+                    if key.startswith("raw_origin_fallback_")
+                    else key
+                )
+                result[f"pair_record_schedule_response_probe_{suffix}"] = (
+                    response_debug.get(key)
+                )
+            return result
+
+        def estimate_deferred_prestep_pair_record_contact(current_reject, current_raw_error):
+            if not (
+                pair_record_deferred_prestep_enabled
+                or pair_record_deferred_prestep_probe_enabled
+            ):
+                return {"contact": None, "reject": "disabled"}
+            if current_raw_error is not None:
+                return {"contact": None, "reject": "current_raw_origin_error"}
+            if current_reject != "no_raw_origin_contact":
+                return {
+                    "contact": None,
+                    "reject": "current_pair_contact_not_clear",
+                }
+            start_pos = finite_triplet(pre_pos)
+            start_vel = finite_triplet(pre_vel)
+            current_pos = finite_triplet((anchor[0], anchor[1], anchor[2]))
+            if start_pos is None or start_vel is None or current_pos is None:
+                return {"contact": None, "reject": "nonfinite_prestep_state"}
+            distance = math.sqrt(
+                (current_pos[0] - start_pos[0]) * (current_pos[0] - start_pos[0])
+                + (current_pos[1] - start_pos[1]) * (current_pos[1] - start_pos[1])
+                + (current_pos[2] - start_pos[2]) * (current_pos[2] - start_pos[2])
+            )
+            if (
+                pair_record_deferred_prestep_max_distance > 0.0
+                and distance > pair_record_deferred_prestep_max_distance
+            ):
+                return {
+                    "contact": None,
+                    "reject": "prestep_pair_record_too_far",
+                    "distance": distance,
+                }
+            pair_probe = sample_pair_record_contact_at(start_pos, velocity=start_vel)
+            pair_contact = pair_probe.get("contact")
+            reject = pair_probe.get("reject")
+            if (
+                pair_probe.get("selected_raw_error") is not None
+                or pair_contact is None
+                or reject != ""
+                or pair_contact.penetration <= self._PENETRATION_SLOP_DEFAULT
+            ):
+                return {
+                    "contact": None,
+                    "reject": (
+                        f"prestep_pair_record_{reject}"
+                        if reject
+                        else "no_prestep_pair_record_contact"
+                    ),
+                    "distance": distance,
+                    "probe": pair_probe,
+                }
+            return {
+                "contact": pair_contact,
+                "delta_contact": pair_probe.get("delta_contact"),
+                "pos": start_pos,
+                "velocity": start_vel,
+                "distance": distance,
+                "probe": pair_probe,
+                "reject": "",
+            }
+
+        phase_lookahead_queue_attr = "terrain_pair_record_phase_lookahead_queue"
+
+        def estimate_phase_lookahead_pair_record_contact(current_reject, current_raw_error):
+            if not pair_record_phase_lookahead_enabled:
+                return {"contact": None, "reject": "disabled"}
+            if current_raw_error is not None:
+                return {"contact": None, "reject": "current_raw_origin_error"}
+            if current_reject != "no_raw_origin_contact":
+                return {
+                    "contact": None,
+                    "reject": "current_pair_contact_not_clear",
+                }
+            current_pos = finite_triplet((anchor[0], anchor[1], anchor[2]))
+            current_vel = finite_triplet((vx, vy, vz))
+            if current_pos is None or current_vel is None:
+                return {"contact": None, "reject": "nonfinite_current_state"}
+            speed_sq = (
+                current_vel[0] * current_vel[0]
+                + current_vel[1] * current_vel[1]
+                + current_vel[2] * current_vel[2]
+            )
+            if speed_sq <= 1e-8:
+                return {"contact": None, "reject": "stationary_current_velocity"}
+            max_time = max(0.0, float(pair_record_phase_lookahead_max_time))
+            if max_time <= 0.0:
+                return {"contact": None, "reject": "zero_lookahead_window"}
+            if pair_record_phase_lookahead_accel_mode in {
+                "frame",
+                "frame_accel",
+                "frame_acceleration",
+                "accel",
+                "acceleration",
+                "decompile",
+            }:
+                acc = timing_acceleration()
+                acceleration_source = "frame_acceleration"
+            else:
+                acc = (0.0, 0.0, 0.0)
+                acceleration_source = "constant_velocity"
+
+            def state_at(elapsed_s):
+                return motion_state_at(
+                    current_pos,
+                    current_vel,
+                    acc,
+                    elapsed_s,
+                    max_time,
+                )
+
+            def distance_from_current(pos):
+                return math.sqrt(
+                    (pos[0] - current_pos[0]) * (pos[0] - current_pos[0])
+                    + (pos[1] - current_pos[1]) * (pos[1] - current_pos[1])
+                    + (pos[2] - current_pos[2]) * (pos[2] - current_pos[2])
+                )
+
+            def candidate_at(elapsed_s):
+                pos, velocity = state_at(elapsed_s)
+                distance = distance_from_current(pos)
+                if (
+                    pair_record_phase_lookahead_max_distance > 0.0
+                    and distance > pair_record_phase_lookahead_max_distance
+                ):
+                    return {
+                        "contact": None,
+                        "reject": "phase_lookahead_too_far",
+                        "elapsed_s": elapsed_s,
+                        "distance": distance,
+                    }
+                pair_probe = sample_pair_record_contact_at(pos, velocity=velocity)
+                pair_contact = pair_probe.get("contact")
+                reject = pair_probe.get("reject")
+                if (
+                    pair_probe.get("selected_raw_error") is None
+                    and pair_contact is not None
+                    and reject == ""
+                    and pair_contact.penetration > self._PENETRATION_SLOP_DEFAULT
+                ):
+                    return {
+                        "pos": pos,
+                        "velocity": velocity,
+                        "distance": distance,
+                        "probe": pair_probe,
+                        "contact": pair_contact,
+                        "delta_contact": pair_probe.get("delta_contact"),
+                        "reject": "",
+                    }
+                return {
+                    "contact": None,
+                    "reject": (
+                        f"phase_lookahead_{reject}"
+                        if reject
+                        else "phase_lookahead_no_pair_record_contact"
+                    ),
+                    "elapsed_s": elapsed_s,
+                    "distance": distance,
+                    "probe": pair_probe,
+                }
+
+            scan_steps = max(1, int(pair_record_phase_lookahead_steps))
+            previous_clear_time = 0.0
+            previous_clear = candidate_at(0.0)
+            found_time = None
+            found = None
+            scan_clear_count = 0
+            scan_contact_count = 0
+            last_reject = previous_clear.get("reject")
+            for scan_index in range(1, scan_steps + 1):
+                scan_time = max_time * (float(scan_index) / float(scan_steps))
+                candidate = candidate_at(scan_time)
+                if candidate.get("contact") is not None:
+                    found_time = scan_time
+                    found = candidate
+                    scan_contact_count += 1
+                    break
+                previous_clear_time = scan_time
+                scan_clear_count += 1
+                last_reject = candidate.get("reject")
+            if found_time is None or found is None:
+                return {
+                    "contact": None,
+                    "reject": last_reject or "phase_lookahead_no_pair_record_contact",
+                    "scan_steps": scan_steps,
+                    "scan_clear_count": scan_clear_count,
+                    "scan_contact_count": scan_contact_count,
+                    "acceleration_source": acceleration_source,
+                }
+
+            lo = previous_clear_time
+            hi = found_time
+            best = found
+            iterations = 0
+            while hi - lo > 0.0025 and iterations < 24:
+                mid = (lo + hi) * 0.5
+                candidate = candidate_at(mid)
+                iterations += 1
+                if candidate.get("contact") is not None:
+                    hi = mid
+                    best = candidate
+                    scan_contact_count += 1
+                else:
+                    lo = mid
+                    scan_clear_count += 1
+                    last_reject = candidate.get("reject")
+
+            return {
+                "contact": best["contact"],
+                "delta_contact": best.get("delta_contact"),
+                "pos": best["pos"],
+                "velocity": best["velocity"],
+                "distance": best.get("distance"),
+                "collision_time_s": hi,
+                "remaining_time_s": max(0.0, max_time - hi),
+                "scan_steps": scan_steps,
+                "scan_clear_count": scan_clear_count,
+                "scan_contact_count": scan_contact_count,
+                "sweep_iterations": iterations,
+                "hit_time_s": found_time,
+                "last_clear_time_s": previous_clear_time,
+                "acceleration_source": acceleration_source,
+                "probe": best.get("probe"),
+                "reject": "",
+            }
+
+        def apply_queued_phase_lookahead_pair_record_contact(queue_record):
+            nonlocal vx, vy, vz
+            if not pair_record_phase_lookahead_queue_enabled:
+                return False, {"reject": "phase_lookahead_queue_disabled"}
+            if not isinstance(queue_record, dict):
+                return False, {"reject": "phase_lookahead_queue_empty"}
+            contact = queue_record.get("contact")
+            if contact is None:
+                setattr(ctx, phase_lookahead_queue_attr, None)
+                return False, {"reject": "phase_lookahead_queue_missing_contact"}
+            try:
+                time_to_contact = float(queue_record.get("time_to_contact_s") or 0.0)
+            except (TypeError, ValueError, OverflowError):
+                time_to_contact = 0.0
+            frame_dt = max(0.0, float(dt or 0.0))
+            if frame_dt <= 0.0:
+                setattr(ctx, phase_lookahead_queue_attr, None)
+                return False, {"reject": "phase_lookahead_queue_zero_dt"}
+            if time_to_contact > frame_dt:
+                queue_record = dict(queue_record)
+                queue_record["time_to_contact_s"] = max(0.0, time_to_contact - frame_dt)
+                queue_record["age_steps"] = int(queue_record.get("age_steps") or 0) + 1
+                setattr(ctx, phase_lookahead_queue_attr, queue_record)
+                return False, {
+                    "queued": True,
+                    "pending": True,
+                    "time_to_contact_s": queue_record["time_to_contact_s"],
+                    "age_steps": queue_record["age_steps"],
+                    "collision_time_s": queue_record.get("collision_time_s"),
+                    "distance": queue_record.get("distance"),
+                }
+
+            start_pos = finite_triplet(pre_pos) or finite_triplet(
+                (anchor[0], anchor[1], anchor[2])
+            )
+            start_vel = finite_triplet(pre_vel) or finite_triplet((vx, vy, vz))
+            if start_pos is None or start_vel is None:
+                setattr(ctx, phase_lookahead_queue_attr, None)
+                return False, {"reject": "phase_lookahead_queue_nonfinite_start"}
+
+            collision_time = max(0.0, min(frame_dt, time_to_contact))
+            contact_pos, contact_vel = motion_state_at(
+                start_pos,
+                start_vel,
+                timing_acceleration(),
+                collision_time,
+                frame_dt,
+            )
+            endpoint_pos = (anchor[0], anchor[1], anchor[2])
+            endpoint_vel = (vx, vy, vz)
+            endpoint_ang = tuple(contact_angular_velocity)
+            saved_body_ang_vel = getattr(ctx, "spring_body_ang_vel", None)
+            saved_yaw = getattr(ctx, "angular_vel_yaw", None)
+            try:
+                anchor[0], anchor[1], anchor[2] = contact_pos
+                vx, vy, vz = contact_vel
+                delta_contact = queue_record.get("delta_contact")
+                response_debug, applied = apply_raw_origin_fallback_contact(
+                    contact,
+                    projection_order=pair_record_contact_projection_order,
+                    delta_mode=pair_record_contact_delta_mode,
+                    delta_normal=(
+                        None if delta_contact is None else delta_contact.normal
+                    ),
+                    delta_normal_source=(
+                        None
+                        if delta_contact is None
+                        else getattr(delta_contact, "normal_source", None)
+                    ),
+                    angular_mode=pair_record_contact_angular_mode,
+                    closing_only=pair_record_contact_closing_only,
+                    max_velocity_delta=pair_record_contact_max_velocity_delta,
+                    max_vertical_delta=pair_record_contact_max_vertical_delta,
+                    vertical_delta_mode=pair_record_contact_vertical_delta_mode,
+                    max_speed=pair_record_contact_max_speed,
+                    max_angular_delta=pair_record_contact_max_angular_delta,
+                )
+                if not applied:
+                    anchor[0], anchor[1], anchor[2] = endpoint_pos
+                    vx, vy, vz = endpoint_vel
+                    contact_angular_velocity[0], contact_angular_velocity[1], contact_angular_velocity[2] = endpoint_ang
+                    ctx.spring_body_ang_vel = saved_body_ang_vel
+                    ctx.angular_vel_yaw = saved_yaw
+                    setattr(ctx, phase_lookahead_queue_attr, None)
+                    return False, {
+                        "reject": "phase_lookahead_queue_response_not_applied",
+                        **dict(response_debug or {}),
+                    }
+
+                post_contact_pos = (anchor[0], anchor[1], anchor[2])
+                post_contact_vel = (vx, vy, vz)
+                remaining_after_contact = max(0.0, frame_dt - collision_time)
+                if remaining_after_contact > 0.0:
+                    final_pos, final_vel = motion_state_at(
+                        post_contact_pos,
+                        post_contact_vel,
+                        timing_acceleration(),
+                        remaining_after_contact,
+                        remaining_after_contact,
+                    )
+                    anchor[0], anchor[1], anchor[2] = final_pos
+                    vx, vy, vz = final_vel
+                response_debug = dict(response_debug or {})
+                response_debug.update({
+                    "phase_lookahead_queued_pair_record_contact": True,
+                    "pair_record_phase_lookahead_queue_enabled": True,
+                    "pair_record_phase_lookahead_queued_collision_time_s": (
+                        collision_time
+                    ),
+                    "pair_record_phase_lookahead_queued_remaining_time_s": (
+                        remaining_after_contact
+                    ),
+                    "pair_record_phase_lookahead_queued_original_collision_time_s": (
+                        queue_record.get("collision_time_s")
+                    ),
+                    "pair_record_phase_lookahead_queued_age_steps": (
+                        queue_record.get("age_steps")
+                    ),
+                    "pair_record_phase_lookahead_queued_distance": (
+                        queue_record.get("distance")
+                    ),
+                    "pair_record_phase_lookahead_queued_contact_pos": contact_pos,
+                    "pair_record_phase_lookahead_queued_contact_vel_before": (
+                        contact_vel
+                    ),
+                    "pair_record_phase_lookahead_queued_post_contact_pos": (
+                        post_contact_pos
+                    ),
+                    "pair_record_phase_lookahead_queued_post_contact_vel": (
+                        post_contact_vel
+                    ),
+                    "pair_record_phase_lookahead_queued_endpoint_pos": endpoint_pos,
+                    "pair_record_phase_lookahead_queued_endpoint_vel": endpoint_vel,
+                    "velocity_after": (vx, vy, vz),
+                })
+                setattr(ctx, phase_lookahead_queue_attr, None)
+                return True, response_debug
+            except Exception:
+                anchor[0], anchor[1], anchor[2] = endpoint_pos
+                vx, vy, vz = endpoint_vel
+                contact_angular_velocity[0], contact_angular_velocity[1], contact_angular_velocity[2] = endpoint_ang
+                ctx.spring_body_ang_vel = saved_body_ang_vel
+                ctx.angular_vel_yaw = saved_yaw
+                setattr(ctx, phase_lookahead_queue_attr, None)
+                raise
+
+        def estimate_phase_backtrack_pair_record_contact(current_reject, current_raw_error):
+            if not pair_record_phase_backtrack_enabled:
+                return {"contact": None, "reject": "disabled"}
+            if current_raw_error is not None:
+                return {"contact": None, "reject": "current_raw_origin_error"}
+            if current_reject != "no_raw_origin_contact":
+                return {
+                    "contact": None,
+                    "reject": "current_pair_contact_not_clear",
+                }
+
+            source = pair_record_phase_backtrack_source
+            if source in {"current", "endpoint", "post", "poststep"}:
+                base_source = "current"
+                base_pos = finite_triplet((anchor[0], anchor[1], anchor[2]))
+                base_vel = finite_triplet((vx, vy, vz))
+            elif source in {"ref", "reference", "dirty_reference", "world_ref"}:
+                base_source = "dirty_reference"
+                base_pos = finite_triplet(reference_pos)
+                base_vel = finite_triplet(pre_vel) or finite_triplet((vx, vy, vz))
+            else:
+                base_source = "pre"
+                base_pos = finite_triplet(pre_pos)
+                base_vel = finite_triplet(pre_vel)
+                if base_pos is None or base_vel is None:
+                    base_source = "current"
+                    base_pos = finite_triplet((anchor[0], anchor[1], anchor[2]))
+                    base_vel = finite_triplet((vx, vy, vz))
+            if base_pos is None or base_vel is None:
+                return {
+                    "contact": None,
+                    "reject": "nonfinite_backtrack_state",
+                    "source": base_source,
+                }
+            speed_sq = (
+                base_vel[0] * base_vel[0]
+                + base_vel[1] * base_vel[1]
+                + base_vel[2] * base_vel[2]
+            )
+            if speed_sq <= 1e-8:
+                return {
+                    "contact": None,
+                    "reject": "stationary_backtrack_velocity",
+                    "source": base_source,
+                }
+            max_time = max(0.0, float(pair_record_phase_backtrack_max_time))
+            if max_time <= 0.0:
+                return {
+                    "contact": None,
+                    "reject": "zero_backtrack_window",
+                    "source": base_source,
+                }
+            if pair_record_phase_backtrack_accel_mode in {
+                "frame",
+                "frame_accel",
+                "frame_acceleration",
+                "accel",
+                "acceleration",
+                "decompile",
+            }:
+                acc = timing_acceleration()
+                acceleration_source = "frame_acceleration"
+            else:
+                acc = (0.0, 0.0, 0.0)
+                acceleration_source = "constant_velocity"
+
+            def state_at(elapsed_s):
+                elapsed_s = max(0.0, float(elapsed_s))
+                return (
+                    (
+                        base_pos[0] - base_vel[0] * elapsed_s + 0.5 * acc[0] * elapsed_s * elapsed_s,
+                        base_pos[1] - base_vel[1] * elapsed_s + 0.5 * acc[1] * elapsed_s * elapsed_s,
+                        base_pos[2] - base_vel[2] * elapsed_s + 0.5 * acc[2] * elapsed_s * elapsed_s,
+                    ),
+                    (
+                        base_vel[0] - acc[0] * elapsed_s,
+                        base_vel[1] - acc[1] * elapsed_s,
+                        base_vel[2] - acc[2] * elapsed_s,
+                    ),
+                )
+
+            def distance_from_base(pos):
+                return math.sqrt(
+                    (pos[0] - base_pos[0]) * (pos[0] - base_pos[0])
+                    + (pos[1] - base_pos[1]) * (pos[1] - base_pos[1])
+                    + (pos[2] - base_pos[2]) * (pos[2] - base_pos[2])
+                )
+
+            def candidate_at(elapsed_s):
+                pos, velocity = state_at(elapsed_s)
+                distance = distance_from_base(pos)
+                if (
+                    pair_record_phase_backtrack_max_distance > 0.0
+                    and distance > pair_record_phase_backtrack_max_distance
+                ):
+                    return {
+                        "contact": None,
+                        "reject": "phase_backtrack_too_far",
+                        "elapsed_s": elapsed_s,
+                        "distance": distance,
+                    }
+                pair_probe = sample_pair_record_contact_at(pos, velocity=velocity)
+                pair_contact = pair_probe.get("contact")
+                reject = pair_probe.get("reject")
+                if (
+                    pair_probe.get("selected_raw_error") is None
+                    and pair_contact is not None
+                    and reject == ""
+                    and pair_contact.penetration > self._PENETRATION_SLOP_DEFAULT
+                ):
+                    return {
+                        "pos": pos,
+                        "velocity": velocity,
+                        "distance": distance,
+                        "probe": pair_probe,
+                        "contact": pair_contact,
+                        "delta_contact": pair_probe.get("delta_contact"),
+                        "reject": "",
+                    }
+                return {
+                    "contact": None,
+                    "reject": (
+                        f"phase_backtrack_{reject}"
+                        if reject
+                        else "phase_backtrack_no_pair_record_contact"
+                    ),
+                    "elapsed_s": elapsed_s,
+                    "distance": distance,
+                    "probe": pair_probe,
+                }
+
+            scan_steps = max(1, int(pair_record_phase_backtrack_steps))
+            previous_clear_time = 0.0
+            previous_clear = candidate_at(0.0)
+            if previous_clear.get("contact") is not None:
+                return {
+                    "contact": previous_clear["contact"],
+                    "delta_contact": previous_clear.get("delta_contact"),
+                    "pos": previous_clear["pos"],
+                    "velocity": previous_clear["velocity"],
+                    "distance": previous_clear.get("distance"),
+                    "backtrack_time_s": 0.0,
+                    "scan_steps": scan_steps,
+                    "scan_clear_count": 0,
+                    "scan_contact_count": 1,
+                    "sweep_iterations": 0,
+                    "source": base_source,
+                    "base_pos": base_pos,
+                    "base_vel": base_vel,
+                    "acceleration_source": acceleration_source,
+                    "probe": previous_clear.get("probe"),
+                    "reject": "",
+                }
+
+            found_time = None
+            found = None
+            scan_clear_count = 1
+            scan_contact_count = 0
+            last_reject = previous_clear.get("reject")
+            for scan_index in range(1, scan_steps + 1):
+                scan_time = max_time * (float(scan_index) / float(scan_steps))
+                candidate = candidate_at(scan_time)
+                if candidate.get("contact") is not None:
+                    found_time = scan_time
+                    found = candidate
+                    scan_contact_count += 1
+                    break
+                previous_clear_time = scan_time
+                scan_clear_count += 1
+                last_reject = candidate.get("reject")
+            if found_time is None or found is None:
+                return {
+                    "contact": None,
+                    "reject": last_reject or "phase_backtrack_no_pair_record_contact",
+                    "scan_steps": scan_steps,
+                    "scan_clear_count": scan_clear_count,
+                    "scan_contact_count": scan_contact_count,
+                    "source": base_source,
+                    "base_pos": base_pos,
+                    "base_vel": base_vel,
+                    "acceleration_source": acceleration_source,
+                }
+
+            lo = previous_clear_time
+            hi = found_time
+            best = found
+            iterations = 0
+            while hi - lo > 0.0025 and iterations < 24:
+                mid = (lo + hi) * 0.5
+                candidate = candidate_at(mid)
+                iterations += 1
+                if candidate.get("contact") is not None:
+                    hi = mid
+                    best = candidate
+                    scan_contact_count += 1
+                else:
+                    lo = mid
+                    scan_clear_count += 1
+                    last_reject = candidate.get("reject")
+
+            return {
+                "contact": best["contact"],
+                "delta_contact": best.get("delta_contact"),
+                "pos": best["pos"],
+                "velocity": best["velocity"],
+                "distance": best.get("distance"),
+                "backtrack_time_s": hi,
+                "hit_time_s": found_time,
+                "last_clear_time_s": previous_clear_time,
+                "scan_steps": scan_steps,
+                "scan_clear_count": scan_clear_count,
+                "scan_contact_count": scan_contact_count,
+                "sweep_iterations": iterations,
+                "source": base_source,
+                "base_pos": base_pos,
+                "base_vel": base_vel,
+                "acceleration_source": acceleration_source,
+                "probe": best.get("probe"),
+                "reject": "",
             }
 
         def estimate_timed_contact_from(start_pos, start_vel, acc, remaining_time):
@@ -11774,6 +14617,9 @@ class WulframServer:
                                 "pair_record_contact_reject"
                             ),
                             "pair_record_contact_enabled": pair_record_contact_enabled,
+                            "pair_record_contact_response_profile": (
+                                pair_record_contact_response_profile
+                            ),
                             "pair_record_contact_selection": pair_record_contact_selection,
                             "pair_record_contact_normal_source": pair_record_contact_normal_source,
                             "pair_record_contact_delta_normal_source": pair_record_contact_delta_normal_source,
@@ -12093,14 +14939,24 @@ class WulframServer:
                     if pair_raw_error is not None:
                         pair_raw_contact = raw_contact
                         pair_raw_bounds_contact = raw_bounds_contact
-                raw_fallback_contact = raw_origin_contact_for_fallback(raw_contact)
-                raw_fallback_reject = raw_origin_fallback_reject_reason(raw_fallback_contact)
+                raw_fallback_contact, raw_fallback_reject, tank_raw_fallback = (
+                    raw_origin_fallback_probe_for(raw_contact, velocity=(vx, vy, vz))
+                )
+                if raw_fallback_contact is None or raw_fallback_reject in {
+                    "no_raw_origin_contact",
+                    "above_max_depth",
+                    "normal_z_below_min",
+                }:
+                    tank_face_fallback_latch_clear(raw_fallback_reject or "no_contact")
+                pair_contact_source = pair_raw_contact
+                if pair_contact_source is None and pair_record_bounds_sat_apply_enabled:
+                    pair_contact_source = pair_raw_bounds_contact
                 pair_contact = raw_origin_contact_for_fallback(
-                    pair_raw_contact,
+                    pair_contact_source,
                     normal_source=pair_record_contact_normal_source,
                 )
                 pair_delta_contact = raw_origin_contact_for_fallback(
-                    pair_raw_contact,
+                    pair_contact_source,
                     normal_source=pair_record_contact_delta_normal_source,
                 )
                 pair_contact_reject = pair_record_contact_reject_reason(pair_contact)
@@ -12121,50 +14977,301 @@ class WulframServer:
                     raw_bounds_contact=raw_bounds_contact,
                     raw_error=raw_error,
                     raw_fallback_reject=raw_fallback_reject,
+                    tank_raw_origin_fallback=tank_raw_fallback,
                     pair_record_contact=pair_contact,
                     pair_record_delta_contact=pair_delta_contact,
                     pair_record_contact_reject=pair_contact_reject,
                     raycast_probe=raycast_probe,
                 )
-                direct_pair_timing = estimate_direct_pair_record_contact_timing()
-                if pair_record_continue_remaining_enabled:
+                direct_pair_schedule_probe = estimate_direct_pair_record_contact_timing()
+                spatial_ref_schedule_probe = (
+                    estimate_spatial_ref_pair_record_contact_timing()
+                )
+                direct_pair_timing = (
+                    direct_pair_schedule_probe
+                    if pair_record_continue_remaining_enabled
+                    else None
+                )
+                if pair_record_spatial_ref_schedule_probe_enabled:
                     probe_debug = getattr(ctx, "debug_last_terrain_contact_probe", None)
                     if isinstance(probe_debug, dict):
-                        if direct_pair_timing is None:
-                            probe_debug.update({
-                                "pair_record_continue_probe_result": "no_interval_contact",
-                            })
+                        spatial_probe = spatial_ref_schedule_probe or {
+                            "probe_result": "no_interval_contact",
+                            "step_dt_s": max(0.0, float(dt)),
+                        }
+                        spatial_result = spatial_probe.get(
+                            "probe_result", "no_interval_contact"
+                        )
+                        collision_time_s = spatial_probe.get("collision_time_s")
+                        frame_dt = max(0.0, float(dt))
+                        bucket_index = None
+                        bucket_count = 30
+                        bucket_start_s = None
+                        bucket_end_s = None
+                        bucket_rate_hz = None
+                        try:
+                            if (
+                                frame_dt > 0.0
+                                and collision_time_s is not None
+                                and math.isfinite(float(collision_time_s))
+                            ):
+                                bucket_rate_hz = float(bucket_count) / frame_dt
+                                bucket_index = max(
+                                    0,
+                                    min(
+                                        bucket_count - 1,
+                                        int(
+                                            (float(collision_time_s) / frame_dt)
+                                            * float(bucket_count)
+                                        ),
+                                    ),
+                                )
+                                bucket_width_s = frame_dt / float(bucket_count)
+                                bucket_start_s = bucket_width_s * float(bucket_index)
+                                bucket_end_s = bucket_width_s * float(bucket_index + 1)
+                        except (TypeError, ValueError, OverflowError):
+                            bucket_index = None
+                            bucket_start_s = None
+                            bucket_end_s = None
+                            bucket_rate_hz = None
+                        probe_debug.update({
+                            "pair_record_spatial_ref_schedule_probe_enabled": True,
+                            "pair_record_spatial_ref_schedule_probe_result": (
+                                spatial_result
+                            ),
+                            "pair_record_spatial_ref_schedule_decompile_pool_model": (
+                                "CollisionPairPool_30_bucket_spatial_ref"
+                            ),
+                            "pair_record_spatial_ref_schedule_ref_pos": (
+                                spatial_probe.get("ref_pos")
+                            ),
+                            "pair_record_spatial_ref_schedule_current_pos": (
+                                spatial_probe.get("current_pos")
+                            ),
+                            "pair_record_spatial_ref_schedule_ref_to_current_distance": (
+                                spatial_probe.get("ref_to_current_distance")
+                            ),
+                            "pair_record_spatial_ref_schedule_ref_to_current_xy_distance": (
+                                spatial_probe.get("ref_to_current_xy_distance")
+                            ),
+                            "pair_record_spatial_ref_schedule_ref_to_current_z_delta": (
+                                spatial_probe.get("ref_to_current_z_delta")
+                            ),
+                            "pair_record_spatial_ref_schedule_collision_time_s": (
+                                collision_time_s
+                            ),
+                            "pair_record_spatial_ref_schedule_step_dt_s": (
+                                spatial_probe.get("step_dt_s", frame_dt)
+                            ),
+                            "pair_record_spatial_ref_schedule_remaining_time_s": (
+                                spatial_probe.get("remaining_time_s")
+                            ),
+                            "pair_record_spatial_ref_schedule_bucket_count": (
+                                bucket_count
+                            ),
+                            "pair_record_spatial_ref_schedule_bucket_rate_hz": (
+                                bucket_rate_hz
+                            ),
+                            "pair_record_spatial_ref_schedule_bucket_index": (
+                                bucket_index
+                            ),
+                            "pair_record_spatial_ref_schedule_bucket_start_s": (
+                                bucket_start_s
+                            ),
+                            "pair_record_spatial_ref_schedule_bucket_end_s": (
+                                bucket_end_s
+                            ),
+                            "pair_record_spatial_ref_schedule_collision_at_start": (
+                                spatial_probe.get("collision_at_start")
+                            ),
+                            "pair_record_spatial_ref_schedule_sweep_iterations": (
+                                spatial_probe.get("sweep_iterations")
+                            ),
+                            "pair_record_spatial_ref_schedule_sweep_clear_count": (
+                                spatial_probe.get("sweep_clear_count")
+                            ),
+                            "pair_record_spatial_ref_schedule_sweep_contact_count": (
+                                spatial_probe.get("sweep_contact_count")
+                            ),
+                            "pair_record_spatial_ref_schedule_contact_sweep_scan": (
+                                spatial_probe.get("contact_sweep_scan")
+                            ),
+                            "pair_record_spatial_ref_schedule_contact_sweep_scan_steps": (
+                                spatial_probe.get("contact_sweep_scan_steps")
+                            ),
+                            "pair_record_spatial_ref_schedule_contact_sweep_scan_hit_time_s": (
+                                spatial_probe.get("contact_sweep_scan_hit_time_s")
+                            ),
+                            "pair_record_spatial_ref_schedule_contact": (
+                                probe_contact_fields(
+                                    spatial_probe.get("contact"),
+                                    center=spatial_probe.get("pos"),
+                                    z_lift_used=0.0,
+                                )
+                            ),
+                            "pair_record_spatial_ref_schedule_delta_contact": (
+                                probe_contact_fields(
+                                    spatial_probe.get("delta_contact"),
+                                    center=spatial_probe.get("pos"),
+                                    z_lift_used=0.0,
+                                )
+                            ),
+                            "pair_record_spatial_ref_schedule_contact_pos": (
+                                spatial_probe.get("pos")
+                            ),
+                            "pair_record_spatial_ref_schedule_contact_vel_before": (
+                                spatial_probe.get("velocity")
+                            ),
+                        })
+                if pair_record_schedule_probe_enabled:
+                    probe_debug = getattr(ctx, "debug_last_terrain_contact_probe", None)
+                    if isinstance(probe_debug, dict):
+                        if direct_pair_schedule_probe is None:
+                            schedule_update = {
+                                "pair_record_schedule_probe_result": "no_interval_contact",
+                            }
+                            if pair_record_schedule_response_probe_enabled:
+                                schedule_update.update(
+                                    probe_direct_pair_record_contact_response(None)
+                                )
+                            if pair_record_continue_remaining_enabled:
+                                schedule_update[
+                                    "pair_record_continue_probe_result"
+                                ] = "no_interval_contact"
+                            probe_debug.update(schedule_update)
                         else:
-                            probe_debug.update({
-                                "pair_record_continue_probe_result": "interval_contact",
-                                "pair_record_continue_collision_time_s": direct_pair_timing.get(
-                                    "collision_time_s"
+                            collision_time_s = direct_pair_schedule_probe.get(
+                                "collision_time_s"
+                            )
+                            remaining_time_s = direct_pair_schedule_probe.get(
+                                "remaining_time_s"
+                            )
+                            frame_dt = max(0.0, float(dt))
+                            bucket_index = None
+                            bucket_count = 30
+                            bucket_start_s = None
+                            bucket_end_s = None
+                            bucket_rate_hz = None
+                            try:
+                                if (
+                                    frame_dt > 0.0
+                                    and collision_time_s is not None
+                                    and math.isfinite(float(collision_time_s))
+                                ):
+                                    bucket_rate_hz = float(bucket_count) / frame_dt
+                                    bucket_index = max(
+                                        0,
+                                        min(
+                                            bucket_count - 1,
+                                            int(
+                                                (
+                                                    float(collision_time_s)
+                                                    / frame_dt
+                                                )
+                                                * float(bucket_count)
+                                            ),
+                                        ),
+                                    )
+                                    bucket_width_s = frame_dt / float(bucket_count)
+                                    bucket_start_s = bucket_width_s * float(bucket_index)
+                                    bucket_end_s = bucket_width_s * float(bucket_index + 1)
+                            except (TypeError, ValueError, OverflowError):
+                                bucket_index = None
+                                bucket_start_s = None
+                                bucket_end_s = None
+                                bucket_rate_hz = None
+                            schedule_update = {
+                                "pair_record_schedule_probe_result": "interval_contact",
+                                "pair_record_schedule_decompile_pool_model": (
+                                    "CollisionPairPool_30_bucket_time_order"
                                 ),
-                                "pair_record_continue_remaining_time_s": direct_pair_timing.get(
-                                    "remaining_time_s"
+                                "pair_record_schedule_collision_time_s": collision_time_s,
+                                "pair_record_schedule_step_dt_s": frame_dt,
+                                "pair_record_schedule_remaining_time_s": remaining_time_s,
+                                "pair_record_schedule_resolve_remaining_to_tick_end_s": (
+                                    remaining_time_s
                                 ),
-                                "pair_record_continue_collision_at_start": direct_pair_timing.get(
+                                "pair_record_schedule_bucket_count": bucket_count,
+                                "pair_record_schedule_bucket_rate_hz": bucket_rate_hz,
+                                "pair_record_schedule_bucket_index": bucket_index,
+                                "pair_record_schedule_bucket_start_s": bucket_start_s,
+                                "pair_record_schedule_bucket_end_s": bucket_end_s,
+                                "pair_record_schedule_collision_at_start": direct_pair_schedule_probe.get(
                                     "collision_at_start"
                                 ),
-                                "pair_record_continue_sweep_iterations": direct_pair_timing.get(
+                                "pair_record_schedule_sweep_iterations": direct_pair_schedule_probe.get(
                                     "sweep_iterations"
                                 ),
-                                "pair_record_continue_sweep_clear_count": direct_pair_timing.get(
+                                "pair_record_schedule_sweep_clear_count": direct_pair_schedule_probe.get(
                                     "sweep_clear_count"
                                 ),
-                                "pair_record_continue_sweep_contact_count": direct_pair_timing.get(
+                                "pair_record_schedule_sweep_contact_count": direct_pair_schedule_probe.get(
                                     "sweep_contact_count"
                                 ),
-                                "pair_record_continue_contact_sweep_scan": direct_pair_timing.get(
+                                "pair_record_schedule_contact_sweep_scan": direct_pair_schedule_probe.get(
                                     "contact_sweep_scan"
                                 ),
-                                "pair_record_continue_contact_sweep_scan_steps": direct_pair_timing.get(
+                                "pair_record_schedule_contact_sweep_scan_steps": direct_pair_schedule_probe.get(
                                     "contact_sweep_scan_steps"
                                 ),
-                                "pair_record_continue_contact_sweep_scan_hit_time_s": direct_pair_timing.get(
+                                "pair_record_schedule_contact_sweep_scan_hit_time_s": direct_pair_schedule_probe.get(
                                     "contact_sweep_scan_hit_time_s"
                                 ),
-                            })
+                                "pair_record_schedule_contact": probe_contact_fields(
+                                    direct_pair_schedule_probe.get("contact"),
+                                    center=direct_pair_schedule_probe.get("pos"),
+                                    z_lift_used=0.0,
+                                ),
+                                "pair_record_schedule_delta_contact": probe_contact_fields(
+                                    direct_pair_schedule_probe.get("delta_contact"),
+                                    center=direct_pair_schedule_probe.get("pos"),
+                                    z_lift_used=0.0,
+                                ),
+                                "pair_record_schedule_contact_pos": direct_pair_schedule_probe.get(
+                                    "pos"
+                                ),
+                                "pair_record_schedule_contact_vel_before": direct_pair_schedule_probe.get(
+                                    "velocity"
+                                ),
+                            }
+                            if pair_record_schedule_response_probe_enabled:
+                                schedule_update.update(
+                                    probe_direct_pair_record_contact_response(
+                                        direct_pair_schedule_probe
+                                    )
+                                )
+                            if pair_record_continue_remaining_enabled:
+                                schedule_update.update({
+                                    "pair_record_continue_probe_result": "interval_contact",
+                                    "pair_record_continue_collision_time_s": direct_pair_schedule_probe.get(
+                                        "collision_time_s"
+                                    ),
+                                    "pair_record_continue_remaining_time_s": direct_pair_schedule_probe.get(
+                                        "remaining_time_s"
+                                    ),
+                                    "pair_record_continue_collision_at_start": direct_pair_schedule_probe.get(
+                                        "collision_at_start"
+                                    ),
+                                    "pair_record_continue_sweep_iterations": direct_pair_schedule_probe.get(
+                                        "sweep_iterations"
+                                    ),
+                                    "pair_record_continue_sweep_clear_count": direct_pair_schedule_probe.get(
+                                        "sweep_clear_count"
+                                    ),
+                                    "pair_record_continue_sweep_contact_count": direct_pair_schedule_probe.get(
+                                        "sweep_contact_count"
+                                    ),
+                                    "pair_record_continue_contact_sweep_scan": direct_pair_schedule_probe.get(
+                                        "contact_sweep_scan"
+                                    ),
+                                    "pair_record_continue_contact_sweep_scan_steps": direct_pair_schedule_probe.get(
+                                        "contact_sweep_scan_steps"
+                                    ),
+                                    "pair_record_continue_contact_sweep_scan_hit_time_s": direct_pair_schedule_probe.get(
+                                        "contact_sweep_scan_hit_time_s"
+                                    ),
+                                })
+                            probe_debug.update(schedule_update)
                 if (
                     direct_pair_timing is not None
                     or (
@@ -12204,6 +15311,8 @@ class WulframServer:
                     )
                     if not applied_pair_record_contact:
                         return False
+                    if pair_record_phase_lookahead_queue_enabled:
+                        setattr(ctx, phase_lookahead_queue_attr, None)
                     if direct_pair_timing is not None:
                         response_debug = dict(response_debug or {})
                         post_contact_pos = (anchor[0], anchor[1], anchor[2])
@@ -12301,6 +15410,17 @@ class WulframServer:
                             "velocity_after": (vx, vy, vz),
                             "contact_events": [direct_event_debug],
                         })
+                    record_pair_record_contact_cache(
+                        pair_contact,
+                        delta_contact=pair_delta_contact,
+                        pos=(anchor[0], anchor[1], anchor[2]),
+                        velocity=(vx, vy, vz),
+                        source=(
+                            "continued_pair_record_contact"
+                            if direct_pair_timing is not None
+                            else "pair_record_contact"
+                        ),
+                    )
                     ctx.debug_last_collision = {
                         "kind": (
                             "terrain_pair_record_continued_contact"
@@ -12317,12 +15437,29 @@ class WulframServer:
                         ),
                         "pair_record_contact": True,
                         "pair_record_contact_reason": (
-                            "lifted_clear_raw_origin_contact"
+                            (
+                                "lifted_clear_raw_origin_bounds_contact"
+                                if pair_raw_contact is None
+                                and pair_raw_bounds_contact is not None
+                                else "lifted_clear_raw_origin_contact"
+                            )
                             if contact is None
-                            else "lifted_below_slop_raw_origin_contact"
+                            else (
+                                "lifted_below_slop_raw_origin_bounds_contact"
+                                if pair_raw_contact is None
+                                and pair_raw_bounds_contact is not None
+                                else "lifted_below_slop_raw_origin_contact"
+                            )
                         ),
                         "pair_record_contact_reject": pair_contact_reject,
                         "pair_record_contact_enabled": pair_record_contact_enabled,
+                        "pair_record_bounds_sat_enabled": pair_record_bounds_sat_enabled,
+                        "pair_record_bounds_sat_apply_enabled": (
+                            pair_record_bounds_sat_apply_enabled
+                        ),
+                        "pair_record_contact_response_profile": (
+                            pair_record_contact_response_profile
+                        ),
                         "pair_record_contact_selection": pair_record_contact_selection,
                         "pair_record_contact_normal_source": pair_record_contact_normal_source,
                         "pair_record_contact_delta_normal_source": pair_record_contact_delta_normal_source,
@@ -12358,18 +15495,23 @@ class WulframServer:
                             "normal",
                             None,
                         ),
+                        "pair_record_selected_raw_bounds_normal": getattr(
+                            pair_raw_bounds_contact,
+                            "normal",
+                            None,
+                        ),
                         "pair_record_terrain_face_normal": getattr(
-                            pair_raw_contact,
+                            pair_raw_contact or pair_raw_bounds_contact,
                             "terrain_face_normal",
                             None,
                         ),
                         "pair_record_mesh_face_normal": getattr(
-                            pair_raw_contact,
+                            pair_raw_contact or pair_raw_bounds_contact,
                             "mesh_face_normal",
                             None,
                         ),
                         "pair_record_entity_radial_normal": getattr(
-                            pair_raw_contact,
+                            pair_raw_contact or pair_raw_bounds_contact,
                             "entity_radial_normal",
                             None,
                         ),
@@ -12377,11 +15519,1181 @@ class WulframServer:
                     }
                     ctx.debug_last_motion_collision = dict(ctx.debug_last_collision)
                     return True
+                queued_phase_lookahead = getattr(
+                    ctx,
+                    phase_lookahead_queue_attr,
+                    None,
+                )
+                queued_phase_applied = False
+                queued_phase_debug = {}
+                if pair_record_phase_lookahead_queue_enabled:
+                    queued_phase_applied, queued_phase_debug = (
+                        apply_queued_phase_lookahead_pair_record_contact(
+                            queued_phase_lookahead
+                        )
+                    )
+                    probe_debug = getattr(ctx, "debug_last_terrain_contact_probe", None)
+                    if isinstance(probe_debug, dict) and queued_phase_debug:
+                        probe_debug.update({
+                            "pair_record_phase_lookahead_queue_enabled": True,
+                            "pair_record_phase_lookahead_queue_pending": (
+                                queued_phase_debug.get("pending")
+                            ),
+                            "pair_record_phase_lookahead_queue_reject": (
+                                queued_phase_debug.get("reject")
+                            ),
+                            "pair_record_phase_lookahead_queue_time_to_contact_s": (
+                                queued_phase_debug.get("time_to_contact_s")
+                            ),
+                            "pair_record_phase_lookahead_queue_age_steps": (
+                                queued_phase_debug.get("age_steps")
+                            ),
+                            "pair_record_phase_lookahead_queue_collision_time_s": (
+                                queued_phase_debug.get("collision_time_s")
+                            ),
+                            "pair_record_phase_lookahead_queue_distance": (
+                                queued_phase_debug.get("distance")
+                            ),
+                        })
+                    if queued_phase_applied:
+                        queued_contact = (
+                            queued_phase_lookahead.get("contact")
+                            if isinstance(queued_phase_lookahead, dict)
+                            else None
+                        )
+                        queued_delta_contact = (
+                            queued_phase_lookahead.get("delta_contact")
+                            if isinstance(queued_phase_lookahead, dict)
+                            else None
+                        )
+                        event_debug = {
+                            "iteration": 1,
+                            "pair_record_contact": True,
+                            "phase_lookahead_queued_pair_record_contact": True,
+                            "point": (
+                                None if queued_contact is None else queued_contact.position
+                            ),
+                            "normal": (
+                                None if queued_contact is None else queued_contact.normal
+                            ),
+                            "depth": (
+                                None
+                                if queued_contact is None
+                                else queued_contact.penetration
+                            ),
+                            **contact_debug_fields(queued_contact),
+                            **queued_phase_debug,
+                        }
+                        record_pair_record_contact_cache(
+                            queued_contact,
+                            delta_contact=queued_delta_contact,
+                            pos=(anchor[0], anchor[1], anchor[2]),
+                            velocity=(vx, vy, vz),
+                            source="phase_lookahead_queued_pair_record_contact",
+                        )
+                        queued_probe = (
+                            queued_phase_lookahead.get("probe") or {}
+                            if isinstance(queued_phase_lookahead, dict)
+                            else {}
+                        )
+                        queued_raw_contact = queued_probe.get("raw_contact")
+                        queued_selected_raw_contact = queued_probe.get(
+                            "selected_raw_contact"
+                        )
+                        ctx.debug_last_collision = {
+                            "kind": "terrain_phase_lookahead_queued_pair_record_contact",
+                            "point": (
+                                None if queued_contact is None else queued_contact.position
+                            ),
+                            "normal": (
+                                None if queued_contact is None else queued_contact.normal
+                            ),
+                            "depth": (
+                                None
+                                if queued_contact is None
+                                else queued_contact.penetration
+                            ),
+                            **contact_debug_fields(queued_contact),
+                            "lifted_contact_missing": contact is None,
+                            "lifted_contact_depth": (
+                                None if contact is None else contact.penetration
+                            ),
+                            "pair_record_contact": True,
+                            "phase_lookahead_queued_pair_record_contact": True,
+                            "pair_record_contact_reason": (
+                                "phase_lookahead_queued_pair_record_contact"
+                            ),
+                            "pair_record_contact_reject": pair_contact_reject,
+                            "pair_record_contact_enabled": pair_record_contact_enabled,
+                            "pair_record_contact_response_profile": (
+                                pair_record_contact_response_profile
+                            ),
+                            "pair_record_contact_selection": (
+                                pair_record_contact_selection
+                            ),
+                            "pair_record_contact_normal_source": (
+                                pair_record_contact_normal_source
+                            ),
+                            "pair_record_contact_delta_normal_source": (
+                                pair_record_contact_delta_normal_source
+                            ),
+                            "pair_record_solver_normal_source": getattr(
+                                queued_contact,
+                                "normal_source",
+                                None,
+                            ),
+                            "pair_record_delta_normal_source": (
+                                None
+                                if queued_delta_contact is None
+                                else getattr(
+                                    queued_delta_contact,
+                                    "normal_source",
+                                    None,
+                                )
+                            ),
+                            "pair_record_delta_normal": (
+                                None
+                                if queued_delta_contact is None
+                                else queued_delta_contact.normal
+                            ),
+                            "pair_record_contact_projection_order": (
+                                pair_record_contact_projection_order
+                            ),
+                            "pair_record_contact_delta_mode": (
+                                pair_record_contact_delta_mode
+                            ),
+                            "pair_record_contact_angular_mode": (
+                                pair_record_contact_angular_mode
+                            ),
+                            "pair_record_contact_vertical_delta_mode": (
+                                pair_record_contact_vertical_delta_mode
+                            ),
+                            "pair_record_contact_closing_only": (
+                                pair_record_contact_closing_only
+                            ),
+                            "pair_record_contact_min_depth": pair_record_contact_min_depth,
+                            "pair_record_contact_max_depth": pair_record_contact_max_depth,
+                            "pair_record_contact_min_normal_z": (
+                                pair_record_contact_min_normal_z
+                            ),
+                            "pair_record_contact_min_face_normal_z": (
+                                pair_record_contact_min_face_normal_z
+                            ),
+                            "pair_record_contact_max_velocity_delta": (
+                                pair_record_contact_max_velocity_delta
+                            ),
+                            "pair_record_contact_max_vertical_delta": (
+                                pair_record_contact_max_vertical_delta
+                            ),
+                            "pair_record_contact_max_speed": (
+                                pair_record_contact_max_speed
+                            ),
+                            "pair_record_contact_max_angular_delta": (
+                                pair_record_contact_max_angular_delta
+                            ),
+                            "pair_record_raw_normal": getattr(
+                                queued_raw_contact,
+                                "normal",
+                                None,
+                            ),
+                            "pair_record_selected_raw_normal": getattr(
+                                queued_selected_raw_contact,
+                                "normal",
+                                None,
+                            ),
+                            "pair_record_terrain_face_normal": getattr(
+                                queued_selected_raw_contact,
+                                "terrain_face_normal",
+                                None,
+                            ),
+                            "pair_record_mesh_face_normal": getattr(
+                                queued_selected_raw_contact,
+                                "mesh_face_normal",
+                                None,
+                            ),
+                            "pair_record_entity_radial_normal": getattr(
+                                queued_selected_raw_contact,
+                                "entity_radial_normal",
+                                None,
+                            ),
+                            "contact_events": [event_debug],
+                            **queued_phase_debug,
+                        }
+                        ctx.debug_last_motion_collision = dict(ctx.debug_last_collision)
+                        return True
+
+                phase_lookahead_pair = estimate_phase_lookahead_pair_record_contact(
+                    pair_contact_reject,
+                    pair_raw_error,
+                )
+                if pair_record_phase_lookahead_enabled:
+                    probe_debug = getattr(ctx, "debug_last_terrain_contact_probe", None)
+                    if isinstance(probe_debug, dict):
+                        phase_probe = phase_lookahead_pair.get("probe") or {}
+                        phase_contact = phase_lookahead_pair.get("contact")
+                        phase_delta_contact = phase_lookahead_pair.get("delta_contact")
+                        probe_debug.update({
+                            "pair_record_phase_lookahead_enabled": (
+                                pair_record_phase_lookahead_enabled
+                            ),
+                            "pair_record_phase_lookahead_apply_enabled": (
+                                pair_record_phase_lookahead_apply_enabled
+                            ),
+                            "pair_record_phase_lookahead_queue_enabled": (
+                                pair_record_phase_lookahead_queue_enabled
+                            ),
+                            "pair_record_phase_lookahead_mode": (
+                                pair_record_phase_lookahead_mode
+                            ),
+                            "pair_record_phase_lookahead_reject": (
+                                phase_lookahead_pair.get("reject")
+                            ),
+                            "pair_record_phase_lookahead_collision_time_s": (
+                                phase_lookahead_pair.get("collision_time_s")
+                            ),
+                            "pair_record_phase_lookahead_hit_time_s": (
+                                phase_lookahead_pair.get("hit_time_s")
+                            ),
+                            "pair_record_phase_lookahead_distance": (
+                                phase_lookahead_pair.get("distance")
+                            ),
+                            "pair_record_phase_lookahead_scan_steps": (
+                                phase_lookahead_pair.get("scan_steps")
+                            ),
+                            "pair_record_phase_lookahead_sweep_iterations": (
+                                phase_lookahead_pair.get("sweep_iterations")
+                            ),
+                            "pair_record_phase_lookahead_scan_clear_count": (
+                                phase_lookahead_pair.get("scan_clear_count")
+                            ),
+                            "pair_record_phase_lookahead_scan_contact_count": (
+                                phase_lookahead_pair.get("scan_contact_count")
+                            ),
+                            "pair_record_phase_lookahead_pos": (
+                                phase_lookahead_pair.get("pos")
+                            ),
+                            "pair_record_phase_lookahead_velocity": (
+                                phase_lookahead_pair.get("velocity")
+                            ),
+                            "pair_record_phase_lookahead_acceleration_source": (
+                                phase_lookahead_pair.get("acceleration_source")
+                            ),
+                            "pair_record_phase_lookahead_contact": (
+                                probe_contact_fields(
+                                    phase_contact,
+                                    center=phase_lookahead_pair.get("pos"),
+                                    z_lift_used=0.0,
+                                )
+                            ),
+                            "pair_record_phase_lookahead_delta_contact": (
+                                probe_contact_fields(
+                                    phase_delta_contact,
+                                    center=phase_lookahead_pair.get("pos"),
+                                    z_lift_used=0.0,
+                                )
+                            ),
+                            "pair_record_phase_lookahead_selected_raw_error": (
+                                phase_probe.get("selected_raw_error")
+                            ),
+                        })
+                if (
+                    pair_record_phase_lookahead_queue_enabled
+                    and phase_lookahead_pair.get("contact") is not None
+                    and not isinstance(
+                        getattr(ctx, phase_lookahead_queue_attr, None),
+                        dict,
+                    )
+                ):
+                    queued_collision_time = max(
+                        0.0,
+                        float(phase_lookahead_pair.get("collision_time_s") or 0.0),
+                    )
+                    setattr(
+                        ctx,
+                        phase_lookahead_queue_attr,
+                        {
+                            "time_to_contact_s": queued_collision_time,
+                            "collision_time_s": queued_collision_time,
+                            "hit_time_s": phase_lookahead_pair.get("hit_time_s"),
+                            "distance": phase_lookahead_pair.get("distance"),
+                            "scan_steps": phase_lookahead_pair.get("scan_steps"),
+                            "sweep_iterations": phase_lookahead_pair.get(
+                                "sweep_iterations"
+                            ),
+                            "scan_clear_count": phase_lookahead_pair.get(
+                                "scan_clear_count"
+                            ),
+                            "scan_contact_count": phase_lookahead_pair.get(
+                                "scan_contact_count"
+                            ),
+                            "acceleration_source": phase_lookahead_pair.get(
+                                "acceleration_source"
+                            ),
+                            "pos": phase_lookahead_pair.get("pos"),
+                            "velocity": phase_lookahead_pair.get("velocity"),
+                            "contact": phase_lookahead_pair.get("contact"),
+                            "delta_contact": phase_lookahead_pair.get(
+                                "delta_contact"
+                            ),
+                            "probe": phase_lookahead_pair.get("probe"),
+                            "age_steps": 0,
+                        },
+                    )
+                    probe_debug = getattr(ctx, "debug_last_terrain_contact_probe", None)
+                    if isinstance(probe_debug, dict):
+                        probe_debug.update({
+                            "pair_record_phase_lookahead_queue_stored": True,
+                            "pair_record_phase_lookahead_queue_time_to_contact_s": (
+                                queued_collision_time
+                            ),
+                            "pair_record_phase_lookahead_queue_distance": (
+                                phase_lookahead_pair.get("distance")
+                            ),
+                        })
+                if (
+                    pair_record_phase_lookahead_apply_enabled
+                    and phase_lookahead_pair.get("contact") is not None
+                ):
+                    phase_pair_contact = phase_lookahead_pair["contact"]
+                    phase_pair_delta_contact = phase_lookahead_pair.get(
+                        "delta_contact"
+                    )
+                    current_pos_before = (anchor[0], anchor[1], anchor[2])
+                    current_vel_before = (vx, vy, vz)
+                    current_ang_before = tuple(contact_angular_velocity)
+                    phase_pos = phase_lookahead_pair["pos"]
+                    phase_vel = phase_lookahead_pair["velocity"]
+                    anchor[0], anchor[1], anchor[2] = phase_pos
+                    vx, vy, vz = phase_vel
+                    response_debug, applied_phase_pair_contact = (
+                        apply_raw_origin_fallback_contact(
+                            phase_pair_contact,
+                            projection_order=pair_record_contact_projection_order,
+                            delta_mode=pair_record_contact_delta_mode,
+                            delta_normal=(
+                                None
+                                if phase_pair_delta_contact is None
+                                else phase_pair_delta_contact.normal
+                            ),
+                            delta_normal_source=(
+                                None
+                                if phase_pair_delta_contact is None
+                                else getattr(
+                                    phase_pair_delta_contact,
+                                    "normal_source",
+                                    None,
+                                )
+                            ),
+                            angular_mode=pair_record_contact_angular_mode,
+                            closing_only=pair_record_contact_closing_only,
+                            max_velocity_delta=pair_record_contact_max_velocity_delta,
+                            max_vertical_delta=pair_record_contact_max_vertical_delta,
+                            vertical_delta_mode=pair_record_contact_vertical_delta_mode,
+                            max_speed=pair_record_contact_max_speed,
+                            max_angular_delta=pair_record_contact_max_angular_delta,
+                        )
+                    )
+                    phase_post_contact_pos = (anchor[0], anchor[1], anchor[2])
+                    phase_post_contact_vel = (vx, vy, vz)
+                    phase_post_contact_ang = tuple(contact_angular_velocity)
+                    if not applied_phase_pair_contact:
+                        anchor[0], anchor[1], anchor[2] = current_pos_before
+                        vx, vy, vz = current_vel_before
+                        contact_angular_velocity[0], contact_angular_velocity[1], contact_angular_velocity[2] = current_ang_before
+                        ctx.spring_body_ang_vel = (
+                            current_ang_before[0],
+                            current_ang_before[1],
+                        )
+                        ctx.angular_vel_yaw = current_ang_before[2]
+                        return False
+                    phase_velocity_delta = (
+                        phase_post_contact_vel[0] - phase_vel[0],
+                        phase_post_contact_vel[1] - phase_vel[1],
+                        phase_post_contact_vel[2] - phase_vel[2],
+                    )
+                    phase_angular_delta = (
+                        phase_post_contact_ang[0] - current_ang_before[0],
+                        phase_post_contact_ang[1] - current_ang_before[1],
+                        phase_post_contact_ang[2] - current_ang_before[2],
+                    )
+                    final_vel = (
+                        current_vel_before[0] + phase_velocity_delta[0],
+                        current_vel_before[1] + phase_velocity_delta[1],
+                        current_vel_before[2] + phase_velocity_delta[2],
+                    )
+                    anchor[0], anchor[1], anchor[2] = current_pos_before
+                    vx, vy, vz = final_vel
+                    contact_angular_velocity[0], contact_angular_velocity[1], contact_angular_velocity[2] = phase_post_contact_ang
+                    ctx.spring_body_ang_vel = (
+                        contact_angular_velocity[0],
+                        contact_angular_velocity[1],
+                    )
+                    ctx.angular_vel_yaw = contact_angular_velocity[2]
+                    response_debug = dict(response_debug or {})
+                    response_debug.update({
+                        "pair_record_phase_lookahead_contact": True,
+                        "phase_lookahead_pair_record_contact": True,
+                        "pair_record_phase_lookahead_apply_enabled": (
+                            pair_record_phase_lookahead_apply_enabled
+                        ),
+                        "pair_record_phase_lookahead_collision_time_s": (
+                            phase_lookahead_pair.get("collision_time_s")
+                        ),
+                        "pair_record_phase_lookahead_hit_time_s": (
+                            phase_lookahead_pair.get("hit_time_s")
+                        ),
+                        "pair_record_phase_lookahead_distance": (
+                            phase_lookahead_pair.get("distance")
+                        ),
+                        "pair_record_phase_lookahead_scan_steps": (
+                            phase_lookahead_pair.get("scan_steps")
+                        ),
+                        "pair_record_phase_lookahead_sweep_iterations": (
+                            phase_lookahead_pair.get("sweep_iterations")
+                        ),
+                        "pair_record_phase_lookahead_scan_clear_count": (
+                            phase_lookahead_pair.get("scan_clear_count")
+                        ),
+                        "pair_record_phase_lookahead_scan_contact_count": (
+                            phase_lookahead_pair.get("scan_contact_count")
+                        ),
+                        "pair_record_phase_lookahead_acceleration_source": (
+                            phase_lookahead_pair.get("acceleration_source")
+                        ),
+                        "pair_record_phase_lookahead_current_pos": (
+                            current_pos_before
+                        ),
+                        "pair_record_phase_lookahead_current_vel": (
+                            current_vel_before
+                        ),
+                        "pair_record_phase_lookahead_contact_pos": phase_pos,
+                        "pair_record_phase_lookahead_contact_vel_before": phase_vel,
+                        "pair_record_phase_lookahead_post_contact_pos": (
+                            phase_post_contact_pos
+                        ),
+                        "pair_record_phase_lookahead_post_contact_vel": (
+                            phase_post_contact_vel
+                        ),
+                        "pair_record_phase_lookahead_velocity_delta": (
+                            phase_velocity_delta
+                        ),
+                        "pair_record_phase_lookahead_angular_delta": (
+                            phase_angular_delta
+                        ),
+                        "pair_record_phase_lookahead_preserved_position": True,
+                        "velocity_before": current_vel_before,
+                        "velocity_after": final_vel,
+                    })
+                    phase_probe = phase_lookahead_pair.get("probe") or {}
+                    phase_raw_contact = phase_probe.get("raw_contact")
+                    phase_selected_raw_contact = phase_probe.get(
+                        "selected_raw_contact"
+                    )
+                    ctx.debug_last_collision = {
+                        "kind": "terrain_phase_lookahead_pair_record_contact",
+                        "point": phase_pair_contact.position,
+                        "normal": phase_pair_contact.normal,
+                        "depth": phase_pair_contact.penetration,
+                        **contact_debug_fields(phase_pair_contact),
+                        "lifted_contact_missing": contact is None,
+                        "lifted_contact_depth": (
+                            None if contact is None else contact.penetration
+                        ),
+                        "pair_record_contact": True,
+                        "pair_record_contact_reason": (
+                            "phase_lookahead_pair_record_contact"
+                        ),
+                        "pair_record_contact_reject": "",
+                        "pair_record_contact_enabled": pair_record_contact_enabled,
+                        "pair_record_contact_response_profile": (
+                            pair_record_contact_response_profile
+                        ),
+                        "pair_record_contact_selection": pair_record_contact_selection,
+                        "pair_record_contact_normal_source": pair_record_contact_normal_source,
+                        "pair_record_contact_delta_normal_source": pair_record_contact_delta_normal_source,
+                        "pair_record_solver_normal_source": getattr(
+                            phase_pair_contact,
+                            "normal_source",
+                            None,
+                        ),
+                        "pair_record_delta_normal_source": (
+                            None
+                            if phase_pair_delta_contact is None
+                            else getattr(
+                                phase_pair_delta_contact,
+                                "normal_source",
+                                None,
+                            )
+                        ),
+                        "pair_record_delta_normal": (
+                            None
+                            if phase_pair_delta_contact is None
+                            else phase_pair_delta_contact.normal
+                        ),
+                        "pair_record_contact_projection_order": pair_record_contact_projection_order,
+                        "pair_record_contact_delta_mode": pair_record_contact_delta_mode,
+                        "pair_record_contact_angular_mode": pair_record_contact_angular_mode,
+                        "pair_record_contact_vertical_delta_mode": pair_record_contact_vertical_delta_mode,
+                        "pair_record_contact_closing_only": pair_record_contact_closing_only,
+                        "pair_record_contact_min_depth": pair_record_contact_min_depth,
+                        "pair_record_contact_max_depth": pair_record_contact_max_depth,
+                        "pair_record_contact_min_normal_z": pair_record_contact_min_normal_z,
+                        "pair_record_contact_min_face_normal_z": pair_record_contact_min_face_normal_z,
+                        "pair_record_contact_max_velocity_delta": pair_record_contact_max_velocity_delta,
+                        "pair_record_contact_max_vertical_delta": pair_record_contact_max_vertical_delta,
+                        "pair_record_contact_max_speed": pair_record_contact_max_speed,
+                        "pair_record_contact_max_angular_delta": pair_record_contact_max_angular_delta,
+                        "pair_record_raw_normal": getattr(
+                            phase_raw_contact,
+                            "normal",
+                            None,
+                        ),
+                        "pair_record_selected_raw_normal": getattr(
+                            phase_selected_raw_contact,
+                            "normal",
+                            None,
+                        ),
+                        "pair_record_terrain_face_normal": getattr(
+                            phase_selected_raw_contact,
+                            "terrain_face_normal",
+                            None,
+                        ),
+                        "pair_record_mesh_face_normal": getattr(
+                            phase_selected_raw_contact,
+                            "mesh_face_normal",
+                            None,
+                        ),
+                        "pair_record_entity_radial_normal": getattr(
+                            phase_selected_raw_contact,
+                            "entity_radial_normal",
+                            None,
+                        ),
+                        **response_debug,
+                    }
+                    ctx.debug_last_motion_collision = dict(ctx.debug_last_collision)
+                    return True
+                phase_backtrack_pair = estimate_phase_backtrack_pair_record_contact(
+                    pair_contact_reject,
+                    pair_raw_error,
+                )
+                if pair_record_phase_backtrack_enabled:
+                    probe_debug = getattr(ctx, "debug_last_terrain_contact_probe", None)
+                    if isinstance(probe_debug, dict):
+                        backtrack_probe = phase_backtrack_pair.get("probe") or {}
+                        backtrack_contact = phase_backtrack_pair.get("contact")
+                        backtrack_delta_contact = phase_backtrack_pair.get(
+                            "delta_contact"
+                        )
+                        probe_debug.update({
+                            "pair_record_phase_backtrack_enabled": (
+                                pair_record_phase_backtrack_enabled
+                            ),
+                            "pair_record_phase_backtrack_apply_enabled": (
+                                pair_record_phase_backtrack_apply_enabled
+                            ),
+                            "pair_record_phase_backtrack_mode": (
+                                pair_record_phase_backtrack_mode
+                            ),
+                            "pair_record_phase_backtrack_reject": (
+                                phase_backtrack_pair.get("reject")
+                            ),
+                            "pair_record_phase_backtrack_time_s": (
+                                phase_backtrack_pair.get("backtrack_time_s")
+                            ),
+                            "pair_record_phase_backtrack_hit_time_s": (
+                                phase_backtrack_pair.get("hit_time_s")
+                            ),
+                            "pair_record_phase_backtrack_distance": (
+                                phase_backtrack_pair.get("distance")
+                            ),
+                            "pair_record_phase_backtrack_scan_steps": (
+                                phase_backtrack_pair.get("scan_steps")
+                            ),
+                            "pair_record_phase_backtrack_sweep_iterations": (
+                                phase_backtrack_pair.get("sweep_iterations")
+                            ),
+                            "pair_record_phase_backtrack_scan_clear_count": (
+                                phase_backtrack_pair.get("scan_clear_count")
+                            ),
+                            "pair_record_phase_backtrack_scan_contact_count": (
+                                phase_backtrack_pair.get("scan_contact_count")
+                            ),
+                            "pair_record_phase_backtrack_source": (
+                                phase_backtrack_pair.get("source")
+                            ),
+                            "pair_record_phase_backtrack_base_pos": (
+                                phase_backtrack_pair.get("base_pos")
+                            ),
+                            "pair_record_phase_backtrack_base_vel": (
+                                phase_backtrack_pair.get("base_vel")
+                            ),
+                            "pair_record_phase_backtrack_pos": (
+                                phase_backtrack_pair.get("pos")
+                            ),
+                            "pair_record_phase_backtrack_velocity": (
+                                phase_backtrack_pair.get("velocity")
+                            ),
+                            "pair_record_phase_backtrack_acceleration_source": (
+                                phase_backtrack_pair.get("acceleration_source")
+                            ),
+                            "pair_record_phase_backtrack_contact": (
+                                probe_contact_fields(
+                                    backtrack_contact,
+                                    center=phase_backtrack_pair.get("pos"),
+                                    z_lift_used=0.0,
+                                )
+                            ),
+                            "pair_record_phase_backtrack_delta_contact": (
+                                probe_contact_fields(
+                                    backtrack_delta_contact,
+                                    center=phase_backtrack_pair.get("pos"),
+                                    z_lift_used=0.0,
+                                )
+                            ),
+                            "pair_record_phase_backtrack_selected_raw_error": (
+                                backtrack_probe.get("selected_raw_error")
+                            ),
+                        })
+                if (
+                    pair_record_phase_backtrack_apply_enabled
+                    and phase_backtrack_pair.get("contact") is not None
+                ):
+                    backtrack_probe = phase_backtrack_pair.get("probe") or {}
+                    backtrack_pair_contact = phase_backtrack_pair["contact"]
+                    backtrack_pair_delta_contact = phase_backtrack_pair.get(
+                        "delta_contact"
+                    )
+                    current_pos = (anchor[0], anchor[1], anchor[2])
+                    current_vel = (vx, vy, vz)
+                    contact_pos = phase_backtrack_pair["pos"]
+                    contact_vel = phase_backtrack_pair["velocity"]
+                    anchor[0], anchor[1], anchor[2] = contact_pos
+                    vx, vy, vz = contact_vel
+                    response_debug, applied_backtrack_pair_contact = (
+                        apply_raw_origin_fallback_contact(
+                            backtrack_pair_contact,
+                            projection_order=pair_record_contact_projection_order,
+                            delta_mode=pair_record_contact_delta_mode,
+                            delta_normal=(
+                                None
+                                if backtrack_pair_delta_contact is None
+                                else backtrack_pair_delta_contact.normal
+                            ),
+                            delta_normal_source=(
+                                None
+                                if backtrack_pair_delta_contact is None
+                                else getattr(
+                                    backtrack_pair_delta_contact,
+                                    "normal_source",
+                                    None,
+                                )
+                            ),
+                            angular_mode=pair_record_contact_angular_mode,
+                            closing_only=pair_record_contact_closing_only,
+                            max_velocity_delta=pair_record_contact_max_velocity_delta,
+                            max_vertical_delta=pair_record_contact_max_vertical_delta,
+                            vertical_delta_mode=pair_record_contact_vertical_delta_mode,
+                            max_speed=pair_record_contact_max_speed,
+                            max_angular_delta=pair_record_contact_max_angular_delta,
+                        )
+                    )
+                    if not applied_backtrack_pair_contact:
+                        return False
+                    response_debug = dict(response_debug or {})
+                    post_contact_pos = (anchor[0], anchor[1], anchor[2])
+                    post_contact_vel = (vx, vy, vz)
+                    remaining_after_contact = max(
+                        0.0,
+                        float(phase_backtrack_pair.get("backtrack_time_s") or 0.0),
+                    )
+                    replay_acc = (
+                        timing_acceleration()
+                        if phase_backtrack_pair.get("acceleration_source")
+                        == "frame_acceleration"
+                        else (0.0, 0.0, 0.0)
+                    )
+                    if remaining_after_contact > 0.0:
+                        final_pos, final_vel = motion_state_at(
+                            post_contact_pos,
+                            post_contact_vel,
+                            replay_acc,
+                            remaining_after_contact,
+                            remaining_after_contact,
+                        )
+                        anchor[0], anchor[1], anchor[2] = final_pos
+                        vx, vy, vz = final_vel
+                    event_debug = {
+                        "iteration": 1,
+                        "pair_record_contact": True,
+                        "phase_backtrack_pair_record_contact": True,
+                        "pair_record_phase_backtrack_time_s": (
+                            phase_backtrack_pair.get("backtrack_time_s")
+                        ),
+                        "pair_record_phase_backtrack_hit_time_s": (
+                            phase_backtrack_pair.get("hit_time_s")
+                        ),
+                        "pair_record_phase_backtrack_distance": (
+                            phase_backtrack_pair.get("distance")
+                        ),
+                        "pair_record_phase_backtrack_scan_steps": (
+                            phase_backtrack_pair.get("scan_steps")
+                        ),
+                        "pair_record_phase_backtrack_sweep_iterations": (
+                            phase_backtrack_pair.get("sweep_iterations")
+                        ),
+                        "pair_record_phase_backtrack_scan_clear_count": (
+                            phase_backtrack_pair.get("scan_clear_count")
+                        ),
+                        "pair_record_phase_backtrack_scan_contact_count": (
+                            phase_backtrack_pair.get("scan_contact_count")
+                        ),
+                        "pair_record_phase_backtrack_source": (
+                            phase_backtrack_pair.get("source")
+                        ),
+                        "point": backtrack_pair_contact.position,
+                        "normal": backtrack_pair_contact.normal,
+                        "depth": backtrack_pair_contact.penetration,
+                        **contact_debug_fields(backtrack_pair_contact),
+                        **response_debug,
+                    }
+                    response_debug.update({
+                        "phase_backtrack_pair_record_contact": True,
+                        "pair_record_phase_backtrack_apply_enabled": (
+                            pair_record_phase_backtrack_apply_enabled
+                        ),
+                        "pair_record_phase_backtrack_time_s": (
+                            phase_backtrack_pair.get("backtrack_time_s")
+                        ),
+                        "pair_record_phase_backtrack_hit_time_s": (
+                            phase_backtrack_pair.get("hit_time_s")
+                        ),
+                        "pair_record_phase_backtrack_distance": (
+                            phase_backtrack_pair.get("distance")
+                        ),
+                        "pair_record_phase_backtrack_scan_steps": (
+                            phase_backtrack_pair.get("scan_steps")
+                        ),
+                        "pair_record_phase_backtrack_sweep_iterations": (
+                            phase_backtrack_pair.get("sweep_iterations")
+                        ),
+                        "pair_record_phase_backtrack_scan_clear_count": (
+                            phase_backtrack_pair.get("scan_clear_count")
+                        ),
+                        "pair_record_phase_backtrack_scan_contact_count": (
+                            phase_backtrack_pair.get("scan_contact_count")
+                        ),
+                        "pair_record_phase_backtrack_source": (
+                            phase_backtrack_pair.get("source")
+                        ),
+                        "pair_record_phase_backtrack_base_pos": (
+                            phase_backtrack_pair.get("base_pos")
+                        ),
+                        "pair_record_phase_backtrack_base_vel": (
+                            phase_backtrack_pair.get("base_vel")
+                        ),
+                        "pair_record_phase_backtrack_contact_pos": contact_pos,
+                        "pair_record_phase_backtrack_contact_vel_before": contact_vel,
+                        "pair_record_phase_backtrack_current_pos": current_pos,
+                        "pair_record_phase_backtrack_current_vel": current_vel,
+                        "pair_record_phase_backtrack_post_contact_pos": (
+                            post_contact_pos
+                        ),
+                        "pair_record_phase_backtrack_post_contact_vel": (
+                            post_contact_vel
+                        ),
+                        "pair_record_phase_backtrack_endpoint_pos": (
+                            anchor[0],
+                            anchor[1],
+                            anchor[2],
+                        ),
+                        "pair_record_phase_backtrack_endpoint_vel": (vx, vy, vz),
+                        "pair_record_phase_backtrack_replayed_position": True,
+                        "pair_record_phase_backtrack_replay_acceleration_source": (
+                            phase_backtrack_pair.get("acceleration_source")
+                        ),
+                        "velocity_after": (vx, vy, vz),
+                        "contact_events": [event_debug],
+                    })
+                    record_pair_record_contact_cache(
+                        backtrack_pair_contact,
+                        delta_contact=backtrack_pair_delta_contact,
+                        pos=(anchor[0], anchor[1], anchor[2]),
+                        velocity=(vx, vy, vz),
+                        source="phase_backtrack_pair_record_contact",
+                    )
+                    ctx.debug_last_collision = {
+                        "kind": "terrain_phase_backtrack_pair_record_contact",
+                        "point": backtrack_pair_contact.position,
+                        "normal": backtrack_pair_contact.normal,
+                        "depth": backtrack_pair_contact.penetration,
+                        **contact_debug_fields(backtrack_pair_contact),
+                        "lifted_contact_missing": contact is None,
+                        "lifted_contact_depth": (
+                            None if contact is None else contact.penetration
+                        ),
+                        "pair_record_contact": True,
+                        "phase_backtrack_pair_record_contact": True,
+                        "pair_record_contact_reason": (
+                            "phase_backtrack_pair_record_contact"
+                        ),
+                        "pair_record_contact_reject": pair_contact_reject,
+                        "pair_record_contact_enabled": pair_record_contact_enabled,
+                        "pair_record_contact_response_profile": (
+                            pair_record_contact_response_profile
+                        ),
+                        "pair_record_contact_selection": pair_record_contact_selection,
+                        "pair_record_contact_normal_source": (
+                            pair_record_contact_normal_source
+                        ),
+                        "pair_record_contact_delta_normal_source": (
+                            pair_record_contact_delta_normal_source
+                        ),
+                        "pair_record_solver_normal_source": getattr(
+                            backtrack_pair_contact,
+                            "normal_source",
+                            None,
+                        ),
+                        "pair_record_delta_normal_source": (
+                            None
+                            if backtrack_pair_delta_contact is None
+                            else getattr(
+                                backtrack_pair_delta_contact,
+                                "normal_source",
+                                None,
+                            )
+                        ),
+                        "pair_record_delta_normal": (
+                            None
+                            if backtrack_pair_delta_contact is None
+                            else backtrack_pair_delta_contact.normal
+                        ),
+                        "pair_record_contact_projection_order": (
+                            pair_record_contact_projection_order
+                        ),
+                        "pair_record_contact_delta_mode": (
+                            pair_record_contact_delta_mode
+                        ),
+                        "pair_record_contact_angular_mode": (
+                            pair_record_contact_angular_mode
+                        ),
+                        "pair_record_contact_vertical_delta_mode": (
+                            pair_record_contact_vertical_delta_mode
+                        ),
+                        "pair_record_contact_closing_only": (
+                            pair_record_contact_closing_only
+                        ),
+                        "pair_record_contact_min_depth": pair_record_contact_min_depth,
+                        "pair_record_contact_max_depth": pair_record_contact_max_depth,
+                        "pair_record_contact_min_normal_z": (
+                            pair_record_contact_min_normal_z
+                        ),
+                        "pair_record_contact_min_face_normal_z": (
+                            pair_record_contact_min_face_normal_z
+                        ),
+                        "pair_record_contact_max_velocity_delta": (
+                            pair_record_contact_max_velocity_delta
+                        ),
+                        "pair_record_contact_max_vertical_delta": (
+                            pair_record_contact_max_vertical_delta
+                        ),
+                        "pair_record_contact_max_speed": (
+                            pair_record_contact_max_speed
+                        ),
+                        "pair_record_contact_max_angular_delta": (
+                            pair_record_contact_max_angular_delta
+                        ),
+                        "pair_record_raw_normal": getattr(raw_contact, "normal", None),
+                        "pair_record_selected_raw_normal": getattr(
+                            backtrack_probe.get("selected_raw_contact"),
+                            "normal",
+                            None,
+                        ),
+                        "pair_record_terrain_face_normal": getattr(
+                            backtrack_probe.get("selected_raw_contact"),
+                            "terrain_face_normal",
+                            None,
+                        ),
+                        "pair_record_mesh_face_normal": getattr(
+                            backtrack_probe.get("selected_raw_contact"),
+                            "mesh_face_normal",
+                            None,
+                        ),
+                        "pair_record_entity_radial_normal": getattr(
+                            backtrack_probe.get("selected_raw_contact"),
+                            "entity_radial_normal",
+                            None,
+                        ),
+                        **response_debug,
+                    }
+                    ctx.debug_last_motion_collision = dict(ctx.debug_last_collision)
+                    return True
+                deferred_prestep_pair = estimate_deferred_prestep_pair_record_contact(
+                    pair_contact_reject,
+                    pair_raw_error,
+                )
+                if (
+                    pair_record_deferred_prestep_enabled
+                    or pair_record_deferred_prestep_probe_enabled
+                ):
+                    probe_debug = getattr(ctx, "debug_last_terrain_contact_probe", None)
+                    if isinstance(probe_debug, dict):
+                        deferred_probe = deferred_prestep_pair.get("probe") or {}
+                        deferred_contact = deferred_prestep_pair.get("contact")
+                        deferred_delta_contact = deferred_prestep_pair.get(
+                            "delta_contact"
+                        )
+                        probe_debug.update({
+                            "pair_record_deferred_prestep_enabled": (
+                                pair_record_deferred_prestep_enabled
+                            ),
+                            "pair_record_deferred_prestep_probe_enabled": (
+                                pair_record_deferred_prestep_probe_enabled
+                            ),
+                            "pair_record_deferred_prestep_reject": (
+                                deferred_prestep_pair.get("reject")
+                            ),
+                            "pair_record_deferred_prestep_distance": (
+                                deferred_prestep_pair.get("distance")
+                            ),
+                            "pair_record_deferred_prestep_pos": (
+                                deferred_prestep_pair.get("pos")
+                            ),
+                            "pair_record_deferred_prestep_contact": (
+                                probe_contact_fields(
+                                    deferred_contact,
+                                    center=deferred_prestep_pair.get("pos"),
+                                    z_lift_used=0.0,
+                                )
+                            ),
+                            "pair_record_deferred_prestep_delta_contact": (
+                                probe_contact_fields(
+                                    deferred_delta_contact,
+                                    center=deferred_prestep_pair.get("pos"),
+                                    z_lift_used=0.0,
+                                )
+                            ),
+                            "pair_record_deferred_prestep_selected_raw_error": (
+                                deferred_probe.get("selected_raw_error")
+                            ),
+                        })
+                if (
+                    pair_record_deferred_prestep_enabled
+                    and deferred_prestep_pair.get("contact") is not None
+                ):
+                    deferred_pair_contact = deferred_prestep_pair["contact"]
+                    deferred_pair_delta_contact = deferred_prestep_pair.get(
+                        "delta_contact"
+                    )
+                    endpoint_pos = (anchor[0], anchor[1], anchor[2])
+                    endpoint_vel = (vx, vy, vz)
+                    endpoint_ang = tuple(contact_angular_velocity)
+                    anchor[0], anchor[1], anchor[2] = deferred_prestep_pair["pos"]
+                    vx, vy, vz = deferred_prestep_pair["velocity"]
+                    response_debug, applied_deferred_pair_contact = (
+                        apply_raw_origin_fallback_contact(
+                            deferred_pair_contact,
+                            projection_order=pair_record_contact_projection_order,
+                            delta_mode=pair_record_contact_delta_mode,
+                            delta_normal=(
+                                None
+                                if deferred_pair_delta_contact is None
+                                else deferred_pair_delta_contact.normal
+                            ),
+                            delta_normal_source=(
+                                None
+                                if deferred_pair_delta_contact is None
+                                else getattr(
+                                    deferred_pair_delta_contact,
+                                    "normal_source",
+                                    None,
+                                )
+                            ),
+                            angular_mode=pair_record_contact_angular_mode,
+                            closing_only=pair_record_contact_closing_only,
+                            max_velocity_delta=pair_record_contact_max_velocity_delta,
+                            max_vertical_delta=pair_record_contact_max_vertical_delta,
+                            vertical_delta_mode=pair_record_contact_vertical_delta_mode,
+                            max_speed=pair_record_contact_max_speed,
+                            max_angular_delta=pair_record_contact_max_angular_delta,
+                        )
+                    )
+                    if not applied_deferred_pair_contact:
+                        anchor[0], anchor[1], anchor[2] = endpoint_pos
+                        vx, vy, vz = endpoint_vel
+                        contact_angular_velocity[0], contact_angular_velocity[1], contact_angular_velocity[2] = endpoint_ang
+                        ctx.spring_body_ang_vel = (endpoint_ang[0], endpoint_ang[1])
+                        ctx.angular_vel_yaw = endpoint_ang[2]
+                    else:
+                        response_debug = dict(response_debug or {})
+                        post_contact_pos = (anchor[0], anchor[1], anchor[2])
+                        post_contact_vel = (vx, vy, vz)
+                        remaining_after_contact = max(0.0, float(dt or 0.0))
+                        if remaining_after_contact > 0.0:
+                            final_pos, final_vel = motion_state_at(
+                                post_contact_pos,
+                                post_contact_vel,
+                                timing_acceleration(),
+                                remaining_after_contact,
+                                remaining_after_contact,
+                            )
+                            anchor[0], anchor[1], anchor[2] = final_pos
+                            vx, vy, vz = final_vel
+                        event_debug = {
+                            "iteration": 1,
+                            "collision_time_s": 0.0,
+                            "remaining_time_s": remaining_after_contact,
+                            "collision_at_start": True,
+                            "pair_record_contact": True,
+                            "pair_record_deferred_prestep_contact": True,
+                            "point": deferred_pair_contact.position,
+                            "normal": deferred_pair_contact.normal,
+                            "depth": deferred_pair_contact.penetration,
+                            **contact_debug_fields(deferred_pair_contact),
+                            **response_debug,
+                        }
+                        response_debug.update({
+                            "deferred_prestep_pair_record_contact": True,
+                            "pair_record_deferred_prestep_enabled": (
+                                pair_record_deferred_prestep_enabled
+                            ),
+                            "pair_record_deferred_prestep_distance": (
+                                deferred_prestep_pair.get("distance")
+                            ),
+                            "pair_record_deferred_prestep_max_distance": (
+                                pair_record_deferred_prestep_max_distance
+                            ),
+                            "pair_record_deferred_prestep_pos": (
+                                deferred_prestep_pair.get("pos")
+                            ),
+                            "pair_record_deferred_prestep_vel_before": (
+                                deferred_prestep_pair.get("velocity")
+                            ),
+                            "pair_record_deferred_prestep_endpoint_pos": endpoint_pos,
+                            "pair_record_deferred_prestep_endpoint_vel": endpoint_vel,
+                            "pair_record_deferred_prestep_post_contact_pos": (
+                                post_contact_pos
+                            ),
+                            "pair_record_deferred_prestep_post_contact_vel": (
+                                post_contact_vel
+                            ),
+                            "pair_record_deferred_prestep_remaining_time_s": (
+                                remaining_after_contact
+                            ),
+                            "velocity_after": (vx, vy, vz),
+                            "contact_events": [event_debug],
+                        })
+                        deferred_pair_probe = (
+                            deferred_prestep_pair.get("probe") or {}
+                        )
+                        deferred_raw_contact = deferred_pair_probe.get("raw_contact")
+                        deferred_selected_raw_contact = deferred_pair_probe.get(
+                            "selected_raw_contact"
+                        )
+                        ctx.debug_last_collision = {
+                            "kind": "terrain_deferred_prestep_pair_record_contact",
+                            "point": deferred_pair_contact.position,
+                            "normal": deferred_pair_contact.normal,
+                            "depth": deferred_pair_contact.penetration,
+                            **contact_debug_fields(deferred_pair_contact),
+                            "lifted_contact_missing": contact is None,
+                            "lifted_contact_depth": (
+                                None if contact is None else contact.penetration
+                            ),
+                            "pair_record_contact": True,
+                            "pair_record_contact_reason": (
+                                "deferred_prestep_pair_record_contact"
+                            ),
+                            "pair_record_contact_reject": "",
+                            "pair_record_contact_enabled": pair_record_contact_enabled,
+                            "pair_record_contact_response_profile": (
+                                pair_record_contact_response_profile
+                            ),
+                            "pair_record_contact_selection": pair_record_contact_selection,
+                            "pair_record_contact_normal_source": (
+                                pair_record_contact_normal_source
+                            ),
+                            "pair_record_contact_delta_normal_source": (
+                                pair_record_contact_delta_normal_source
+                            ),
+                            "pair_record_solver_normal_source": getattr(
+                                deferred_pair_contact,
+                                "normal_source",
+                                None,
+                            ),
+                            "pair_record_delta_normal_source": (
+                                None
+                                if deferred_pair_delta_contact is None
+                                else getattr(
+                                    deferred_pair_delta_contact,
+                                    "normal_source",
+                                    None,
+                                )
+                            ),
+                            "pair_record_delta_normal": (
+                                None
+                                if deferred_pair_delta_contact is None
+                                else deferred_pair_delta_contact.normal
+                            ),
+                            "pair_record_contact_projection_order": pair_record_contact_projection_order,
+                            "pair_record_contact_delta_mode": pair_record_contact_delta_mode,
+                            "pair_record_contact_angular_mode": pair_record_contact_angular_mode,
+                            "pair_record_contact_vertical_delta_mode": pair_record_contact_vertical_delta_mode,
+                            "pair_record_contact_closing_only": pair_record_contact_closing_only,
+                            "pair_record_contact_min_depth": pair_record_contact_min_depth,
+                            "pair_record_contact_max_depth": pair_record_contact_max_depth,
+                            "pair_record_contact_min_normal_z": pair_record_contact_min_normal_z,
+                            "pair_record_contact_min_face_normal_z": pair_record_contact_min_face_normal_z,
+                            "pair_record_contact_max_velocity_delta": pair_record_contact_max_velocity_delta,
+                            "pair_record_contact_max_vertical_delta": pair_record_contact_max_vertical_delta,
+                            "pair_record_contact_max_speed": pair_record_contact_max_speed,
+                            "pair_record_contact_max_angular_delta": pair_record_contact_max_angular_delta,
+                            "pair_record_raw_normal": getattr(
+                                deferred_raw_contact,
+                                "normal",
+                                None,
+                            ),
+                            "pair_record_selected_raw_normal": getattr(
+                                deferred_selected_raw_contact,
+                                "normal",
+                                None,
+                            ),
+                            "pair_record_terrain_face_normal": getattr(
+                                deferred_selected_raw_contact,
+                                "terrain_face_normal",
+                                None,
+                            ),
+                            "pair_record_mesh_face_normal": getattr(
+                                deferred_selected_raw_contact,
+                                "mesh_face_normal",
+                                None,
+                            ),
+                            "pair_record_entity_radial_normal": getattr(
+                                deferred_selected_raw_contact,
+                                "entity_radial_normal",
+                                None,
+                            ),
+                            **response_debug,
+                        }
+                        ctx.debug_last_motion_collision = dict(ctx.debug_last_collision)
+                        return True
                 reference_pair = select_reference_pose_pair_record_contact(
                     (anchor[0], anchor[1], anchor[2]),
                     velocity=(vx, vy, vz),
                 )
-                if reference_pair is not None:
+                if resolve_reference_pose_pair_response(reference_pair):
+                    probe_debug = getattr(ctx, "debug_last_terrain_contact_probe", None)
+                    if isinstance(probe_debug, dict):
+                        probe_debug["reference_pose_pair_response_enabled"] = (
+                            reference_pose_pair_response_enabled
+                        )
+                        probe_debug["reference_pose_pair_response_apply_enabled"] = (
+                            reference_pose_pair_response_apply_enabled
+                        )
+                        probe_debug["reference_pose_pair_response"] = (
+                            dirty_dispatch_debug.get("reference_pose_pair_response")
+                        )
+                    return True
+                if reference_pair is not None and reference_pose_contact_response_enabled:
                     reference_pair_contact = reference_pair["contact"]
                     reference_pair_delta_contact = reference_pair.get("delta_contact")
                     response_debug, applied_reference_pair_contact = (
@@ -12442,6 +16754,9 @@ class WulframServer:
                         ),
                         "pair_record_contact_reject": "",
                         "pair_record_contact_enabled": pair_record_contact_enabled,
+                        "pair_record_contact_response_profile": (
+                            pair_record_contact_response_profile
+                        ),
                         "pair_record_contact_selection": pair_record_contact_selection,
                         "pair_record_contact_normal_source": pair_record_contact_normal_source,
                         "pair_record_contact_delta_normal_source": pair_record_contact_delta_normal_source,
@@ -12506,10 +16821,280 @@ class WulframServer:
                     }
                     ctx.debug_last_motion_collision = dict(ctx.debug_last_collision)
                     return True
+                cached_pair = None
+                if (
+                    pair_contact_reject == "no_raw_origin_contact"
+                    and raw_error is None
+                ):
+                    cached_pair = cached_pair_record_contact_probe(
+                        (anchor[0], anchor[1], anchor[2]),
+                        velocity=(vx, vy, vz),
+                    )
+                    probe_debug = getattr(ctx, "debug_last_terrain_contact_probe", None)
+                    if isinstance(probe_debug, dict):
+                        probe_debug.update({
+                            "pair_record_cached_contact_enabled": (
+                                pair_record_cached_contact_enabled
+                            ),
+                            "pair_record_cached_contact_reject": cached_pair.get(
+                                "reject"
+                            ),
+                            "pair_record_cached_contact_age_steps": cached_pair.get(
+                                "age_steps"
+                            ),
+                            "pair_record_cached_contact_distance": cached_pair.get(
+                                "distance"
+                            ),
+                            "pair_record_cached_contact_reference_distance": (
+                                cached_pair.get("reference_distance")
+                            ),
+                            "pair_record_cached_contact_source": cached_pair.get(
+                                "source"
+                            ),
+                        })
+                if cached_pair is not None and cached_pair.get("contact") is not None:
+                    cached_pair_contact = cached_pair["contact"]
+                    cached_pair_delta_contact = cached_pair.get("delta_contact")
+                    response_debug, applied_cached_pair_contact = (
+                        apply_raw_origin_fallback_contact(
+                            cached_pair_contact,
+                            projection_order=pair_record_contact_projection_order,
+                            delta_mode=pair_record_contact_delta_mode,
+                            delta_normal=(
+                                None
+                                if cached_pair_delta_contact is None
+                                else cached_pair_delta_contact.normal
+                            ),
+                            delta_normal_source=(
+                                None
+                                if cached_pair_delta_contact is None
+                                else getattr(
+                                    cached_pair_delta_contact,
+                                    "normal_source",
+                                    None,
+                                )
+                            ),
+                            angular_mode=pair_record_contact_angular_mode,
+                            closing_only=pair_record_contact_closing_only,
+                            max_velocity_delta=pair_record_contact_max_velocity_delta,
+                            max_vertical_delta=pair_record_contact_max_vertical_delta,
+                            vertical_delta_mode=pair_record_contact_vertical_delta_mode,
+                            max_speed=pair_record_contact_max_speed,
+                            max_angular_delta=pair_record_contact_max_angular_delta,
+                        )
+                    )
+                    if not applied_cached_pair_contact:
+                        return False
+                    ctx.debug_last_collision = {
+                        "kind": "terrain_cached_pair_record_contact",
+                        "point": cached_pair_contact.position,
+                        "normal": cached_pair_contact.normal,
+                        "depth": cached_pair_contact.penetration,
+                        **contact_debug_fields(cached_pair_contact),
+                        "lifted_contact_missing": contact is None,
+                        "lifted_contact_depth": (
+                            None if contact is None else contact.penetration
+                        ),
+                        "cached_pair_record_contact": True,
+                        "pair_record_cached_contact_enabled": (
+                            pair_record_cached_contact_enabled
+                        ),
+                        "pair_record_cached_contact_age_steps": cached_pair.get(
+                            "age_steps"
+                        ),
+                        "pair_record_cached_contact_distance": cached_pair.get(
+                            "distance"
+                        ),
+                        "pair_record_cached_contact_reference_distance": (
+                            cached_pair.get("reference_distance")
+                        ),
+                        "pair_record_cached_contact_source": cached_pair.get(
+                            "source"
+                        ),
+                        "pair_record_contact": True,
+                        "pair_record_contact_reason": "cached_pair_record_contact",
+                        "pair_record_contact_reject": "",
+                        "pair_record_contact_enabled": pair_record_contact_enabled,
+                        "pair_record_contact_response_profile": (
+                            pair_record_contact_response_profile
+                        ),
+                        "pair_record_contact_selection": pair_record_contact_selection,
+                        "pair_record_contact_normal_source": pair_record_contact_normal_source,
+                        "pair_record_contact_delta_normal_source": pair_record_contact_delta_normal_source,
+                        "pair_record_solver_normal_source": getattr(
+                            cached_pair_contact,
+                            "normal_source",
+                            None,
+                        ),
+                        "pair_record_delta_normal_source": (
+                            None
+                            if cached_pair_delta_contact is None
+                            else getattr(
+                                cached_pair_delta_contact,
+                                "normal_source",
+                                None,
+                            )
+                        ),
+                        "pair_record_delta_normal": (
+                            None
+                            if cached_pair_delta_contact is None
+                            else cached_pair_delta_contact.normal
+                        ),
+                        "pair_record_contact_projection_order": pair_record_contact_projection_order,
+                        "pair_record_contact_delta_mode": pair_record_contact_delta_mode,
+                        "pair_record_contact_angular_mode": pair_record_contact_angular_mode,
+                        "pair_record_contact_vertical_delta_mode": pair_record_contact_vertical_delta_mode,
+                        "pair_record_contact_closing_only": pair_record_contact_closing_only,
+                        "pair_record_contact_min_depth": pair_record_contact_min_depth,
+                        "pair_record_contact_max_depth": pair_record_contact_max_depth,
+                        "pair_record_contact_min_normal_z": pair_record_contact_min_normal_z,
+                        "pair_record_contact_min_face_normal_z": pair_record_contact_min_face_normal_z,
+                        "pair_record_contact_max_velocity_delta": pair_record_contact_max_velocity_delta,
+                        "pair_record_contact_max_vertical_delta": pair_record_contact_max_vertical_delta,
+                        "pair_record_contact_max_speed": pair_record_contact_max_speed,
+                        "pair_record_contact_max_angular_delta": pair_record_contact_max_angular_delta,
+                        **(response_debug or {}),
+                    }
+                    ctx.debug_last_motion_collision = dict(ctx.debug_last_collision)
+                    return True
                 if raw_error is None and raw_fallback_contact is not None and raw_fallback_reject == "":
-                    response_debug, applied_raw_fallback = apply_raw_origin_fallback_contact(raw_fallback_contact)
+                    if tank_raw_fallback and tank_face_fallback_latch_matches(
+                        raw_fallback_contact
+                    ):
+                        ctx.debug_last_collision = tank_face_fallback_latched_debug(
+                            raw_fallback_contact,
+                            kind="terrain_raw_origin_fallback_latched",
+                        )
+                        ctx.debug_last_collision.update({
+                            "raw_origin_fallback": True,
+                            "tank_raw_origin_fallback": True,
+                            "raw_origin_fallback_reject": raw_fallback_reject,
+                        })
+                        ctx.debug_last_motion_collision = dict(ctx.debug_last_collision)
+                        return True
+                    tank_raw_delta_normal = None
+                    tank_raw_delta_normal_source = None
+                    if tank_raw_fallback and not raw_fallback_enabled:
+                        tank_raw_delta_normal, tank_raw_delta_normal_source = (
+                            tank_raw_fallback_delta_normal_for(raw_fallback_contact)
+                        )
+                    response_debug, applied_raw_fallback = apply_raw_origin_fallback_contact(
+                        raw_fallback_contact,
+                        projection_order=(
+                            tank_raw_fallback_projection_order
+                            if tank_raw_fallback and not raw_fallback_enabled
+                            else None
+                        ),
+                        delta_mode=(
+                            tank_raw_fallback_delta_mode
+                            if tank_raw_fallback and not raw_fallback_enabled
+                            else None
+                        ),
+                        delta_normal=tank_raw_delta_normal,
+                        delta_normal_source=tank_raw_delta_normal_source,
+                        angular_mode=(
+                            tank_raw_fallback_angular_mode
+                            if tank_raw_fallback and not raw_fallback_enabled
+                            else None
+                        ),
+                        closing_only=(
+                            tank_raw_fallback_closing_only
+                            if tank_raw_fallback and not raw_fallback_enabled
+                            else None
+                        ),
+                        max_velocity_delta=(
+                            tank_raw_fallback_max_velocity_delta
+                            if tank_raw_fallback and not raw_fallback_enabled
+                            else None
+                        ),
+                        max_vertical_delta=(
+                            tank_raw_fallback_max_vertical_delta
+                            if tank_raw_fallback and not raw_fallback_enabled
+                            else None
+                        ),
+                        vertical_delta_mode=(
+                            tank_raw_fallback_vertical_delta_mode
+                            if tank_raw_fallback and not raw_fallback_enabled
+                            else None
+                        ),
+                        max_speed=(
+                            tank_raw_fallback_max_speed
+                            if tank_raw_fallback and not raw_fallback_enabled
+                            else None
+                        ),
+                        max_angular_delta=(
+                            tank_raw_fallback_max_angular_delta
+                            if tank_raw_fallback and not raw_fallback_enabled
+                            else None
+                        ),
+                        friction=(
+                            0.0
+                            if tank_raw_fallback and not raw_fallback_enabled
+                            else None
+                        ),
+                    )
                     if not applied_raw_fallback:
                         return False
+                    if tank_raw_fallback:
+                        tank_face_fallback_latch_record(
+                            raw_fallback_contact,
+                            source="raw_origin",
+                        )
+                    raw_debug_projection_order = (
+                        tank_raw_fallback_projection_order
+                        if tank_raw_fallback and not raw_fallback_enabled
+                        else raw_fallback_projection_order
+                    )
+                    raw_debug_normal_source = (
+                        tank_raw_fallback_normal_source
+                        if tank_raw_fallback and not raw_fallback_enabled
+                        else raw_fallback_normal_source
+                    )
+                    raw_debug_min_depth = (
+                        tank_raw_fallback_min_depth
+                        if tank_raw_fallback and not raw_fallback_enabled
+                        else raw_fallback_min_depth
+                    )
+                    raw_debug_max_depth = (
+                        tank_raw_fallback_max_depth
+                        if tank_raw_fallback and not raw_fallback_enabled
+                        else raw_fallback_max_depth
+                    )
+                    raw_debug_min_normal_z = (
+                        tank_raw_fallback_min_normal_z
+                        if tank_raw_fallback and not raw_fallback_enabled
+                        else raw_fallback_min_normal_z
+                    )
+                    raw_debug_min_speed = (
+                        tank_raw_fallback_min_speed
+                        if tank_raw_fallback and not raw_fallback_enabled
+                        else raw_fallback_min_speed
+                    )
+                    raw_debug_max_velocity_delta = (
+                        tank_raw_fallback_max_velocity_delta
+                        if tank_raw_fallback and not raw_fallback_enabled
+                        else raw_fallback_max_velocity_delta
+                    )
+                    raw_debug_max_speed = (
+                        tank_raw_fallback_max_speed
+                        if tank_raw_fallback and not raw_fallback_enabled
+                        else raw_fallback_max_speed
+                    )
+                    raw_debug_max_angular_delta = (
+                        tank_raw_fallback_max_angular_delta
+                        if tank_raw_fallback and not raw_fallback_enabled
+                        else raw_fallback_max_angular_delta
+                    )
+                    raw_debug_angular_mode = (
+                        tank_raw_fallback_angular_mode
+                        if tank_raw_fallback and not raw_fallback_enabled
+                        else raw_fallback_angular_mode
+                    )
+                    raw_debug_closing_only = (
+                        tank_raw_fallback_closing_only
+                        if tank_raw_fallback and not raw_fallback_enabled
+                        else raw_fallback_closing_only
+                    )
                     ctx.debug_last_collision = {
                         "kind": "terrain_raw_origin_fallback_contact",
                         "point": raw_fallback_contact.position,
@@ -12521,17 +17106,24 @@ class WulframServer:
                             None if contact is None else contact.penetration
                         ),
                         "raw_origin_fallback": True,
-                        "raw_origin_fallback_projection_order": raw_fallback_projection_order,
-                        "raw_origin_fallback_normal_source": raw_fallback_normal_source,
-                        "raw_origin_fallback_min_depth": raw_fallback_min_depth,
-                        "raw_origin_fallback_max_depth": raw_fallback_max_depth,
-                        "raw_origin_fallback_min_normal_z": raw_fallback_min_normal_z,
-                        "raw_origin_fallback_min_speed": raw_fallback_min_speed,
-                        "raw_origin_fallback_max_velocity_delta": raw_fallback_max_velocity_delta,
-                        "raw_origin_fallback_max_speed": raw_fallback_max_speed,
-                        "raw_origin_fallback_max_angular_delta": raw_fallback_max_angular_delta,
-                        "raw_origin_fallback_angular_mode": raw_fallback_angular_mode,
-                        "raw_origin_fallback_closing_only": raw_fallback_closing_only,
+                        "tank_raw_origin_fallback": bool(tank_raw_fallback),
+                        "raw_origin_fallback_reject": raw_fallback_reject,
+                        "raw_origin_fallback_projection_order": raw_debug_projection_order,
+                        "raw_origin_fallback_normal_source": raw_debug_normal_source,
+                        "raw_origin_fallback_min_depth": raw_debug_min_depth,
+                        "raw_origin_fallback_max_depth": raw_debug_max_depth,
+                        "raw_origin_fallback_min_normal_z": raw_debug_min_normal_z,
+                        "raw_origin_fallback_min_speed": raw_debug_min_speed,
+                        "raw_origin_fallback_max_velocity_delta": raw_debug_max_velocity_delta,
+                        "raw_origin_fallback_max_speed": raw_debug_max_speed,
+                        "raw_origin_fallback_max_angular_delta": raw_debug_max_angular_delta,
+                        "raw_origin_fallback_angular_mode": raw_debug_angular_mode,
+                        "raw_origin_fallback_closing_only": raw_debug_closing_only,
+                        "tank_raw_origin_fallback_delta_normal_mode": (
+                            tank_raw_fallback_delta_normal_mode
+                            if tank_raw_fallback and not raw_fallback_enabled
+                            else None
+                        ),
                         **(response_debug or {}),
                     }
                     ctx.debug_last_motion_collision = dict(ctx.debug_last_collision)
@@ -12578,6 +17170,77 @@ class WulframServer:
                 contact,
                 reason="lifted_contact",
             )
+            tank_face_contact, tank_face_reject = tank_clean_face_fallback_contact_for(
+                contact
+            )
+            if tank_face_contact is None:
+                tank_face_fallback_latch_clear(tank_face_reject)
+            if tank_face_contact is not None and tank_face_reject == "":
+                if tank_face_fallback_latch_matches(tank_face_contact):
+                    ctx.debug_last_collision = tank_face_fallback_latched_debug(
+                        tank_face_contact,
+                        kind="terrain_clean_face_fallback_latched",
+                    )
+                    ctx.debug_last_motion_collision = dict(ctx.debug_last_collision)
+                    return True
+                tank_face_delta_normal, tank_face_delta_normal_source = (
+                    tank_clean_face_fallback_delta_normal_for(tank_face_contact)
+                )
+                response_debug, applied_tank_face_fallback = (
+                    apply_raw_origin_fallback_contact(
+                        tank_face_contact,
+                        projection_order=tank_raw_fallback_projection_order,
+                        delta_mode=tank_clean_face_fallback_delta_mode,
+                        delta_normal=tank_face_delta_normal,
+                        delta_normal_source=tank_face_delta_normal_source,
+                        angular_mode=tank_raw_fallback_angular_mode,
+                        closing_only=tank_raw_fallback_closing_only,
+                        max_velocity_delta=tank_raw_fallback_max_velocity_delta,
+                        max_vertical_delta=tank_raw_fallback_max_vertical_delta,
+                        vertical_delta_mode=tank_raw_fallback_vertical_delta_mode,
+                        max_speed=tank_raw_fallback_max_speed,
+                        max_angular_delta=tank_raw_fallback_max_angular_delta,
+                        friction=0.0,
+                    )
+                )
+                if not applied_tank_face_fallback:
+                    return False
+                tank_face_fallback_latch_record(
+                    tank_face_contact,
+                    source="clean_face",
+                )
+                ctx.debug_last_collision = {
+                    "kind": "terrain_clean_face_fallback_contact",
+                    "point": tank_face_contact.position,
+                    "normal": tank_face_contact.normal,
+                    "depth": tank_face_contact.penetration,
+                    "terrain_collision_shape": terrain_collision_shape,
+                    **contact_debug_fields(tank_face_contact),
+                    "tank_clean_face_fallback": True,
+                    "tank_clean_face_fallback_reject": tank_face_reject,
+                    "tank_clean_face_fallback_max_contact_normal_z": (
+                        tank_clean_face_fallback_max_contact_normal_z
+                    ),
+                    "tank_clean_face_fallback_min_face_normal_z": (
+                        tank_clean_face_fallback_min_face_normal_z
+                    ),
+                    "clean_contact_original_normal": contact.normal,
+                    "clean_contact_original_normal_source": getattr(
+                        contact,
+                        "normal_source",
+                        None,
+                    ),
+                    "clean_contact_original_depth": contact.penetration,
+                    "tank_clean_face_fallback_delta_mode": (
+                        tank_clean_face_fallback_delta_mode
+                    ),
+                    "tank_clean_face_fallback_delta_normal_mode": (
+                        tank_clean_face_fallback_delta_normal_mode
+                    ),
+                    **(response_debug or {}),
+                }
+                ctx.debug_last_motion_collision = dict(ctx.debug_last_collision)
+                return True
             response_debug = apply_contact(contact)
             ctx.debug_last_collision = {
                 "kind": "terrain_clean_contact",
@@ -12585,6 +17248,7 @@ class WulframServer:
                 "normal": contact.normal,
                 "depth": contact.penetration,
                 "terrain_collision_shape": terrain_collision_shape,
+                "tank_clean_face_fallback_reject": tank_face_reject,
                 **contact_debug_fields(contact),
                 **(response_debug or {}),
             }
@@ -12619,6 +17283,13 @@ class WulframServer:
             "dirty_bounds_box_fallback_enabled": dirty_bounds_box_fallback_enabled,
             "dirty_bounds_box_shape": dirty_bounds_box_shape,
             "dirty_bounds_box_center_mode": dirty_bounds_box_center_mode,
+            "dirty_reference_pair_response_enabled": (
+                dirty_reference_pair_response_enabled
+            ),
+            "dirty_reference_pair_response_apply_enabled": (
+                dirty_reference_pair_response_apply_enabled
+            ),
+            "dirty_bounds_safe_response_enabled": dirty_bounds_safe_response_enabled,
         })
         dirty_bounds_overlap_fn = getattr(
             self._terrain_grid_collision,
@@ -12749,7 +17420,11 @@ class WulframServer:
                             "dirty_bounds_box_bounds_center": box_args[0],
                             "dirty_bounds_box_collision_center": box_args[1],
                         })
-                        contact = box_contact_fn(*box_args)
+                        contact = box_contact_fn(
+                            *box_args,
+                            rotation_matrix=model_contact_rotation_matrix,
+                            contact_selection=pair_record_contact_selection,
+                        )
                         if contact is not None:
                             dirty_contact_source = "box_bounds_fallback"
                             dirty_contact_args = box_args
@@ -12772,6 +17447,9 @@ class WulframServer:
                             "dirty_bounds_box_reject"
                         ] = "no_box_bounds_contact_fn"
                 if contact is not None:
+                    dirty_dispatch_debug["dirty_bounds_contact_source"] = (
+                        dirty_contact_source
+                    )
                     if self._is_pathological_dirty_bounds_contact((anchor[0], anchor[1], anchor[2]), contact, bounding_radius):
                         ctx.debug_last_collision = {
                             "kind": "terrain_dirty_bounds_filtered",
@@ -12885,6 +17563,16 @@ class WulframServer:
                     return finish_result(anchor[0], anchor[1], anchor[2], vx, vy, vz)
                 else:
                     dirty_dispatch_debug["dirty_miss_reason"] = "dirty_clean_contact_clear"
+            dirty_reference_pair = record_dirty_reference_pair_probe()
+            if resolve_dirty_reference_pair_response(dirty_reference_pair):
+                update_contact_probe(
+                    (anchor[0], anchor[1], anchor[2]),
+                    None,
+                    reason="dirty_reference_pair_response",
+                    raw_error="dirty_bounds_contact",
+                )
+                ctx.world_collision_ref_pos = (anchor[0], anchor[1], anchor[2])
+                return finish_result(anchor[0], anchor[1], anchor[2], vx, vy, vz)
             terrain_hit = raycast_fn(reference_pos, (anchor[0], anchor[1], anchor[2]))
             ray_dir = (
                 anchor[0] - reference_pos[0],
@@ -13112,7 +17800,19 @@ class WulframServer:
         origin_mode = (
             os.environ.get("WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN", "lift").strip().lower()
         )
-        cache_key = (ctx.entity_type, team_id, origin_mode)
+        model_variant = (
+            os.environ.get("WULFRAM_ENTITY_COLLISION_MODEL_VARIANT", "primary")
+            .strip()
+            .lower()
+        )
+        model_name_override = os.environ.get("WULFRAM_ENTITY_COLLISION_MODEL_NAME", "").strip()
+        cache_key = (
+            ctx.entity_type,
+            team_id,
+            origin_mode,
+            model_variant,
+            model_name_override,
+        )
         if cache_key in self._entity_collision_model_cache:
             return self._entity_collision_model_cache[cache_key]
 
@@ -13121,7 +17821,9 @@ class WulframServer:
             self._entity_collision_model_cache[cache_key] = None
             return None
 
-        model_name = self._select_team_model_name(model_names, team_id)
+        model_name = model_name_override or self._select_team_model_name(model_names, team_id)
+        if model_variant in {"simplified", "simple", "s", "_s"} and model_name:
+            model_name = model_name if model_name.endswith("_s") else f"{model_name}_s"
         model = self._building_collision.models.get(model_name)
         mesh = getattr(model, "collision_mesh", None) if model is not None else None
         vertices = getattr(mesh, "vertices", None) if mesh is not None else None
@@ -14902,7 +19604,7 @@ class WulframServer:
 
     def _on_jump_jet_triggered(self, ctx: ClientContext, player_id: int, impulse: float, new_vel_z: float):
         """Callback when a jump jet is triggered."""
-        print(f"[JUMP] Jump triggered for player {player_id}: impulse={impulse}, vel_z={new_vel_z:.1f}")
+        print(f"[JUMP] Jump triggered for player {player_id}: impulse={impulse}, vel_up={new_vel_z:.1f}")
         burst_count = int(getattr(self, "jump_jet_correction_burst_count", 0) or 0)
         if burst_count > 0 and not handlers._is_loopback_client(ctx):
             # The original Tank controller has no local jumpjet impulse, so OG
@@ -15017,13 +19719,7 @@ class WulframServer:
                 setattr(self, attr, val)
 
         # Re-read .env file so new vars are visible
-        env_file = Path(__file__).parent.parent / ".env"
-        if env_file.exists():
-            for line in env_file.read_text().splitlines():
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    key, _, val = line.partition("=")
-                    os.environ[key.strip()] = val.strip()
+        server_config.load_env_file(overwrite=True)
 
         print("[RELOAD] _apply_reload_defaults done")
 
@@ -15038,6 +19734,29 @@ class WulframServer:
             ctx.tick_thread = thread
             thread.start()
             return True
+
+    @staticmethod
+    def _advance_tick_pacer(
+        next_tick_time: float,
+        tick_period: float,
+        *,
+        now: float,
+        max_catchup_steps: int = 5,
+    ) -> tuple[float, float]:
+        """Advance the wall-clock pacer while preserving a capped physics backlog."""
+
+        next_tick_time += tick_period
+        sleep_dt = next_tick_time - now
+        if tick_period <= 0.0:
+            return next_tick_time, 0.0
+
+        catchup_steps = max(1, int(max_catchup_steps))
+        max_backlog = tick_period * float(catchup_steps)
+        if sleep_dt < -max_backlog:
+            # OG caps large elapsed physics deltas to a small substep batch.
+            next_tick_time = now - tick_period * float(catchup_steps - 1)
+            sleep_dt = next_tick_time - now
+        return next_tick_time, max(0.0, sleep_dt)
 
     def _tick_loop(self, ctx: ClientContext):
         """Game tick loop - sends UPDATE_ARRAY periodically."""
@@ -15903,14 +20622,15 @@ class WulframServer:
                         f"udp={udp_addr} mask={mask_note} health_bytes={health_hex}"
                     )
 
-                # Wall-clock pacing: sleep until next tick boundary
-                next_tick_time += tick_period
-                sleep_dt = next_tick_time - time.monotonic()
+                # Wall-clock pacing: preserve a capped fixed-step backlog when late.
+                next_tick_time, sleep_dt = self._advance_tick_pacer(
+                    next_tick_time,
+                    tick_period,
+                    now=time.monotonic(),
+                    max_catchup_steps=5,
+                )
                 if sleep_dt > 0:
                     time.sleep(sleep_dt)
-                elif sleep_dt < -tick_period:
-                    # Fallen behind by more than one tick â€” reset to avoid burst
-                    next_tick_time = time.monotonic()
 
             except Exception as e:
                 print(f"[TICK] Client {ctx.client_id} Error: {e}")

@@ -65,6 +65,16 @@ def _normalize3(v):
     return (v[0] * inv, v[1] * inv, v[2] * inv)
 
 
+def _angle_between3(a, b) -> float | None:
+    len_a = _length3(a)
+    len_b = _length3(b)
+    if len_a <= 1e-8 or len_b <= 1e-8:
+        return None
+    dot = _dot3(a, b) / (len_a * len_b)
+    dot = max(-1.0, min(1.0, dot))
+    return math.degrees(math.acos(dot))
+
+
 def _signbit(value: float) -> bool:
     return math.copysign(1.0, value) < 0.0
 
@@ -147,6 +157,17 @@ class TerrainContact:
     terrain_face_normal: Optional[tuple[float, float, float]] = None
     mesh_face_normal: Optional[tuple[float, float, float]] = None
     entity_radial_normal: Optional[tuple[float, float, float]] = None
+    cbsp_store_normal0: Optional[tuple[float, float, float]] = None
+    cbsp_store_normal1: Optional[tuple[float, float, float]] = None
+    cbsp_record_hit_source: Optional[str] = None
+    cbsp_mesh_triangle_indices: Optional[tuple[int, int, int]] = None
+    cbsp_guess7_order: Optional[tuple[int, int, int]] = None
+    cbsp_guess7_terms: Optional[tuple[float, float, float]] = None
+    cbsp_edge_hit_kind: Optional[str] = None
+    cbsp_edge_t: Optional[float] = None
+    cbsp_node_index: Optional[int] = None
+    cbsp_node_depth: Optional[int] = None
+    cbsp_node_mesh_normal_angle_deg: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -158,6 +179,17 @@ class _CBSPContact:
     terrain_face_normal: Optional[tuple[float, float, float]] = None
     mesh_face_normal: Optional[tuple[float, float, float]] = None
     entity_radial_normal: Optional[tuple[float, float, float]] = None
+    store_normal0: Optional[tuple[float, float, float]] = None
+    store_normal1: Optional[tuple[float, float, float]] = None
+    record_hit_source: Optional[str] = None
+    mesh_triangle_indices: Optional[tuple[int, int, int]] = None
+    guess7_order: Optional[tuple[int, int, int]] = None
+    guess7_terms: Optional[tuple[float, float, float]] = None
+    edge_hit_kind: Optional[str] = None
+    edge_t: Optional[float] = None
+    node_index: Optional[int] = None
+    node_depth: Optional[int] = None
+    node_mesh_normal_angle_deg: Optional[float] = None
 
     def __iter__(self):
         yield self.position
@@ -269,7 +301,7 @@ class TerrainGridCollision:
         sin_h: float,
         rotation_matrix=None,
     ) -> dict[str, tuple[float, float, float] | None]:
-        def local_normal_to_world(value):
+        def local_normal_to_world(value, *, orient: bool = True):
             if value is None:
                 return None
             try:
@@ -279,7 +311,7 @@ class TerrainGridCollision:
             except (TypeError, ValueError, OverflowError):
                 return None
             world = self._local_to_world_dir(local, cos_h, sin_h, rotation_matrix)
-            return self._orient_terrain_normal(world)
+            return self._orient_terrain_normal(world) if orient else world
 
         cbsp_split_normal = local_normal_to_world(
             getattr(mesh_contact, "cbsp_split_normal", normal_local)
@@ -319,6 +351,14 @@ class TerrainGridCollision:
                 getattr(mesh_contact, "mesh_face_normal", None)
             ),
             "entity_radial_normal": entity_radial_normal,
+            "cbsp_store_normal0": local_normal_to_world(
+                getattr(mesh_contact, "store_normal0", None),
+                orient=False,
+            ),
+            "cbsp_store_normal1": local_normal_to_world(
+                getattr(mesh_contact, "store_normal1", None),
+                orient=False,
+            ),
         }
 
     @staticmethod
@@ -456,6 +496,8 @@ class TerrainGridCollision:
         half_extents: tuple[float, float, float],
         heading: float,
         bounding_radius: Optional[float] = None,
+        rotation_matrix=None,
+        contact_selection: str = "first",
     ) -> Optional[TerrainContact]:
         """Return the first terrain contact found while scanning bounds-overlapping cells."""
         finite_values = (*bounds_center, *collision_center, *half_extents, heading)
@@ -463,6 +505,27 @@ class TerrainGridCollision:
             finite_values = (*finite_values, bounding_radius)
         if not self._all_finite(finite_values):
             return None
+        model_matrix = self._coerce_rotation_matrix(rotation_matrix)
+        selection = str(contact_selection or "first").strip().lower()
+        collect_candidates = selection in {
+            "upward",
+            "upward_min_depth",
+            "upward_shallow",
+            "min_depth_upward",
+            "shallow_upward",
+            "cbsp_record_hit_strict_probe",
+            "cbsp_record_hit_guess7_order_probe",
+            "cbsp_node_plane_vertex_probe",
+            "cbsp_node_plane_vertex_traversal_probe",
+            "cbsp_mesh_edge_terrain_plane_probe",
+            "cbsp_mesh_edge_terrain_plane_traversal_probe",
+            "cbsp_mesh_edge_endpoint_terrain_plane_probe",
+            "cbsp_mesh_edge_endpoint_terrain_plane_traversal_probe",
+            "cbsp_mesh_vertex_probe",
+            "cbsp_mesh_vertex_traversal_probe",
+        }
+        best_contact = None
+        best_score = None
         radius = bounding_radius
         if radius is None:
             radius = math.sqrt(
@@ -487,24 +550,70 @@ class TerrainGridCollision:
             for cell_x, cell_y in self._iter_sector_cells(aabb_min, aabb_max, sector):
                 for tri_world in self._iter_cell_triangles(cell_x, cell_y):
                     tri_local = tuple(
-                        self._world_to_local_box(vertex, collision_center, cos_h, sin_h)
+                        self._world_to_local_box(
+                            vertex,
+                            collision_center,
+                            cos_h,
+                            sin_h,
+                            model_matrix,
+                        )
                         for vertex in tri_world
                     )
                     sat_contact = self._triangle_box_contact(tri_local, half_extents)
                     if sat_contact is None:
                         continue
                     axis_local, penetration = sat_contact
-                    axis_world = self._local_to_world_dir(axis_local, cos_h, sin_h)
+                    axis_world = self._local_to_world_dir(axis_local, cos_h, sin_h, model_matrix)
                     closest_local = _closest_point_on_triangle((0.0, 0.0, 0.0), *tri_local)
-                    closest_world = self._local_to_world_point(closest_local, collision_center, cos_h, sin_h)
-                    return TerrainContact(
+                    closest_world = self._local_to_world_point(
+                        closest_local,
+                        collision_center,
+                        cos_h,
+                        sin_h,
+                        model_matrix,
+                    )
+                    terrain_face_normal = _normalize3(
+                        _cross3(
+                            _sub3(tri_world[1], tri_world[0]),
+                            _sub3(tri_world[2], tri_world[0]),
+                        )
+                    )
+                    if terrain_face_normal is not None:
+                        terrain_face_normal = self._orient_terrain_normal(terrain_face_normal)
+                    entity_radial_normal = _normalize3(
+                        self._local_to_world_dir(
+                            (
+                                -float(closest_local[0]),
+                                -float(closest_local[1]),
+                                -float(closest_local[2]),
+                            ),
+                            cos_h,
+                            sin_h,
+                            model_matrix,
+                        )
+                    )
+                    if entity_radial_normal is not None:
+                        entity_radial_normal = self._orient_terrain_normal(
+                            entity_radial_normal
+                        )
+                    contact = TerrainContact(
                         position=closest_world,
                         normal=self._orient_terrain_normal(axis_world),
                         penetration=penetration,
                         sector_index=sector.index,
                         cell=(cell_x, cell_y),
+                        normal_source="terrain_bounds_sat",
+                        terrain_face_normal=terrain_face_normal,
+                        entity_radial_normal=entity_radial_normal,
                     )
-        return None
+                    if collect_candidates:
+                        score = self._model_contact_selection_score(contact, selection)
+                        if score is not None and (best_score is None or score < best_score):
+                            best_score = score
+                            best_contact = contact
+                        continue
+                    return contact
+        return best_contact
 
     def raycast(
         self,
@@ -541,6 +650,12 @@ class TerrainGridCollision:
             "upward_shallow",
             "min_depth_upward",
             "shallow_upward",
+            "cbsp_mesh_edge_terrain_plane_probe",
+            "cbsp_mesh_edge_terrain_plane_traversal_probe",
+            "cbsp_mesh_edge_endpoint_terrain_plane_probe",
+            "cbsp_mesh_edge_endpoint_terrain_plane_traversal_probe",
+            "cbsp_node_plane_vertex_probe",
+            "cbsp_node_plane_vertex_traversal_probe",
         }
         best_contact = None
         best_score = None
@@ -558,12 +673,81 @@ class TerrainGridCollision:
                         self._world_to_local_box(vertex, center, cos_h, sin_h, model_matrix)
                         for vertex in tri_world
                     )
-                    mesh_contact = self._triangle_cbsp_contact(
-                        tri_local,
-                        vertices,
-                        cbsp_tree,
-                        bounding_radius,
-                    )
+                    if selection in {"cbsp_mesh_vertex_probe", "cbsp_mesh_vertex_traversal_probe"}:
+                        mesh_contact = self._triangle_cbsp_mesh_vertex_contact(
+                            tri_local,
+                            vertices,
+                            cbsp_tree,
+                            traversal_order=selection == "cbsp_mesh_vertex_traversal_probe",
+                        )
+                    elif selection in {
+                        "cbsp_node_plane_vertex_probe",
+                        "cbsp_node_plane_vertex_traversal_probe",
+                    }:
+                        mesh_contact = self._triangle_cbsp_node_plane_vertex_contact(
+                            tri_local,
+                            vertices,
+                            cbsp_tree,
+                            traversal_order=(
+                                selection == "cbsp_node_plane_vertex_traversal_probe"
+                            ),
+                        )
+                    elif selection in {
+                        "cbsp_mesh_edge_terrain_plane_probe",
+                        "cbsp_mesh_edge_terrain_plane_traversal_probe",
+                        "cbsp_mesh_edge_endpoint_terrain_plane_probe",
+                        "cbsp_mesh_edge_endpoint_terrain_plane_traversal_probe",
+                    }:
+                        mesh_contact = self._triangle_cbsp_mesh_edge_terrain_plane_contact(
+                            tri_local,
+                            vertices,
+                            cbsp_tree,
+                            traversal_order=(
+                                selection
+                                in {
+                                    "cbsp_mesh_edge_terrain_plane_traversal_probe",
+                                    "cbsp_mesh_edge_endpoint_terrain_plane_traversal_probe",
+                                }
+                            ),
+                            endpoint_only=(
+                                selection
+                                in {
+                                    "cbsp_mesh_edge_endpoint_terrain_plane_probe",
+                                    "cbsp_mesh_edge_endpoint_terrain_plane_traversal_probe",
+                                }
+                            ),
+                            prefer_deep_endpoint=(
+                                selection
+                                in {
+                                    "cbsp_mesh_edge_endpoint_terrain_plane_probe",
+                                    "cbsp_mesh_edge_endpoint_terrain_plane_traversal_probe",
+                                }
+                            ),
+                        )
+                    else:
+                        if selection in {
+                            "cbsp_record_hit_strict_probe",
+                            "cbsp_record_hit_guess7_order_probe",
+                        }:
+                            mesh_contact = self._triangle_cbsp_contact(
+                                tri_local,
+                                vertices,
+                                cbsp_tree,
+                                bounding_radius,
+                                include_heuristic_fallbacks=False,
+                                point_inside_mode=(
+                                    "guess7_order_probe"
+                                    if selection == "cbsp_record_hit_guess7_order_probe"
+                                    else "edge_walk"
+                                ),
+                            )
+                        else:
+                            mesh_contact = self._triangle_cbsp_contact(
+                                tri_local,
+                                vertices,
+                                cbsp_tree,
+                                bounding_radius,
+                            )
                     if mesh_contact is None:
                         continue
                     contact_point_local, normal_local, penetration = mesh_contact
@@ -598,6 +782,51 @@ class TerrainGridCollision:
                         sector_index=sector.index,
                         cell=(cell_x, cell_y),
                         normal_source=normal_source,
+                        cbsp_record_hit_source=getattr(
+                            mesh_contact,
+                            "record_hit_source",
+                            None,
+                        ),
+                        cbsp_mesh_triangle_indices=getattr(
+                            mesh_contact,
+                            "mesh_triangle_indices",
+                            None,
+                        ),
+                        cbsp_guess7_order=getattr(
+                            mesh_contact,
+                            "guess7_order",
+                            None,
+                        ),
+                        cbsp_guess7_terms=getattr(
+                            mesh_contact,
+                            "guess7_terms",
+                            None,
+                        ),
+                        cbsp_edge_hit_kind=getattr(
+                            mesh_contact,
+                            "edge_hit_kind",
+                            None,
+                        ),
+                        cbsp_edge_t=getattr(
+                            mesh_contact,
+                            "edge_t",
+                            None,
+                        ),
+                        cbsp_node_index=getattr(
+                            mesh_contact,
+                            "node_index",
+                            None,
+                        ),
+                        cbsp_node_depth=getattr(
+                            mesh_contact,
+                            "node_depth",
+                            None,
+                        ),
+                        cbsp_node_mesh_normal_angle_deg=getattr(
+                            mesh_contact,
+                            "node_mesh_normal_angle_deg",
+                            None,
+                        ),
                         **normal_metadata,
                     )
                     if collect_candidates:
@@ -632,6 +861,16 @@ class TerrainGridCollision:
             "upward_shallow",
             "min_depth_upward",
             "shallow_upward",
+            "cbsp_record_hit_strict_probe",
+            "cbsp_record_hit_guess7_order_probe",
+            "cbsp_mesh_edge_terrain_plane_probe",
+            "cbsp_mesh_edge_terrain_plane_traversal_probe",
+            "cbsp_mesh_edge_endpoint_terrain_plane_probe",
+            "cbsp_mesh_edge_endpoint_terrain_plane_traversal_probe",
+            "cbsp_node_plane_vertex_probe",
+            "cbsp_node_plane_vertex_traversal_probe",
+            "cbsp_mesh_vertex_probe",
+            "cbsp_mesh_vertex_traversal_probe",
         }
         best_contact = None
         best_score = None
@@ -661,12 +900,81 @@ class TerrainGridCollision:
                         )
                         for vertex in tri_world
                     )
-                    mesh_contact = self._triangle_cbsp_contact(
-                        tri_local,
-                        vertices,
-                        cbsp_tree,
-                        bounding_radius,
-                    )
+                    if selection in {"cbsp_mesh_vertex_probe", "cbsp_mesh_vertex_traversal_probe"}:
+                        mesh_contact = self._triangle_cbsp_mesh_vertex_contact(
+                            tri_local,
+                            vertices,
+                            cbsp_tree,
+                            traversal_order=selection == "cbsp_mesh_vertex_traversal_probe",
+                        )
+                    elif selection in {
+                        "cbsp_node_plane_vertex_probe",
+                        "cbsp_node_plane_vertex_traversal_probe",
+                    }:
+                        mesh_contact = self._triangle_cbsp_node_plane_vertex_contact(
+                            tri_local,
+                            vertices,
+                            cbsp_tree,
+                            traversal_order=(
+                                selection == "cbsp_node_plane_vertex_traversal_probe"
+                            ),
+                        )
+                    elif selection in {
+                        "cbsp_mesh_edge_terrain_plane_probe",
+                        "cbsp_mesh_edge_terrain_plane_traversal_probe",
+                        "cbsp_mesh_edge_endpoint_terrain_plane_probe",
+                        "cbsp_mesh_edge_endpoint_terrain_plane_traversal_probe",
+                    }:
+                        mesh_contact = self._triangle_cbsp_mesh_edge_terrain_plane_contact(
+                            tri_local,
+                            vertices,
+                            cbsp_tree,
+                            traversal_order=(
+                                selection
+                                in {
+                                    "cbsp_mesh_edge_terrain_plane_traversal_probe",
+                                    "cbsp_mesh_edge_endpoint_terrain_plane_traversal_probe",
+                                }
+                            ),
+                            endpoint_only=(
+                                selection
+                                in {
+                                    "cbsp_mesh_edge_endpoint_terrain_plane_probe",
+                                    "cbsp_mesh_edge_endpoint_terrain_plane_traversal_probe",
+                                }
+                            ),
+                            prefer_deep_endpoint=(
+                                selection
+                                in {
+                                    "cbsp_mesh_edge_endpoint_terrain_plane_probe",
+                                    "cbsp_mesh_edge_endpoint_terrain_plane_traversal_probe",
+                                }
+                            ),
+                        )
+                    else:
+                        if selection in {
+                            "cbsp_record_hit_strict_probe",
+                            "cbsp_record_hit_guess7_order_probe",
+                        }:
+                            mesh_contact = self._triangle_cbsp_contact(
+                                tri_local,
+                                vertices,
+                                cbsp_tree,
+                                bounding_radius,
+                                include_heuristic_fallbacks=False,
+                                point_inside_mode=(
+                                    "guess7_order_probe"
+                                    if selection == "cbsp_record_hit_guess7_order_probe"
+                                    else "edge_walk"
+                                ),
+                            )
+                        else:
+                            mesh_contact = self._triangle_cbsp_contact(
+                                tri_local,
+                                vertices,
+                                cbsp_tree,
+                                bounding_radius,
+                            )
                     if mesh_contact is None:
                         continue
                     contact_point_local, normal_local, penetration = mesh_contact
@@ -701,6 +1009,51 @@ class TerrainGridCollision:
                         sector_index=sector.index,
                         cell=(cell_x, cell_y),
                         normal_source=normal_source,
+                        cbsp_record_hit_source=getattr(
+                            mesh_contact,
+                            "record_hit_source",
+                            None,
+                        ),
+                        cbsp_mesh_triangle_indices=getattr(
+                            mesh_contact,
+                            "mesh_triangle_indices",
+                            None,
+                        ),
+                        cbsp_guess7_order=getattr(
+                            mesh_contact,
+                            "guess7_order",
+                            None,
+                        ),
+                        cbsp_guess7_terms=getattr(
+                            mesh_contact,
+                            "guess7_terms",
+                            None,
+                        ),
+                        cbsp_edge_hit_kind=getattr(
+                            mesh_contact,
+                            "edge_hit_kind",
+                            None,
+                        ),
+                        cbsp_edge_t=getattr(
+                            mesh_contact,
+                            "edge_t",
+                            None,
+                        ),
+                        cbsp_node_index=getattr(
+                            mesh_contact,
+                            "node_index",
+                            None,
+                        ),
+                        cbsp_node_depth=getattr(
+                            mesh_contact,
+                            "node_depth",
+                            None,
+                        ),
+                        cbsp_node_mesh_normal_angle_deg=getattr(
+                            mesh_contact,
+                            "node_mesh_normal_angle_deg",
+                            None,
+                        ),
                         **normal_metadata,
                     )
                     if collect_candidates:
@@ -915,6 +1268,18 @@ class TerrainGridCollision:
             return None
         if "upward" in selection and normal_z < 0.5:
             return None
+        if selection in {
+            "cbsp_mesh_edge_terrain_plane_probe",
+            "cbsp_mesh_edge_terrain_plane_traversal_probe",
+            "cbsp_mesh_edge_endpoint_terrain_plane_probe",
+            "cbsp_mesh_edge_endpoint_terrain_plane_traversal_probe",
+            "cbsp_mesh_vertex_probe",
+            "cbsp_mesh_vertex_traversal_probe",
+            "cbsp_node_plane_vertex_probe",
+            "cbsp_node_plane_vertex_traversal_probe",
+            "cbsp_record_hit_guess7_order_probe",
+        }:
+            return (penetration, -normal_z)
         if "min_depth" in selection or "shallow" in selection or selection == "upward":
             return (penetration, -normal_z)
         return (-normal_z, penetration)
@@ -987,7 +1352,16 @@ class TerrainGridCollision:
             abs(axis[2]) * half_extents[2]
         )
 
-    def _triangle_cbsp_contact(self, tri_local, vertices, cbsp_tree, bounding_radius: float):
+    def _triangle_cbsp_contact(
+        self,
+        tri_local,
+        vertices,
+        cbsp_tree,
+        bounding_radius: float,
+        *,
+        include_heuristic_fallbacks: bool = True,
+        point_inside_mode: str = "edge_walk",
+    ):
         tri_normal_raw = _cross3(_sub3(tri_local[1], tri_local[0]), _sub3(tri_local[2], tri_local[0]))
         tri_normal = _normalize3(tri_normal_raw)
         if tri_normal is None or cbsp_tree is None or not getattr(cbsp_tree, "nodes", None):
@@ -1021,7 +1395,15 @@ class TerrainGridCollision:
             (tri_local[1], tri_local[2]),
         )
 
-        def record_hit(hit_point, mesh_tri, hit_normal, mesh_normal=None):
+        def record_hit(
+            hit_point,
+            mesh_tri,
+            hit_normal,
+            mesh_normal=None,
+            *,
+            source: str = "unknown",
+            mesh_tri_indices=None,
+        ):
             penetration = self._estimate_triangle_penetration(tri_local, mesh_tri, hit_normal)
             return _CBSPContact(
                 position=hit_point,
@@ -1030,6 +1412,14 @@ class TerrainGridCollision:
                 cbsp_split_normal=hit_normal,
                 terrain_face_normal=tri_normal,
                 mesh_face_normal=mesh_normal,
+                store_normal0=tri_normal,
+                store_normal1=hit_normal,
+                record_hit_source=source,
+                mesh_triangle_indices=(
+                    tuple(int(index) for index in mesh_tri_indices)
+                    if mesh_tri_indices is not None
+                    else None
+                ),
             )
 
         def signbits_differ(value_a: float, value_b: float) -> bool:
@@ -1056,6 +1446,11 @@ class TerrainGridCollision:
                 node.center.y + (-node.half_extent_y if _signbit(direction[1]) == ref_negative else node.half_extent_y),
                 node.center.z + (-node.half_extent_z if _signbit(direction[2]) == ref_negative else node.half_extent_z),
             )
+
+        def point_inside_mesh_triangle(point, mesh_tri, mesh_normal) -> bool:
+            if point_inside_mode == "guess7_order_probe":
+                return self._guess7_point_in_triangle_any_order(point, mesh_tri)
+            return self._point_in_triangle(point, mesh_tri, mesh_normal)
 
         def leaf_test_triangles(node):
             node_hit_normal = _normalize3(
@@ -1094,11 +1489,29 @@ class TerrainGridCollision:
                     continue
                 mesh_plane_d = -_dot3(mesh_normal, mesh_tri[0])
 
-                for clip_point in clip_points:
-                    if self._point_in_triangle(clip_point, mesh_tri, mesh_normal):
-                        return record_hit(clip_point, mesh_tri, node_hit_normal, mesh_normal)
+                for clip_index, clip_point in enumerate(clip_points):
+                    if point_inside_mesh_triangle(clip_point, mesh_tri, mesh_normal):
+                        return record_hit(
+                            clip_point,
+                            mesh_tri,
+                            node_hit_normal,
+                            mesh_normal,
+                            source=(
+                                f"cbsp_leaf_clip_point_guess7_order_{clip_index}"
+                                if point_inside_mode == "guess7_order_probe"
+                                else
+                                "cbsp_leaf_clip_point"
+                                if include_heuristic_fallbacks
+                                else f"cbsp_leaf_clip_point_{clip_index}"
+                            ),
+                            mesh_tri_indices=mesh_tri_indices,
+                        )
 
-                for edge_start, edge_end in tri_edges:
+                for edge_name, (edge_start, edge_end) in (
+                    ("edge_ab", tri_edges[0]),
+                    ("edge_ac", tri_edges[1]),
+                    ("edge_bc", tri_edges[2]),
+                ):
                     dist_start = _dot3(mesh_normal, edge_start) + mesh_plane_d
                     dist_end = _dot3(mesh_normal, edge_end) + mesh_plane_d
                     if not edge_crosses_plane(dist_start, dist_end):
@@ -1106,16 +1519,44 @@ class TerrainGridCollision:
                     hit_point = lerp_clip(edge_start, edge_end, dist_start, dist_end)
                     if hit_point is None:
                         continue
-                    if self._point_in_triangle(hit_point, mesh_tri, mesh_normal):
-                        return record_hit(hit_point, mesh_tri, node_hit_normal, mesh_normal)
+                    if point_inside_mesh_triangle(hit_point, mesh_tri, mesh_normal):
+                        return record_hit(
+                            hit_point,
+                            mesh_tri,
+                            node_hit_normal,
+                            mesh_normal,
+                            source=(
+                                f"cbsp_edge_triangle_intersect_guess7_order_{edge_name}"
+                                if point_inside_mode == "guess7_order_probe"
+                                else f"cbsp_edge_triangle_intersect_{edge_name}"
+                            ),
+                            mesh_tri_indices=mesh_tri_indices,
+                        )
+
+                if not include_heuristic_fallbacks:
+                    continue
 
                 vertex_contact = self._terrain_triangle_vertex_contact(tri_local, mesh_tri, tri_normal)
                 if vertex_contact is not None:
                     hit_point, _ = vertex_contact
-                    return record_hit(hit_point, mesh_tri, node_hit_normal, mesh_normal)
+                    return record_hit(
+                        hit_point,
+                        mesh_tri,
+                        node_hit_normal,
+                        mesh_normal,
+                        source="cbsp_vertex_contact",
+                        mesh_tri_indices=mesh_tri_indices,
+                    )
                 hit_point = self._triangles_intersection_point(tri_local, mesh_tri)
                 if hit_point is not None:
-                    return record_hit(hit_point, mesh_tri, node_hit_normal, mesh_normal)
+                    return record_hit(
+                        hit_point,
+                        mesh_tri,
+                        node_hit_normal,
+                        mesh_normal,
+                        source="cbsp_triangle_intersection",
+                        mesh_tri_indices=mesh_tri_indices,
+                    )
             return None
 
         def traverse(node_index: int):
@@ -1176,6 +1617,610 @@ class TerrainGridCollision:
         node_dist_c = 0.0
         best_contact = None
         traverse(cbsp_tree.root_index)
+        return best_contact
+
+    def _triangle_cbsp_mesh_vertex_contact(
+        self,
+        tri_local,
+        vertices,
+        cbsp_tree,
+        *,
+        traversal_order: bool = False,
+    ):
+        """Report-only probe for CBSP mesh vertices embedded in a terrain triangle."""
+        tri_normal_raw = _cross3(_sub3(tri_local[1], tri_local[0]), _sub3(tri_local[2], tri_local[0]))
+        tri_normal = _normalize3(tri_normal_raw)
+        if tri_normal is None or cbsp_tree is None or not getattr(cbsp_tree, "nodes", None):
+            return None
+
+        tri_center = (
+            (tri_local[0][0] + tri_local[1][0] + tri_local[2][0]) / 3.0,
+            (tri_local[0][1] + tri_local[1][1] + tri_local[2][1]) / 3.0,
+            (tri_local[0][2] + tri_local[1][2] + tri_local[2][2]) / 3.0,
+        )
+        if _dot3(tri_normal, tri_center) > 0.0:
+            tri_normal_raw = (-tri_normal_raw[0], -tri_normal_raw[1], -tri_normal_raw[2])
+            tri_normal = (-tri_normal[0], -tri_normal[1], -tri_normal[2])
+
+        tri_aabb_min, tri_aabb_max = self._triangle_bounds(tri_local)
+
+        def make_contact(vertex, mesh_tri, mesh_normal, mesh_tri_indices, signed_plane_distance):
+            return _CBSPContact(
+                position=vertex,
+                normal=mesh_normal,
+                penetration=max(0.01, abs(signed_plane_distance)),
+                cbsp_split_normal=mesh_normal,
+                terrain_face_normal=tri_normal,
+                mesh_face_normal=mesh_normal,
+                store_normal0=tri_normal,
+                store_normal1=mesh_normal,
+                record_hit_source=(
+                    "cbsp_mesh_vertex_inside_terrain_traversal_probe"
+                    if traversal_order
+                    else "cbsp_mesh_vertex_inside_terrain_probe"
+                ),
+                mesh_triangle_indices=tuple(int(index) for index in mesh_tri_indices),
+            )
+
+        def first_contact_in_node(node):
+            for mesh_tri_indices in getattr(node, "triangles", None) or ():
+                i0, i1, i2 = mesh_tri_indices
+                if i0 >= len(vertices) or i1 >= len(vertices) or i2 >= len(vertices):
+                    continue
+                mesh_tri = (
+                    (vertices[i0].x, vertices[i0].y, vertices[i0].z),
+                    (vertices[i1].x, vertices[i1].y, vertices[i1].z),
+                    (vertices[i2].x, vertices[i2].y, vertices[i2].z),
+                )
+                if not self._triangle_overlaps_aabb(mesh_tri, tri_aabb_min, tri_aabb_max):
+                    continue
+                mesh_normal = _normalize3(_cross3(_sub3(mesh_tri[1], mesh_tri[0]), _sub3(mesh_tri[2], mesh_tri[0])))
+                if mesh_normal is None:
+                    continue
+                for vertex in mesh_tri:
+                    if not self._point_in_triangle(vertex, tri_local, tri_normal, eps=1e-4):
+                        continue
+                    signed_plane_distance = _dot3(tri_normal, _sub3(vertex, tri_local[0]))
+                    return make_contact(
+                        vertex,
+                        mesh_tri,
+                        mesh_normal,
+                        mesh_tri_indices,
+                        signed_plane_distance,
+                    )
+            return None
+
+        if traversal_order:
+            tri_normal_len_sq = _dot3(tri_normal_raw, tri_normal_raw)
+            if tri_normal_len_sq <= 1e-10:
+                return None
+
+            def signbits_differ(value_a: float, value_b: float) -> bool:
+                return _signbit(value_a) != _signbit(value_b)
+
+            def node_support_vertex(node, direction, reference_sign_value: float):
+                ref_negative = _signbit(reference_sign_value)
+                return (
+                    node.center.x + (-node.half_extent_x if _signbit(direction[0]) == ref_negative else node.half_extent_x),
+                    node.center.y + (-node.half_extent_y if _signbit(direction[1]) == ref_negative else node.half_extent_y),
+                    node.center.z + (-node.half_extent_z if _signbit(direction[2]) == ref_negative else node.half_extent_z),
+                )
+
+            def traverse(node_index: int):
+                if node_index < 0:
+                    return None
+                node = cbsp_tree.nodes[node_index]
+                center_delta = (
+                    node.center.x - tri_local[0][0],
+                    node.center.y - tri_local[0][1],
+                    node.center.z - tri_local[0][2],
+                )
+                proj_dist = _dot3(center_delta, tri_normal_raw)
+                if (proj_dist * proj_dist) > (node.radius * node.radius * tri_normal_len_sq + 1e-6):
+                    return None
+                support_point = node_support_vertex(node, tri_normal_raw, proj_dist)
+                support_proj = _dot3(_sub3(support_point, tri_local[0]), tri_normal_raw)
+                if not signbits_differ(support_proj, proj_dist):
+                    return None
+
+                split_normal = (node.split_normal.x, node.split_normal.y, node.split_normal.z)
+                if _dot3(split_normal, split_normal) <= 1e-10:
+                    return None
+                dist_a = _dot3(split_normal, tri_local[0]) + node.split_plane_d
+                dist_b = _dot3(split_normal, tri_local[1]) + node.split_plane_d
+                dist_c = _dot3(split_normal, tri_local[2]) + node.split_plane_d
+                straddles = (
+                    signbits_differ(dist_a, dist_b) or
+                    signbits_differ(dist_a, dist_c) or
+                    signbits_differ(dist_b, dist_c)
+                )
+                if straddles:
+                    leaf_hit = first_contact_in_node(node)
+                    if leaf_hit is not None:
+                        return leaf_hit
+                    return traverse(node.child_pos) or traverse(node.child_neg)
+                if not _signbit(dist_a):
+                    return traverse(node.child_pos)
+                return traverse(node.child_neg)
+
+            return traverse(cbsp_tree.root_index)
+
+        best_contact = None
+        best_score = None
+        for node_index, node in enumerate(cbsp_tree.nodes):
+            for triangle_order, mesh_tri_indices in enumerate(getattr(node, "triangles", None) or ()):
+                i0, i1, i2 = mesh_tri_indices
+                if i0 >= len(vertices) or i1 >= len(vertices) or i2 >= len(vertices):
+                    continue
+                mesh_tri = (
+                    (vertices[i0].x, vertices[i0].y, vertices[i0].z),
+                    (vertices[i1].x, vertices[i1].y, vertices[i1].z),
+                    (vertices[i2].x, vertices[i2].y, vertices[i2].z),
+                )
+                if not self._triangle_overlaps_aabb(mesh_tri, tri_aabb_min, tri_aabb_max):
+                    continue
+                mesh_normal = _normalize3(_cross3(_sub3(mesh_tri[1], mesh_tri[0]), _sub3(mesh_tri[2], mesh_tri[0])))
+                if mesh_normal is None:
+                    continue
+                for vertex_order, vertex in enumerate(mesh_tri):
+                    if not self._point_in_triangle(vertex, tri_local, tri_normal, eps=1e-4):
+                        continue
+                    signed_plane_distance = _dot3(tri_normal, _sub3(vertex, tri_local[0]))
+                    score = (
+                        abs(signed_plane_distance),
+                        node_index,
+                        triangle_order,
+                        vertex_order,
+                    )
+                    if best_score is not None and score >= best_score:
+                        continue
+                    best_score = score
+                    best_contact = make_contact(
+                        vertex,
+                        mesh_tri,
+                        mesh_normal,
+                        mesh_tri_indices,
+                        signed_plane_distance,
+                    )
+        return best_contact
+
+    def _triangle_cbsp_mesh_edge_terrain_plane_contact(
+        self,
+        tri_local,
+        vertices,
+        cbsp_tree,
+        *,
+        traversal_order: bool = False,
+        endpoint_only: bool = False,
+        prefer_deep_endpoint: bool = False,
+    ):
+        """Report-only probe for mesh edges crossing the terrain triangle plane."""
+        tri_normal_raw = _cross3(_sub3(tri_local[1], tri_local[0]), _sub3(tri_local[2], tri_local[0]))
+        tri_normal = _normalize3(tri_normal_raw)
+        if tri_normal is None or cbsp_tree is None or not getattr(cbsp_tree, "nodes", None):
+            return None
+
+        tri_center = (
+            (tri_local[0][0] + tri_local[1][0] + tri_local[2][0]) / 3.0,
+            (tri_local[0][1] + tri_local[1][1] + tri_local[2][1]) / 3.0,
+            (tri_local[0][2] + tri_local[1][2] + tri_local[2][2]) / 3.0,
+        )
+        if _dot3(tri_normal, tri_center) > 0.0:
+            tri_normal_raw = (-tri_normal_raw[0], -tri_normal_raw[1], -tri_normal_raw[2])
+            tri_normal = (-tri_normal[0], -tri_normal[1], -tri_normal[2])
+
+        tri_aabb_min, tri_aabb_max = self._triangle_bounds(tri_local)
+
+        def signbits_differ(value_a: float, value_b: float) -> bool:
+            return _signbit(value_a) != _signbit(value_b)
+
+        def node_depths():
+            depths = {}
+            stack = [(getattr(cbsp_tree, "root_index", 0), 0)]
+            while stack:
+                node_index, depth = stack.pop()
+                if node_index < 0 or node_index in depths or node_index >= len(cbsp_tree.nodes):
+                    continue
+                depths[node_index] = depth
+                node = cbsp_tree.nodes[node_index]
+                stack.append((getattr(node, "child_neg", -1), depth + 1))
+                stack.append((getattr(node, "child_pos", -1), depth + 1))
+            return depths
+
+        depth_by_node = node_depths() if prefer_deep_endpoint else {}
+
+        def make_contact(
+            point,
+            node_normal,
+            mesh_tri,
+            mesh_normal,
+            mesh_tri_indices,
+            edge_name: str,
+            *,
+            guess7_terms=None,
+            edge_hit_kind: str = "crossing",
+            edge_t: float | None = None,
+            node_index: int | None = None,
+            node_depth: int | None = None,
+            node_mesh_normal_angle_deg: float | None = None,
+        ):
+            return _CBSPContact(
+                position=point,
+                normal=node_normal,
+                penetration=0.01,
+                cbsp_split_normal=node_normal,
+                terrain_face_normal=tri_normal,
+                mesh_face_normal=mesh_normal,
+                store_normal0=tri_normal,
+                store_normal1=node_normal,
+                record_hit_source=(
+                    (
+                        f"cbsp_mesh_edge_endpoint_terrain_plane_traversal_probe_{edge_name}"
+                        if traversal_order
+                        else f"cbsp_mesh_edge_endpoint_terrain_plane_probe_{edge_name}"
+                    )
+                    if endpoint_only
+                    else (
+                        f"cbsp_mesh_edge_terrain_plane_traversal_probe_{edge_name}"
+                        if traversal_order
+                        else f"cbsp_mesh_edge_terrain_plane_probe_{edge_name}"
+                    )
+                ),
+                mesh_triangle_indices=tuple(int(index) for index in mesh_tri_indices),
+                guess7_order=(1, 0, 2) if guess7_terms is not None else None,
+                guess7_terms=(
+                    tuple(float(term) for term in guess7_terms)
+                    if guess7_terms is not None
+                    else None
+                ),
+                edge_hit_kind=edge_hit_kind,
+                edge_t=edge_t,
+                node_index=node_index,
+                node_depth=node_depth,
+                node_mesh_normal_angle_deg=node_mesh_normal_angle_deg,
+            )
+
+        def edge_plane_hit_point(start, end, dist_start: float, dist_end: float):
+            endpoint_epsilon = 1e-2 if endpoint_only else 1e-3
+            if abs(dist_start) <= endpoint_epsilon:
+                return "start_on_terrain_plane", 0.0, start
+            if abs(dist_end) <= endpoint_epsilon:
+                return "end_on_terrain_plane", 1.0, end
+            if endpoint_only or not signbits_differ(dist_start, dist_end):
+                return None
+            denom = dist_start - dist_end
+            if abs(denom) <= 1e-8:
+                return None
+            t = dist_start / denom
+            if t < -1e-6 or t > 1.0 + 1e-6:
+                return None
+            point = (
+                start[0] + (end[0] - start[0]) * t,
+                start[1] + (end[1] - start[1]) * t,
+                start[2] + (end[2] - start[2]) * t,
+            )
+            return "crossing", t, point
+
+        def first_contact_in_node(node, node_index: int | None = None):
+            node_normal = _normalize3(
+                (node.split_normal.x, node.split_normal.y, node.split_normal.z)
+            )
+            if node_normal is None:
+                return None
+            node_depth = (
+                depth_by_node.get(node_index)
+                if node_index is not None
+                else None
+            )
+            for mesh_tri_indices in getattr(node, "triangles", None) or ():
+                i0, i1, i2 = mesh_tri_indices
+                if i0 >= len(vertices) or i1 >= len(vertices) or i2 >= len(vertices):
+                    continue
+                mesh_tri = (
+                    (vertices[i0].x, vertices[i0].y, vertices[i0].z),
+                    (vertices[i1].x, vertices[i1].y, vertices[i1].z),
+                    (vertices[i2].x, vertices[i2].y, vertices[i2].z),
+                )
+                if not self._triangle_overlaps_aabb(mesh_tri, tri_aabb_min, tri_aabb_max):
+                    continue
+                mesh_normal = _normalize3(_cross3(_sub3(mesh_tri[1], mesh_tri[0]), _sub3(mesh_tri[2], mesh_tri[0])))
+                if mesh_normal is None:
+                    continue
+                node_mesh_normal_angle_deg = _angle_between3(node_normal, mesh_normal)
+                terrain_distances = [
+                    _dot3(tri_normal, _sub3(vertex, tri_local[0]))
+                    for vertex in mesh_tri
+                ]
+                for edge_name, start_idx, end_idx in (
+                    ("ab", 0, 1),
+                    ("bc", 1, 2),
+                    ("ca", 2, 0),
+                ):
+                    dist_start = terrain_distances[start_idx]
+                    dist_end = terrain_distances[end_idx]
+                    start = mesh_tri[start_idx]
+                    end = mesh_tri[end_idx]
+                    edge_hit = edge_plane_hit_point(
+                        start,
+                        end,
+                        dist_start,
+                        dist_end,
+                    )
+                    if edge_hit is None:
+                        continue
+                    edge_hit_kind, edge_t, point = edge_hit
+                    guess7_terms = self._guess7_point_in_triangle_edge_intersect_terms(
+                        point,
+                        tri_local,
+                        tri_normal,
+                    )
+                    if not all(term >= 0.0 for term in guess7_terms):
+                        continue
+                    return make_contact(
+                        point,
+                        node_normal,
+                        mesh_tri,
+                        mesh_normal,
+                        mesh_tri_indices,
+                        edge_name,
+                        guess7_terms=guess7_terms,
+                        edge_hit_kind=edge_hit_kind,
+                        edge_t=edge_t,
+                        node_index=node_index,
+                        node_depth=node_depth,
+                        node_mesh_normal_angle_deg=node_mesh_normal_angle_deg,
+                    )
+            return None
+
+        if traversal_order:
+            tri_normal_len_sq = _dot3(tri_normal_raw, tri_normal_raw)
+            if tri_normal_len_sq <= 1e-10:
+                return None
+
+            def node_support_vertex(node, direction, reference_sign_value: float):
+                ref_negative = _signbit(reference_sign_value)
+                return (
+                    node.center.x + (-node.half_extent_x if _signbit(direction[0]) == ref_negative else node.half_extent_x),
+                    node.center.y + (-node.half_extent_y if _signbit(direction[1]) == ref_negative else node.half_extent_y),
+                    node.center.z + (-node.half_extent_z if _signbit(direction[2]) == ref_negative else node.half_extent_z),
+                )
+
+            def traverse(node_index: int):
+                if node_index < 0:
+                    return None
+                node = cbsp_tree.nodes[node_index]
+                center_delta = (
+                    node.center.x - tri_local[0][0],
+                    node.center.y - tri_local[0][1],
+                    node.center.z - tri_local[0][2],
+                )
+                proj_dist = _dot3(center_delta, tri_normal_raw)
+                if (proj_dist * proj_dist) > (node.radius * node.radius * tri_normal_len_sq + 1e-6):
+                    return None
+                support_point = node_support_vertex(node, tri_normal_raw, proj_dist)
+                support_proj = _dot3(_sub3(support_point, tri_local[0]), tri_normal_raw)
+                if not signbits_differ(support_proj, proj_dist):
+                    return None
+
+                split_normal = (node.split_normal.x, node.split_normal.y, node.split_normal.z)
+                if _dot3(split_normal, split_normal) <= 1e-10:
+                    return None
+                dist_a = _dot3(split_normal, tri_local[0]) + node.split_plane_d
+                dist_b = _dot3(split_normal, tri_local[1]) + node.split_plane_d
+                dist_c = _dot3(split_normal, tri_local[2]) + node.split_plane_d
+                straddles = (
+                    signbits_differ(dist_a, dist_b) or
+                    signbits_differ(dist_a, dist_c) or
+                    signbits_differ(dist_b, dist_c)
+                )
+                if straddles:
+                    leaf_hit = first_contact_in_node(node, node_index)
+                    if leaf_hit is not None:
+                        return leaf_hit
+                    return traverse(node.child_pos) or traverse(node.child_neg)
+                if not _signbit(dist_a):
+                    return traverse(node.child_pos)
+                return traverse(node.child_neg)
+
+            return traverse(cbsp_tree.root_index)
+
+        best_contact = None
+        best_score = None
+        for node_index, node in enumerate(cbsp_tree.nodes):
+            for triangle_order, mesh_tri_indices in enumerate(getattr(node, "triangles", None) or ()):
+                contact = first_contact_in_node(
+                    type(
+                        "_SingleTriangleNode",
+                        (),
+                        {
+                            "triangles": (mesh_tri_indices,),
+                            "split_normal": node.split_normal,
+                        },
+                    )(),
+                    node_index,
+                )
+                if contact is None:
+                    continue
+                score = (
+                    (
+                        float(getattr(contact, "node_mesh_normal_angle_deg", None))
+                        if getattr(contact, "node_mesh_normal_angle_deg", None) is not None
+                        else 999.0
+                    ),
+                    -int(getattr(contact, "node_depth", None) or 0),
+                    node_index,
+                    triangle_order,
+                ) if endpoint_only and prefer_deep_endpoint else (
+                    node_index,
+                    triangle_order,
+                )
+                if best_score is not None and score >= best_score:
+                    continue
+                best_score = score
+                best_contact = contact
+        return best_contact
+
+    def _triangle_cbsp_node_plane_vertex_contact(
+        self,
+        tri_local,
+        vertices,
+        cbsp_tree,
+        *,
+        traversal_order: bool = False,
+    ):
+        """Report-only probe for near-plane mesh vertices using the CBSP node normal."""
+        tri_normal_raw = _cross3(_sub3(tri_local[1], tri_local[0]), _sub3(tri_local[2], tri_local[0]))
+        tri_normal = _normalize3(tri_normal_raw)
+        if tri_normal is None or cbsp_tree is None or not getattr(cbsp_tree, "nodes", None):
+            return None
+
+        tri_center = (
+            (tri_local[0][0] + tri_local[1][0] + tri_local[2][0]) / 3.0,
+            (tri_local[0][1] + tri_local[1][1] + tri_local[2][1]) / 3.0,
+            (tri_local[0][2] + tri_local[1][2] + tri_local[2][2]) / 3.0,
+        )
+        if _dot3(tri_normal, tri_center) > 0.0:
+            tri_normal_raw = (-tri_normal_raw[0], -tri_normal_raw[1], -tri_normal_raw[2])
+            tri_normal = (-tri_normal[0], -tri_normal[1], -tri_normal[2])
+
+        tri_aabb_min, tri_aabb_max = self._triangle_bounds(tri_local)
+
+        def make_contact(vertex, node_normal, mesh_tri_indices, signed_plane_distance):
+            projected = (
+                vertex[0] - tri_normal[0] * signed_plane_distance,
+                vertex[1] - tri_normal[1] * signed_plane_distance,
+                vertex[2] - tri_normal[2] * signed_plane_distance,
+            )
+            return _CBSPContact(
+                position=projected,
+                normal=node_normal,
+                penetration=max(0.01, abs(signed_plane_distance)),
+                cbsp_split_normal=node_normal,
+                terrain_face_normal=tri_normal,
+                mesh_face_normal=node_normal,
+                store_normal0=tri_normal,
+                store_normal1=node_normal,
+                record_hit_source=(
+                    "cbsp_node_plane_vertex_traversal_probe"
+                    if traversal_order
+                    else "cbsp_node_plane_vertex_probe"
+                ),
+                mesh_triangle_indices=tuple(int(index) for index in mesh_tri_indices),
+            )
+
+        def first_contact_in_node(node):
+            node_normal = _normalize3(
+                (node.split_normal.x, node.split_normal.y, node.split_normal.z)
+            )
+            if node_normal is None:
+                return None
+            best_contact = None
+            best_score = None
+            for triangle_order, mesh_tri_indices in enumerate(getattr(node, "triangles", None) or ()):
+                i0, i1, i2 = mesh_tri_indices
+                if i0 >= len(vertices) or i1 >= len(vertices) or i2 >= len(vertices):
+                    continue
+                mesh_tri = (
+                    (vertices[i0].x, vertices[i0].y, vertices[i0].z),
+                    (vertices[i1].x, vertices[i1].y, vertices[i1].z),
+                    (vertices[i2].x, vertices[i2].y, vertices[i2].z),
+                )
+                if not self._triangle_overlaps_aabb(mesh_tri, tri_aabb_min, tri_aabb_max):
+                    continue
+                for vertex_order, vertex in enumerate(mesh_tri):
+                    if not self._point_in_triangle(vertex, tri_local, tri_normal, eps=1e-4):
+                        continue
+                    node_plane_distance = abs(
+                        _dot3(node_normal, vertex) + node.split_plane_d
+                    )
+                    if node_plane_distance > 1e-3:
+                        continue
+                    signed_plane_distance = _dot3(tri_normal, _sub3(vertex, tri_local[0]))
+                    score = (
+                        abs(signed_plane_distance),
+                        triangle_order,
+                        vertex_order,
+                    )
+                    if best_score is not None and score >= best_score:
+                        continue
+                    best_score = score
+                    best_contact = make_contact(
+                        vertex,
+                        node_normal,
+                        mesh_tri_indices,
+                        signed_plane_distance,
+                    )
+            return best_contact
+
+        if traversal_order:
+            tri_normal_len_sq = _dot3(tri_normal_raw, tri_normal_raw)
+            if tri_normal_len_sq <= 1e-10:
+                return None
+
+            def signbits_differ(value_a: float, value_b: float) -> bool:
+                return _signbit(value_a) != _signbit(value_b)
+
+            def node_support_vertex(node, direction, reference_sign_value: float):
+                ref_negative = _signbit(reference_sign_value)
+                return (
+                    node.center.x + (-node.half_extent_x if _signbit(direction[0]) == ref_negative else node.half_extent_x),
+                    node.center.y + (-node.half_extent_y if _signbit(direction[1]) == ref_negative else node.half_extent_y),
+                    node.center.z + (-node.half_extent_z if _signbit(direction[2]) == ref_negative else node.half_extent_z),
+                )
+
+            def traverse(node_index: int):
+                if node_index < 0:
+                    return None
+                node = cbsp_tree.nodes[node_index]
+                center_delta = (
+                    node.center.x - tri_local[0][0],
+                    node.center.y - tri_local[0][1],
+                    node.center.z - tri_local[0][2],
+                )
+                proj_dist = _dot3(center_delta, tri_normal_raw)
+                if (proj_dist * proj_dist) > (node.radius * node.radius * tri_normal_len_sq + 1e-6):
+                    return None
+                support_point = node_support_vertex(node, tri_normal_raw, proj_dist)
+                support_proj = _dot3(_sub3(support_point, tri_local[0]), tri_normal_raw)
+                if not signbits_differ(support_proj, proj_dist):
+                    return None
+
+                split_normal = (node.split_normal.x, node.split_normal.y, node.split_normal.z)
+                if _dot3(split_normal, split_normal) <= 1e-10:
+                    return None
+                dist_a = _dot3(split_normal, tri_local[0]) + node.split_plane_d
+                dist_b = _dot3(split_normal, tri_local[1]) + node.split_plane_d
+                dist_c = _dot3(split_normal, tri_local[2]) + node.split_plane_d
+                straddles = (
+                    signbits_differ(dist_a, dist_b) or
+                    signbits_differ(dist_a, dist_c) or
+                    signbits_differ(dist_b, dist_c)
+                )
+                if straddles:
+                    leaf_hit = first_contact_in_node(node)
+                    if leaf_hit is not None:
+                        return leaf_hit
+                    return traverse(node.child_pos) or traverse(node.child_neg)
+                if not _signbit(dist_a):
+                    return traverse(node.child_pos)
+                return traverse(node.child_neg)
+
+            return traverse(cbsp_tree.root_index)
+
+        best_contact = None
+        best_score = None
+        for node_index, node in enumerate(cbsp_tree.nodes):
+            contact = first_contact_in_node(node)
+            if contact is None:
+                continue
+            score = (
+                float(contact.penetration),
+                node_index,
+            )
+            if best_score is not None and score >= best_score:
+                continue
+            best_score = score
+            best_contact = contact
         return best_contact
 
     def _triangle_box_contact(self, tri_local, half_extents):
@@ -1286,6 +2331,55 @@ class TerrainGridCollision:
             if _dot3(normal, _cross3(edge, to_point)) < -eps:
                 return False
         return True
+
+    @staticmethod
+    def _guess7_point_in_triangle_terms(point, tri, normal):
+        vertex_a, vertex_b, reference_vertex = tri
+        return (
+            _dot3(
+                normal,
+                _cross3(_sub3(vertex_a, vertex_b), _sub3(point, vertex_b)),
+            ),
+            _dot3(
+                normal,
+                _cross3(_sub3(reference_vertex, vertex_a), _sub3(point, vertex_a)),
+            ),
+            _dot3(
+                normal,
+                _cross3(_sub3(vertex_b, reference_vertex), _sub3(point, reference_vertex)),
+            ),
+        )
+
+    @classmethod
+    def _guess7_point_in_triangle_any_order(cls, point, tri, normal=None) -> bool:
+        for order in (
+            (0, 1, 2),
+            (0, 2, 1),
+            (1, 0, 2),
+            (1, 2, 0),
+            (2, 0, 1),
+            (2, 1, 0),
+        ):
+            ordered = (tri[order[0]], tri[order[1]], tri[order[2]])
+            order_normal = normal or _normalize3(
+                _cross3(_sub3(ordered[1], ordered[0]), _sub3(ordered[2], ordered[0]))
+            )
+            if order_normal is None:
+                continue
+            terms = cls._guess7_point_in_triangle_terms(point, ordered, order_normal)
+            if terms[0] >= 0.0 and terms[1] >= 0.0 and terms[2] >= 0.0:
+                return True
+        return False
+
+    @classmethod
+    def _guess7_point_in_triangle_edge_intersect_order(cls, point, tri, normal) -> bool:
+        terms = cls._guess7_point_in_triangle_edge_intersect_terms(point, tri, normal)
+        return terms[0] >= 0.0 and terms[1] >= 0.0 and terms[2] >= 0.0
+
+    @classmethod
+    def _guess7_point_in_triangle_edge_intersect_terms(cls, point, tri, normal):
+        ordered = (tri[1], tri[0], tri[2])
+        return cls._guess7_point_in_triangle_terms(point, ordered, normal)
 
     def _triangles_intersection_point(self, tri_a, tri_b):
         for idx in range(3):

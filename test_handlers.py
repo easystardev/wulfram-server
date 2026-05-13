@@ -29,7 +29,14 @@ from wulfram.server import WulframServer, _StaticWorldRayNode
 from wulfram.physics import _matrix3_from_euler_xyz
 from wulfram.terrain import Terrain
 from wulfram.building_collision import BuildingCollisionAssets, BuildingEntity
-from wulfram.world_collision import TerrainContact, TerrainGridCollision, TerrainRaycastHit
+from wulfram.world_collision import (
+    TerrainContact,
+    TerrainGridCollision,
+    TerrainRaycastHit,
+    _cross3,
+    _normalize3,
+    _sub3,
+)
 from wulfram.weapons import (
     WeaponSystem,
     WeaponType,
@@ -59,6 +66,7 @@ def _legacy_contact_response_test(fn):
 from wulfram.packets import (
     build_chat_message,
     build_behavior_packet,
+    get_ticks,
     build_player_info,
     build_translation_packet,
     build_update_array_create_tank,
@@ -4243,6 +4251,7 @@ def test_remote_og_movement_input_delay_replays_prior_axis_sample():
     """Remote OG movement should use delayed action history, not immediate slots."""
     server = WulframServer.__new__(WulframServer)
     server.remote_og_movement_input_delay = 0.20
+    server.remote_og_movement_input_selection = "latest_before_target"
 
     ctx = ClientContext(
         client_id=1,
@@ -4265,10 +4274,125 @@ def test_remote_og_movement_input_delay_replays_prior_axis_sample():
     assert fwd == 0.0, (fwd, source)
     assert strafe == 0.0, strafe
     assert source == "delayed_remote_og_action_history", source
+    selection = getattr(ctx, "debug_last_movement_input_selection", {})
+    assert selection["source"] == "delayed_remote_og_action_history", selection
+    assert selection["history_len"] == 2, selection
+    assert 0.35 <= selection["selected_age_s"] <= 0.45, selection
+    assert selection["selected_fwd"] == 0.0, selection
+    assert selection["latest_fwd"] == 0.5188, selection
+    assert selection["time_probe_before_found"] is True, selection
+    assert selection["time_probe_after_found"] is True, selection
+    assert selection["time_probe_nearest_found"] is True, selection
+    assert selection["time_probe_before_fwd"] == 0.0, selection
+    assert selection["time_probe_after_fwd"] == 0.5188, selection
+    assert selection["selected_interval_contains_target"] is True, selection
+    assert selection["selected_interval_end_target_error_s"] > 0.0, selection
 
     ctx.client_addr = ("127.0.0.1", 50000)
     assert server._remote_og_movement_input_delay_for_ctx(ctx) == 0.0
     print("test_remote_og_movement_input_delay_replays_prior_axis_sample: PASSED")
+    return True
+
+
+def test_remote_og_movement_input_delay_can_probe_nearest_axis_sample():
+    """Default-off nearest selection bounds replay jitter from sparse OG dumps."""
+    server = WulframServer.__new__(WulframServer)
+    server.remote_og_movement_input_delay = 0.20
+    server.remote_og_movement_input_selection = "nearest_to_target"
+
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    now = time.monotonic()
+    ctx.movement_input_history.append({"time": now - 0.40, "fwd": 0.0, "strafe": 0.0})
+    ctx.movement_input_history.append({"time": now - 0.05, "fwd": 0.5188, "strafe": 0.0})
+
+    delay = server._remote_og_movement_input_delay_for_ctx(ctx)
+    fwd, strafe, source = server._select_delayed_movement_input(
+        ctx,
+        current_fwd=0.5188,
+        current_strafe=0.0,
+        delay_s=delay,
+    )
+
+    assert abs(delay - 0.20) < 1e-6, delay
+    assert fwd == 0.5188, (fwd, source)
+    assert strafe == 0.0, strafe
+    assert source == "delayed_remote_og_action_history", source
+    selection = getattr(ctx, "debug_last_movement_input_selection", {})
+    assert selection["selection_policy"] == "nearest_to_target", selection
+    assert selection["selected_future_of_target"] is True, selection
+    assert abs(selection["selected_fwd"] - 0.5188) < 1e-6, selection
+    assert selection["selected_abs_target_error_s"] < 0.20, selection
+    assert selection["time_probe_before_found"] is True, selection
+    assert selection["time_probe_after_found"] is True, selection
+    assert selection["time_probe_nearest_fwd"] == 0.5188, selection
+    assert selection["selected_interval_contains_target"] is False, selection
+
+    print("test_remote_og_movement_input_delay_can_probe_nearest_axis_sample: PASSED")
+    return True
+
+
+def test_remote_og_movement_input_tick_probe_reports_tick_domain_candidates():
+    """Default-off tick probe should compare client-tick candidates without changing input."""
+    server = WulframServer.__new__(WulframServer)
+    server.remote_og_movement_input_delay = 0.10
+    server.remote_og_movement_input_selection = "latest_before_target"
+    server.remote_og_movement_input_tick_probe = True
+
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    current_client_tick = 100000
+    ctx.tick_offset = current_client_tick - int(get_ticks())
+    ctx.last_client_tick = current_client_tick - 5
+    now = time.monotonic()
+    ctx.movement_input_history.append(
+        {
+            "time": now - 0.40,
+            "fwd": 0.0,
+            "strafe": 0.0,
+            "client_tick": 99700,
+        }
+    )
+    ctx.movement_input_history.append(
+        {
+            "time": now - 0.05,
+            "fwd": 0.5188,
+            "strafe": 0.0,
+            "client_tick": 99950,
+        }
+    )
+
+    fwd, strafe, source = server._select_delayed_movement_input(
+        ctx,
+        current_fwd=0.5188,
+        current_strafe=0.0,
+        delay_s=server.remote_og_movement_input_delay,
+    )
+
+    assert fwd == 0.0, (fwd, source)
+    assert strafe == 0.0, strafe
+    assert source == "delayed_remote_og_action_history", source
+    selection = getattr(ctx, "debug_last_movement_input_selection", {})
+    assert selection["tick_probe_enabled"] is True, selection
+    assert selection["tick_probe_target_client_tick"] == 99900, selection
+    assert selection["tick_probe_before_client_tick"] == 99700, selection
+    assert selection["tick_probe_before_fwd"] == 0.0, selection
+    assert selection["tick_probe_nearest_client_tick"] == 99950, selection
+    assert selection["tick_probe_nearest_future_of_target"] is True, selection
+    assert abs(selection["tick_probe_nearest_fwd"] - 0.5188) < 1e-6, selection
+    assert selection["tick_probe_nearest_abs_target_error_ms"] == 50, selection
+
+    print(
+        "test_remote_og_movement_input_tick_probe_reports_tick_domain_candidates: PASSED"
+    )
     return True
 
 
@@ -4387,6 +4511,199 @@ def test_server_jump_jets_have_visible_peak_under_default_gravity():
     return True
 
 
+def test_server_jump_jets_use_tank_body_up_direction():
+    """Tank jumpjets should follow body pitch/roll instead of hardcoded world Z."""
+    server = WulframServer.__new__(WulframServer)
+    server.tick_rate_hz = 30.0
+    server.linear_damp_driving = 0.0
+    server.linear_damp_coasting = 0.0
+    server.turn_deadzone = 0.05
+    server.turn_sign = -1.0
+    server.up_axis = "z"
+    server.terrain = None
+    server.terrain_pitch_enabled = False
+    server.gravity = 0.0
+    server.ground_level = 0.0
+    server.world_bound = 100000.0
+    server.f32_physics = False
+    server.jump_jets_enabled = True
+    server.jump_jet_direction = "body"
+    server.weapon_energy_enabled = True
+    server.player_energy_max = 100.0
+    server._resolve_entity_world_collision = (
+        lambda ctx, px, py, pz, vx, vy, vz: (px, py, pz, vx, vy, vz)
+    )
+    server._check_building_collisions = (
+        lambda ctx, px, py, pz, vx, vy: (px, py, vx, vy)
+    )
+
+    pitch = math.radians(30.0)
+    body_matrix = _matrix3_from_euler_xyz(0.0, pitch, 0.0)
+    expected_direction = (body_matrix[2], body_matrix[5], body_matrix[8])
+    tank_jump = JUMP_JET_CONFIGS[EntityType.TANK]
+
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    ctx.injected_input = (0.0, 0.0)
+    ctx.injected_jumpjet = 1.0
+    ctx.entity_type = EntityType.TANK
+    ctx.player_pos = (0.0, 0.0, 10.0)
+    ctx.player_vel = (0.0, 0.0, 0.0)
+    ctx.player_fuel = 33000.0
+    ctx.player_energy = 100.0
+    ctx.player_heading = 0.0
+    ctx.ground_level_override = None
+    ctx.player_pose = {"roll": 0.0, "pitch": pitch, "yaw": 0.0}
+    ctx.spring_body_matrix = body_matrix
+    ctx.jump_spawn_lockout = 0.0
+    ctx.jump_cooldown_remaining = 0.0
+    ctx.jump_prev_thrust_input = 0.0
+
+    server._update_player_position(ctx, dt_override=1.0 / 30.0)
+
+    assert ctx.debug_last_controller_step["jump_jet_fired"] is True
+    assert ctx.debug_last_controller_step["jump_jet_direction_mode"] == "body"
+    assert abs(ctx.player_vel[0] - tank_jump.impulse * expected_direction[0]) < 1e-4, ctx.player_vel
+    assert abs(ctx.player_vel[1] - tank_jump.impulse * expected_direction[1]) < 1e-4, ctx.player_vel
+    assert abs(ctx.player_vel[2] - tank_jump.impulse * expected_direction[2]) < 1e-4, ctx.player_vel
+    print("test_server_jump_jets_use_tank_body_up_direction: PASSED")
+    return True
+
+
+def test_server_jump_jet_landing_guard_rejects_large_world_collision_projection():
+    """Jumpjet landing should not accept terrain-model side shoves as authority."""
+    server = WulframServer.__new__(WulframServer)
+    server.tick_rate_hz = 30.0
+    server.linear_damp_driving = 0.0
+    server.linear_damp_coasting = 0.0
+    server.turn_deadzone = 0.05
+    server.turn_sign = -1.0
+    server.up_axis = "z"
+    server.terrain = None
+    server.terrain_pitch_enabled = False
+    server.gravity = 0.0
+    server.ground_level = 0.0
+    server.world_bound = 100000.0
+    server.f32_physics = False
+    server.jump_jets_enabled = True
+    server.jump_jet_direction = "body"
+    server.jump_jet_collision_guard = True
+    server.jump_jet_collision_guard_xy = 1.0
+    server.jump_jet_collision_guard_zpop = 2.0
+    server.jump_jet_landing_clearance = 1.85
+    server.tank_suspension_enabled = False
+    server.weapon_energy_enabled = True
+    server.player_energy_max = 100.0
+    server._resolve_entity_world_collision = (
+        lambda ctx, px, py, pz, vx, vy, vz: (px - 4.0, py - 9.0, pz + 8.0, vx, vy, vz)
+    )
+    server._check_building_collisions = (
+        lambda ctx, px, py, pz, vx, vy: (px, py, vx, vy)
+    )
+
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    ctx.injected_input = (0.0, 0.0)
+    ctx.injected_jumpjet = 0.0
+    ctx.entity_type = EntityType.TANK
+    ctx.player_pos = (10.0, 20.0, 0.5)
+    ctx.player_vel = (0.0, 0.0, -40.0)
+    ctx.player_fuel = 33000.0
+    ctx.player_energy = 100.0
+    ctx.player_heading = 0.0
+    ctx.ground_level_override = None
+    ctx.player_pose = {}
+    ctx.jump_spawn_lockout = 0.0
+    ctx.jump_cooldown_remaining = 2.0
+    ctx.jump_prev_thrust_input = 0.0
+
+    server._update_player_position(ctx, dt_override=1.0 / 30.0)
+
+    guard = ctx.debug_last_controller_step["jump_jet_collision_guard"]
+    assert guard["applied"] is True, guard
+    assert guard["collision_xy"] > 9.0, guard
+    assert guard["landing_floor_applied"] is True, guard
+    assert abs(ctx.player_pos[0] - 10.0) < 1e-6, ctx.player_pos
+    assert abs(ctx.player_pos[1] - 20.0) < 1e-6, ctx.player_pos
+    assert abs(ctx.player_pos[2] - 1.85) < 1e-6, ctx.player_pos
+    assert ctx.player_vel == (0.0, 0.0, 0.0), ctx.player_vel
+    print("test_server_jump_jet_landing_guard_rejects_large_world_collision_projection: PASSED")
+    return True
+
+
+def test_server_tank_terrain_projection_guard_rejects_fast_straight_side_shove():
+    """Fast tank travel should not accept large terrain-model side projections."""
+    server = WulframServer.__new__(WulframServer)
+    server.tick_rate_hz = 30.0
+    server.linear_damp_driving = 0.0
+    server.linear_damp_coasting = 0.0
+    server.turn_deadzone = 0.05
+    server.turn_sign = -1.0
+    server.up_axis = "z"
+    server.terrain = None
+    server.terrain_pitch_enabled = False
+    server.gravity = 0.0
+    server.ground_level = 0.0
+    server.world_bound = 100000.0
+    server.f32_physics = False
+    server.jump_jets_enabled = True
+    server.jump_jet_direction = "body"
+    server.tank_terrain_projection_guard = True
+    server.tank_terrain_projection_guard_xy = 1.0
+    server.tank_terrain_projection_guard_zpop = 2.0
+    server.tank_terrain_projection_guard_min_clearance = 0.5
+    server.tank_suspension_enabled = False
+    server.weapon_energy_enabled = True
+    server.player_energy_max = 100.0
+    server._resolve_entity_world_collision = (
+        lambda ctx, px, py, pz, vx, vy, vz: (px, py - 8.75, pz, vx, vy, vz)
+    )
+    server._check_building_collisions = (
+        lambda ctx, px, py, pz, vx, vy: (px, py, vx, vy)
+    )
+
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    ctx.injected_input = (0.0, 0.0)
+    ctx.injected_jumpjet = 0.0
+    ctx.entity_type = EntityType.TANK
+    ctx.player_pos = (10.0, 20.0, 3.25)
+    ctx.player_vel = (25.0, 0.0, 0.0)
+    ctx.player_fuel = 33000.0
+    ctx.player_energy = 100.0
+    ctx.player_heading = 0.0
+    ctx.ground_level_override = None
+    ctx.player_pose = {}
+    ctx.jump_spawn_lockout = 0.0
+    ctx.jump_cooldown_remaining = 0.0
+    ctx.jump_prev_thrust_input = 0.0
+
+    server._update_player_position(ctx, dt_override=1.0 / 30.0)
+
+    guard = ctx.debug_last_controller_step["tank_terrain_projection_guard"]
+    assert guard["applied"] is True, guard
+    assert guard["collision_xy"] > 8.0, guard
+    assert guard["projection_clearance"] >= 3.0, guard
+    assert abs(ctx.player_pos[0] - guard["pre_world_collision_pos"][0]) < 1e-6, ctx.player_pos
+    assert abs(ctx.player_pos[1] - guard["pre_world_collision_pos"][1]) < 1e-6, ctx.player_pos
+    assert abs(ctx.player_pos[2] - guard["pre_world_collision_pos"][2]) < 1e-6, ctx.player_pos
+    assert ctx.player_vel == tuple(guard["pre_world_collision_vel"]), ctx.player_vel
+    print("test_server_tank_terrain_projection_guard_rejects_fast_straight_side_shove: PASSED")
+    return True
+
+
 def test_server_jump_jets_queue_remote_og_correction_burst():
     """Remote OG clients need correction bursts because OG has no local jump impulse."""
     server = WulframServer.__new__(WulframServer)
@@ -4400,7 +4717,8 @@ def test_server_jump_jets_queue_remote_og_correction_burst():
         entity_id=0x14EA,
     )
 
-    server._on_jump_jet_triggered(ctx, player_id=ctx.entity_id, impulse=45.0, new_vel_z=45.0)
+    tank_jump = JUMP_JET_CONFIGS[EntityType.TANK]
+    server._on_jump_jet_triggered(ctx, player_id=ctx.entity_id, impulse=tank_jump.impulse, new_vel_z=tank_jump.impulse)
 
     assert ctx.force_correction_once is True
     assert ctx.correction_burst_remaining == 11
@@ -4416,8 +4734,8 @@ def test_server_jump_jets_queue_remote_og_correction_burst():
     server._on_jump_jet_triggered(
         loopback_ctx,
         player_id=loopback_ctx.entity_id,
-        impulse=45.0,
-        new_vel_z=45.0,
+        impulse=tank_jump.impulse,
+        new_vel_z=tank_jump.impulse,
     )
 
     assert loopback_ctx.force_correction_once is False
@@ -5975,6 +6293,10 @@ def test_triangle_cbsp_contact_uses_node_split_normal():
     assert contact.cbsp_split_normal == (1.0, 0.0, 0.0), contact
     assert contact.terrain_face_normal == (0.0, 0.0, -1.0), contact
     assert contact.mesh_face_normal == (1.0, 0.0, 0.0), contact
+    assert contact.store_normal0 == (0.0, 0.0, -1.0), contact
+    assert contact.store_normal1 == (1.0, 0.0, 0.0), contact
+    assert contact.record_hit_source == "cbsp_leaf_clip_point", contact
+    assert contact.mesh_triangle_indices == (0, 1, 2), contact
     assert penetration > 0.0, penetration
     print("test_triangle_cbsp_contact_uses_node_split_normal: PASSED")
     return True
@@ -6031,6 +6353,595 @@ def test_triangle_cbsp_contact_uses_entity_bounding_radius_for_plane_reject():
     )
     assert contact is not None
     print("test_triangle_cbsp_contact_uses_entity_bounding_radius_for_plane_reject: PASSED")
+    return True
+
+
+def test_triangle_cbsp_mesh_vertex_probe_reports_embedded_vertex():
+    """Default-off CBSP mesh-vertex probe should return a mesh vertex, not a projected fallback point."""
+
+    class FlatTerrain:
+        cell_x = 1.0
+        cell_z = 1.0
+        world_w = 2.0
+        world_h = 2.0
+        num_x = 2
+        num_z = 2
+
+        @staticmethod
+        def _get_raw_height(cell_x, cell_y):
+            return 0.0
+
+    grid = TerrainGridCollision(FlatTerrain(), 0.0)
+    vertices = [
+        Vec3(0.25, 0.25, -0.001),
+        Vec3(0.8, 0.25, 0.2),
+        Vec3(0.25, 0.8, 0.2),
+    ]
+    tree = CBSPTree(
+        nodes=[
+            CBSPTreeNode(
+                radius=2.0,
+                half_extent_x=1.0,
+                half_extent_y=1.0,
+                half_extent_z=1.0,
+                center=Vec3(0.0, 0.0, 0.0),
+                triangles=[(0, 1, 2)],
+                split_normal=Vec3(1.0, 0.0, 0.0),
+                split_plane_d=0.0,
+                child_neg=-1,
+                child_pos=-1,
+            )
+        ],
+        root_index=0,
+    )
+
+    contact = grid._triangle_cbsp_mesh_vertex_contact(
+        (
+            (0.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0),
+        ),
+        vertices,
+        tree,
+    )
+    assert contact is not None
+    assert contact.position == (0.25, 0.25, -0.001), contact
+    assert contact.record_hit_source == "cbsp_mesh_vertex_inside_terrain_probe", contact
+    assert contact.mesh_triangle_indices == (0, 1, 2), contact
+    assert abs(contact.penetration - 0.01) <= 1e-6, contact.penetration
+    traversal_contact = grid._triangle_cbsp_mesh_vertex_contact(
+        (
+            (-1.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0),
+        ),
+        vertices,
+        CBSPTree(
+            nodes=[
+                CBSPTreeNode(
+                    radius=2.0,
+                    half_extent_x=1.0,
+                    half_extent_y=1.0,
+                    half_extent_z=1.0,
+                    center=Vec3(0.0, 0.0, -0.5),
+                    triangles=[(0, 1, 2)],
+                    split_normal=Vec3(1.0, 0.0, 0.0),
+                    split_plane_d=0.0,
+                    child_neg=-1,
+                    child_pos=-1,
+                )
+            ],
+            root_index=0,
+        ),
+        traversal_order=True,
+    )
+    assert traversal_contact is not None
+    assert traversal_contact.position == (0.25, 0.25, -0.001), traversal_contact
+    assert (
+        traversal_contact.record_hit_source
+        == "cbsp_mesh_vertex_inside_terrain_traversal_probe"
+    ), traversal_contact
+    print("test_triangle_cbsp_mesh_vertex_probe_reports_embedded_vertex: PASSED")
+    return True
+
+
+def test_triangle_cbsp_mesh_edge_terrain_plane_probe_reports_crossing_edge():
+    """Default-off mesh-edge probe should report a mesh edge crossing the terrain plane."""
+
+    class FlatTerrain:
+        cell_x = 1.0
+        cell_z = 1.0
+        world_w = 2.0
+        world_h = 2.0
+        num_x = 2
+        num_z = 2
+
+        @staticmethod
+        def _get_raw_height(cell_x, cell_y):
+            return 0.0
+
+    grid = TerrainGridCollision(FlatTerrain(), 0.0)
+    vertices = [
+        Vec3(0.25, 0.25, -0.1),
+        Vec3(0.75, 0.25, 0.1),
+        Vec3(0.25, 0.75, 0.1),
+    ]
+    tree = CBSPTree(
+        nodes=[
+            CBSPTreeNode(
+                radius=2.0,
+                half_extent_x=1.0,
+                half_extent_y=1.0,
+                half_extent_z=1.0,
+                center=Vec3(0.0, 0.0, 0.0),
+                triangles=[(0, 1, 2)],
+                split_normal=Vec3(1.0, 0.0, 0.0),
+                split_plane_d=0.0,
+                child_neg=-1,
+                child_pos=-1,
+            )
+        ],
+        root_index=0,
+    )
+
+    contact = grid._triangle_cbsp_mesh_edge_terrain_plane_contact(
+        (
+            (0.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0),
+        ),
+        vertices,
+        tree,
+    )
+
+    assert contact is not None
+    assert contact.position == (0.5, 0.25, 0.0), contact
+    assert contact.record_hit_source == "cbsp_mesh_edge_terrain_plane_probe_ab", contact
+    assert contact.mesh_triangle_indices == (0, 1, 2), contact
+    assert contact.store_normal0 == (0.0, 0.0, 1.0), contact
+    assert contact.store_normal1 == (1.0, 0.0, 0.0), contact
+    assert contact.cbsp_split_normal == (1.0, 0.0, 0.0), contact
+    assert contact.guess7_order == (1, 0, 2), contact
+    assert tuple(round(term, 6) for term in contact.guess7_terms) == (
+        0.25,
+        0.25,
+        0.5,
+    ), contact
+    print("test_triangle_cbsp_mesh_edge_terrain_plane_probe_reports_crossing_edge: PASSED")
+    return True
+
+
+def test_triangle_cbsp_mesh_edge_terrain_plane_probe_reports_second_tilted_fixture():
+    """A second static terrain fixture should use the same exact edge-intersect lane."""
+
+    class TiltedTerrain:
+        cell_x = 1.0
+        cell_z = 1.0
+        world_w = 2.0
+        world_h = 2.0
+        num_x = 2
+        num_z = 2
+
+        @staticmethod
+        def _get_raw_height(cell_x, cell_y):
+            return 0.0
+
+    grid = TerrainGridCollision(TiltedTerrain(), 0.0)
+    vertices = [
+        Vec3(0.25, 0.25, -0.1),
+        Vec3(0.75, 0.25, 0.3),
+        Vec3(0.25, 0.75, 0.3),
+    ]
+    tree = CBSPTree(
+        nodes=[
+            CBSPTreeNode(
+                radius=2.0,
+                half_extent_x=1.0,
+                half_extent_y=1.0,
+                half_extent_z=1.0,
+                center=Vec3(0.0, 0.0, 0.0),
+                triangles=[(0, 1, 2)],
+                split_normal=Vec3(0.0, 1.0, 0.0),
+                split_plane_d=0.0,
+                child_neg=-1,
+                child_pos=-1,
+            )
+        ],
+        root_index=0,
+    )
+
+    contact = grid._triangle_cbsp_mesh_edge_terrain_plane_contact(
+        (
+            (0.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            (0.0, 1.0, 0.2),
+        ),
+        vertices,
+        tree,
+    )
+
+    assert contact is not None
+    assert all(
+        abs(actual - expected) <= 1e-6
+        for actual, expected in zip(contact.position, (0.4375, 0.25, 0.05))
+    ), contact
+    assert contact.record_hit_source == "cbsp_mesh_edge_terrain_plane_probe_ab", contact
+    assert contact.mesh_triangle_indices == (0, 1, 2), contact
+    assert contact.store_normal1 == (0.0, 1.0, 0.0), contact
+    assert contact.guess7_order == (1, 0, 2), contact
+    assert all(term >= 0.0 for term in contact.guess7_terms), contact
+    print("test_triangle_cbsp_mesh_edge_terrain_plane_probe_reports_second_tilted_fixture: PASSED")
+    return True
+
+
+def test_triangle_cbsp_mesh_edge_terrain_plane_probe_preserves_endpoint_hit():
+    """The edge-plane lane should accept near/on-plane endpoints, not only sign crossings."""
+
+    class FlatTerrain:
+        cell_x = 1.0
+        cell_z = 1.0
+        world_w = 2.0
+        world_h = 2.0
+        num_x = 2
+        num_z = 2
+
+        @staticmethod
+        def _get_raw_height(cell_x, cell_y):
+            return 0.0
+
+    grid = TerrainGridCollision(FlatTerrain(), 0.0)
+    vertices = [
+        Vec3(0.25, 0.25, 0.1),
+        Vec3(0.75, 0.25, 0.0),
+        Vec3(0.25, 0.75, 0.2),
+    ]
+    tree = CBSPTree(
+        nodes=[
+            CBSPTreeNode(
+                radius=2.0,
+                half_extent_x=1.0,
+                half_extent_y=1.0,
+                half_extent_z=1.0,
+                center=Vec3(0.0, 0.0, 0.0),
+                triangles=[(0, 1, 2)],
+                split_normal=Vec3(0.0, 1.0, 0.0),
+                split_plane_d=0.0,
+                child_neg=-1,
+                child_pos=-1,
+            )
+        ],
+        root_index=0,
+    )
+
+    contact = grid._triangle_cbsp_mesh_edge_terrain_plane_contact(
+        (
+            (0.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0),
+        ),
+        vertices,
+        tree,
+    )
+
+    assert contact is not None
+    assert contact.position == (0.75, 0.25, 0.0), contact
+    assert contact.record_hit_source == "cbsp_mesh_edge_terrain_plane_probe_ab", contact
+    assert contact.edge_hit_kind == "end_on_terrain_plane", contact
+    assert contact.edge_t == 1.0, contact
+    assert contact.mesh_triangle_indices == (0, 1, 2), contact
+    assert contact.store_normal1 == (0.0, 1.0, 0.0), contact
+    assert contact.guess7_order == (1, 0, 2), contact
+    assert all(term >= 0.0 for term in contact.guess7_terms), contact
+    print("test_triangle_cbsp_mesh_edge_terrain_plane_probe_preserves_endpoint_hit: PASSED")
+    return True
+
+
+def test_triangle_cbsp_mesh_edge_endpoint_probe_prefers_deeper_node():
+    """Report-only endpoint probe should surface the deeper target-node endpoint row."""
+
+    class FlatTerrain:
+        cell_x = 1.0
+        cell_z = 1.0
+        world_w = 2.0
+        world_h = 2.0
+        num_x = 2
+        num_z = 2
+
+        @staticmethod
+        def _get_raw_height(cell_x, cell_y):
+            return 0.0
+
+    grid = TerrainGridCollision(FlatTerrain(), 0.0)
+    vertices = [
+        Vec3(0.25, 0.25, 0.0),
+        Vec3(0.75, 0.25, 0.2),
+        Vec3(0.25, 0.75, 0.2),
+        Vec3(0.4, 0.4, 0.0),
+        Vec3(0.2, 0.4, 0.2),
+        Vec3(0.8, 0.4, 0.2),
+    ]
+    tree = CBSPTree(
+        nodes=[
+            CBSPTreeNode(
+                radius=2.0,
+                half_extent_x=1.0,
+                half_extent_y=1.0,
+                half_extent_z=1.0,
+                center=Vec3(0.0, 0.0, 0.0),
+                triangles=[(0, 1, 2)],
+                split_normal=Vec3(1.0, 0.0, 0.0),
+                split_plane_d=0.0,
+                child_neg=-1,
+                child_pos=1,
+            ),
+            CBSPTreeNode(
+                radius=2.0,
+                half_extent_x=1.0,
+                half_extent_y=1.0,
+                half_extent_z=1.0,
+                center=Vec3(0.0, 0.0, 0.0),
+                triangles=[(3, 4, 5)],
+                split_normal=Vec3(0.0, 1.0, 0.0),
+                split_plane_d=0.0,
+                child_neg=-1,
+                child_pos=-1,
+            ),
+        ],
+        root_index=0,
+    )
+
+    contact = grid._triangle_cbsp_mesh_edge_terrain_plane_contact(
+        (
+            (0.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0),
+        ),
+        vertices,
+        tree,
+        endpoint_only=True,
+        prefer_deep_endpoint=True,
+    )
+
+    assert contact is not None
+    assert contact.position == (0.4, 0.4, 0.0), contact
+    assert contact.record_hit_source == "cbsp_mesh_edge_endpoint_terrain_plane_probe_ab", contact
+    assert contact.mesh_triangle_indices == (3, 4, 5), contact
+    assert contact.cbsp_split_normal == (0.0, 1.0, 0.0), contact
+    assert contact.edge_hit_kind == "start_on_terrain_plane", contact
+    assert contact.node_index == 1, contact
+    assert contact.node_depth == 1, contact
+    assert abs(contact.node_mesh_normal_angle_deg) <= 1e-6, contact
+    assert contact.guess7_order == (1, 0, 2), contact
+    print("test_triangle_cbsp_mesh_edge_endpoint_probe_prefers_deeper_node: PASSED")
+    return True
+
+
+def test_triangle_cbsp_node_plane_vertex_probe_uses_split_normal():
+    """Default-off node-plane probe should use the CBSP node normal, not mesh face normal."""
+
+    class FlatTerrain:
+        cell_x = 1.0
+        cell_z = 1.0
+        world_w = 2.0
+        world_h = 2.0
+        num_x = 2
+        num_z = 2
+
+        @staticmethod
+        def _get_raw_height(cell_x, cell_y):
+            return 0.0
+
+    grid = TerrainGridCollision(FlatTerrain(), 0.0)
+    vertices = [
+        Vec3(0.25, 0.25, -0.02),
+        Vec3(0.75, 0.25, 0.1),
+        Vec3(0.25, 0.75, 0.1),
+    ]
+    tree = CBSPTree(
+        nodes=[
+            CBSPTreeNode(
+                radius=2.0,
+                half_extent_x=1.0,
+                half_extent_y=1.0,
+                half_extent_z=1.0,
+                center=Vec3(0.0, 0.0, -0.5),
+                triangles=[(0, 1, 2)],
+                split_normal=Vec3(1.0, 0.0, 0.0),
+                split_plane_d=-0.25,
+                child_neg=-1,
+                child_pos=-1,
+            )
+        ],
+        root_index=0,
+    )
+
+    contact = grid._triangle_cbsp_node_plane_vertex_contact(
+        (
+            (0.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0),
+        ),
+        vertices,
+        tree,
+    )
+
+    assert contact is not None
+    assert contact.position == (0.25, 0.25, 0.0), contact
+    assert contact.store_normal0 == (0.0, 0.0, 1.0), contact
+    assert contact.store_normal1 == (1.0, 0.0, 0.0), contact
+    assert contact.record_hit_source == "cbsp_node_plane_vertex_probe", contact
+
+    traversal_contact = grid._triangle_cbsp_node_plane_vertex_contact(
+        (
+            (-1.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0),
+        ),
+        vertices,
+        tree,
+        traversal_order=True,
+    )
+    assert traversal_contact is not None
+    assert traversal_contact.record_hit_source == "cbsp_node_plane_vertex_traversal_probe"
+    print("test_triangle_cbsp_node_plane_vertex_probe_uses_split_normal: PASSED")
+    return True
+
+
+def test_triangle_cbsp_strict_probe_skips_heuristic_vertex_fallback():
+    """Strict CBSP probe should report only decompile leaf/edge-triangle hits."""
+
+    class FlatTerrain:
+        cell_x = 1.0
+        cell_z = 1.0
+        world_w = 2.0
+        world_h = 2.0
+        num_x = 2
+        num_z = 2
+
+        @staticmethod
+        def _get_raw_height(cell_x, cell_y):
+            return 0.0
+
+    grid = TerrainGridCollision(FlatTerrain(), 0.0)
+    vertices = [
+        Vec3(0.25, 0.25, -0.1),
+        Vec3(0.8, 0.25, 0.2),
+        Vec3(0.25, 0.8, 0.2),
+    ]
+    tree = CBSPTree(
+        nodes=[
+            CBSPTreeNode(
+                radius=2.0,
+                half_extent_x=1.0,
+                half_extent_y=1.0,
+                half_extent_z=1.0,
+                center=Vec3(0.0, 0.0, 0.0),
+                triangles=[(0, 1, 2)],
+                split_normal=Vec3(1.0, 0.0, 0.0),
+                split_plane_d=0.0,
+                child_neg=-1,
+                child_pos=-1,
+            )
+        ],
+        root_index=0,
+    )
+    terrain_tri = (
+        (-1.0, 0.0, 0.0),
+        (1.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+    )
+
+    default_contact = grid._triangle_cbsp_contact(
+        terrain_tri,
+        vertices,
+        tree,
+        2.0,
+    )
+    strict_contact = grid._triangle_cbsp_contact(
+        terrain_tri,
+        vertices,
+        tree,
+        2.0,
+        include_heuristic_fallbacks=False,
+    )
+
+    assert default_contact is not None
+    assert default_contact.record_hit_source == "cbsp_vertex_contact", default_contact
+    assert strict_contact is None, strict_contact
+    print("test_triangle_cbsp_strict_probe_skips_heuristic_vertex_fallback: PASSED")
+    return True
+
+
+def test_triangle_cbsp_guess7_order_probe_rejects_target_point_shortcut():
+    """Default-off GUESS7 probe should reject the old non-point-dependent shortcut."""
+
+    class FlatTerrain:
+        cell_x = 1.0
+        cell_z = 1.0
+        world_w = 2.0
+        world_h = 2.0
+        num_x = 2
+        num_z = 2
+
+        @staticmethod
+        def _get_raw_height(cell_x, cell_y):
+            return 0.0
+
+    grid = TerrainGridCollision(FlatTerrain(), 0.0)
+    point = (5.920485, -3.373555, -1.851819)
+    vertices = [
+        Vec3(5.934570, -3.314636, -1.856628),
+        Vec3(5.934570, -1.390167, -1.856628),
+        Vec3(6.796585, -0.727112, -1.193542),
+    ]
+    split_normal = Vec3(0.609709, 0.0, -0.792625)
+    tree = CBSPTree(
+        nodes=[
+            CBSPTreeNode(
+                radius=8.0,
+                half_extent_x=4.0,
+                half_extent_y=4.0,
+                half_extent_z=4.0,
+                center=Vec3(5.0, -2.0, -1.5),
+                triangles=[(0, 1, 2)],
+                split_normal=split_normal,
+                split_plane_d=-(
+                    split_normal.x * point[0]
+                    + split_normal.y * point[1]
+                    + split_normal.z * point[2]
+                ),
+                child_neg=-1,
+                child_pos=-1,
+            )
+        ],
+        root_index=0,
+    )
+    tri_local = (
+        (
+            point[0] - split_normal.x,
+            point[1] - 1.0,
+            point[2] - split_normal.z,
+        ),
+        (
+            point[0] + split_normal.x,
+            point[1] + 1.0,
+            point[2] + split_normal.z,
+        ),
+        (6.5, -2.0, -1.0),
+    )
+
+    strict_contact = grid._triangle_cbsp_contact(
+        tri_local,
+        vertices,
+        tree,
+        8.0,
+        include_heuristic_fallbacks=False,
+    )
+    guess7_contact = grid._triangle_cbsp_contact(
+        tri_local,
+        vertices,
+        tree,
+        8.0,
+        include_heuristic_fallbacks=False,
+        point_inside_mode="guess7_order_probe",
+    )
+
+    assert strict_contact is None, strict_contact
+    assert guess7_contact is None, guess7_contact
+
+    ordered = (
+        (vertices[0].x, vertices[0].y, vertices[0].z),
+        (vertices[1].x, vertices[1].y, vertices[1].z),
+        (vertices[2].x, vertices[2].y, vertices[2].z),
+    )
+    normal = _normalize3(_cross3(_sub3(ordered[1], ordered[0]), _sub3(ordered[2], ordered[0])))
+    terms = TerrainGridCollision._guess7_point_in_triangle_terms(point, ordered, normal)
+    assert tuple(round(term, 6) for term in terms) == (
+        0.015842,
+        0.042776,
+        -2.151564,
+    ), terms
+    print("test_triangle_cbsp_guess7_order_probe_rejects_target_point_shortcut: PASSED")
     return True
 
 
@@ -6697,7 +7608,19 @@ def _fake_tank_collision_server():
                     nodes=[object()],
                     root=SimpleNamespace(radius=7.5),
                 ),
-            )
+            ),
+            "tank_1_s": SimpleNamespace(
+                collision_mesh=SimpleNamespace(
+                    vertices=[
+                        SimpleNamespace(x=-0.5, y=-1.0, z=-1.5),
+                        SimpleNamespace(x=0.5, y=1.0, z=2.0),
+                    ]
+                ),
+                cbsp_tree=SimpleNamespace(
+                    nodes=[object()],
+                    root=SimpleNamespace(radius=3.75),
+                ),
+            ),
         },
     )
     return server
@@ -6754,6 +7677,30 @@ def test_entity_world_collision_model_entity_origin_can_be_requested():
         else:
             os.environ["WULFRAM_ENTITY_COLLISION_MODEL_ORIGIN"] = old_env
     print("test_entity_world_collision_model_entity_origin_can_be_requested: PASSED")
+    return True
+
+
+def test_entity_world_collision_model_simplified_variant_is_opt_in():
+    """Default-off model variant can select the OG-style simplified `_s` CBSP mesh."""
+    env_key = "WULFRAM_ENTITY_COLLISION_MODEL_VARIANT"
+    old_env = os.environ.get(env_key)
+    try:
+        os.environ[env_key] = "simplified"
+        server = _fake_tank_collision_server()
+        ctx = _fake_tank_collision_context()
+
+        vertices, _tree, radius, z_lift = server._get_entity_world_collision_model(ctx)
+
+        assert len(vertices) == 2, vertices
+        assert abs(radius - 3.75) < 1e-6, radius
+        assert abs(z_lift - 1.5) < 1e-6, z_lift
+        assert abs(vertices[0].x + 0.5) < 1e-6, vertices[0]
+    finally:
+        if old_env is None:
+            os.environ.pop(env_key, None)
+        else:
+            os.environ[env_key] = old_env
+    print("test_entity_world_collision_model_simplified_variant_is_opt_in: PASSED")
     return True
 
 
@@ -7103,6 +8050,477 @@ def test_entity_world_collision_reference_pose_pair_record_contact_can_apply_whe
     return True
 
 
+def test_entity_world_collision_reference_pose_pair_response_preserves_position():
+    """Reference-pose pair response should apply only velocity delta at current pose."""
+    env_keys = [
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK",
+        "WULFRAM_ENTITY_TERRAIN_REFERENCE_POSE_CONTACT",
+        "WULFRAM_ENTITY_TERRAIN_REFERENCE_POSE_PAIR_RESPONSE",
+        "WULFRAM_ENTITY_TERRAIN_REFERENCE_POSE_PAIR_RESPONSE_MAX_DISTANCE",
+        "WULFRAM_ENTITY_TERRAIN_REFERENCE_POSE_CONTACT_ORDER",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_TIMED_CONTACT",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT_SELECTION",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_NORMAL_SOURCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VELOCITY_DELTA",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VERTICAL_DELTA",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE",
+    ]
+    old_env = {key: os.environ.get(key) for key in env_keys}
+    try:
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK", None)
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_REFERENCE_POSE_CONTACT", None)
+        os.environ["WULFRAM_ENTITY_TERRAIN_REFERENCE_POSE_PAIR_RESPONSE"] = "apply"
+        os.environ[
+            "WULFRAM_ENTITY_TERRAIN_REFERENCE_POSE_PAIR_RESPONSE_MAX_DISTANCE"
+        ] = "3.0"
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_REFERENCE_POSE_CONTACT_ORDER", None)
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT", None)
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_TIMED_CONTACT"] = "0"
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT_SELECTION", None)
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_NORMAL_SOURCE"] = "mesh"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE"] = "mesh"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VELOCITY_DELTA"] = "0.5"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VERTICAL_DELTA"] = "0.5"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE"] = "closing_velocity"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE"] = "preserve"
+
+        calls = []
+
+        def fake_model_collision(center, *args, **kwargs):
+            calls.append((tuple(center), kwargs.get("contact_selection")))
+            if (
+                abs(center[2] - 10.0) < 1e-6
+                and 0.0 <= center[0] < 9.0
+            ):
+                return TerrainContact(
+                    position=(center[0], 0.0, 6.0),
+                    normal=(0.0, 0.0, 1.0),
+                    penetration=4.0,
+                    sector_index=2,
+                    cell=(7, 8),
+                    normal_source="entity_cbsp_split",
+                    cbsp_split_normal=(0.0, 0.0, 1.0),
+                    terrain_face_normal=(0.0, 0.0, 1.0),
+                    mesh_face_normal=(0.0, 0.0, 1.0),
+                    entity_radial_normal=(0.6, 0.0, 0.8),
+                )
+            return None
+
+        server = WulframServer.__new__(WulframServer)
+        server._terrain_grid_collision = SimpleNamespace(
+            test_box_collision=lambda *args, **kwargs: None,
+            test_model_collision=fake_model_collision,
+        )
+        server._get_entity_world_half_extents = lambda ctx: (2.0, 2.0, 3.0)
+        server._get_entity_world_collision_model = lambda ctx: (
+            [],
+            SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=7.5)),
+            7.5,
+            3.0,
+        )
+        server._get_entity_dirty_threshold_sq = lambda ctx, half_extents: 999999.0
+
+        ctx = _fake_tank_collision_context()
+        ctx.player_heading = 0.0
+        ctx.player_pos = (0.0, 0.0, 10.0)
+        ctx.world_collision_ref_pos = (0.0, 0.0, 10.0)
+        ctx.spring_body_matrix = _matrix3_from_euler_xyz(0.0, 0.0, 0.0)
+
+        result = server._resolve_entity_world_collision(
+            ctx,
+            10.0,
+            0.0,
+            10.0,
+            10.0,
+            0.0,
+            -10.0,
+            pre_pos=(0.0, 0.0, 10.0),
+            pre_vel=(2.0, 0.0, -4.0),
+            dt=1.0 / 30.0,
+        )
+
+        px, py, pz, _vx, _vy, vz = result
+        assert (px, py, pz) == (10.0, 0.0, 10.0), result
+        assert vz > -10.0, result
+        assert vz - (-10.0) <= 0.500001, result
+        debug = ctx.debug_last_motion_collision
+        assert debug["kind"] == "terrain_reference_pose_pair_response", debug
+        assert debug["pair_record_contact_reason"] == "reference_pose_pair_response", debug
+        assert debug["reference_pose_pair_response_preserved_position"] is True, debug
+        assert debug["reference_pose_pair_response_label"] == "pre_to_current_75", debug
+        assert debug["reference_pose_pair_response_max_distance"] == 3.0, debug
+        assert abs(debug["reference_pose_pair_response_current_distance"] - 2.5) < 1e-6, debug
+        probe = ctx.debug_last_terrain_contact_probe
+        assert probe["reference_pose_probe_enabled"] is True, probe
+        assert probe["reference_pose_pair_response_enabled"] is True, probe
+        response = probe["reference_pose_pair_response"]
+        assert response["applied"] is True, response
+        assert response["applied_to_current_state"] is True, response
+        assert response["label"] == "pre_to_current_75", response
+        assert response["max_distance"] == 3.0, response
+        assert abs(response["current_distance"] - 2.5) < 1e-6, response
+        assert abs(response["current_xy_distance"] - 2.5) < 1e-6, response
+        assert response["current_z_delta"] == 0.0, response
+        assert response["current_pos"] == (10.0, 0.0, 10.0), response
+        assert response["velocity_before"] == (8.0, 0.0, -8.5), response
+        assert response["velocity_fraction"] == 0.75, response
+        assert response["velocity_source"] == "pre_to_current_fraction", response
+        assert response["final_vel"][2] == vz, response
+        assert any(
+            call == ((7.5, 0.0, 10.0), "upward_min_depth")
+            for call in calls
+        ), calls
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    print(
+        "test_entity_world_collision_reference_pose_pair_response_preserves_position: PASSED"
+    )
+    return True
+
+
+def test_entity_world_collision_cached_pair_record_contact_can_bridge_lifted_clear_when_enabled():
+    """Opt-in cached pair-record contact can replay a short-lived OG-style world pair."""
+    env_keys = [
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CACHE_CONTACT",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CACHE_MAX_AGE_STEPS",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CACHE_MAX_DISTANCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_TIMED_CONTACT",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT_SELECTION",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_NORMAL_SOURCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE",
+    ]
+    old_env = {key: os.environ.get(key) for key in env_keys}
+    try:
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK", None)
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CACHE_CONTACT"] = "1"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CACHE_MAX_AGE_STEPS"] = "4"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CACHE_MAX_DISTANCE"] = "3.0"
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT", None)
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_TIMED_CONTACT"] = "0"
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT_SELECTION", None)
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_NORMAL_SOURCE"] = "mesh"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE"] = "mesh"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE"] = "closing_velocity"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE"] = "preserve"
+
+        calls = []
+
+        def fake_model_collision(center, *args, **kwargs):
+            calls.append((tuple(center), kwargs.get("contact_selection")))
+            if abs(center[2]) < 1e-6 and center[0] < 0.5:
+                return TerrainContact(
+                    position=(0.0, 0.0, -2.0),
+                    normal=(0.0, 0.0, 1.0),
+                    penetration=2.0,
+                    sector_index=2,
+                    cell=(7, 8),
+                    normal_source="entity_cbsp_split",
+                    cbsp_split_normal=(0.0, 0.0, 1.0),
+                    terrain_face_normal=(0.0, 0.0, 1.0),
+                    mesh_face_normal=(0.0, 0.0, 1.0),
+                    entity_radial_normal=(0.0, 0.0, 1.0),
+                )
+            return None
+
+        server = WulframServer.__new__(WulframServer)
+        server._terrain_grid_collision = SimpleNamespace(
+            test_box_collision=lambda *args, **kwargs: None,
+            test_model_collision=fake_model_collision,
+        )
+        server._get_entity_world_half_extents = lambda ctx: (2.0, 2.0, 3.0)
+        server._get_entity_world_collision_model = lambda ctx: (
+            [],
+            SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=7.5)),
+            7.5,
+            3.0,
+        )
+        server._get_entity_dirty_threshold_sq = lambda ctx, half_extents: 999999.0
+
+        ctx = _fake_tank_collision_context()
+        ctx.player_heading = 0.0
+        ctx.player_pos = (0.0, 0.0, 0.0)
+        ctx.world_collision_ref_pos = (0.0, 0.0, 0.0)
+        ctx.spring_body_matrix = _matrix3_from_euler_xyz(0.0, 0.0, 0.0)
+
+        _px, _py, _pz, _vx, _vy, vz = server._resolve_entity_world_collision(
+            ctx,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            -1.0,
+            pre_pos=(0.0, 0.0, 0.0),
+            pre_vel=(0.0, 0.0, -1.0),
+            dt=1.0 / 30.0,
+        )
+        first_debug = ctx.debug_last_motion_collision
+        assert first_debug["kind"] == "terrain_pair_record_contact", first_debug
+        assert first_debug["pair_record_contact_reason"] == "lifted_clear_raw_origin_contact", first_debug
+        assert vz > -1.0, (vz, first_debug)
+
+        _px, _py, pz, _vx, _vy, vz = server._resolve_entity_world_collision(
+            ctx,
+            1.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            -1.0,
+            pre_pos=(0.0, 0.0, 0.0),
+            pre_vel=(0.0, 0.0, -1.0),
+            dt=1.0 / 30.0,
+        )
+
+        debug = ctx.debug_last_motion_collision
+        assert debug["kind"] == "terrain_cached_pair_record_contact", debug
+        assert debug["cached_pair_record_contact"] is True, debug
+        assert debug["pair_record_contact_reason"] == "cached_pair_record_contact", debug
+        assert debug["pair_record_cached_contact_age_steps"] == 1, debug
+        assert debug["pair_record_cached_contact_distance"] < 3.0, debug
+        assert pz >= 0.0 and vz > -1.0, (pz, vz, debug)
+        probe = ctx.debug_last_terrain_contact_probe
+        assert probe["pair_record_contact_reject"] == "no_raw_origin_contact", probe
+        assert probe["pair_record_cached_contact_reject"] == "", probe
+        assert any(call[1] == "upward_min_depth" for call in calls), calls
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    print(
+        "test_entity_world_collision_cached_pair_record_contact_can_bridge_lifted_clear_when_enabled: PASSED"
+    )
+    return True
+
+
+def test_entity_world_collision_deferred_prestep_pair_record_contact_when_enabled():
+    """Opt-in pre-step pair-record contact should resolve at the start pose then step forward."""
+    env_keys = [
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_TIMED_CONTACT",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTINUE_REMAINING",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DEFERRED_PRESTEP",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DEFERRED_PRESTEP_MAX_DISTANCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT_SELECTION",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_NORMAL_SOURCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE",
+    ]
+    old_env = {key: os.environ.get(key) for key in env_keys}
+    try:
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK", None)
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT", None)
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_TIMED_CONTACT"] = "0"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTINUE_REMAINING"] = "0"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DEFERRED_PRESTEP"] = "1"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DEFERRED_PRESTEP_MAX_DISTANCE"] = "2.0"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT_SELECTION"] = "upward_min_depth"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_NORMAL_SOURCE"] = "mesh"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE"] = "mesh"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE"] = "closing_velocity"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE"] = "preserve"
+
+        calls = []
+
+        def fake_model_collision(center, *args, **kwargs):
+            calls.append((tuple(center), kwargs.get("contact_selection")))
+            if abs(center[0]) < 1e-6 and abs(center[2]) < 1e-6:
+                return TerrainContact(
+                    position=(0.0, 0.0, -2.0),
+                    normal=(0.0, 0.0, 1.0),
+                    penetration=1.0,
+                    sector_index=2,
+                    cell=(7, 8),
+                    normal_source="entity_cbsp_split",
+                    cbsp_split_normal=(0.0, 0.0, 1.0),
+                    terrain_face_normal=(0.0, 0.0, 1.0),
+                    mesh_face_normal=(0.0, 0.0, 1.0),
+                    entity_radial_normal=(0.0, 0.0, 1.0),
+                )
+            return None
+
+        server = WulframServer.__new__(WulframServer)
+        server._terrain_grid_collision = SimpleNamespace(
+            test_box_collision=lambda *args, **kwargs: None,
+            test_model_collision=fake_model_collision,
+        )
+        server._get_entity_world_half_extents = lambda ctx: (2.0, 2.0, 3.0)
+        server._get_entity_world_collision_model = lambda ctx: (
+            [],
+            SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=7.5)),
+            7.5,
+            3.0,
+        )
+        server._get_entity_dirty_threshold_sq = lambda ctx, half_extents: 999999.0
+
+        ctx = _fake_tank_collision_context()
+        ctx.player_heading = 0.0
+        ctx.player_pos = (0.0, 0.0, 0.0)
+        ctx.world_collision_ref_pos = (0.0, 0.0, 0.0)
+        ctx.spring_body_matrix = _matrix3_from_euler_xyz(0.0, 0.0, 0.0)
+
+        px, _py, pz, _vx, _vy, vz = server._resolve_entity_world_collision(
+            ctx,
+            1.0,
+            0.0,
+            -1.0,
+            1.0,
+            0.0,
+            -1.0,
+            pre_pos=(0.0, 0.0, 0.0),
+            pre_vel=(1.0, 0.0, -1.0),
+            dt=1.0,
+        )
+
+        debug = ctx.debug_last_motion_collision
+        assert debug["kind"] == "terrain_deferred_prestep_pair_record_contact", debug
+        assert debug["deferred_prestep_pair_record_contact"] is True, debug
+        assert debug["pair_record_contact_reason"] == "deferred_prestep_pair_record_contact", debug
+        assert debug["pair_record_deferred_prestep_pos"] == (0.0, 0.0, 0.0), debug
+        assert debug["pair_record_deferred_prestep_endpoint_pos"] == (1.0, 0.0, -1.0), debug
+        assert debug["pair_record_deferred_prestep_remaining_time_s"] == 1.0, debug
+        assert debug["contact_events"][0]["pair_record_deferred_prestep_contact"] is True, debug
+        assert px > 0.9 and pz > -1.0 and vz > -1.0, (px, pz, vz, debug)
+        probe = ctx.debug_last_terrain_contact_probe
+        assert probe["pair_record_contact_reject"] == "no_raw_origin_contact", probe
+        assert probe["pair_record_deferred_prestep_reject"] == "", probe
+        assert probe["pair_record_deferred_prestep_contact"]["contact_cell"] == (7, 8), probe
+        assert any(call == ((0.0, 0.0, 0.0), "upward_min_depth") for call in calls), calls
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    print(
+        "test_entity_world_collision_deferred_prestep_pair_record_contact_when_enabled: PASSED"
+    )
+    return True
+
+
+def test_entity_world_collision_deferred_prestep_pair_record_probe_is_read_only():
+    """Read-only pre-step pair-record probe should report contact without resolving it."""
+    env_keys = [
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_TIMED_CONTACT",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTINUE_REMAINING",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DEFERRED_PRESTEP",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DEFERRED_PRESTEP_PROBE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DEFERRED_PRESTEP_MAX_DISTANCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT_SELECTION",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_NORMAL_SOURCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE",
+    ]
+    old_env = {key: os.environ.get(key) for key in env_keys}
+    try:
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK", None)
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT", None)
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_TIMED_CONTACT"] = "0"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTINUE_REMAINING"] = "0"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DEFERRED_PRESTEP"] = "0"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DEFERRED_PRESTEP_PROBE"] = "1"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DEFERRED_PRESTEP_MAX_DISTANCE"] = "2.0"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT_SELECTION"] = "upward_min_depth"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_NORMAL_SOURCE"] = "mesh"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE"] = "mesh"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE"] = "closing_velocity"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE"] = "preserve"
+
+        calls = []
+
+        def fake_model_collision(center, *args, **kwargs):
+            calls.append((tuple(center), kwargs.get("contact_selection")))
+            if abs(center[0]) < 1e-6 and abs(center[2]) < 1e-6:
+                return TerrainContact(
+                    position=(0.0, 0.0, -2.0),
+                    normal=(0.0, 0.0, 1.0),
+                    penetration=1.0,
+                    sector_index=2,
+                    cell=(7, 8),
+                    normal_source="entity_cbsp_split",
+                    cbsp_split_normal=(0.0, 0.0, 1.0),
+                    terrain_face_normal=(0.0, 0.0, 1.0),
+                    mesh_face_normal=(0.0, 0.0, 1.0),
+                    entity_radial_normal=(0.0, 0.0, 1.0),
+                )
+            return None
+
+        server = WulframServer.__new__(WulframServer)
+        server._terrain_grid_collision = SimpleNamespace(
+            test_box_collision=lambda *args, **kwargs: None,
+            test_model_collision=fake_model_collision,
+        )
+        server._get_entity_world_half_extents = lambda ctx: (2.0, 2.0, 3.0)
+        server._get_entity_world_collision_model = lambda ctx: (
+            [],
+            SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=7.5)),
+            7.5,
+            3.0,
+        )
+        server._get_entity_dirty_threshold_sq = lambda ctx, half_extents: 999999.0
+
+        ctx = _fake_tank_collision_context()
+        ctx.player_heading = 0.0
+        ctx.player_pos = (0.0, 0.0, 0.0)
+        ctx.world_collision_ref_pos = (0.0, 0.0, 0.0)
+        ctx.spring_body_matrix = _matrix3_from_euler_xyz(0.0, 0.0, 0.0)
+
+        result = server._resolve_entity_world_collision(
+            ctx,
+            1.0,
+            0.0,
+            -1.0,
+            1.0,
+            0.0,
+            -1.0,
+            pre_pos=(0.0, 0.0, 0.0),
+            pre_vel=(1.0, 0.0, -1.0),
+            dt=1.0,
+        )
+
+        assert result == (1.0, 0.0, -1.0, 1.0, 0.0, -1.0), result
+        assert getattr(ctx, "debug_last_motion_collision", {}) == {}, (
+            getattr(ctx, "debug_last_motion_collision", {})
+        )
+        probe = ctx.debug_last_terrain_contact_probe
+        assert probe["pair_record_contact_reject"] == "no_raw_origin_contact", probe
+        assert probe["pair_record_deferred_prestep_enabled"] is False, probe
+        assert probe["pair_record_deferred_prestep_probe_enabled"] is True, probe
+        assert probe["pair_record_deferred_prestep_reject"] == "", probe
+        assert probe["pair_record_deferred_prestep_distance"] == 1.4142135623730951, probe
+        assert probe["pair_record_deferred_prestep_pos"] == (0.0, 0.0, 0.0), probe
+        assert probe["pair_record_deferred_prestep_contact"]["contact_cell"] == (7, 8), probe
+        assert any(call == ((0.0, 0.0, 0.0), "upward_min_depth") for call in calls), calls
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    print(
+        "test_entity_world_collision_deferred_prestep_pair_record_probe_is_read_only: PASSED"
+    )
+    return True
+
+
 def test_entity_world_collision_pair_record_contact_can_continue_remaining_step_when_enabled():
     """Opt-in direct pair-record contacts can apply at estimated TOI then step the remainder."""
     env_keys = [
@@ -7309,6 +8727,964 @@ def test_entity_world_collision_pair_record_continue_sweeps_transient_contact():
     return True
 
 
+def test_entity_world_collision_pair_record_schedule_probe_reports_without_applying():
+    """Default-off schedule probe should report interval contact without changing motion."""
+    env_keys = [
+        "WULFRAM_ENTITY_TERRAIN_CONTACT_SWEEP_SCAN_STEPS",
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_TIMED_CONTACT",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTINUE_REMAINING",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_SCHEDULE_PROBE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT_SELECTION",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_NORMAL_SOURCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE",
+    ]
+    old_env = {key: os.environ.get(key) for key in env_keys}
+    try:
+        os.environ["WULFRAM_ENTITY_TERRAIN_CONTACT_SWEEP_SCAN_STEPS"] = "9"
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK", None)
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT", None)
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_TIMED_CONTACT"] = "0"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTINUE_REMAINING"] = "0"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_SCHEDULE_PROBE"] = "1"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT_SELECTION"] = "upward_min_depth"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_NORMAL_SOURCE"] = "mesh"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE"] = "mesh"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE"] = "closing_velocity"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE"] = "preserve"
+
+        def fake_model_collision(center, *args, **kwargs):
+            if 0.45 <= center[0] <= 0.55:
+                return TerrainContact(
+                    position=(center[0], 0.0, -2.0),
+                    normal=(0.0, 0.0, 1.0),
+                    penetration=1.0,
+                    sector_index=2,
+                    cell=(7, 8),
+                    normal_source="entity_cbsp_split",
+                    cbsp_split_normal=(0.0, 0.0, 1.0),
+                    terrain_face_normal=(0.0, 0.0, 1.0),
+                    mesh_face_normal=(0.0, 0.0, 1.0),
+                    entity_radial_normal=(0.0, 0.0, 1.0),
+                )
+            return None
+
+        server = WulframServer.__new__(WulframServer)
+        server._terrain_grid_collision = SimpleNamespace(
+            test_box_collision=lambda *args, **kwargs: None,
+            test_model_collision=fake_model_collision,
+        )
+        server._get_entity_world_half_extents = lambda ctx: (2.0, 2.0, 3.0)
+        server._get_entity_world_collision_model = lambda ctx: (
+            [],
+            SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=7.5)),
+            7.5,
+            3.0,
+        )
+        server._get_entity_dirty_threshold_sq = lambda ctx, half_extents: 999999.0
+
+        ctx = _fake_tank_collision_context()
+        ctx.player_heading = 0.0
+        ctx.player_pos = (0.0, 0.0, 0.0)
+        ctx.world_collision_ref_pos = (0.0, 0.0, 0.0)
+        ctx.spring_body_matrix = _matrix3_from_euler_xyz(0.0, 0.0, 0.0)
+
+        result = server._resolve_entity_world_collision(
+            ctx,
+            1.0,
+            0.0,
+            -1.0,
+            1.0,
+            0.0,
+            -1.0,
+            pre_pos=(0.0, 0.0, 0.0),
+            pre_vel=(1.0, 0.0, -1.0),
+            dt=1.0,
+        )
+
+        assert result == (1.0, 0.0, -1.0, 1.0, 0.0, -1.0), result
+        assert getattr(ctx, "debug_last_motion_collision", {}) == {}
+        probe = ctx.debug_last_terrain_contact_probe
+        assert probe["pair_record_schedule_probe_enabled"] is True, probe
+        assert probe["pair_record_continue_remaining_enabled"] is False, probe
+        assert probe["pair_record_schedule_probe_result"] == "interval_contact", probe
+        assert 0.44 <= probe["pair_record_schedule_collision_time_s"] <= 0.46, probe
+        assert probe["pair_record_schedule_decompile_pool_model"] == (
+            "CollisionPairPool_30_bucket_time_order"
+        ), probe
+        assert probe["pair_record_schedule_step_dt_s"] == 1.0, probe
+        assert probe["pair_record_schedule_bucket_count"] == 30, probe
+        assert probe["pair_record_schedule_bucket_rate_hz"] == 30.0, probe
+        assert probe["pair_record_schedule_bucket_index"] == 13, probe
+        assert 0.433 <= probe["pair_record_schedule_bucket_start_s"] <= 0.434, probe
+        assert 0.466 <= probe["pair_record_schedule_bucket_end_s"] <= 0.467, probe
+        assert probe[
+            "pair_record_schedule_resolve_remaining_to_tick_end_s"
+        ] == probe["pair_record_schedule_remaining_time_s"], probe
+        assert probe["pair_record_schedule_contact_sweep_scan"] is True, probe
+        assert probe["pair_record_schedule_contact"]["contact_cell"] == (7, 8), probe
+        assert "pair_record_continue_probe_result" not in probe, probe
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    print(
+        "test_entity_world_collision_pair_record_schedule_probe_reports_without_applying: PASSED"
+    )
+    return True
+
+
+def test_entity_world_collision_spatial_ref_schedule_probe_reports_without_applying():
+    """Spatial-reference schedule probe should report from ref pose without response."""
+    env_keys = [
+        "WULFRAM_ENTITY_TERRAIN_CONTACT_SWEEP_SCAN_STEPS",
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_TIMED_CONTACT",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTINUE_REMAINING",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_SCHEDULE_PROBE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_SPATIAL_REF_SCHEDULE_PROBE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT_SELECTION",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_NORMAL_SOURCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE",
+    ]
+    old_env = {key: os.environ.get(key) for key in env_keys}
+    try:
+        os.environ["WULFRAM_ENTITY_TERRAIN_CONTACT_SWEEP_SCAN_STEPS"] = "9"
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK", None)
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT", None)
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_TIMED_CONTACT"] = "0"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTINUE_REMAINING"] = "0"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_SCHEDULE_PROBE"] = "0"
+        os.environ[
+            "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_SPATIAL_REF_SCHEDULE_PROBE"
+        ] = "1"
+        os.environ[
+            "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT_SELECTION"
+        ] = "upward_min_depth"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_NORMAL_SOURCE"] = "mesh"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE"] = "mesh"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE"] = "closing_velocity"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE"] = "preserve"
+
+        def fake_model_collision(center, *args, **kwargs):
+            if 0.45 <= center[0] <= 0.55:
+                return TerrainContact(
+                    position=(center[0], 0.0, -2.0),
+                    normal=(0.0, 0.0, 1.0),
+                    penetration=1.0,
+                    sector_index=2,
+                    cell=(7, 8),
+                    normal_source="entity_cbsp_split",
+                    cbsp_split_normal=(0.0, 0.0, 1.0),
+                    terrain_face_normal=(0.0, 0.0, 1.0),
+                    mesh_face_normal=(0.0, 0.0, 1.0),
+                    entity_radial_normal=(0.0, 0.0, 1.0),
+                )
+            return None
+
+        server = WulframServer.__new__(WulframServer)
+        server._terrain_grid_collision = SimpleNamespace(
+            test_box_collision=lambda *args, **kwargs: None,
+            test_model_collision=fake_model_collision,
+        )
+        server._get_entity_world_half_extents = lambda ctx: (2.0, 2.0, 3.0)
+        server._get_entity_world_collision_model = lambda ctx: (
+            [],
+            SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=7.5)),
+            7.5,
+            3.0,
+        )
+        server._get_entity_dirty_threshold_sq = lambda ctx, half_extents: 999999.0
+
+        ctx = _fake_tank_collision_context()
+        ctx.player_heading = 0.0
+        ctx.player_pos = (1.0, 0.0, 0.0)
+        ctx.world_collision_ref_pos = (0.5, 0.0, 0.0)
+        ctx.spring_body_matrix = _matrix3_from_euler_xyz(0.0, 0.0, 0.0)
+
+        result = server._resolve_entity_world_collision(
+            ctx,
+            1.0,
+            0.0,
+            -1.0,
+            0.0,
+            0.0,
+            -1.0,
+            pre_pos=(1.0, 0.0, 0.0),
+            pre_vel=(0.0, 0.0, -1.0),
+            dt=1.0,
+        )
+
+        assert result == (1.0, 0.0, -1.0, 0.0, 0.0, -1.0), result
+        assert getattr(ctx, "debug_last_motion_collision", {}) == {}
+        probe = ctx.debug_last_terrain_contact_probe
+        assert probe["pair_record_schedule_probe_enabled"] is False, probe
+        assert probe["pair_record_spatial_ref_schedule_probe_enabled"] is True, probe
+        assert probe["pair_record_spatial_ref_schedule_probe_result"] == (
+            "interval_contact"
+        ), probe
+        assert probe["pair_record_spatial_ref_schedule_collision_time_s"] == 0.0, probe
+        assert probe["pair_record_spatial_ref_schedule_decompile_pool_model"] == (
+            "CollisionPairPool_30_bucket_spatial_ref"
+        ), probe
+        assert probe["pair_record_spatial_ref_schedule_step_dt_s"] == 1.0, probe
+        assert probe["pair_record_spatial_ref_schedule_bucket_count"] == 30, probe
+        assert probe["pair_record_spatial_ref_schedule_bucket_index"] == 0, probe
+        assert probe["pair_record_spatial_ref_schedule_ref_pos"] == (
+            0.5,
+            0.0,
+            0.0,
+        ), probe
+        assert probe["pair_record_spatial_ref_schedule_current_pos"] == (
+            1.0,
+            0.0,
+            -1.0,
+        ), probe
+        assert 1.11 <= probe[
+            "pair_record_spatial_ref_schedule_ref_to_current_distance"
+        ] <= 1.12, probe
+        assert probe[
+            "pair_record_spatial_ref_schedule_ref_to_current_z_delta"
+        ] == -1.0, probe
+        assert probe["pair_record_spatial_ref_schedule_contact"]["contact_cell"] == (
+            7,
+            8,
+        ), probe
+        assert "pair_record_schedule_probe_result" not in probe, probe
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    print(
+        "test_entity_world_collision_spatial_ref_schedule_probe_reports_without_applying: PASSED"
+    )
+    return True
+
+
+def test_entity_world_collision_pair_record_schedule_response_probe_is_read_only():
+    """Schedule response probe should simulate the guarded response without applying it."""
+    env_keys = [
+        "WULFRAM_ENTITY_TERRAIN_CONTACT_SWEEP_SCAN_STEPS",
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_TIMED_CONTACT",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTINUE_REMAINING",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_SCHEDULE_PROBE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_SCHEDULE_RESPONSE_PROBE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT_SELECTION",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_NORMAL_SOURCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VELOCITY_DELTA",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VERTICAL_DELTA",
+    ]
+    old_env = {key: os.environ.get(key) for key in env_keys}
+    try:
+        os.environ["WULFRAM_ENTITY_TERRAIN_CONTACT_SWEEP_SCAN_STEPS"] = "9"
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK", None)
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT", None)
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_TIMED_CONTACT"] = "0"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTINUE_REMAINING"] = "0"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_SCHEDULE_PROBE"] = "1"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_SCHEDULE_RESPONSE_PROBE"] = "1"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT_SELECTION"] = "upward_min_depth"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_NORMAL_SOURCE"] = "mesh"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE"] = "mesh"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE"] = "closing_velocity"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE"] = "preserve"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VELOCITY_DELTA"] = "3.0"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VERTICAL_DELTA"] = "1.0"
+
+        def fake_model_collision(center, *args, **kwargs):
+            if 0.45 <= center[0] <= 0.55:
+                return TerrainContact(
+                    position=(center[0], 0.0, -2.0),
+                    normal=(0.0, 0.0, 1.0),
+                    penetration=1.0,
+                    sector_index=2,
+                    cell=(7, 8),
+                    normal_source="entity_cbsp_split",
+                    cbsp_split_normal=(0.0, 0.0, 1.0),
+                    terrain_face_normal=(0.0, 0.0, 1.0),
+                    mesh_face_normal=(0.0, 0.0, 1.0),
+                    entity_radial_normal=(0.0, 0.0, 1.0),
+                )
+            return None
+
+        server = WulframServer.__new__(WulframServer)
+        server._terrain_grid_collision = SimpleNamespace(
+            test_box_collision=lambda *args, **kwargs: None,
+            test_model_collision=fake_model_collision,
+        )
+        server._get_entity_world_half_extents = lambda ctx: (2.0, 2.0, 3.0)
+        server._get_entity_world_collision_model = lambda ctx: (
+            [],
+            SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=7.5)),
+            7.5,
+            3.0,
+        )
+        server._get_entity_dirty_threshold_sq = lambda ctx, half_extents: 999999.0
+
+        ctx = _fake_tank_collision_context()
+        ctx.player_heading = 0.0
+        ctx.player_pos = (0.0, 0.0, 0.0)
+        ctx.world_collision_ref_pos = (0.0, 0.0, 0.0)
+        ctx.spring_body_matrix = _matrix3_from_euler_xyz(0.0, 0.0, 0.0)
+        ctx.spring_body_ang_vel = (0.12, -0.08)
+        ctx.angular_vel_yaw = 0.04
+        ctx.rigid_body_last_interp_tick = 77
+
+        result = server._resolve_entity_world_collision(
+            ctx,
+            1.0,
+            0.0,
+            -1.0,
+            1.0,
+            0.0,
+            -1.0,
+            pre_pos=(0.0, 0.0, 0.0),
+            pre_vel=(1.0, 0.0, -1.0),
+            dt=1.0,
+        )
+
+        assert result == (1.0, 0.0, -1.0, 1.0, 0.0, -1.0), result
+        assert getattr(ctx, "debug_last_motion_collision", {}) == {}
+        assert ctx.spring_body_ang_vel == (0.12, -0.08), ctx.spring_body_ang_vel
+        assert ctx.angular_vel_yaw == 0.04, ctx.angular_vel_yaw
+        assert ctx.rigid_body_last_interp_tick == 77, ctx.rigid_body_last_interp_tick
+        probe = ctx.debug_last_terrain_contact_probe
+        assert probe["pair_record_schedule_probe_result"] == "interval_contact", probe
+        assert probe["pair_record_schedule_response_probe_enabled"] is True, probe
+        assert probe["pair_record_schedule_response_probe_result"] == "applied", probe
+        assert probe["pair_record_schedule_response_probe_applied"] is True, probe
+        assert probe["pair_record_schedule_response_probe_vel_before"] == (
+            1.0,
+            0.0,
+            -1.0,
+        ), probe
+        assert probe["pair_record_schedule_response_probe_contact_pos"] == (
+            0.45,
+            0.0,
+            -0.45,
+        ), probe
+        assert probe["pair_record_schedule_response_probe_post_contact_vel"][2] > -1.0, probe
+        assert probe["pair_record_schedule_response_probe_endpoint_vel"][2] > -1.0, probe
+        assert (
+            probe[
+                "pair_record_schedule_response_probe_velocity_delta_after_safety"
+            ][2]
+            > 0.0
+        ), probe
+        assert probe["pair_record_schedule_response_probe_angular_preserved"] is True, probe
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    print(
+        "test_entity_world_collision_pair_record_schedule_response_probe_is_read_only: PASSED"
+    )
+    return True
+
+
+def test_entity_world_collision_phase_lookahead_probe_reports_future_pair_contact():
+    """Default-off phase lookahead should report a near-future pair lane without moving the tank."""
+    env_keys = [
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_LOOKAHEAD",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_LOOKAHEAD_MAX_TIME",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_LOOKAHEAD_STEPS",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_LOOKAHEAD_MAX_DISTANCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_TIMED_CONTACT",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT_SELECTION",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_NORMAL_SOURCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE",
+    ]
+    old_env = {key: os.environ.get(key) for key in env_keys}
+    try:
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK", None)
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_LOOKAHEAD"] = "probe"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_LOOKAHEAD_MAX_TIME"] = "0.1"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_LOOKAHEAD_STEPS"] = "5"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_LOOKAHEAD_MAX_DISTANCE"] = "2.0"
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT", None)
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_TIMED_CONTACT"] = "0"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT_SELECTION"] = "upward_min_depth"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_NORMAL_SOURCE"] = "mesh"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE"] = "mesh"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE"] = "closing_velocity"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE"] = "preserve"
+
+        calls = []
+
+        def fake_model_collision(center, *args, **kwargs):
+            calls.append((tuple(center), kwargs.get("contact_selection")))
+            if (
+                kwargs.get("contact_selection") == "upward_min_depth"
+                and 0.49 <= float(center[0]) <= 0.61
+                and float(center[2]) < 0.0
+            ):
+                return TerrainContact(
+                    position=(float(center[0]), 0.0, -2.0),
+                    normal=(0.0, 0.0, 1.0),
+                    penetration=1.0,
+                    sector_index=2,
+                    cell=(71, 56),
+                    normal_source="entity_cbsp_split",
+                    cbsp_split_normal=(0.0, 0.0, 1.0),
+                    terrain_face_normal=(0.0, 0.0, 1.0),
+                    mesh_face_normal=(0.0, 0.0, 1.0),
+                    entity_radial_normal=(0.0, 0.0, 1.0),
+                )
+            return None
+
+        server = WulframServer.__new__(WulframServer)
+        server._terrain_grid_collision = SimpleNamespace(
+            test_box_collision=lambda *args, **kwargs: None,
+            test_model_collision=fake_model_collision,
+        )
+        server._get_entity_world_half_extents = lambda ctx: (2.0, 2.0, 3.0)
+        server._get_entity_world_collision_model = lambda ctx: (
+            [],
+            SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=7.5)),
+            7.5,
+            3.0,
+        )
+        server._get_entity_dirty_threshold_sq = lambda ctx, half_extents: 999999.0
+
+        ctx = _fake_tank_collision_context()
+        ctx.player_heading = 0.0
+        ctx.player_pos = (0.0, 0.0, -1.0)
+        ctx.world_collision_ref_pos = (0.0, 0.0, -1.0)
+        ctx.spring_body_matrix = _matrix3_from_euler_xyz(0.0, 0.0, 0.0)
+
+        result = server._resolve_entity_world_collision(
+            ctx,
+            0.0,
+            0.0,
+            -1.0,
+            10.0,
+            0.0,
+            0.0,
+            pre_pos=(-0.333333, 0.0, -1.0),
+            pre_vel=(10.0, 0.0, 0.0),
+            dt=1.0 / 30.0,
+        )
+
+        assert result == (0.0, 0.0, -1.0, 10.0, 0.0, 0.0), result
+        assert getattr(ctx, "debug_last_motion_collision", {}) == {}
+        probe = ctx.debug_last_terrain_contact_probe
+        assert probe["pair_record_phase_lookahead_enabled"] is True, probe
+        assert probe["pair_record_phase_lookahead_apply_enabled"] is False, probe
+        assert probe["pair_record_phase_lookahead_reject"] == "", probe
+        assert 0.049 <= probe["pair_record_phase_lookahead_collision_time_s"] <= 0.061, probe
+        assert probe["pair_record_phase_lookahead_distance"] < 0.7, probe
+        assert probe["pair_record_phase_lookahead_contact"]["contact_cell"] == (71, 56), probe
+        assert any(call[1] == "upward_min_depth" for call in calls), calls
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    print(
+        "test_entity_world_collision_phase_lookahead_probe_reports_future_pair_contact: PASSED"
+    )
+    return True
+
+
+def test_entity_world_collision_phase_lookahead_contact_applies_without_future_teleport():
+    """Apply mode uses the future contact as an impulse source while preserving current position."""
+    env_keys = [
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_LOOKAHEAD",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_LOOKAHEAD_MAX_TIME",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_LOOKAHEAD_STEPS",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_LOOKAHEAD_MAX_DISTANCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_TIMED_CONTACT",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT_SELECTION",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_NORMAL_SOURCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE",
+    ]
+    old_env = {key: os.environ.get(key) for key in env_keys}
+    try:
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK", None)
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_LOOKAHEAD"] = "apply"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_LOOKAHEAD_MAX_TIME"] = "0.1"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_LOOKAHEAD_STEPS"] = "5"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_LOOKAHEAD_MAX_DISTANCE"] = "2.0"
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT", None)
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_TIMED_CONTACT"] = "0"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT_SELECTION"] = "upward_min_depth"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_NORMAL_SOURCE"] = "mesh"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE"] = "mesh"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE"] = "closing_velocity"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE"] = "preserve"
+
+        def fake_model_collision(center, *args, **kwargs):
+            if (
+                kwargs.get("contact_selection") == "upward_min_depth"
+                and 0.49 <= float(center[0]) <= 0.61
+                and float(center[2]) < 0.0
+            ):
+                return TerrainContact(
+                    position=(float(center[0]), 0.0, -2.0),
+                    normal=(0.0, 0.0, 1.0),
+                    penetration=1.0,
+                    sector_index=2,
+                    cell=(71, 56),
+                    normal_source="entity_cbsp_split",
+                    cbsp_split_normal=(0.0, 0.0, 1.0),
+                    terrain_face_normal=(0.0, 0.0, 1.0),
+                    mesh_face_normal=(0.0, 0.0, 1.0),
+                    entity_radial_normal=(0.0, 0.0, 1.0),
+                )
+            return None
+
+        server = WulframServer.__new__(WulframServer)
+        server._terrain_grid_collision = SimpleNamespace(
+            test_box_collision=lambda *args, **kwargs: None,
+            test_model_collision=fake_model_collision,
+        )
+        server._get_entity_world_half_extents = lambda ctx: (2.0, 2.0, 3.0)
+        server._get_entity_world_collision_model = lambda ctx: (
+            [],
+            SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=7.5)),
+            7.5,
+            3.0,
+        )
+        server._get_entity_dirty_threshold_sq = lambda ctx, half_extents: 999999.0
+
+        ctx = _fake_tank_collision_context()
+        ctx.player_heading = 0.0
+        ctx.player_pos = (0.0, 0.0, -1.0)
+        ctx.world_collision_ref_pos = (0.0, 0.0, -1.0)
+        ctx.spring_body_matrix = _matrix3_from_euler_xyz(0.0, 0.0, 0.0)
+
+        px, py, pz, vx, vy, vz = server._resolve_entity_world_collision(
+            ctx,
+            0.0,
+            0.0,
+            -1.0,
+            10.0,
+            0.0,
+            -1.0,
+            pre_pos=(-0.333333, 0.0, -1.0),
+            pre_vel=(10.0, 0.0, -1.0),
+            dt=1.0 / 30.0,
+        )
+
+        debug = ctx.debug_last_motion_collision
+        assert debug["kind"] == "terrain_phase_lookahead_pair_record_contact", debug
+        assert debug["phase_lookahead_pair_record_contact"] is True, debug
+        assert debug["pair_record_phase_lookahead_preserved_position"] is True, debug
+        assert 0.049 <= debug["pair_record_phase_lookahead_collision_time_s"] <= 0.061, debug
+        assert debug["pair_record_phase_lookahead_current_pos"] == (0.0, 0.0, -1.0), debug
+        assert abs(px) < 1e-6 and abs(py) < 1e-6 and abs(pz + 1.0) < 1e-6, (px, py, pz, debug)
+        assert vx == debug["velocity_after"][0], debug
+        assert vz > -1.0, (vx, vy, vz, debug)
+        assert debug["pair_record_phase_lookahead_velocity_delta"][2] > 0.0, debug
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    print(
+        "test_entity_world_collision_phase_lookahead_contact_applies_without_future_teleport: PASSED"
+    )
+    return True
+
+
+def test_entity_world_collision_phase_lookahead_queue_resolves_when_due():
+    """Queue mode stores a future pair contact and resolves it in a later frame."""
+    env_keys = [
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_LOOKAHEAD",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_LOOKAHEAD_MAX_TIME",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_LOOKAHEAD_STEPS",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_LOOKAHEAD_MAX_DISTANCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_TIMED_CONTACT",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT_SELECTION",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_NORMAL_SOURCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE",
+    ]
+    old_env = {key: os.environ.get(key) for key in env_keys}
+    try:
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK", None)
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_LOOKAHEAD"] = "queue"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_LOOKAHEAD_MAX_TIME"] = "0.1"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_LOOKAHEAD_STEPS"] = "5"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_LOOKAHEAD_MAX_DISTANCE"] = "2.0"
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT", None)
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_TIMED_CONTACT"] = "0"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT_SELECTION"] = "upward_min_depth"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_NORMAL_SOURCE"] = "mesh"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE"] = "mesh"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE"] = "closing_velocity"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE"] = "preserve"
+
+        def fake_model_collision(center, *args, **kwargs):
+            if (
+                kwargs.get("contact_selection") == "upward_min_depth"
+                and 0.49 <= float(center[0]) <= 0.61
+                and float(center[2]) < 0.0
+            ):
+                return TerrainContact(
+                    position=(float(center[0]), 0.0, -2.0),
+                    normal=(0.0, 0.0, 1.0),
+                    penetration=1.0,
+                    sector_index=2,
+                    cell=(71, 56),
+                    normal_source="entity_cbsp_split",
+                    cbsp_split_normal=(0.0, 0.0, 1.0),
+                    terrain_face_normal=(0.0, 0.0, 1.0),
+                    mesh_face_normal=(0.0, 0.0, 1.0),
+                    entity_radial_normal=(0.0, 0.0, 1.0),
+                )
+            return None
+
+        server = WulframServer.__new__(WulframServer)
+        server._terrain_grid_collision = SimpleNamespace(
+            test_box_collision=lambda *args, **kwargs: None,
+            test_model_collision=fake_model_collision,
+        )
+        server._get_entity_world_half_extents = lambda ctx: (2.0, 2.0, 3.0)
+        server._get_entity_world_collision_model = lambda ctx: (
+            [],
+            SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=7.5)),
+            7.5,
+            3.0,
+        )
+        server._get_entity_dirty_threshold_sq = lambda ctx, half_extents: 999999.0
+
+        ctx = _fake_tank_collision_context()
+        ctx.player_heading = 0.0
+        ctx.player_pos = (0.0, 0.0, -1.0)
+        ctx.world_collision_ref_pos = (0.0, 0.0, -1.0)
+        ctx.spring_body_matrix = _matrix3_from_euler_xyz(0.0, 0.0, 0.0)
+
+        result = server._resolve_entity_world_collision(
+            ctx,
+            0.0,
+            0.0,
+            -1.0,
+            10.0,
+            0.0,
+            -1.0,
+            pre_pos=(-0.333333, 0.0, -1.0),
+            pre_vel=(10.0, 0.0, -1.0),
+            dt=1.0 / 30.0,
+        )
+        assert result == (0.0, 0.0, -1.0, 10.0, 0.0, -1.0), result
+        assert getattr(ctx, "debug_last_motion_collision", {}) == {}
+        first_probe = ctx.debug_last_terrain_contact_probe
+        assert first_probe["pair_record_phase_lookahead_queue_enabled"] is True, first_probe
+        assert first_probe["pair_record_phase_lookahead_queue_stored"] is True, first_probe
+        queued = getattr(ctx, "terrain_pair_record_phase_lookahead_queue")
+        assert 0.049 <= queued["time_to_contact_s"] <= 0.061, queued
+
+        result = server._resolve_entity_world_collision(
+            ctx,
+            0.333333,
+            0.0,
+            -1.033333,
+            10.0,
+            0.0,
+            -1.0,
+            pre_pos=(0.0, 0.0, -1.0),
+            pre_vel=(10.0, 0.0, -1.0),
+            dt=1.0 / 30.0,
+        )
+        assert result == (0.333333, 0.0, -1.033333, 10.0, 0.0, -1.0), result
+        pending_probe = ctx.debug_last_terrain_contact_probe
+        assert pending_probe["pair_record_phase_lookahead_queue_pending"] is True, pending_probe
+        queued = getattr(ctx, "terrain_pair_record_phase_lookahead_queue")
+        assert 0.01 <= queued["time_to_contact_s"] <= 0.03, queued
+        assert queued["age_steps"] == 1, queued
+
+        px, py, pz, vx, vy, vz = server._resolve_entity_world_collision(
+            ctx,
+            0.666666,
+            0.0,
+            -1.066666,
+            10.0,
+            0.0,
+            -1.0,
+            pre_pos=(0.333333, 0.0, -1.033333),
+            pre_vel=(10.0, 0.0, -1.0),
+            dt=1.0 / 30.0,
+        )
+        debug = ctx.debug_last_motion_collision
+        assert debug["kind"] == "terrain_phase_lookahead_queued_pair_record_contact", debug
+        assert debug["phase_lookahead_queued_pair_record_contact"] is True, debug
+        assert debug["pair_record_phase_lookahead_queue_enabled"] is True, debug
+        assert 0.01 <= debug["pair_record_phase_lookahead_queued_collision_time_s"] <= 0.03, debug
+        assert debug["pair_record_phase_lookahead_queued_contact_pos"][0] > 0.49, debug
+        assert vx == debug["velocity_after"][0], debug
+        assert vz > -1.0, (px, py, pz, vx, vy, vz, debug)
+        assert getattr(ctx, "terrain_pair_record_phase_lookahead_queue") is None
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    print(
+        "test_entity_world_collision_phase_lookahead_queue_resolves_when_due: PASSED"
+    )
+    return True
+
+
+def test_entity_world_collision_phase_backtrack_probe_reports_prior_pair_contact():
+    """Default-off phase backtrack should report a recently passed pair lane without moving the tank."""
+    env_keys = [
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_BACKTRACK",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_BACKTRACK_MAX_TIME",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_BACKTRACK_STEPS",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_BACKTRACK_MAX_DISTANCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_BACKTRACK_SOURCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_TIMED_CONTACT",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT_SELECTION",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_NORMAL_SOURCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE",
+    ]
+    old_env = {key: os.environ.get(key) for key in env_keys}
+    try:
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK", None)
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_BACKTRACK"] = "probe"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_BACKTRACK_MAX_TIME"] = "0.1"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_BACKTRACK_STEPS"] = "5"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_BACKTRACK_MAX_DISTANCE"] = "2.0"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_BACKTRACK_SOURCE"] = "pre"
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT", None)
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_TIMED_CONTACT"] = "0"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT_SELECTION"] = "upward_min_depth"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_NORMAL_SOURCE"] = "mesh"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE"] = "mesh"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE"] = "closing_velocity"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE"] = "preserve"
+
+        calls = []
+
+        def fake_model_collision(center, *args, **kwargs):
+            calls.append((tuple(center), kwargs.get("contact_selection")))
+            if (
+                kwargs.get("contact_selection") == "upward_min_depth"
+                and -0.61 <= float(center[0]) <= -0.49
+                and float(center[2]) < 0.0
+            ):
+                return TerrainContact(
+                    position=(float(center[0]), 0.0, -2.0),
+                    normal=(0.0, 0.0, 1.0),
+                    penetration=1.0,
+                    sector_index=2,
+                    cell=(71, 56),
+                    normal_source="entity_cbsp_split",
+                    cbsp_split_normal=(0.0, 0.0, 1.0),
+                    terrain_face_normal=(0.0, 0.0, 1.0),
+                    mesh_face_normal=(0.0, 0.0, 1.0),
+                    entity_radial_normal=(0.0, 0.0, 1.0),
+                )
+            return None
+
+        server = WulframServer.__new__(WulframServer)
+        server._terrain_grid_collision = SimpleNamespace(
+            test_box_collision=lambda *args, **kwargs: None,
+            test_model_collision=fake_model_collision,
+        )
+        server._get_entity_world_half_extents = lambda ctx: (2.0, 2.0, 3.0)
+        server._get_entity_world_collision_model = lambda ctx: (
+            [],
+            SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=7.5)),
+            7.5,
+            3.0,
+        )
+        server._get_entity_dirty_threshold_sq = lambda ctx, half_extents: 999999.0
+
+        ctx = _fake_tank_collision_context()
+        ctx.player_heading = 0.0
+        ctx.player_pos = (0.0, 0.0, -1.0)
+        ctx.world_collision_ref_pos = (0.0, 0.0, -1.0)
+        ctx.spring_body_matrix = _matrix3_from_euler_xyz(0.0, 0.0, 0.0)
+
+        result = server._resolve_entity_world_collision(
+            ctx,
+            0.0,
+            0.0,
+            -1.0,
+            10.0,
+            0.0,
+            0.0,
+            pre_pos=(0.0, 0.0, -1.0),
+            pre_vel=(10.0, 0.0, 0.0),
+            dt=1.0 / 30.0,
+        )
+
+        assert result == (0.0, 0.0, -1.0, 10.0, 0.0, 0.0), result
+        assert getattr(ctx, "debug_last_motion_collision", {}) == {}
+        probe = ctx.debug_last_terrain_contact_probe
+        assert probe["pair_record_phase_backtrack_enabled"] is True, probe
+        assert probe["pair_record_phase_backtrack_reject"] == "", probe
+        assert 0.049 <= probe["pair_record_phase_backtrack_time_s"] <= 0.061, probe
+        assert probe["pair_record_phase_backtrack_distance"] < 0.7, probe
+        assert probe["pair_record_phase_backtrack_source"] == "pre", probe
+        assert probe["pair_record_phase_backtrack_contact"]["contact_cell"] == (71, 56), probe
+        assert any(call[1] == "upward_min_depth" for call in calls), calls
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    print(
+        "test_entity_world_collision_phase_backtrack_probe_reports_prior_pair_contact: PASSED"
+    )
+    return True
+
+
+def test_entity_world_collision_phase_backtrack_contact_replays_to_endpoint():
+    env_keys = [
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_BACKTRACK",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_BACKTRACK_MAX_TIME",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_BACKTRACK_STEPS",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_BACKTRACK_MAX_DISTANCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_BACKTRACK_SOURCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_TIMED_CONTACT",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT_SELECTION",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_NORMAL_SOURCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_VERTICAL_DELTA_MODE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VELOCITY_DELTA",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VERTICAL_DELTA",
+    ]
+    old_env = {key: os.environ.get(key) for key in env_keys}
+    try:
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK", None)
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_BACKTRACK"] = "apply"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_BACKTRACK_MAX_TIME"] = "0.1"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_BACKTRACK_STEPS"] = "5"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_BACKTRACK_MAX_DISTANCE"] = "2.0"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_PHASE_BACKTRACK_SOURCE"] = "current"
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT", None)
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_TIMED_CONTACT"] = "0"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT_SELECTION"] = "upward_min_depth"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_NORMAL_SOURCE"] = "mesh"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE"] = "mesh"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE"] = "closing_velocity"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE"] = "preserve"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_VERTICAL_DELTA_MODE"] = "component"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VELOCITY_DELTA"] = "4.0"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VERTICAL_DELTA"] = "2.0"
+
+        def fake_model_collision(center, *args, **kwargs):
+            if (
+                kwargs.get("contact_selection") == "upward_min_depth"
+                and -0.61 <= float(center[0]) <= -0.49
+                and float(center[2]) < 0.0
+            ):
+                return TerrainContact(
+                    position=(float(center[0]), 0.0, -2.0),
+                    normal=(0.0, 0.0, 1.0),
+                    penetration=1.0,
+                    sector_index=2,
+                    cell=(71, 56),
+                    normal_source="entity_cbsp_split",
+                    cbsp_split_normal=(0.0, 0.0, 1.0),
+                    terrain_face_normal=(0.0, 0.0, 1.0),
+                    mesh_face_normal=(0.0, 0.0, 1.0),
+                    entity_radial_normal=(0.0, 0.0, 1.0),
+                )
+            return None
+
+        server = WulframServer.__new__(WulframServer)
+        server._terrain_grid_collision = SimpleNamespace(
+            test_box_collision=lambda *args, **kwargs: None,
+            test_model_collision=fake_model_collision,
+        )
+        server._get_entity_world_half_extents = lambda ctx: (2.0, 2.0, 3.0)
+        server._get_entity_world_collision_model = lambda ctx: (
+            [],
+            SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=7.5)),
+            7.5,
+            3.0,
+        )
+        server._get_entity_dirty_threshold_sq = lambda ctx, half_extents: 999999.0
+
+        ctx = _fake_tank_collision_context()
+        ctx.player_heading = 0.0
+        ctx.player_pos = (0.0, 0.0, -1.0)
+        ctx.world_collision_ref_pos = (0.0, 0.0, -1.0)
+        ctx.spring_body_matrix = _matrix3_from_euler_xyz(0.0, 0.0, 0.0)
+
+        result = server._resolve_entity_world_collision(
+            ctx,
+            0.0,
+            0.0,
+            -1.0,
+            10.0,
+            0.0,
+            -1.0,
+            pre_pos=(0.0, 0.0, -1.0),
+            pre_vel=(10.0, 0.0, -1.0),
+            dt=1.0 / 30.0,
+        )
+
+        assert result[0] > -0.05, result
+        assert result[5] > -1.0, result
+        debug = ctx.debug_last_motion_collision
+        assert debug["kind"] == "terrain_phase_backtrack_pair_record_contact", debug
+        assert debug["phase_backtrack_pair_record_contact"] is True, debug
+        assert debug["pair_record_phase_backtrack_apply_enabled"] is True, debug
+        assert debug["pair_record_phase_backtrack_source"] == "current", debug
+        assert debug["pair_record_phase_backtrack_replayed_position"] is True, debug
+        assert debug["pair_record_phase_backtrack_contact_pos"][0] < -0.49, debug
+        assert debug["pair_record_phase_backtrack_endpoint_pos"][0] > -0.05, debug
+        assert debug["contact_events"][0]["phase_backtrack_pair_record_contact"] is True, debug
+        probe = ctx.debug_last_terrain_contact_probe
+        assert probe["pair_record_phase_backtrack_apply_enabled"] is True, probe
+        assert probe["pair_record_phase_backtrack_reject"] == "", probe
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    print(
+        "test_entity_world_collision_phase_backtrack_contact_replays_to_endpoint: PASSED"
+    )
+    return True
+
+
 def test_entity_world_collision_pair_record_contact_applies_decompile_face_gated_contact():
     """Default pair-record contact should activate only on raw contacts carrying terrain-face evidence."""
     env_keys = [
@@ -7438,6 +9814,127 @@ def test_entity_world_collision_pair_record_contact_applies_decompile_face_gated
     return True
 
 
+def test_entity_world_collision_pair_record_can_probe_raw_solver_linear_response():
+    """Default-off pair-record response profile should preserve raw solver linear delta."""
+    env_keys = [
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_RESPONSE_PROFILE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_TIMED_CONTACT",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT_SELECTION",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_NORMAL_SOURCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_VERTICAL_DELTA_MODE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VELOCITY_DELTA",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VERTICAL_DELTA",
+    ]
+    old_env = {key: os.environ.get(key) for key in env_keys}
+    try:
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK", None)
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT", None)
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_RESPONSE_PROFILE"] = (
+            "decompile_linear_solver"
+        )
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_TIMED_CONTACT"] = "0"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT_SELECTION"] = (
+            "upward_min_depth"
+        )
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_NORMAL_SOURCE"] = "mesh"
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE", None)
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE", None)
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE"] = "preserve"
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_VERTICAL_DELTA_MODE", None)
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VELOCITY_DELTA", None)
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VERTICAL_DELTA", None)
+
+        def fake_model_collision(center, *args, **kwargs):
+            if abs(center[2] - 10.0) >= 1e-6:
+                return None
+            return TerrainContact(
+                position=(1.0, 2.0, 3.0),
+                normal=(0.0, 0.0, 1.0),
+                penetration=4.0,
+                sector_index=2,
+                cell=(71, 56),
+                normal_source="entity_cbsp_split",
+                cbsp_split_normal=(0.0, 0.0, 1.0),
+                terrain_face_normal=(0.25, 0.0, 0.9682458365518543),
+                mesh_face_normal=(0.0, 0.0, 1.0),
+                entity_radial_normal=(0.6, 0.8, 0.0),
+            )
+
+        server = WulframServer.__new__(WulframServer)
+        server._terrain_grid_collision = SimpleNamespace(
+            test_box_collision=lambda *args, **kwargs: None,
+            test_model_collision=fake_model_collision,
+        )
+        server._get_entity_world_half_extents = lambda ctx: (2.0, 2.0, 3.0)
+        server._get_entity_world_collision_model = lambda ctx: (
+            [],
+            SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=7.5)),
+            7.5,
+            3.0,
+        )
+        server._get_entity_dirty_threshold_sq = lambda ctx, half_extents: 999999.0
+
+        ctx = _fake_tank_collision_context()
+        ctx.player_heading = 0.0
+        ctx.player_pos = (0.0, 0.0, 10.0)
+        ctx.world_collision_ref_pos = (0.0, 0.0, 10.0)
+        ctx.spring_body_matrix = _matrix3_from_euler_xyz(0.0, 0.0, 0.0)
+
+        _px, _py, _pz, _vx, _vy, _vz = server._resolve_entity_world_collision(
+            ctx,
+            0.0,
+            0.0,
+            10.0,
+            0.0,
+            0.0,
+            -10.0,
+            pre_pos=(0.0, 0.0, 10.0),
+            pre_vel=(0.0, 0.0, -10.0),
+            dt=1.0 / 30.0,
+        )
+
+        debug = ctx.debug_last_motion_collision
+        assert debug["kind"] == "terrain_pair_record_contact", debug
+        assert debug["pair_record_contact_response_profile"] == (
+            "decompile_linear_solver"
+        ), debug
+        assert debug["raw_origin_fallback_delta_mode"] == "solver_vector", debug
+        assert debug["raw_origin_fallback_velocity_safety_max_delta"] == 0.0, debug
+        assert debug["raw_origin_fallback_velocity_safety_max_vertical_delta"] == 0.0, debug
+        assert debug["raw_origin_fallback_velocity_delta_clamped"] is False, debug
+        assert debug["raw_origin_fallback_vertical_delta_clamped"] is False, debug
+        assert debug["raw_origin_fallback_angular_preserved"] is True, debug
+        assert (
+            debug["raw_origin_fallback_velocity_delta_after_safety"]
+            == debug["raw_origin_fallback_velocity_delta_unclamped"]
+        ), debug
+        assert (
+            debug["raw_origin_fallback_solver_velocity_delta_unprojected"]
+            == debug["raw_origin_fallback_velocity_delta_unclamped"]
+        ), debug
+        probe = ctx.debug_last_terrain_contact_probe
+        assert probe["pair_record_contact_response_profile"] == (
+            "decompile_linear_solver"
+        ), probe
+        assert probe["pair_record_contact_max_velocity_delta"] == 0.0, probe
+        assert probe["pair_record_contact_max_vertical_delta"] == 0.0, probe
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    print(
+        "test_entity_world_collision_pair_record_can_probe_raw_solver_linear_response: PASSED"
+    )
+    return True
+
+
 def test_entity_world_collision_pair_record_contact_uses_shallow_upward_selection():
     """Pair-record contact selection should skip a deep side split for a shallow upward hit."""
     env_keys = [
@@ -7564,6 +10061,592 @@ def test_entity_world_collision_pair_record_contact_uses_shallow_upward_selectio
             else:
                 os.environ[key] = value
     print("test_entity_world_collision_pair_record_contact_uses_shallow_upward_selection: PASSED")
+    return True
+
+
+def test_entity_world_collision_pair_record_contact_accepts_og_straightaway_face():
+    """Empirical straightaway contact should pass the default pair-record gates."""
+    env_keys = [
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_TIMED_CONTACT",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT_SELECTION",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_NORMAL_SOURCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_VERTICAL_DELTA_MODE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_DEPTH",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MIN_FACE_NORMAL_Z",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VELOCITY_DELTA",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VERTICAL_DELTA",
+    ]
+    old_env = {key: os.environ.get(key) for key in env_keys}
+    try:
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK", None)
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT", None)
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_TIMED_CONTACT"] = "0"
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT_SELECTION", None)
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_NORMAL_SOURCE", None)
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE", None)
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE", None)
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE", None)
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_VERTICAL_DELTA_MODE", None)
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_DEPTH", None)
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MIN_FACE_NORMAL_Z", None)
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VELOCITY_DELTA", None)
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VERTICAL_DELTA", None)
+        terrain_face_normal = (-0.900996, -0.000522, 0.433826)
+        mesh_normal = (-0.061263, 0.294716, 0.95362)
+        calls = []
+
+        def fake_model_collision(center, *args, **kwargs):
+            calls.append((center, kwargs.get("contact_selection")))
+            if abs(center[2] - 10.0) >= 1e-6:
+                return None
+            return TerrainContact(
+                position=(2.0, -1.0, 8.0),
+                normal=mesh_normal,
+                penetration=8.541382,
+                sector_index=7,
+                cell=(120, 70),
+                normal_source="entity_cbsp_split",
+                cbsp_split_normal=mesh_normal,
+                terrain_face_normal=terrain_face_normal,
+                mesh_face_normal=mesh_normal,
+                entity_radial_normal=(0.132776, 0.951725, 0.276748),
+            )
+
+        server = WulframServer.__new__(WulframServer)
+        server._terrain_grid_collision = SimpleNamespace(
+            test_box_collision=lambda *args, **kwargs: None,
+            test_model_collision=fake_model_collision,
+        )
+        server._get_entity_world_half_extents = lambda ctx: (2.0, 2.0, 3.0)
+        server._get_entity_world_collision_model = lambda ctx: (
+            [],
+            SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=7.5)),
+            7.5,
+            3.0,
+        )
+        server._get_entity_dirty_threshold_sq = lambda ctx, half_extents: 999999.0
+
+        ctx = _fake_tank_collision_context()
+        ctx.player_heading = 0.0
+        ctx.player_pos = (0.0, 0.0, 10.0)
+        ctx.world_collision_ref_pos = (0.0, 0.0, 10.0)
+        ctx.spring_body_matrix = _matrix3_from_euler_xyz(0.0, 0.0, 0.0)
+
+        _px, _py, _pz, vx, _vy, vz = server._resolve_entity_world_collision(
+            ctx,
+            0.0,
+            0.0,
+            10.0,
+            24.0,
+            0.0,
+            -0.02,
+            pre_pos=(0.0, 0.0, 10.0),
+            pre_vel=(24.0, 0.0, -0.02),
+            dt=1.0 / 30.0,
+        )
+
+        debug = ctx.debug_last_motion_collision
+        assert debug["kind"] == "terrain_pair_record_contact", debug
+        assert debug["pair_record_contact"] is True, debug
+        assert debug["pair_record_contact_reject"] == "", debug
+        assert debug["pair_record_contact_max_depth"] == 10.0, debug
+        assert debug["pair_record_contact_min_face_normal_z"] == 0.4, debug
+        assert debug["pair_record_terrain_face_normal"] == terrain_face_normal, debug
+        assert debug["depth"] == 8.541382, debug
+        assert debug["raw_origin_fallback_velocity_delta_mag_after_safety"] > 0.0, debug
+        assert vx < 24.0 and vz > -0.02, (vx, vz, debug)
+        probe = ctx.debug_last_terrain_contact_probe
+        assert probe["pair_record_contact_reject"] == "", probe
+        assert calls[0] == ((0.0, 0.0, 13.0), "first")
+        assert calls[1] == ((0.0, 0.0, 10.0), "first")
+        assert calls[2] == ((0.0, 0.0, 10.0), "upward_min_depth")
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    print(
+        "test_entity_world_collision_pair_record_contact_accepts_og_straightaway_face: PASSED"
+    )
+    return True
+
+
+def test_tank_clean_terrain_contact_uses_pair_solver_by_default():
+    """Tank auto-response should not use the legacy projection path for clean terrain hits."""
+    env_keys = [
+        "WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE",
+        "WULFRAM_TANK_CLEAN_TERRAIN_PAIR_SOLVER",
+        "WULFRAM_ENTITY_TERRAIN_PROJECTION_ORDER",
+        "WULFRAM_TANK_CLEAN_TERRAIN_PROJECTION_ORDER",
+        "WULFRAM_ENTITY_CONTACT_POSITION_CORRECTION_CAP",
+    ]
+    old_env = {key: os.environ.get(key) for key in env_keys}
+    try:
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE", None)
+        os.environ.pop("WULFRAM_TANK_CLEAN_TERRAIN_PAIR_SOLVER", None)
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_PROJECTION_ORDER", None)
+        os.environ.pop("WULFRAM_TANK_CLEAN_TERRAIN_PROJECTION_ORDER", None)
+        os.environ.pop("WULFRAM_ENTITY_CONTACT_POSITION_CORRECTION_CAP", None)
+        terrain_face_normal = (-0.900996, -0.000522, 0.433826)
+        contact_normal = (-0.901, -0.0005, 0.4338)
+
+        def fake_model_collision(center, *args, **kwargs):
+            if abs(center[2] - 13.0) >= 1e-6:
+                return None
+            return TerrainContact(
+                position=(7.0, 0.0, 4.0),
+                normal=contact_normal,
+                penetration=8.541382,
+                sector_index=7,
+                cell=(120, 70),
+                normal_source="entity_cbsp_split",
+                cbsp_split_normal=contact_normal,
+                terrain_face_normal=terrain_face_normal,
+                mesh_face_normal=contact_normal,
+                entity_radial_normal=(0.9, 0.0, 0.4338),
+            )
+
+        server = WulframServer.__new__(WulframServer)
+        server._terrain_grid_collision = SimpleNamespace(
+            test_box_collision=lambda *args, **kwargs: None,
+            test_model_collision=fake_model_collision,
+        )
+        server._get_entity_world_half_extents = lambda ctx: (2.0, 2.0, 3.0)
+        server._get_entity_world_collision_model = lambda ctx: (
+            [],
+            SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=7.5)),
+            7.5,
+            3.0,
+        )
+        server._get_entity_dirty_threshold_sq = lambda ctx, half_extents: 999999.0
+
+        ctx = _fake_tank_collision_context()
+        ctx.player_heading = 0.0
+        ctx.player_pos = (0.0, 0.0, 10.0)
+        ctx.world_collision_ref_pos = (0.0, 0.0, 10.0)
+        ctx.spring_body_matrix = _matrix3_from_euler_xyz(0.0, 0.0, 0.0)
+
+        px, _py, pz, vx, _vy, vz = server._resolve_entity_world_collision(
+            ctx,
+            0.0,
+            0.0,
+            10.0,
+            24.0,
+            0.0,
+            -0.02,
+            pre_pos=(0.0, 0.0, 10.0),
+            pre_vel=(24.0, 0.0, -0.02),
+            dt=1.0 / 30.0,
+        )
+
+        debug = ctx.debug_last_motion_collision
+        assert debug["kind"] == "terrain_clean_contact", debug
+        assert debug["response"] == "terrain_contact_constraint_solver", debug
+        assert debug["constraint_projection_order"] == "opposite_if_separating", debug
+        assert debug["position_correction"] <= 0.005001, debug
+        assert debug["contact_terrain_face_normal"] == terrain_face_normal, debug
+        assert px < 0.0 and pz > 10.0, (px, pz, debug)
+        assert vx < 24.0 and vz > -0.02, (vx, vz, debug)
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    print("test_tank_clean_terrain_contact_uses_pair_solver_by_default: PASSED")
+    return True
+
+
+def test_tank_clean_terrain_projection_order_uses_opposite_probe_by_default():
+    """Tank clean contacts should activate the OG opposite projection when needed."""
+    env_keys = [
+        "WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE",
+        "WULFRAM_TANK_CLEAN_TERRAIN_PAIR_SOLVER",
+        "WULFRAM_ENTITY_TERRAIN_PROJECTION_ORDER",
+        "WULFRAM_TANK_CLEAN_TERRAIN_PROJECTION_ORDER",
+        "WULFRAM_ENTITY_CONTACT_POSITION_CORRECTION_CAP",
+    ]
+    old_env = {key: os.environ.get(key) for key in env_keys}
+    try:
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE", None)
+        os.environ.pop("WULFRAM_TANK_CLEAN_TERRAIN_PAIR_SOLVER", None)
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_PROJECTION_ORDER", None)
+        os.environ.pop("WULFRAM_TANK_CLEAN_TERRAIN_PROJECTION_ORDER", None)
+        os.environ.pop("WULFRAM_ENTITY_CONTACT_POSITION_CORRECTION_CAP", None)
+
+        def fake_model_collision(center, *args, **kwargs):
+            if abs(center[2] - 13.0) >= 1e-6:
+                return None
+            return TerrainContact(
+                position=(0.0, 0.0, 9.0),
+                normal=(0.0, 0.0, 1.0),
+                penetration=4.0,
+                sector_index=2,
+                cell=(7, 8),
+                normal_source="entity_cbsp_split",
+                cbsp_split_normal=(0.0, 0.0, 1.0),
+                terrain_face_normal=(0.0, 0.0, 1.0),
+                mesh_face_normal=(0.0, 0.0, 1.0),
+                entity_radial_normal=(0.0, 0.0, 1.0),
+            )
+
+        server = WulframServer.__new__(WulframServer)
+        server._terrain_grid_collision = SimpleNamespace(
+            test_box_collision=lambda *args, **kwargs: None,
+            test_model_collision=fake_model_collision,
+        )
+        server._get_entity_world_half_extents = lambda ctx: (2.0, 2.0, 3.0)
+        server._get_entity_world_collision_model = lambda ctx: (
+            [],
+            SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=7.5)),
+            7.5,
+            3.0,
+        )
+        server._get_entity_dirty_threshold_sq = lambda ctx, half_extents: 999999.0
+
+        ctx = _fake_tank_collision_context()
+        ctx.player_heading = 0.0
+        ctx.player_pos = (0.0, 0.0, 10.0)
+        ctx.world_collision_ref_pos = (0.0, 0.0, 10.0)
+        ctx.spring_body_matrix = _matrix3_from_euler_xyz(0.0, 0.0, 0.0)
+
+        _px, _py, _pz, _vx, _vy, vz = server._resolve_entity_world_collision(
+            ctx,
+            0.0,
+            0.0,
+            10.0,
+            0.0,
+            0.0,
+            0.006,
+            pre_pos=(0.0, 0.0, 10.0),
+            pre_vel=(0.0, 0.0, 0.006),
+            dt=1.0 / 30.0,
+        )
+
+        debug = ctx.debug_last_motion_collision
+        assert debug["kind"] == "terrain_clean_contact", debug
+        assert debug["response"] == "terrain_contact_constraint_solver", debug
+        assert debug["constraint_projection_order"] == "opposite_if_separating", debug
+        assert (
+            debug["constraint_primary_projection_speed_source"]
+            == "world_minus_body_if_body_separating"
+        ), debug
+        assert debug["normal_iterations"] > 0, debug
+        assert debug["normal_impulse"] > 0.0, debug
+        assert vz > 0.006, (vz, debug)
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    print(
+        "test_tank_clean_terrain_projection_order_uses_opposite_probe_by_default: PASSED"
+    )
+    return True
+
+
+def test_tank_default_raw_origin_fallback_uses_empirical_straightaway_face():
+    """Default tank auto mode should catch the OG straightaway raw-origin face contact."""
+    env_keys = [
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK",
+        "WULFRAM_TANK_RAW_ORIGIN_FALLBACK",
+        "WULFRAM_TANK_RAW_ORIGIN_NORMAL_SOURCE",
+        "WULFRAM_TANK_RAW_ORIGIN_MAX_DEPTH",
+        "WULFRAM_TANK_RAW_ORIGIN_MIN_NORMAL_Z",
+        "WULFRAM_TANK_RAW_ORIGIN_MIN_FACE_NORMAL_Z",
+        "WULFRAM_TANK_RAW_ORIGIN_MAX_VELOCITY_DELTA",
+        "WULFRAM_TANK_RAW_ORIGIN_MAX_VERTICAL_DELTA",
+        "WULFRAM_TANK_RAW_ORIGIN_DELTA_MODE",
+        "WULFRAM_TANK_RAW_ORIGIN_DELTA_NORMAL",
+        "WULFRAM_TANK_RAW_ORIGIN_ANGULAR_MODE",
+    ]
+    old_env = {key: os.environ.get(key) for key in env_keys}
+    try:
+        for key in env_keys:
+            os.environ.pop(key, None)
+        terrain_face_normal = (-0.900996, -0.000522, 0.433826)
+
+        def fake_model_collision(center, *args, **kwargs):
+            if abs(center[2] - 3.21) >= 1e-6:
+                return None
+            return TerrainContact(
+                position=(5251.66, 3071.04, 3.41),
+                normal=(0.0, -1.0, 0.0),
+                penetration=8.541382,
+                sector_index=7,
+                cell=(120, 70),
+                normal_source="entity_cbsp_split",
+                cbsp_split_normal=(0.0, -1.0, 0.0),
+                terrain_face_normal=terrain_face_normal,
+                mesh_face_normal=(0.0, 1.0, 0.0),
+                entity_radial_normal=(0.951729, -0.3053, 0.031683),
+            )
+
+        server = WulframServer.__new__(WulframServer)
+        server._terrain_grid_collision = SimpleNamespace(
+            test_box_collision=lambda *args, **kwargs: None,
+            test_model_collision=fake_model_collision,
+        )
+        server._get_entity_world_half_extents = lambda ctx: (2.0, 2.0, 3.0)
+        server._get_entity_world_collision_model = lambda ctx: (
+            [],
+            SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=7.5)),
+            7.5,
+            3.0,
+        )
+        server._get_entity_dirty_threshold_sq = lambda ctx, half_extents: 999999.0
+
+        ctx = _fake_tank_collision_context()
+        ctx.player_heading = 0.0
+        ctx.player_pos = (5245.68, 3072.96, 3.21)
+        ctx.world_collision_ref_pos = (5245.68, 3072.96, 3.21)
+        ctx.spring_body_matrix = _matrix3_from_euler_xyz(0.0, 0.0, 0.0)
+        ctx.spring_body_ang_vel = (0.12, -0.08)
+
+        _px, _py, _pz, vx, _vy, vz = server._resolve_entity_world_collision(
+            ctx,
+            5245.68,
+            3072.96,
+            3.21,
+            26.4,
+            0.0,
+            -0.01,
+            pre_pos=(5244.8, 3072.96, 3.21),
+            pre_vel=(26.3, 0.0, -0.01),
+            dt=1.0 / 30.0,
+        )
+
+        debug = ctx.debug_last_motion_collision
+        assert debug["kind"] == "terrain_raw_origin_fallback_contact", debug
+        assert debug["tank_raw_origin_fallback"] is True, debug
+        assert debug["contact_normal_source"] == "terrain_triangle_contact_face", debug
+        assert debug["raw_origin_fallback_normal_source"] == "terrain_face", debug
+        assert debug["raw_origin_fallback_delta_mode"] == "closing_velocity", debug
+        assert debug["tank_raw_origin_fallback_delta_normal_mode"] == "horizontal_face", debug
+        assert debug["raw_origin_fallback_delta_normal"][2] == 0.0, debug
+        assert debug["raw_origin_fallback_delta_normal_source"] == "terrain_triangle_contact_face_horizontal", debug
+        assert debug["raw_origin_fallback_angular_mode"] == "preserve", debug
+        assert debug["raw_origin_fallback_angular_preserved"] is True, debug
+        assert debug["raw_origin_fallback_reject"] == "", debug
+        assert debug["raw_origin_fallback_velocity_delta_mag_after_safety"] <= 18.001, debug
+        assert vx < 26.4 and abs(vz + 0.01) < 1e-6, (vx, vz, debug)
+        probe = ctx.debug_last_terrain_contact_probe
+        assert probe["tank_raw_origin_fallback"] is True, probe
+        assert probe["raw_origin_fallback_enabled"] is True, probe
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    print(
+        "test_tank_default_raw_origin_fallback_uses_empirical_straightaway_face: PASSED"
+    )
+    return True
+
+
+def test_tank_clean_side_contact_uses_face_fallback_without_angular_blowup():
+    """Lifted side-split contacts should use the guarded face-normal tank path."""
+    env_keys = [
+        "WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE",
+        "WULFRAM_TANK_CLEAN_TERRAIN_FACE_FALLBACK",
+        "WULFRAM_TANK_CLEAN_TERRAIN_FACE_FALLBACK_MAX_CONTACT_NORMAL_Z",
+        "WULFRAM_TANK_CLEAN_TERRAIN_FACE_FALLBACK_MIN_FACE_NORMAL_Z",
+        "WULFRAM_TANK_CLEAN_TERRAIN_FACE_FALLBACK_DELTA_MODE",
+        "WULFRAM_TANK_CLEAN_TERRAIN_FACE_FALLBACK_DELTA_NORMAL",
+        "WULFRAM_TANK_FACE_FALLBACK_LATCH",
+        "WULFRAM_TANK_RAW_ORIGIN_NORMAL_SOURCE",
+        "WULFRAM_TANK_RAW_ORIGIN_MAX_VELOCITY_DELTA",
+        "WULFRAM_TANK_RAW_ORIGIN_MAX_VERTICAL_DELTA",
+        "WULFRAM_TANK_RAW_ORIGIN_DELTA_MODE",
+        "WULFRAM_TANK_RAW_ORIGIN_ANGULAR_MODE",
+    ]
+    old_env = {key: os.environ.get(key) for key in env_keys}
+    try:
+        for key in env_keys:
+            os.environ.pop(key, None)
+        terrain_face_normal = (-0.900996, -0.000522, 0.433826)
+
+        def fake_model_collision(center, *args, **kwargs):
+            if abs(center[2] - 6.21) >= 1e-6:
+                return None
+            return TerrainContact(
+                position=(5253.0156, 3071.0239, 6.2153),
+                normal=(0.0, -1.0, 0.0),
+                penetration=8.524048,
+                sector_index=7,
+                cell=(120, 70),
+                normal_source="entity_cbsp_split",
+                cbsp_split_normal=(0.0, -1.0, 0.0),
+                terrain_face_normal=terrain_face_normal,
+                mesh_face_normal=(0.0, 1.0, 0.0),
+                entity_radial_normal=(0.95433, -0.298151, 0.018981),
+            )
+
+        server = WulframServer.__new__(WulframServer)
+        server._terrain_grid_collision = SimpleNamespace(
+            test_box_collision=lambda *args, **kwargs: None,
+            test_model_collision=fake_model_collision,
+        )
+        server._get_entity_world_half_extents = lambda ctx: (2.0, 2.0, 3.0)
+        server._get_entity_world_collision_model = lambda ctx: (
+            [],
+            SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=7.5)),
+            7.5,
+            3.0,
+        )
+        server._get_entity_dirty_threshold_sq = lambda ctx, half_extents: 999999.0
+
+        ctx = _fake_tank_collision_context()
+        ctx.player_heading = 0.0
+        ctx.player_pos = (5246.72, 3072.954, 3.21)
+        ctx.world_collision_ref_pos = ctx.player_pos
+        ctx.spring_body_matrix = _matrix3_from_euler_xyz(0.0, 0.0, 0.0)
+        ctx.spring_body_ang_vel = (0.02, -0.82)
+        ctx.angular_vel_yaw = 0.0
+
+        _px, _py, _pz, vx, _vy, vz = server._resolve_entity_world_collision(
+            ctx,
+            5246.72,
+            3072.954,
+            3.21,
+            3.26,
+            -0.19,
+            -6.35,
+            pre_pos=(5246.6, 3072.96, 3.4),
+            pre_vel=(3.26, -0.19, -6.35),
+            dt=1.0 / 30.0,
+        )
+
+        debug = ctx.debug_last_motion_collision
+        assert debug["kind"] == "terrain_clean_face_fallback_contact", debug
+        assert debug["tank_clean_face_fallback"] is True, debug
+        assert debug["clean_contact_original_normal"] == (0.0, -1.0, 0.0), debug
+        assert debug["contact_normal_source"] == "terrain_triangle_contact_face", debug
+        assert debug["raw_origin_fallback_delta_mode"] == "center_closing_velocity", debug
+        assert debug["tank_clean_face_fallback_delta_normal_mode"] == "horizontal_face", debug
+        assert debug["raw_origin_fallback_delta_normal"][2] == 0.0, debug
+        assert debug["raw_origin_fallback_delta_normal_source"] == "terrain_triangle_contact_face_horizontal", debug
+        assert debug["raw_origin_fallback_before_normal_speed_source"] == "center_velocity", debug
+        assert debug["raw_origin_fallback_angular_mode"] == "preserve", debug
+        assert debug["raw_origin_fallback_angular_preserved"] is True, debug
+        assert debug["raw_origin_fallback_velocity_delta_mag_after_safety"] <= 18.001, debug
+        assert abs(debug["angular_velocity_after"][0] - 0.02) < 1e-6, debug
+        assert abs(debug["angular_velocity_after"][1] + 0.82) < 1e-6, debug
+        assert vx < 3.26 and abs(vz + 6.35) < 1e-6, (vx, vz, debug)
+
+        second = server._resolve_entity_world_collision(
+            ctx,
+            5246.72,
+            3072.954,
+            3.21,
+            -4.0,
+            -0.19,
+            2.0,
+            pre_pos=(5246.6, 3072.96, 3.4),
+            pre_vel=(-4.0, -0.19, 2.0),
+            dt=1.0 / 30.0,
+        )
+        debug = ctx.debug_last_motion_collision
+        assert debug["kind"] == "terrain_clean_face_fallback_contact", debug
+        assert debug["raw_origin_fallback_delta_mode"] == "center_closing_velocity", debug
+        assert debug["raw_origin_fallback_delta_normal"][2] == 0.0, debug
+        assert debug["raw_origin_fallback_before_normal_speed_source"] == "center_velocity", debug
+        assert debug["raw_origin_fallback_before_normal_speed"] > 0.0, debug
+        assert debug["raw_origin_fallback_normal_delta_skip_reason"] == "separating_before_velocity", debug
+        assert debug["raw_origin_fallback_velocity_delta_mag_after_safety"] == 0.0, debug
+        assert abs(second[3] + 4.0) < 1e-6, (second, debug)
+        assert abs(second[5] - 2.0) < 1e-6, (second, debug)
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    print(
+        "test_tank_clean_side_contact_uses_face_fallback_without_angular_blowup: PASSED"
+    )
+    return True
+
+
+def test_tank_clean_terrain_contact_rejects_pathological_depth_by_default():
+    """Deep lifted side contacts should not feed the unconstrained clean solver."""
+    env_keys = [
+        "WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE",
+        "WULFRAM_TANK_CLEAN_TERRAIN_MAX_DEPTH",
+    ]
+    old_env = {key: os.environ.get(key) for key in env_keys}
+    try:
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_CONTACT_RESPONSE", None)
+        os.environ.pop("WULFRAM_TANK_CLEAN_TERRAIN_MAX_DEPTH", None)
+
+        def fake_model_collision(center, *args, **kwargs):
+            if abs(center[2] - 13.0) >= 1e-6:
+                return None
+            return TerrainContact(
+                position=(-3.0, 0.0, 10.0),
+                normal=(-1.0, 0.0, 0.0),
+                penetration=36.0,
+                sector_index=7,
+                cell=(122, 68),
+                normal_source="entity_cbsp_split",
+                terrain_face_normal=(0.91213, 0.0, 0.40989),
+                mesh_face_normal=(-1.0, 0.0, 0.0),
+            )
+
+        server = WulframServer.__new__(WulframServer)
+        server._terrain_grid_collision = SimpleNamespace(
+            test_box_collision=lambda *args, **kwargs: None,
+            test_model_collision=fake_model_collision,
+        )
+        server._get_entity_world_half_extents = lambda ctx: (2.0, 2.0, 3.0)
+        server._get_entity_world_collision_model = lambda ctx: (
+            [],
+            SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=7.5)),
+            7.5,
+            3.0,
+        )
+        server._get_entity_dirty_threshold_sq = lambda ctx, half_extents: 999999.0
+
+        ctx = _fake_tank_collision_context()
+        ctx.player_heading = 0.0
+        ctx.player_pos = (0.0, 0.0, 10.0)
+        ctx.world_collision_ref_pos = (0.0, 0.0, 10.0)
+        ctx.spring_body_matrix = _matrix3_from_euler_xyz(0.0, 0.0, 0.0)
+
+        result = server._resolve_entity_world_collision(
+            ctx,
+            0.0,
+            0.0,
+            10.0,
+            14.0,
+            -1.0,
+            -60.0,
+            pre_pos=(0.0, 0.0, 12.0),
+            pre_vel=(14.0, -1.0, -60.0),
+            dt=1.0 / 30.0,
+        )
+
+        debug = ctx.debug_last_motion_collision
+        assert debug["kind"] == "terrain_clean_contact", debug
+        assert debug["response"] == "terrain_contact_constraint_solver_depth_rejected", debug
+        assert debug["terrain_contact_depth_rejected"] is True, debug
+        assert debug["terrain_contact_max_depth"] == 10.0, debug
+        assert result == (0.0, 0.0, 10.0, 14.0, -1.0, -60.0), (result, debug)
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    print("test_tank_clean_terrain_contact_rejects_pathological_depth_by_default: PASSED")
     return True
 
 
@@ -8979,6 +12062,10 @@ def test_static_terrain_constraint_opposite_projection_probe_activates_separatin
         **base_kwargs,
         projection_order="opposite_if_separating",
     )
+    signed_opposite_probe = solve_static_terrain_constraint(
+        **base_kwargs,
+        projection_order="opposite_if_separating_signed",
+    )
     falling = solve_static_terrain_constraint(
         **{**base_kwargs, "velocity": (0.0, 0.0, -2.0)},
         projection_order="opposite_if_separating",
@@ -9005,6 +12092,22 @@ def test_static_terrain_constraint_opposite_projection_probe_activates_separatin
     assert opposite_probe.debug["normal_iterations"] == 1
     assert opposite_probe.debug["normal_impulse"] > 0.0
     assert opposite_probe.velocity[2] > base_kwargs["velocity"][2]
+    assert (
+        signed_opposite_probe.debug["constraint_projection_order"]
+        == "opposite_if_separating"
+    )
+    assert (
+        signed_opposite_probe.debug["constraint_projection_impulse_sign_mode"]
+        == "match_projection"
+    )
+    assert (
+        signed_opposite_probe.debug["constraint_primary_projection_speed_source"]
+        == "world_minus_body_if_body_separating"
+    )
+    assert signed_opposite_probe.debug["normal_iterations"] == 1
+    assert signed_opposite_probe.debug["normal_impulse"] > 0.0
+    assert signed_opposite_probe.debug["normal_impulse_body_sign"] == -1.0
+    assert signed_opposite_probe.velocity[2] < base_kwargs["velocity"][2]
     assert falling.debug["constraint_primary_projection_speed_source"] == "body_minus_world"
     assert falling.debug["normal_impulse"] > 0.0
     print("test_static_terrain_constraint_opposite_projection_probe_activates_separating_penetration: PASSED")
@@ -10925,6 +14028,58 @@ def test_dirty_bounds_contact_helpers_skip_triangle_prefilter():
     return True
 
 
+def test_decompile_bounds_contact_reports_sat_metadata():
+    """Box-bounds SAT helper should expose a report-only decompile terrain lane."""
+    terrain = SimpleNamespace(
+        cell_x=1.0,
+        cell_z=1.0,
+        world_w=2.0,
+        world_h=2.0,
+        num_x=2,
+        num_z=2,
+        _get_raw_height=lambda x, y: 0.0,
+    )
+    grid = TerrainGridCollision(terrain, 0.0, sector_rows=1, sector_cols=1)
+    tri = ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0))
+
+    grid._iter_aabb_sectors = lambda aabb_min, aabb_max: [SimpleNamespace(index=7)]
+    grid._iter_sector_cells = lambda aabb_min, aabb_max, sector: [(3, 4)]
+    grid._iter_cell_triangles = lambda cell_x, cell_y: [tri]
+    grid._triangle_box_contact = lambda tri_local, half_extents: ((0.0, 0.0, 1.0), 0.75)
+
+    contact = grid.test_box_bounds_contact(
+        (0.5, 0.5, 1.0),
+        (0.5, 0.5, 1.0),
+        (1.0, 1.0, 1.0),
+        0.0,
+        1.0,
+        rotation_matrix=(
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+        ),
+        contact_selection="upward_min_depth",
+    )
+
+    assert contact is not None
+    assert contact.normal_source == "terrain_bounds_sat"
+    assert contact.cell == (3, 4)
+    assert contact.sector_index == 7
+    assert contact.terrain_face_normal is not None
+    assert contact.terrain_face_normal[2] > 0.99
+    assert contact.entity_radial_normal is not None
+    assert contact.entity_radial_normal[2] > 0.99
+    assert abs(contact.penetration - 0.75) < 1e-6
+    print("test_decompile_bounds_contact_reports_sat_metadata: PASSED")
+    return True
+
+
 def _make_test_terrain(size_x: int, size_z: int, heights: list[float]) -> Terrain:
     terrain = Terrain.__new__(Terrain)
     terrain.num_x = size_x
@@ -11407,6 +14562,637 @@ def test_entity_world_collision_can_preserve_dirty_miss_reference_for_probe():
     return True
 
 
+def test_entity_world_collision_dirty_reference_pair_probe_is_read_only():
+    """The dirty-reference pair probe reports missed pair contacts without applying them."""
+    env_keys = [
+        "WULFRAM_ENTITY_TERRAIN_DIRTY_REFERENCE_PAIR_PROBE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT_SELECTION",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_NORMAL_SOURCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE",
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK",
+    ]
+    old_env = {key: os.environ.get(key) for key in env_keys}
+    try:
+        os.environ["WULFRAM_ENTITY_TERRAIN_DIRTY_REFERENCE_PAIR_PROBE"] = "1"
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT", None)
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT_SELECTION"] = (
+            "upward_min_depth"
+        )
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_NORMAL_SOURCE"] = "mesh"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE"] = "mesh"
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK", None)
+
+        model_calls = []
+        raycast_calls = []
+
+        def fake_model_collision(center, *args, **kwargs):
+            model_calls.append((tuple(center), kwargs.get("contact_selection")))
+            if (
+                abs(center[0]) < 1e-6
+                and abs(center[1]) < 1e-6
+                and abs(center[2] - 4.0) < 1e-6
+            ):
+                return TerrainContact(
+                    position=(0.0, 0.0, 2.5),
+                    normal=(0.0, 0.0, 1.0),
+                    penetration=1.5,
+                    sector_index=0,
+                    cell=(7, 8),
+                    normal_source="entity_cbsp_split",
+                    cbsp_split_normal=(0.0, 0.0, 1.0),
+                    terrain_face_normal=(0.0, 0.0, 1.0),
+                    mesh_face_normal=(0.0, 0.0, 1.0),
+                    entity_radial_normal=(0.0, 0.0, 1.0),
+                )
+            return None
+
+        def fake_raycast(start, end):
+            raycast_calls.append((start, end))
+            return None
+
+        server = WulframServer.__new__(WulframServer)
+        server._terrain_grid_collision = SimpleNamespace(
+            test_model_bounds_contact=lambda *args, **kwargs: None,
+            test_bounds_intersection=lambda *args, **kwargs: True,
+            test_box_collision=lambda *args, **kwargs: None,
+            test_model_collision=fake_model_collision,
+            raycast=fake_raycast,
+        )
+        server._get_entity_world_half_extents = lambda ctx: (4.0, 4.0, 4.0)
+        server._get_entity_world_collision_model = lambda ctx: (
+            [],
+            SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=5.0)),
+            5.0,
+            3.0,
+        )
+        server._get_entity_dirty_threshold_sq = lambda ctx, half_extents: 1.0
+
+        ctx = ClientContext(
+            client_id=1,
+            client_addr=("10.10.10.2", 50000),
+            session=Session(),
+            entity_id=0x14EA,
+        )
+        ctx.player_heading = 0.0
+        ctx.player_pos = (0.0, 0.0, 4.0)
+        ctx.world_collision_ref_pos = (0.0, 0.0, 4.0)
+
+        result = server._resolve_entity_world_collision(
+            ctx,
+            10.0,
+            0.0,
+            4.0,
+            1.0,
+            0.0,
+            0.0,
+            pre_pos=(0.0, 0.0, 4.0),
+            pre_vel=(1.0, 0.0, 0.0),
+            dt=1.0 / 30.0,
+        )
+
+        assert result == (10.0, 0.0, 4.0, 1.0, 0.0, 0.0), result
+        assert getattr(ctx, "debug_last_motion_collision", {}) == {}, (
+            getattr(ctx, "debug_last_motion_collision", {})
+        )
+        assert ctx.world_collision_ref_pos == (10.0, 0.0, 4.0), (
+            ctx.world_collision_ref_pos
+        )
+        assert raycast_calls == [((0.0, 0.0, 4.0), (10.0, 0.0, 4.0))], (
+            raycast_calls
+        )
+        probe = ctx.debug_last_terrain_contact_probe
+        assert probe["dirty_bounds_active"] is True, probe
+        assert probe["dirty_bounds_xy_overlap"] is True, probe
+        assert probe["dirty_miss_reason"] == "dirty_bounds_clear", probe
+        assert probe["dirty_reference_pair_probe_enabled"] is True, probe
+        dirty_probe = probe["dirty_reference_pair_probe"]
+        assert dirty_probe["reject"] == "", dirty_probe
+        assert dirty_probe["accept_labels"] == ["dirty_reference_pos"], dirty_probe
+        reference = dirty_probe["results"]["dirty_reference_pos"]
+        assert reference["accepted"] is True, reference
+        assert reference["contact"]["contact_cell"] == (7, 8), reference
+        assert dirty_probe["results"]["dirty_current_pos"]["reject"] == (
+            "no_raw_origin_contact"
+        ), dirty_probe
+        assert any(
+            call == ((0.0, 0.0, 4.0), "upward_min_depth") for call in model_calls
+        ), model_calls
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    print("test_entity_world_collision_dirty_reference_pair_probe_is_read_only: PASSED")
+    return True
+
+
+def test_entity_world_collision_dirty_reference_pair_response_preserves_position():
+    """Dirty-reference pair response applies only the contact velocity delta."""
+    env_keys = [
+        "WULFRAM_ENTITY_TERRAIN_DIRTY_REFERENCE_PAIR_RESPONSE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT_SELECTION",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_NORMAL_SOURCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VELOCITY_DELTA",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VERTICAL_DELTA",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE",
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK",
+        "WULFRAM_ENTITY_TERRAIN_DIRTY_REFERENCE_PAIR_RESPONSE_MAX_DISTANCE",
+    ]
+    old_env = {key: os.environ.get(key) for key in env_keys}
+    try:
+        os.environ["WULFRAM_ENTITY_TERRAIN_DIRTY_REFERENCE_PAIR_RESPONSE"] = "apply"
+        os.environ[
+            "WULFRAM_ENTITY_TERRAIN_DIRTY_REFERENCE_PAIR_RESPONSE_MAX_DISTANCE"
+        ] = "20.0"
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT", None)
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT_SELECTION"] = (
+            "upward_min_depth"
+        )
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_NORMAL_SOURCE"] = "mesh"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE"] = "mesh"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VELOCITY_DELTA"] = "0.5"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VERTICAL_DELTA"] = "0.5"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE"] = "closing_velocity"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE"] = "preserve"
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK", None)
+
+        model_calls = []
+        raycast_calls = []
+
+        def fake_model_collision(center, *args, **kwargs):
+            model_calls.append((tuple(center), kwargs.get("contact_selection")))
+            if (
+                abs(center[0]) < 1e-6
+                and abs(center[1]) < 1e-6
+                and abs(center[2] - 4.0) < 1e-6
+            ):
+                return TerrainContact(
+                    position=(0.0, 0.0, 2.5),
+                    normal=(0.0, 0.0, 1.0),
+                    penetration=1.5,
+                    sector_index=0,
+                    cell=(7, 8),
+                    normal_source="entity_cbsp_split",
+                    cbsp_split_normal=(0.0, 0.0, 1.0),
+                    terrain_face_normal=(0.0, 0.0, 1.0),
+                    mesh_face_normal=(0.0, 0.0, 1.0),
+                    entity_radial_normal=(0.0, 0.0, 1.0),
+                )
+            return None
+
+        def fake_raycast(start, end):
+            raycast_calls.append((start, end))
+            return None
+
+        server = WulframServer.__new__(WulframServer)
+        server._terrain_grid_collision = SimpleNamespace(
+            test_model_bounds_contact=lambda *args, **kwargs: None,
+            test_bounds_intersection=lambda *args, **kwargs: True,
+            test_box_collision=lambda *args, **kwargs: None,
+            test_model_collision=fake_model_collision,
+            raycast=fake_raycast,
+        )
+        server._get_entity_world_half_extents = lambda ctx: (4.0, 4.0, 4.0)
+        server._get_entity_world_collision_model = lambda ctx: (
+            [],
+            SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=5.0)),
+            5.0,
+            3.0,
+        )
+        server._get_entity_dirty_threshold_sq = lambda ctx, half_extents: 1.0
+
+        ctx = ClientContext(
+            client_id=1,
+            client_addr=("10.10.10.2", 50000),
+            session=Session(),
+            entity_id=0x14EA,
+        )
+        ctx.player_heading = 0.0
+        ctx.player_pos = (0.0, 0.0, 4.0)
+        ctx.world_collision_ref_pos = (0.0, 0.0, 4.0)
+
+        result = server._resolve_entity_world_collision(
+            ctx,
+            10.0,
+            0.0,
+            4.0,
+            1.0,
+            0.0,
+            -5.0,
+            pre_pos=(0.0, 0.0, 4.0),
+            pre_vel=(1.0, 0.0, -5.0),
+            dt=1.0 / 30.0,
+        )
+
+        px, py, pz, vx, vy, vz = result
+        assert (px, py, pz) == (10.0, 0.0, 4.0), result
+        assert vz > -5.0, result
+        assert vz - (-5.0) <= 0.500001, result
+        assert raycast_calls == [], raycast_calls
+        assert ctx.world_collision_ref_pos == (10.0, 0.0, 4.0), (
+            ctx.world_collision_ref_pos
+        )
+        collision = ctx.debug_last_collision
+        assert collision["kind"] == "terrain_dirty_reference_pair_response", collision
+        assert collision["pair_record_contact_reason"] == (
+            "dirty_reference_pair_response"
+        ), collision
+        assert collision["dirty_reference_pair_response_preserved_position"] is True, (
+            collision
+        )
+        probe = ctx.debug_last_terrain_contact_probe
+        assert probe["dirty_reference_pair_response_enabled"] is True, probe
+        assert probe["dirty_reference_pair_response_apply_enabled"] is True, probe
+        response = probe["dirty_reference_pair_response"]
+        assert response["applied"] is True, response
+        assert response["applied_to_current_state"] is True, response
+        assert response["label"] == "dirty_reference_pos", response
+        assert response["max_distance"] == 20.0, response
+        assert abs(response["current_distance"] - 10.0) < 1e-6, response
+        assert abs(response["current_xy_distance"] - 10.0) < 1e-6, response
+        assert response["current_z_delta"] == 0.0, response
+        assert response["final_vel"][2] == vz, response
+        assert collision["dirty_reference_pair_response_max_distance"] == 20.0, (
+            collision
+        )
+        assert abs(
+            collision["dirty_reference_pair_response_current_distance"] - 10.0
+        ) < 1e-6, collision
+        assert any(
+            call == ((0.0, 0.0, 4.0), "upward_min_depth") for call in model_calls
+        ), model_calls
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    print(
+        "test_entity_world_collision_dirty_reference_pair_response_preserves_position: PASSED"
+    )
+    return True
+
+
+def test_entity_world_collision_dirty_reference_pair_response_max_distance_rejects():
+    """Dirty-reference pair response can be distance-gated without moving state."""
+    env_keys = [
+        "WULFRAM_ENTITY_TERRAIN_DIRTY_REFERENCE_PAIR_RESPONSE",
+        "WULFRAM_ENTITY_TERRAIN_DIRTY_REFERENCE_PAIR_RESPONSE_MAX_DISTANCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT_SELECTION",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_NORMAL_SOURCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VELOCITY_DELTA",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VERTICAL_DELTA",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE",
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK",
+    ]
+    old_env = {key: os.environ.get(key) for key in env_keys}
+    try:
+        os.environ["WULFRAM_ENTITY_TERRAIN_DIRTY_REFERENCE_PAIR_RESPONSE"] = "apply"
+        os.environ[
+            "WULFRAM_ENTITY_TERRAIN_DIRTY_REFERENCE_PAIR_RESPONSE_MAX_DISTANCE"
+        ] = "1.5"
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT", None)
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT_SELECTION"] = (
+            "upward_min_depth"
+        )
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_NORMAL_SOURCE"] = "mesh"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE"] = "mesh"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VELOCITY_DELTA"] = "0.5"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VERTICAL_DELTA"] = "0.5"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE"] = "closing_velocity"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE"] = "preserve"
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK", None)
+
+        model_calls = []
+        raycast_calls = []
+
+        def fake_model_collision(center, *args, **kwargs):
+            model_calls.append((tuple(center), kwargs.get("contact_selection")))
+            if (
+                abs(center[0]) < 1e-6
+                and abs(center[1]) < 1e-6
+                and abs(center[2] - 4.0) < 1e-6
+            ):
+                return TerrainContact(
+                    position=(0.0, 0.0, 2.5),
+                    normal=(0.0, 0.0, 1.0),
+                    penetration=1.5,
+                    sector_index=0,
+                    cell=(7, 8),
+                    normal_source="entity_cbsp_split",
+                    cbsp_split_normal=(0.0, 0.0, 1.0),
+                    terrain_face_normal=(0.0, 0.0, 1.0),
+                    mesh_face_normal=(0.0, 0.0, 1.0),
+                    entity_radial_normal=(0.0, 0.0, 1.0),
+                )
+            return None
+
+        def fake_raycast(start, end):
+            raycast_calls.append((start, end))
+            return None
+
+        server = WulframServer.__new__(WulframServer)
+        server._terrain_grid_collision = SimpleNamespace(
+            test_model_bounds_contact=lambda *args, **kwargs: None,
+            test_bounds_intersection=lambda *args, **kwargs: True,
+            test_box_collision=lambda *args, **kwargs: None,
+            test_model_collision=fake_model_collision,
+            raycast=fake_raycast,
+        )
+        server._get_entity_world_half_extents = lambda ctx: (4.0, 4.0, 4.0)
+        server._get_entity_world_collision_model = lambda ctx: (
+            [],
+            SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=5.0)),
+            5.0,
+            3.0,
+        )
+        server._get_entity_dirty_threshold_sq = lambda ctx, half_extents: 1.0
+
+        ctx = ClientContext(
+            client_id=1,
+            client_addr=("10.10.10.2", 50000),
+            session=Session(),
+            entity_id=0x14EA,
+        )
+        ctx.player_heading = 0.0
+        ctx.player_pos = (0.0, 0.0, 4.0)
+        ctx.world_collision_ref_pos = (0.0, 0.0, 4.0)
+
+        result = server._resolve_entity_world_collision(
+            ctx,
+            10.0,
+            0.0,
+            4.0,
+            1.0,
+            0.0,
+            -5.0,
+            pre_pos=(0.0, 0.0, 4.0),
+            pre_vel=(1.0, 0.0, -5.0),
+            dt=1.0 / 30.0,
+        )
+
+        assert result == (10.0, 0.0, 4.0, 1.0, 0.0, -5.0), result
+        probe = ctx.debug_last_terrain_contact_probe
+        response = probe["dirty_reference_pair_response"]
+        assert response["reject"] == "dirty_reference_pair_response_too_far", (
+            response
+        )
+        assert response["applied"] is False, response
+        assert response["max_distance"] == 1.5, response
+        assert abs(response["current_distance"] - 10.0) < 1e-6, response
+        assert abs(response["current_xy_distance"] - 10.0) < 1e-6, response
+        assert response["current_z_delta"] == 0.0, response
+        assert raycast_calls == [((0.0, 0.0, 4.0), (10.0, 0.0, 4.0))], (
+            raycast_calls
+        )
+        assert any(
+            call == ((0.0, 0.0, 4.0), "upward_min_depth") for call in model_calls
+        ), model_calls
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    print(
+        "test_entity_world_collision_dirty_reference_pair_response_max_distance_rejects: PASSED"
+    )
+    return True
+
+
+def test_entity_world_collision_dirty_bounds_safe_response_limits_box_fallback():
+    """Dirty AABB fallback can reuse the safety-limited pair response instead of raw solver output."""
+    env_keys = [
+        "WULFRAM_ENTITY_TERRAIN_DIRTY_BOUNDS_BOX_FALLBACK",
+        "WULFRAM_ENTITY_TERRAIN_DIRTY_BOUNDS_SAFE_RESPONSE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VELOCITY_DELTA",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VERTICAL_DELTA",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE",
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK",
+    ]
+    old_env = {key: os.environ.get(key) for key in env_keys}
+    try:
+        os.environ["WULFRAM_ENTITY_TERRAIN_DIRTY_BOUNDS_BOX_FALLBACK"] = "decompile"
+        os.environ["WULFRAM_ENTITY_TERRAIN_DIRTY_BOUNDS_SAFE_RESPONSE"] = "1"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VELOCITY_DELTA"] = "0.25"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VERTICAL_DELTA"] = "0.25"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE"] = "closing_velocity"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE"] = "preserve"
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK", None)
+
+        box_calls = []
+        raycast_calls = []
+
+        def fake_box_bounds_contact(*args, **kwargs):
+            box_calls.append(args)
+            return TerrainContact(
+                position=(10.0, 0.0, 3.0),
+                normal=(0.0, 0.0, 1.0),
+                penetration=2.0,
+                sector_index=0,
+                cell=(2, 3),
+                normal_source="dirty_aabb_test",
+            )
+
+        def fake_raycast(start, end):
+            raycast_calls.append((start, end))
+            return None
+
+        server = WulframServer.__new__(WulframServer)
+        server._terrain_grid_collision = SimpleNamespace(
+            test_model_bounds_contact=lambda *args, **kwargs: None,
+            test_box_bounds_contact=fake_box_bounds_contact,
+            test_bounds_intersection=lambda *args, **kwargs: True,
+            test_box_collision=lambda *args, **kwargs: None,
+            test_model_collision=lambda *args, **kwargs: None,
+            raycast=fake_raycast,
+        )
+        server._get_entity_world_half_extents = lambda ctx: (4.0, 4.0, 4.0)
+        server._get_entity_world_collision_model = lambda ctx: (
+            [],
+            SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=5.0)),
+            5.0,
+            3.0,
+        )
+        server._get_entity_dirty_threshold_sq = lambda ctx, half_extents: 1.0
+
+        ctx = ClientContext(
+            client_id=1,
+            client_addr=("10.10.10.2", 50000),
+            session=Session(),
+            entity_id=0x14EA,
+        )
+        ctx.player_heading = 0.0
+        ctx.player_pos = (0.0, 0.0, 4.0)
+        ctx.world_collision_ref_pos = (0.0, 0.0, 4.0)
+
+        result = server._resolve_entity_world_collision(
+            ctx,
+            10.0,
+            0.0,
+            4.0,
+            0.0,
+            0.0,
+            -10.0,
+            pre_pos=(0.0, 0.0, 4.0),
+            pre_vel=(0.0, 0.0, -10.0),
+            dt=1.0 / 30.0,
+        )
+
+        assert box_calls, box_calls
+        assert raycast_calls == [], raycast_calls
+        px, py, pz, vx, vy, vz = result
+        assert all(math.isfinite(value) for value in result), result
+        assert vz - (-10.0) <= 0.250001, result
+        assert ctx.world_collision_ref_pos == (px, py, pz), ctx.world_collision_ref_pos
+        collision = ctx.debug_last_collision
+        assert collision["kind"] == "terrain_dirty_bounds_safety_limited", collision
+        assert collision["dirty_bounds_safe_response"] is True, collision
+        assert collision["dirty_bounds_safe_response_applied"] is True, collision
+        assert collision["raw_origin_fallback_velocity_delta_clamped"] in {
+            True,
+            False,
+        }, collision
+        probe = ctx.debug_last_terrain_contact_probe
+        assert probe["dirty_bounds_safe_response_enabled"] is True, probe
+        assert probe["dirty_bounds_box_fallback_applied"] is True, probe
+        assert probe["dirty_bounds_box_contact"]["contact_cell"] == (2, 3), probe
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    print(
+        "test_entity_world_collision_dirty_bounds_safe_response_limits_box_fallback: PASSED"
+    )
+    return True
+
+
+def test_pair_record_bounds_sat_can_feed_safety_limited_contact():
+    """Default-off terrain-bounds SAT contact can feed the pair-record response path."""
+    env_keys = [
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_BOUNDS_SAT",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VELOCITY_DELTA",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VERTICAL_DELTA",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE",
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK",
+    ]
+    old_env = {key: os.environ.get(key) for key in env_keys}
+    try:
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_BOUNDS_SAT"] = "apply"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VELOCITY_DELTA"] = "0.25"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_MAX_VERTICAL_DELTA"] = "0.25"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_MODE"] = "closing_velocity"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_ANGULAR_MODE"] = "preserve"
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK", None)
+
+        box_calls = []
+
+        def fake_box_bounds_contact(*args, **kwargs):
+            box_calls.append((args, kwargs))
+            return TerrainContact(
+                position=(0.0, 0.0, 3.0),
+                normal=(0.0, 0.0, 1.0),
+                penetration=1.0,
+                sector_index=0,
+                cell=(2, 3),
+                normal_source="terrain_bounds_sat",
+                terrain_face_normal=(0.0, 0.0, 1.0),
+                entity_radial_normal=(0.6, 0.0, 0.8),
+            )
+
+        server = WulframServer.__new__(WulframServer)
+        server._terrain_grid_collision = SimpleNamespace(
+            test_model_bounds_contact=lambda *args, **kwargs: None,
+            test_box_bounds_contact=fake_box_bounds_contact,
+            test_bounds_intersection=lambda *args, **kwargs: False,
+            test_box_collision=lambda *args, **kwargs: None,
+            test_model_collision=lambda *args, **kwargs: None,
+            raycast=lambda *args, **kwargs: None,
+        )
+        server._get_entity_world_half_extents = lambda ctx: (4.0, 4.0, 4.0)
+        server._get_entity_world_collision_model = lambda ctx: (
+            [],
+            SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=5.0)),
+            5.0,
+            3.0,
+        )
+        server._get_entity_dirty_threshold_sq = lambda ctx, half_extents: 9999.0
+
+        ctx = ClientContext(
+            client_id=1,
+            client_addr=("10.10.10.2", 50000),
+            session=Session(),
+            entity_id=0x14EA,
+        )
+        ctx.player_heading = 0.0
+        ctx.player_pos = (0.0, 0.0, 4.0)
+        ctx.world_collision_ref_pos = (0.0, 0.0, 4.0)
+
+        result = server._resolve_entity_world_collision(
+            ctx,
+            0.0,
+            0.0,
+            4.0,
+            0.0,
+            0.0,
+            -10.0,
+            pre_pos=(0.0, 0.0, 4.0),
+            pre_vel=(0.0, 0.0, -10.0),
+            dt=1.0 / 30.0,
+        )
+
+        assert box_calls, box_calls
+        assert any(
+            call_kwargs.get("contact_selection") == "upward_min_depth"
+            for _call_args, call_kwargs in box_calls
+        ), box_calls
+        px, py, pz, vx, vy, vz = result
+        assert all(math.isfinite(value) for value in result), result
+        assert vz - (-10.0) <= 0.250001, result
+        collision = ctx.debug_last_collision
+        assert collision["kind"] == "terrain_pair_record_contact", collision
+        assert collision["pair_record_contact_reason"] == (
+            "lifted_clear_raw_origin_bounds_contact"
+        ), collision
+        assert collision["pair_record_bounds_sat_apply_enabled"] is True, collision
+        assert collision["pair_record_solver_normal_source"] == "terrain_bounds_sat", collision
+        assert collision["pair_record_delta_normal_source"] == (
+            "entity_radial_terrain_face_blend"
+        ), collision
+        assert collision["raw_origin_fallback_delta_normal_source"] == (
+            "entity_radial_terrain_face_blend"
+        ), collision
+        probe = ctx.debug_last_terrain_contact_probe
+        assert probe["pair_record_bounds_sat_enabled"] is True, probe
+        assert probe["pair_record_bounds_sat_apply_enabled"] is True, probe
+        assert probe["pair_record_contact_delta_normal_source"] == (
+            "entity_radial_terrain_face_blend"
+        ), probe
+        assert probe["raw_origin_bounds_contact"]["contact_normal_source"] == (
+            "terrain_bounds_sat"
+        ), probe
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    print("test_pair_record_bounds_sat_can_feed_safety_limited_contact: PASSED")
+    return True
+
+
 def test_entity_world_collision_dirty_miss_still_records_raw_origin_probe():
     """Dirty lifted misses should still expose the clean/raw-origin probe reason."""
     old_fallback = os.environ.get("WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK")
@@ -11664,7 +15450,10 @@ def test_entity_world_collision_dirty_model_clear_can_use_box_fallback():
         assert box_bounds_calls, box_bounds_calls
         args, kwargs = box_bounds_calls[0]
         assert args == ((10.0, 0.0, 4.0), (10.0, 0.0, 4.0), (4.0, 4.0, 4.0), 0.0, 5.0), args
-        assert kwargs == {}, kwargs
+        assert kwargs == {
+            "rotation_matrix": None,
+            "contact_selection": "upward_min_depth",
+        }, kwargs
         assert raycast_calls == [], raycast_calls
         assert abs(px - 10.0) < 1e-6, (px, py, pz, vx, vy, vz)
         assert abs(py) < 1e-6, (px, py, pz, vx, vy, vz)
@@ -12422,6 +16211,30 @@ def test_tick_loop_start_guard_allows_one_live_thread():
     return True
 
 
+def test_tick_pacer_preserves_capped_catchup_backlog():
+    period = 1.0 / 30.0
+    next_tick, sleep_dt = WulframServer._advance_tick_pacer(
+        0.0,
+        period,
+        now=0.08,
+        max_catchup_steps=5,
+    )
+    assert abs(next_tick - period) < 1e-9, (next_tick, sleep_dt)
+    assert sleep_dt == 0.0, (next_tick, sleep_dt)
+
+    capped_next, capped_sleep = WulframServer._advance_tick_pacer(
+        0.0,
+        period,
+        now=1.0,
+        max_catchup_steps=5,
+    )
+    expected = 1.0 - period * 4.0
+    assert abs(capped_next - expected) < 1e-9, (capped_next, expected)
+    assert capped_sleep == 0.0, (capped_next, capped_sleep)
+    print("test_tick_pacer_preserves_capped_catchup_backlog: PASSED")
+    return True
+
+
 def test_client_weapon_fire_telemetry_records_input_projectiles():
     """Client-input projectile fire should leave structured control-plane evidence."""
     server = WulframServer.__new__(WulframServer)
@@ -13002,8 +16815,13 @@ def main():
         test_tank_ground_contact_damping_limits_low_hover_speed,
         test_tank_high_hover_uses_linear_damping_for_w_motion,
         test_remote_og_movement_input_delay_replays_prior_axis_sample,
+        test_remote_og_movement_input_delay_can_probe_nearest_axis_sample,
+        test_remote_og_movement_input_tick_probe_reports_tick_domain_candidates,
         test_server_jump_jets_apply_fixed_step_rising_edge,
         test_server_jump_jets_have_visible_peak_under_default_gravity,
+        test_server_jump_jets_use_tank_body_up_direction,
+        test_server_jump_jet_landing_guard_rejects_large_world_collision_projection,
+        test_server_tank_terrain_projection_guard_rejects_fast_straight_side_shove,
         test_server_jump_jets_queue_remote_og_correction_burst,
         test_server_motion_clamps_to_move_adjust,
         test_server_motion_reclamps_below_ground_after_collision_response,
@@ -13043,6 +16861,14 @@ def main():
         test_segment_hits_cbsp_tree_detects_plane_hit,
         test_triangle_cbsp_contact_uses_node_split_normal,
         test_triangle_cbsp_contact_uses_entity_bounding_radius_for_plane_reject,
+        test_triangle_cbsp_mesh_vertex_probe_reports_embedded_vertex,
+        test_triangle_cbsp_mesh_edge_terrain_plane_probe_reports_crossing_edge,
+        test_triangle_cbsp_mesh_edge_terrain_plane_probe_reports_second_tilted_fixture,
+        test_triangle_cbsp_mesh_edge_terrain_plane_probe_preserves_endpoint_hit,
+        test_triangle_cbsp_mesh_edge_endpoint_probe_prefers_deeper_node,
+        test_triangle_cbsp_node_plane_vertex_probe_uses_split_normal,
+        test_triangle_cbsp_strict_probe_skips_heuristic_vertex_fallback,
+        test_triangle_cbsp_guess7_order_probe_rejects_target_point_shortcut,
         test_box_collision_returns_first_contact_in_grid_order,
         test_model_collision_returns_first_contact_in_grid_order,
         test_model_collision_can_probe_upward_min_depth_selection,
@@ -13059,14 +16885,38 @@ def main():
         test_entity_world_collision_prefers_mesh_contact_when_collision_model_exists,
         test_entity_world_collision_model_defaults_to_legacy_lift,
         test_entity_world_collision_model_entity_origin_can_be_requested,
+        test_entity_world_collision_model_simplified_variant_is_opt_in,
         test_entity_world_collision_model_contact_can_use_body_matrix_probe,
         test_entity_world_collision_records_raw_origin_probe_without_applying_contact,
         test_entity_world_collision_reference_pose_probe_records_pre_step_contact_when_enabled,
         test_entity_world_collision_reference_pose_pair_record_contact_can_apply_when_enabled,
+        test_entity_world_collision_reference_pose_pair_response_preserves_position,
+        test_entity_world_collision_cached_pair_record_contact_can_bridge_lifted_clear_when_enabled,
+        test_entity_world_collision_deferred_prestep_pair_record_contact_when_enabled,
+        test_entity_world_collision_deferred_prestep_pair_record_probe_is_read_only,
+        test_entity_world_collision_dirty_reference_pair_probe_is_read_only,
+        test_entity_world_collision_dirty_reference_pair_response_preserves_position,
+        test_entity_world_collision_dirty_reference_pair_response_max_distance_rejects,
+        test_entity_world_collision_dirty_bounds_safe_response_limits_box_fallback,
         test_entity_world_collision_pair_record_contact_can_continue_remaining_step_when_enabled,
         test_entity_world_collision_pair_record_continue_sweeps_transient_contact,
+        test_entity_world_collision_pair_record_schedule_probe_reports_without_applying,
+        test_entity_world_collision_spatial_ref_schedule_probe_reports_without_applying,
+        test_entity_world_collision_pair_record_schedule_response_probe_is_read_only,
+        test_entity_world_collision_phase_lookahead_probe_reports_future_pair_contact,
+        test_entity_world_collision_phase_lookahead_contact_applies_without_future_teleport,
+        test_entity_world_collision_phase_lookahead_queue_resolves_when_due,
+        test_entity_world_collision_phase_backtrack_probe_reports_prior_pair_contact,
+        test_entity_world_collision_phase_backtrack_contact_replays_to_endpoint,
         test_entity_world_collision_pair_record_contact_applies_decompile_face_gated_contact,
+        test_entity_world_collision_pair_record_can_probe_raw_solver_linear_response,
         test_entity_world_collision_pair_record_contact_uses_shallow_upward_selection,
+        test_entity_world_collision_pair_record_contact_accepts_og_straightaway_face,
+        test_tank_clean_terrain_contact_uses_pair_solver_by_default,
+        test_tank_clean_terrain_projection_order_uses_opposite_probe_by_default,
+        test_tank_default_raw_origin_fallback_uses_empirical_straightaway_face,
+        test_tank_clean_side_contact_uses_face_fallback_without_angular_blowup,
+        test_tank_clean_terrain_contact_rejects_pathological_depth_by_default,
         test_entity_world_collision_raw_origin_fallback_applies_guarded_pair_solver,
         test_entity_world_collision_raw_origin_fallback_clamps_solver_velocity_delta,
         test_entity_world_collision_raw_origin_fallback_can_use_terrain_normal_probe,
@@ -13104,6 +16954,7 @@ def main():
         test_entity_world_collision_dirty_model_center_defaults_to_lifted_center,
         test_entity_world_collision_dirty_model_center_can_use_raw_center,
         test_entity_world_collision_dirty_bounds_store_accepts_tiny_contact,
+        test_pair_record_bounds_sat_can_feed_safety_limited_contact,
         test_entity_world_collision_dirty_bounds_store_uses_contact_point_radius_resolution,
         test_entity_world_collision_pathological_dirty_bounds_contact_falls_back_to_raycast,
         test_entity_world_collision_downward_dirty_bounds_contact_falls_back_to_raycast,
@@ -13111,6 +16962,7 @@ def main():
         test_entity_world_collision_horizontal_dirty_bounds_contact_falls_back_to_raycast,
         test_entity_world_collision_dirty_bounds_phase_uses_xy_broadphase,
         test_dirty_bounds_contact_helpers_skip_triangle_prefilter,
+        test_decompile_bounds_contact_reports_sat_metadata,
         test_terrain_height_uses_decompile_triangle_plane_not_bilinear,
         test_terrain_slope_uses_active_triangle_plane_normal,
         test_player_terrain_probe_reports_decompile_triangle_state,
@@ -13140,6 +16992,7 @@ def main():
         test_solo_local_player_keepalive_shape_triggers_og_state_request_gate,
         test_view_update_pos_without_rot_clamps_to_safe_shape,
         test_tick_loop_start_guard_allows_one_live_thread,
+        test_tick_pacer_preserves_capped_catchup_backlog,
         test_client_weapon_fire_telemetry_records_input_projectiles,
         test_players_json_includes_transport_addresses,
         test_health_control_uses_server_heartbeat_helper,
