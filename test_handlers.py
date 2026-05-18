@@ -10048,6 +10048,11 @@ def test_entity_world_collision_pair_record_contact_uses_shallow_upward_selectio
         assert pz > 10.0 and vz > -10.0, (pz, vz)
         probe = ctx.debug_last_terrain_contact_probe
         assert probe["raw_origin_contact"]["depth"] == 29.9, probe
+        assert probe["pair_record_raw_contact"]["depth"] == 29.9, probe
+        assert probe["pair_record_selected_raw_contact"]["depth"] == 4.0, probe
+        assert probe["pair_record_selected_raw_bounds_contact"] is None, probe
+        assert probe["pair_record_selected_raw_error"] is None, probe
+        assert probe["pair_record_selected_pair_contact_source"] == "entity_cbsp_split", probe
         assert probe["pair_record_contact"]["depth"] == 4.0, probe
         assert probe["pair_record_contact_selection"] == "upward_min_depth", probe
         assert probe["pair_record_contact_reject"] == "", probe

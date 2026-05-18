@@ -11539,6 +11539,11 @@ class WulframServer:
             pair_record_contact=None,
             pair_record_delta_contact=None,
             pair_record_contact_reject=None,
+            pair_record_raw_contact=None,
+            pair_record_selected_raw_contact=None,
+            pair_record_selected_raw_bounds_contact=None,
+            pair_record_selected_raw_error=None,
+            pair_record_selected_pair_contact_source=None,
             raycast_probe=None,
         ):
             ctx.debug_last_terrain_contact_probe = {}
@@ -11741,6 +11746,8 @@ class WulframServer:
                 ),
                 "pair_record_contact_reject": pair_record_contact_reject,
                 "pair_record_contact_selection": pair_record_contact_selection,
+                "pair_record_selected_raw_error": pair_record_selected_raw_error,
+                "pair_record_selected_pair_contact_source": pair_record_selected_pair_contact_source,
                 "pair_record_contact_normal_source": pair_record_contact_normal_source,
                 "pair_record_contact_delta_normal_source": pair_record_contact_delta_normal_source,
                 "pair_record_contact_vertical_delta_mode": pair_record_contact_vertical_delta_mode,
@@ -11840,6 +11847,21 @@ class WulframServer:
                 ),
                 "raw_origin_contact": probe_contact_fields(
                     raw_contact,
+                    center=raw_center,
+                    z_lift_used=0.0,
+                ),
+                "pair_record_raw_contact": probe_contact_fields(
+                    pair_record_raw_contact,
+                    center=raw_center,
+                    z_lift_used=0.0,
+                ),
+                "pair_record_selected_raw_contact": probe_contact_fields(
+                    pair_record_selected_raw_contact,
+                    center=raw_center,
+                    z_lift_used=0.0,
+                ),
+                "pair_record_selected_raw_bounds_contact": probe_contact_fields(
+                    pair_record_selected_raw_bounds_contact,
                     center=raw_center,
                     z_lift_used=0.0,
                 ),
@@ -15019,6 +15041,15 @@ class WulframServer:
                     pair_record_contact=pair_contact,
                     pair_record_delta_contact=pair_delta_contact,
                     pair_record_contact_reject=pair_contact_reject,
+                    pair_record_raw_contact=raw_contact,
+                    pair_record_selected_raw_contact=pair_raw_contact,
+                    pair_record_selected_raw_bounds_contact=pair_raw_bounds_contact,
+                    pair_record_selected_raw_error=pair_raw_error,
+                    pair_record_selected_pair_contact_source=(
+                        getattr(pair_contact_source, "normal_source", None)
+                        if pair_contact_source is not None
+                        else None
+                    ),
                     raycast_probe=raycast_probe,
                 )
                 direct_pair_schedule_probe = estimate_direct_pair_record_contact_timing()
