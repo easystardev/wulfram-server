@@ -1098,6 +1098,14 @@ class WulframServer:
             self.remote_og_movement_input_delay = 0.20
         if self.remote_og_movement_input_delay < 0.0:
             self.remote_og_movement_input_delay = 0.0
+        try:
+            self.remote_og_movement_input_stale_clamp = float(
+                os.environ.get("WULFRAM_REMOTE_OG_MOVEMENT_INPUT_STALE_CLAMP", "0")
+            )
+        except ValueError:
+            self.remote_og_movement_input_stale_clamp = 0.0
+        if self.remote_og_movement_input_stale_clamp < 0.0:
+            self.remote_og_movement_input_stale_clamp = 0.0
         self.remote_og_movement_input_selection = (
             os.environ.get(
                 "WULFRAM_REMOTE_OG_MOVEMENT_INPUT_SELECTION",
@@ -1128,7 +1136,8 @@ class WulframServer:
         print(f"[CONFIG] remote_og_movement_input_delay={self.remote_og_movement_input_delay:.2f}s")
         print(
             "[CONFIG] remote_og_movement_input_selection="
-            f"{self.remote_og_movement_input_selection}"
+            f"{self.remote_og_movement_input_selection} "
+            f"stale_clamp={self.remote_og_movement_input_stale_clamp:.2f}s"
         )
         tick_probe_mode = (
             os.environ.get("WULFRAM_REMOTE_OG_MOVEMENT_INPUT_TICK_PROBE", "0")
@@ -7478,6 +7487,27 @@ class WulframServer:
             selected_time = float(selected.get("time", 0.0))
         except (TypeError, ValueError, AttributeError):
             selected_time = 0.0
+        selected_target_error = selected_time - target_time if selected_time > 0.0 else None
+        stale_clamp = max(
+            0.0,
+            float(getattr(self, "remote_og_movement_input_stale_clamp", 0.0) or 0.0),
+        )
+        stale_clamp_applied = False
+        stale_clamp_reason = ""
+        if (
+            stale_clamp > 0.0
+            and selected_target_error is not None
+            and selected_target_error < -stale_clamp
+        ):
+            current_changed = (
+                abs(float(current_fwd) - fwd) > 0.05
+                or abs(float(current_strafe) - strafe) > 0.05
+            )
+            if current_changed:
+                fwd = float(current_fwd)
+                strafe = float(current_strafe)
+                stale_clamp_applied = True
+                stale_clamp_reason = "selected_sample_older_than_target_and_current_changed"
         selected_interval_end_time = None
         if selected is before and isinstance(after, dict):
             try:
@@ -7501,15 +7531,18 @@ class WulframServer:
             "history_len": len(history),
             "target_time": target_time,
             "selected_age_s": (now - selected_time) if selected_time > 0.0 else None,
-            "selected_target_error_s": (
-                selected_time - target_time if selected_time > 0.0 else None
-            ),
+            "selected_target_error_s": selected_target_error,
             "selected_abs_target_error_s": (
-                abs(selected_time - target_time) if selected_time > 0.0 else None
+                abs(selected_target_error) if selected_target_error is not None else None
             ),
             "selected_future_of_target": (
                 selected_time > target_time if selected_time > 0.0 else None
             ),
+            "selected_original_fwd": float(selected.get("fwd", 0.0)),
+            "selected_original_strafe": float(selected.get("strafe", 0.0)),
+            "stale_clamp_s": stale_clamp,
+            "stale_clamp_applied": stale_clamp_applied,
+            "stale_clamp_reason": stale_clamp_reason,
             "selected_fwd": fwd,
             "selected_strafe": strafe,
             "selected_client_tick": int(selected.get("client_tick", 0) or 0),
@@ -7538,7 +7571,12 @@ class WulframServer:
             "latest_strafe": float(latest.get("strafe", 0.0)) if isinstance(latest, dict) else 0.0,
             "latest_client_tick": int(latest.get("client_tick", 0) or 0) if isinstance(latest, dict) else 0,
         }
-        return fwd, strafe, "delayed_remote_og_action_history"
+        source = (
+            "delayed_remote_og_action_history_stale_clamped"
+            if stale_clamp_applied
+            else "delayed_remote_og_action_history"
+        )
+        return fwd, strafe, source
 
     def _maybe_promote_remote_full_local_state(self, ctx: ClientContext, *, reason: str) -> bool:
         """Leave the spawn-safe minimal remote path once the client is stably in game."""

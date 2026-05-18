@@ -16535,6 +16535,12 @@ def _comm_request_body(text: str) -> bytes:
     return struct.pack(">HHH", 2, 0, len(encoded)) + encoded
 
 
+CAPTURED_OG_POWER_CELL_COMM_REQUEST_HEX = (
+    "200001002600020000001b"
+    "6275696c642032393030322022506f7765722043656c6c22203000"
+)
+
+
 def _minimal_build_uplink_server(ctx: ClientContext) -> WulframServer:
     class DummyUDP:
         def __init__(self):
@@ -16645,6 +16651,42 @@ def test_build_uplink_command_creates_dynamic_building():
     assert any(payload and payload[0] == 0x0E for payload, _addr in server.udp_handler.sent), server.udp_handler.sent
     assert any(payload and payload[0] == 0x2D for payload, _addr in server.udp_handler.sent), server.udp_handler.sent
     print("test_build_uplink_command_creates_dynamic_building: PASSED")
+    return True
+
+
+def test_dynamic_powercell_service_restores_energy_with_ambient_regen_disabled():
+    """Captured OG Power Cell packet should restore energy without ambient regen."""
+    ctx = _in_game_context()
+    ctx.player_energy = 10.0
+    server = _minimal_build_uplink_server(ctx)
+    server.player_energy_regen = 0.0
+    packet = bytes.fromhex(CAPTURED_OG_POWER_CELL_COMM_REQUEST_HEX)
+
+    event = server._handle_comm_message_request(
+        ctx,
+        packet,
+        transport="udp",
+        body=packet[5:],
+        addr=ctx.session.udp_addr,
+        sequence=1,
+    )
+    oid = int(event["result"]["oid"])
+    building = server._building_entities[oid]
+
+    assert event["result"]["ok"] is True, event
+    assert int(building.entity_type) == int(EntityType.ENERGY_BUILDING), event
+    assert math.hypot(ctx.player_pos[0] - building.x, ctx.player_pos[1] - building.y) <= 40.0
+
+    server._regen_player_energy(ctx, 1.0)
+    assert ctx.player_energy == 10.0, ctx.player_energy
+
+    server._update_supply_buildings(ctx, 1.0 / 30.0)
+    assert ctx.player_energy == 13.0, ctx.player_energy
+    for _ in range(20):
+        server._update_supply_buildings(ctx, 1.0 / 30.0)
+    assert ctx.player_energy >= 70.0, ctx.player_energy
+    assert ctx.player_energy <= server.player_energy_max, ctx.player_energy
+    print("test_dynamic_powercell_service_restores_energy_with_ambient_regen_disabled: PASSED")
     return True
 
 
@@ -16999,6 +17041,7 @@ def main():
         test_energy_control_sets_absolute_or_fractional_energy,
         test_comm_message_request_decodes_og_type2_build_command,
         test_build_uplink_command_creates_dynamic_building,
+        test_dynamic_powercell_service_restores_energy_with_ambient_regen_disabled,
         test_dynamic_building_damage_control_destroys_and_records_delete,
         test_uplink_mvp_bootstrap_sends_minimal_status_packets,
         test_buildings_json_exposes_playable_slice_observability,
