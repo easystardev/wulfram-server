@@ -1741,6 +1741,24 @@ Examples:
                 if not ctx or not ctx.running:
                     continue
                 phase = ctx.session.phase.name if ctx.session else "NONE"
+                movement_history_tail = []
+                for item in list(getattr(ctx, "movement_input_history", []) or [])[-16:]:
+                    if not isinstance(item, dict):
+                        continue
+                    item_time = item.get("time", 0.0)
+                    try:
+                        age = max(0.0, now - float(item_time))
+                    except (TypeError, ValueError, OverflowError):
+                        age = None
+                    movement_history_tail.append(
+                        {
+                            "age_s": None if age is None else round(age, 3),
+                            "packet_type": item.get("packet_type", ""),
+                            "client_tick": int(item.get("client_tick", 0) or 0),
+                            "fwd": float(item.get("fwd", 0.0) or 0.0),
+                            "strafe": float(item.get("strafe", 0.0) or 0.0),
+                        }
+                    )
                 telemetry = {
                     "action_packets": getattr(ctx, "action_packet_count", 0),
                     "action_updates": getattr(ctx, "action_update_count", 0),
@@ -1776,6 +1794,7 @@ Examples:
                     "last_position_change_age_s": _age(getattr(ctx, "last_position_update", 0.0)),
                     "position_changes": getattr(ctx, "position_change_count", 0),
                     "last_input": getattr(ctx, "last_decoded_input", {}) or {},
+                    "movement_input_history_tail": movement_history_tail,
                     "weapon_fire_count": getattr(ctx, "weapon_fire_count", 0),
                     "last_weapon_fire_age_s": _age(getattr(ctx, "last_weapon_fire_time", 0.0)),
                     "last_weapon_fire_source": getattr(ctx, "last_weapon_fire_source", ""),
