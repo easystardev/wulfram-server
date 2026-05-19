@@ -1106,6 +1106,14 @@ class WulframServer:
             self.remote_og_movement_input_stale_clamp = 0.0
         if self.remote_og_movement_input_stale_clamp < 0.0:
             self.remote_og_movement_input_stale_clamp = 0.0
+        try:
+            self.remote_og_movement_input_after_max = float(
+                os.environ.get("WULFRAM_REMOTE_OG_MOVEMENT_INPUT_AFTER_MAX", "0.20")
+            )
+        except ValueError:
+            self.remote_og_movement_input_after_max = 0.20
+        if self.remote_og_movement_input_after_max < 0.0:
+            self.remote_og_movement_input_after_max = 0.0
         self.remote_og_movement_input_selection = (
             os.environ.get(
                 "WULFRAM_REMOTE_OG_MOVEMENT_INPUT_SELECTION",
@@ -1132,6 +1140,15 @@ class WulframServer:
         }:
             self.remote_og_movement_input_selection = "nearest_to_target"
         elif self.remote_og_movement_input_selection in {
+            "after",
+            "after_target",
+            "bounded_after",
+            "bounded_after_target",
+            "first_after",
+            "first_after_target",
+        }:
+            self.remote_og_movement_input_selection = "bounded_after_target"
+        elif self.remote_og_movement_input_selection in {
             "tick_before",
             "tick_before_target",
             "latest_before_tick",
@@ -1155,7 +1172,8 @@ class WulframServer:
         print(
             "[CONFIG] remote_og_movement_input_selection="
             f"{self.remote_og_movement_input_selection} "
-            f"stale_clamp={self.remote_og_movement_input_stale_clamp:.2f}s"
+            f"stale_clamp={self.remote_og_movement_input_stale_clamp:.2f}s "
+            f"after_max={self.remote_og_movement_input_after_max:.2f}s"
         )
         tick_probe_mode = (
             os.environ.get("WULFRAM_REMOTE_OG_MOVEMENT_INPUT_TICK_PROBE", "0")
@@ -7430,6 +7448,7 @@ class WulframServer:
         if selection_policy not in {
             "latest_before_target",
             "nearest_to_target",
+            "bounded_after_target",
             "latest_before_tick_target",
             "nearest_tick_target",
         }:
@@ -7461,6 +7480,25 @@ class WulframServer:
             elif after is None:
                 after = entry
 
+        def entry_axis_delta(entry, fwd, strafe) -> float | None:
+            if not isinstance(entry, dict):
+                return None
+            try:
+                entry_fwd = float(entry.get("fwd", 0.0))
+                entry_strafe = float(entry.get("strafe", 0.0))
+            except (TypeError, ValueError, AttributeError, OverflowError):
+                return None
+            return abs(entry_fwd - float(fwd)) + abs(entry_strafe - float(strafe))
+
+        def entry_target_error(entry) -> float | None:
+            if not isinstance(entry, dict):
+                return None
+            try:
+                sample_time = float(entry.get("time", 0.0))
+            except (TypeError, ValueError, AttributeError, OverflowError):
+                return None
+            return sample_time - target_time if sample_time > 0.0 else None
+
         def movement_time_probe_fields(prefix: str, entry) -> dict:
             if not isinstance(entry, dict):
                 return {f"{prefix}_found": False}
@@ -7481,8 +7519,42 @@ class WulframServer:
             }
 
         selected = None
+        bounded_after_applied = False
+        bounded_after_reason = ""
+        bounded_after_max = max(
+            0.0,
+            float(getattr(self, "remote_og_movement_input_after_max", 0.20) or 0.0),
+        )
         if selection_policy == "nearest_to_target":
             selected = nearest
+        elif selection_policy == "bounded_after_target":
+            selected = before
+            after_target_error = entry_target_error(after)
+            before_current_delta = entry_axis_delta(before, current_fwd, current_strafe)
+            after_current_delta = entry_axis_delta(after, current_fwd, current_strafe)
+            after_is_bounded = (
+                after_target_error is not None
+                and after_target_error >= 0.0
+                and after_target_error <= bounded_after_max
+            )
+            after_moves_toward_current = (
+                after_current_delta is not None
+                and (
+                    before_current_delta is None
+                    or after_current_delta + 1e-6 < before_current_delta
+                )
+            )
+            if after_is_bounded and after_moves_toward_current:
+                selected = after
+                bounded_after_applied = True
+                bounded_after_reason = "after_sample_within_bound_matches_current_input"
+            else:
+                if after is None:
+                    bounded_after_reason = "no_after_sample"
+                elif not after_is_bounded:
+                    bounded_after_reason = "after_sample_outside_bound"
+                elif not after_moves_toward_current:
+                    bounded_after_reason = "after_sample_not_closer_to_current_input"
         elif selection_policy == "latest_before_tick_target":
             selected = tick_context.get("before") if isinstance(tick_context, dict) else None
         elif selection_policy == "nearest_tick_target":
@@ -7508,6 +7580,9 @@ class WulframServer:
                 **movement_time_probe_fields("time_probe_nearest", nearest),
                 "source": "delayed_remote_og_pre_history_zero",
                 "selection_policy": selection_policy,
+                "bounded_after_max_s": bounded_after_max,
+                "bounded_after_applied": bounded_after_applied,
+                "bounded_after_reason": bounded_after_reason,
                 "history_len": len(history),
                 "target_time": target_time,
                 "latest_age_s": (now - latest_time) if latest_time > 0.0 else None,
@@ -7571,6 +7646,9 @@ class WulframServer:
             **movement_time_probe_fields("time_probe_nearest", nearest),
             "source": "delayed_remote_og_action_history",
             "selection_policy": selection_policy,
+            "bounded_after_max_s": bounded_after_max,
+            "bounded_after_applied": bounded_after_applied,
+            "bounded_after_reason": bounded_after_reason,
             "history_len": len(history),
             "target_time": target_time,
             "selected_age_s": (now - selected_time) if selected_time > 0.0 else None,

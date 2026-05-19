@@ -4382,6 +4382,63 @@ def test_remote_og_movement_input_delay_can_probe_nearest_axis_sample():
     return True
 
 
+def test_remote_og_movement_input_can_select_bounded_after_target():
+    """Default-off bounded-after policy can probe late OG key consumption."""
+    server = WulframServer.__new__(WulframServer)
+    server.remote_og_movement_input_delay = 0.20
+    server.remote_og_movement_input_selection = "bounded_after_target"
+    server.remote_og_movement_input_after_max = 0.12
+
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    now = time.monotonic()
+    ctx.movement_input_history.append({"time": now - 0.25, "fwd": 0.0, "strafe": 0.0})
+    ctx.movement_input_history.append({"time": now - 0.09, "fwd": 0.5188, "strafe": 0.0})
+
+    fwd, strafe, source = server._select_delayed_movement_input(
+        ctx,
+        current_fwd=0.5188,
+        current_strafe=0.0,
+        delay_s=server.remote_og_movement_input_delay,
+    )
+
+    selection = getattr(ctx, "debug_last_movement_input_selection", {})
+    assert source == "delayed_remote_og_action_history", source
+    assert abs(fwd - 0.5188) < 1e-6, selection
+    assert strafe == 0.0, selection
+    assert selection["selection_policy"] == "bounded_after_target", selection
+    assert selection["bounded_after_max_s"] == 0.12, selection
+    assert selection["bounded_after_applied"] is True, selection
+    assert selection["bounded_after_reason"] == (
+        "after_sample_within_bound_matches_current_input"
+    ), selection
+    assert selection["selected_future_of_target"] is True, selection
+    assert 0.10 <= selection["selected_abs_target_error_s"] <= 0.12, selection
+    assert selection["time_probe_before_fwd"] == 0.0, selection
+    assert selection["time_probe_after_fwd"] == 0.5188, selection
+
+    server.remote_og_movement_input_after_max = 0.05
+    fwd, strafe, source = server._select_delayed_movement_input(
+        ctx,
+        current_fwd=0.5188,
+        current_strafe=0.0,
+        delay_s=server.remote_og_movement_input_delay,
+    )
+    selection = getattr(ctx, "debug_last_movement_input_selection", {})
+    assert source == "delayed_remote_og_action_history", source
+    assert fwd == 0.0, selection
+    assert strafe == 0.0, selection
+    assert selection["bounded_after_applied"] is False, selection
+    assert selection["bounded_after_reason"] == "after_sample_outside_bound", selection
+
+    print("test_remote_og_movement_input_can_select_bounded_after_target: PASSED")
+    return True
+
+
 def test_remote_og_movement_input_tick_probe_reports_tick_domain_candidates():
     """Default-off tick probe should compare client-tick candidates without changing input."""
     server = WulframServer.__new__(WulframServer)
@@ -17099,6 +17156,7 @@ def main():
         test_tank_high_hover_uses_linear_damping_for_w_motion,
         test_remote_og_movement_input_delay_replays_prior_axis_sample,
         test_remote_og_movement_input_delay_can_probe_nearest_axis_sample,
+        test_remote_og_movement_input_can_select_bounded_after_target,
         test_remote_og_movement_input_tick_probe_reports_tick_domain_candidates,
         test_remote_og_movement_input_can_select_tick_domain_candidates,
         test_server_jump_jets_apply_fixed_step_rising_edge,
