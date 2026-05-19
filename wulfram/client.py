@@ -231,6 +231,12 @@ class ClientContext:
     last_state_sync_vel: Optional[tuple] = None
     last_state_sync_rot: Optional[tuple] = None
     authoritative_state_history: Any = field(default_factory=lambda: deque(maxlen=180))
+    control_pose_reset_time: float = 0.0
+    control_pose_reset_pos: Optional[tuple] = None
+    last_pose_reset_time: float = 0.0
+    last_pose_reset_source: str = ""
+    last_pose_reset: dict = field(default_factory=dict)
+    pose_reset_history: Any = field(default_factory=lambda: deque(maxlen=20))
     debug_last_controller_step: dict = field(default_factory=dict)
     debug_last_spring_state: dict = field(default_factory=dict)
     debug_last_collision: dict = field(default_factory=dict)
@@ -276,3 +282,40 @@ class ClientContext:
         """Update player velocity in both pose dict and legacy field."""
         self.player_vel = vel
         self.player_pose["vel"] = vel
+
+    def record_pose_reset(
+        self,
+        source: str,
+        *,
+        pos: Optional[tuple] = None,
+        vel: Optional[tuple] = None,
+        details: Optional[dict] = None,
+    ) -> dict:
+        """Record an authoritative non-physics pose reset for live harness diagnosis."""
+        now = time.monotonic()
+
+        def _vec(value):
+            if value is None:
+                return None
+            try:
+                return [float(value[0]), float(value[1]), float(value[2])]
+            except Exception:
+                return None
+
+        event = {
+            "time": now,
+            "source": str(source),
+            "pos": _vec(pos if pos is not None else self.player_pos),
+            "vel": _vec(vel if vel is not None else self.player_vel),
+        }
+        if self.session is not None:
+            event["phase"] = self.session.phase.name
+            event["team_id"] = self.session.team_id
+            event["in_game"] = bool(self.session.in_game)
+        if details:
+            event["details"] = dict(details)
+        self.last_pose_reset_time = now
+        self.last_pose_reset_source = event["source"]
+        self.last_pose_reset = event
+        self.pose_reset_history.append(event)
+        return event

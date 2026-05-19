@@ -366,6 +366,128 @@ def test_recent_control_pose_blocks_in_game_spawn_override():
             os.environ["WULFRAM_CONTROL_POSE_BLOCK_SPAWN_OVERRIDE_S"] = old_block
 
 
+def test_recent_control_pose_blocks_delayed_auto_spawn():
+    """A delayed auto-spawn must not undo a control-plane setup pose."""
+    old_block = os.environ.get("WULFRAM_CONTROL_POSE_BLOCK_SPAWN_OVERRIDE_S")
+    try:
+        os.environ["WULFRAM_CONTROL_POSE_BLOCK_SPAWN_OVERRIDE_S"] = "45"
+        server = WulframServer.__new__(WulframServer)
+        captured = {}
+        server._spawn_wf_style = lambda ctx, team_id, **kwargs: captured.update(
+            team_id=team_id,
+            kwargs=kwargs,
+        )
+
+        session = Session(phase=Phase.IN_GAME, in_game=True, team_id=2)
+        session.delayed_spawn_team = 2
+        session.delayed_spawn_time = time.monotonic() - 1.0
+        ctx = ClientContext(
+            client_id=1,
+            client_addr=("127.0.0.1", 50000),
+            session=session,
+            entity_id=0x14EA,
+        )
+        ctx.control_pose_reset_time = time.monotonic()
+        ctx.control_pose_reset_pos = (3160.4343, 2463.2375, -33.4864)
+
+        server._auto_join_team(ctx, 2)
+
+        assert captured == {}, captured
+        assert session.delayed_spawn_team == 0
+        assert session.delayed_spawn_time == 0
+        print("test_recent_control_pose_blocks_delayed_auto_spawn: PASSED")
+        return True
+    finally:
+        if old_block is None:
+            os.environ.pop("WULFRAM_CONTROL_POSE_BLOCK_SPAWN_OVERRIDE_S", None)
+        else:
+            os.environ["WULFRAM_CONTROL_POSE_BLOCK_SPAWN_OVERRIDE_S"] = old_block
+
+
+def test_recent_control_pose_repairs_unstamped_large_jump():
+    """A recent setup pose can recover from an unstamped jump back to spawn."""
+    old_block = os.environ.get("WULFRAM_CONTROL_POSE_BLOCK_SPAWN_OVERRIDE_S")
+    old_distance = os.environ.get("WULFRAM_CONTROL_POSE_REPAIR_DISTANCE")
+    try:
+        os.environ["WULFRAM_CONTROL_POSE_BLOCK_SPAWN_OVERRIDE_S"] = "45"
+        os.environ["WULFRAM_CONTROL_POSE_REPAIR_DISTANCE"] = "100"
+        server = WulframServer.__new__(WulframServer)
+        server.spawn_sets_ground_level = False
+
+        session = Session(phase=Phase.IN_GAME, in_game=True, team_id=2)
+        ctx = ClientContext(
+            client_id=1,
+            client_addr=("127.0.0.1", 50000),
+            session=session,
+            entity_id=0x14EA,
+        )
+        ctx.control_pose_reset_time = time.monotonic()
+        ctx.control_pose_reset_pos = (3160.4343, 2463.2375, -33.4864)
+        ctx.player_pos = (4950.0, 5100.0, 3.25)
+        ctx.player_vel = (1.0, 2.0, 3.0)
+        ctx.player_pose["pos"] = ctx.player_pos
+        ctx.player_pose["vel"] = ctx.player_vel
+
+        repaired = server._repair_recent_control_pose_jump(ctx, "unit_test")
+
+        assert repaired is True
+        assert ctx.player_pos == ctx.control_pose_reset_pos
+        assert ctx.player_vel == (0.0, 0.0, 0.0)
+        assert ctx.last_pose_reset_source == "control_pose_jump_repair"
+        assert ctx.debug_last_control_pose_repair["source"] == "unit_test"
+        assert ctx.debug_last_control_pose_repair["distance"] > 3000.0
+        print("test_recent_control_pose_repairs_unstamped_large_jump: PASSED")
+        return True
+    finally:
+        if old_block is None:
+            os.environ.pop("WULFRAM_CONTROL_POSE_BLOCK_SPAWN_OVERRIDE_S", None)
+        else:
+            os.environ["WULFRAM_CONTROL_POSE_BLOCK_SPAWN_OVERRIDE_S"] = old_block
+        if old_distance is None:
+            os.environ.pop("WULFRAM_CONTROL_POSE_REPAIR_DISTANCE", None)
+        else:
+            os.environ["WULFRAM_CONTROL_POSE_REPAIR_DISTANCE"] = old_distance
+
+
+def test_recent_control_pose_repair_can_be_disabled():
+    """Zero repair distance disables the harness-only jump repair."""
+    old_block = os.environ.get("WULFRAM_CONTROL_POSE_BLOCK_SPAWN_OVERRIDE_S")
+    old_distance = os.environ.get("WULFRAM_CONTROL_POSE_REPAIR_DISTANCE")
+    try:
+        os.environ["WULFRAM_CONTROL_POSE_BLOCK_SPAWN_OVERRIDE_S"] = "45"
+        os.environ["WULFRAM_CONTROL_POSE_REPAIR_DISTANCE"] = "0"
+        server = WulframServer.__new__(WulframServer)
+
+        session = Session(phase=Phase.IN_GAME, in_game=True, team_id=2)
+        ctx = ClientContext(
+            client_id=1,
+            client_addr=("127.0.0.1", 50000),
+            session=session,
+            entity_id=0x14EA,
+        )
+        ctx.control_pose_reset_time = time.monotonic()
+        ctx.control_pose_reset_pos = (3160.4343, 2463.2375, -33.4864)
+        ctx.player_pos = (4950.0, 5100.0, 3.25)
+        ctx.player_pose["pos"] = ctx.player_pos
+
+        repaired = server._repair_recent_control_pose_jump(ctx, "unit_test")
+
+        assert repaired is False
+        assert ctx.player_pos == (4950.0, 5100.0, 3.25)
+        assert ctx.last_pose_reset_source == ""
+        print("test_recent_control_pose_repair_can_be_disabled: PASSED")
+        return True
+    finally:
+        if old_block is None:
+            os.environ.pop("WULFRAM_CONTROL_POSE_BLOCK_SPAWN_OVERRIDE_S", None)
+        else:
+            os.environ["WULFRAM_CONTROL_POSE_BLOCK_SPAWN_OVERRIDE_S"] = old_block
+        if old_distance is None:
+            os.environ.pop("WULFRAM_CONTROL_POSE_REPAIR_DISTANCE", None)
+        else:
+            os.environ["WULFRAM_CONTROL_POSE_REPAIR_DISTANCE"] = old_distance
+
+
 def test_map_entity_z_aligns_buried_entities_to_terrain():
     """Map-state buildings/spawn points below physics terrain should be lifted."""
     server = WulframServer.__new__(WulframServer)
@@ -16338,6 +16460,9 @@ def test_control_pos_exact_reset_targets_specific_client():
     assert ctx.prev_raw_turn_input == 0.0, ctx.prev_raw_turn_input
     assert ctx.control_pose_reset_pos == (100.0, 200.0, 300.0), ctx.control_pose_reset_pos
     assert ctx.control_pose_reset_time > 0.0, ctx.control_pose_reset_time
+    assert ctx.last_pose_reset_source == "control_pos", ctx.last_pose_reset
+    assert ctx.last_pose_reset["pos"] == [100.0, 200.0, 300.0], ctx.last_pose_reset
+    assert list(ctx.pose_reset_history)[-1]["source"] == "control_pos", ctx.pose_reset_history
     assert ctx.player_pose["pos"] == (100.0, 200.0, 300.0), ctx.player_pose["pos"]
     assert ctx.player_pose["vel"] == (0.0, 0.0, 0.0), ctx.player_pose["vel"]
     assert abs(ctx.player_pose["yaw"] + math.radians(45.0)) < 1e-6, ctx.player_pose["yaw"]
@@ -17133,6 +17258,9 @@ def main():
         test_spawn_override_wins_over_map_spawn_points,
         test_spawn_at_point_honors_clicked_pad_when_default_configured,
         test_recent_control_pose_blocks_in_game_spawn_override,
+        test_recent_control_pose_blocks_delayed_auto_spawn,
+        test_recent_control_pose_repairs_unstamped_large_jump,
+        test_recent_control_pose_repair_can_be_disabled,
         test_map_entity_z_aligns_buried_entities_to_terrain,
         test_map_entity_z_preserves_raw_z_above_physics_terrain,
         test_map_entity_z_preserves_elevated_entities,

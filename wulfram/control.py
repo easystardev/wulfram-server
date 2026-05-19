@@ -304,6 +304,13 @@ class ControlServer:
         ctx.last_heading_update = now
         ctx.control_pose_reset_time = now
         ctx.control_pose_reset_pos = ctx.player_pos
+        if hasattr(ctx, "record_pose_reset"):
+            ctx.record_pose_reset(
+                "control_pos",
+                pos=ctx.player_pos,
+                vel=applied_vel,
+                details={"heading_rad": heading},
+            )
         ctx.player_aim_yaw = heading
         ctx.player_aim_pitch = 0.0
         ctx.player_aim_source = "control_pos"
@@ -1853,6 +1860,15 @@ Examples:
                     "last_collision": getattr(ctx, "debug_last_collision", {}) or {},
                     "last_motion_collision": getattr(ctx, "debug_last_motion_collision", {}) or {},
                     "last_terrain_contact_probe": getattr(ctx, "debug_last_terrain_contact_probe", {}) or {},
+                    "last_control_pose_repair": getattr(ctx, "debug_last_control_pose_repair", {}) or {},
+                    "control_pose_reset_age_s": _age(
+                        getattr(ctx, "control_pose_reset_time", 0.0)
+                    ),
+                    "control_pose_reset_pos": list(getattr(ctx, "control_pose_reset_pos", []) or []),
+                    "last_pose_reset_age_s": _age(getattr(ctx, "last_pose_reset_time", 0.0)),
+                    "last_pose_reset_source": getattr(ctx, "last_pose_reset_source", ""),
+                    "last_pose_reset": getattr(ctx, "last_pose_reset", {}) or {},
+                    "pose_reset_history": list(getattr(ctx, "pose_reset_history", []) or [])[-8:],
                 }
                 telemetry["diagnosis"] = build_input_sync_diagnosis(
                     phase=phase,

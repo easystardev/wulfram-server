@@ -2036,6 +2036,7 @@ class WulframServer:
         it removes a confounding variable. See
         docs/keepalive-breaks-correction-2026-04-18.md.
         """
+        self._repair_recent_control_pose_jump(ctx, "correction_payload")
         corr_pos = self._to_client_pos(ctx.player_pos)
         corr_rot = self._local_player_sync_rotation(ctx)
         cmode = self.correction_mode
@@ -3945,6 +3946,18 @@ class WulframServer:
 
         ctx.player_pos = spawn_pos
         ctx.player_pose["pos"] = spawn_pos
+        if hasattr(ctx, "record_pose_reset"):
+            ctx.record_pose_reset(
+                "ghost_rejoin",
+                pos=spawn_pos,
+                vel=(0.0, 0.0, 0.0),
+                details={
+                    "team_id": session.team_id,
+                    "net_id": entity_id,
+                    "unit_type": 0,
+                    "explicit_pos": False,
+                },
+            )
         ctx.world_collision_ref_pos = spawn_pos
         ctx.world_collision_bounds_dirty = False
         ctx.last_state_sync_vel = None
@@ -4190,6 +4203,18 @@ class WulframServer:
 
         ctx.player_pos = spawn_pos
         ctx.player_pose["pos"] = spawn_pos
+        if hasattr(ctx, "record_pose_reset"):
+            ctx.record_pose_reset(
+                "spawn_wf_style",
+                pos=spawn_pos,
+                vel=(0.0, 0.0, 0.0),
+                details={
+                    "team_id": team_id,
+                    "net_id": net_id,
+                    "unit_type": unit_type,
+                    "explicit_pos": pos is not None,
+                },
+            )
         ctx.world_collision_ref_pos = spawn_pos
         ctx.world_collision_bounds_dirty = False
         ctx.last_state_sync_vel = None
@@ -4869,6 +4894,60 @@ class WulframServer:
             ctx.ground_level_override = float(pos[1])
             ctx.ground_override_ref_terrain_level = None
 
+    def _repair_recent_control_pose_jump(self, ctx: ClientContext, source: str) -> bool:
+        """Restore an exact control pose if another path silently rewound it."""
+        block = handlers.recent_control_pose_spawn_block(ctx)
+        if not block["blocked"]:
+            return False
+        target = getattr(ctx, "control_pose_reset_pos", None)
+        if not target or len(target) != 3:
+            return False
+        try:
+            max_distance = float(os.environ.get("WULFRAM_CONTROL_POSE_REPAIR_DISTANCE", "100.0"))
+        except (TypeError, ValueError):
+            max_distance = 100.0
+        if max_distance <= 0.0:
+            return False
+        old_pos = ctx.player_pos
+        dx = float(old_pos[0]) - float(target[0])
+        dy = float(old_pos[1]) - float(target[1])
+        dz = float(old_pos[2]) - float(target[2])
+        distance = math.sqrt(dx * dx + dy * dy + dz * dz)
+        if distance <= max_distance:
+            return False
+
+        repaired_pos = (float(target[0]), float(target[1]), float(target[2]))
+        repaired_vel = (0.0, 0.0, 0.0)
+        ctx.player_pos = repaired_pos
+        ctx.player_vel = repaired_vel
+        ctx.player_speed = 0.0
+        ctx.player_pose["pos"] = repaired_pos
+        ctx.player_pose["vel"] = repaired_vel
+        ctx.world_collision_ref_pos = repaired_pos
+        ctx.world_collision_bounds_dirty = False
+        ctx.last_state_sync_vel = None
+        ctx.last_state_sync_rot = None
+        ctx.debug_last_control_pose_repair = {
+            "source": source,
+            "old_pos": [float(old_pos[0]), float(old_pos[1]), float(old_pos[2])],
+            "target_pos": list(repaired_pos),
+            "distance": distance,
+            "threshold": max_distance,
+            "control_pose_age_s": block["age_s"],
+        }
+        if hasattr(ctx, "record_pose_reset"):
+            ctx.record_pose_reset(
+                "control_pose_jump_repair",
+                pos=repaired_pos,
+                vel=repaired_vel,
+                details=ctx.debug_last_control_pose_repair,
+            )
+        print(
+            f"[CONTROL-POSE] Repaired unstamped pose jump for client {ctx.client_id} "
+            f"source={source} distance={distance:.2f} old={old_pos} target={repaired_pos}"
+        )
+        return True
+
     def _align_map_entity_z_to_terrain(
         self,
         x: float,
@@ -5437,6 +5516,19 @@ class WulframServer:
             if ctx.session.delayed_spawn_team and ctx.session.delayed_spawn_time:
                 now = time.monotonic()
                 if now >= ctx.session.delayed_spawn_time:
+                    if (
+                        (ctx.session.in_game or ctx.session.phase == Phase.IN_GAME)
+                        and handlers.recent_control_pose_spawn_block(ctx, now=now)["blocked"]
+                    ):
+                        block = handlers.recent_control_pose_spawn_block(ctx, now=now)
+                        print(
+                            f"[GAME] Client {ctx.client_id}: Clearing delayed spawn for team "
+                            f"{ctx.session.delayed_spawn_team} after recent control pose reset "
+                            f"(age={block['age_s']:.2f}s < block={block['block_s']:.2f}s)"
+                        )
+                        ctx.session.delayed_spawn_team = 0
+                        ctx.session.delayed_spawn_time = 0
+                        continue
                     if (not ctx.session.input_ready and ctx.session.want_updates_time
                             and (now - ctx.session.want_updates_time) < self.spawn_force_after):
                         if not getattr(ctx.session, "spawn_wait_logged", False):
@@ -5547,6 +5639,18 @@ class WulframServer:
 
     def _auto_join_team(self, ctx: ClientContext, team_id: int):
         """Auto-spawn after WANT_UPDATES using Wulf-Forge-style UDP TANK."""
+        now = time.monotonic()
+        if ctx.session and (ctx.session.in_game or ctx.session.phase == Phase.IN_GAME):
+            block = handlers.recent_control_pose_spawn_block(ctx, now=now)
+            if block["blocked"]:
+                print(
+                    f"[GAME] Client {ctx.client_id}: Ignoring auto-spawn for team {team_id} "
+                    f"after recent control pose reset "
+                    f"(age={block['age_s']:.2f}s < block={block['block_s']:.2f}s)"
+                )
+                ctx.session.delayed_spawn_team = 0
+                ctx.session.delayed_spawn_time = 0
+                return
         print(f"[GAME] Client {ctx.client_id}: Auto-spawn (WF) on team {team_id}")
         # Check for pending respawn position (set by respawn command)
         pos = None
@@ -7823,6 +7927,7 @@ class WulframServer:
         """
         import math
 
+        self._repair_recent_control_pose_jump(ctx, "controller_tick_pre")
         dt = dt_override if dt_override > 0 else 1.0 / self.tick_rate_hz
 
         # Read movement input (slot 2 = forward, slot 3 = strafe)

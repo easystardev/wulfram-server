@@ -799,6 +799,24 @@ def _send_spawn_points_for_client(server: "WulframServer", ctx: "ClientContext")
     session.spawn_points_sent = True
 
 
+def recent_control_pose_spawn_block(ctx: "ClientContext", now: Optional[float] = None) -> dict:
+    """Return whether a spawn path should be blocked after a control pose reset."""
+    try:
+        block_s = float(os.environ.get("WULFRAM_CONTROL_POSE_BLOCK_SPAWN_OVERRIDE_S", "45.0"))
+    except (TypeError, ValueError):
+        block_s = 45.0
+    reset_time = float(getattr(ctx, "control_pose_reset_time", 0.0) or 0.0)
+    now = time.monotonic() if now is None else float(now)
+    age_s = now - reset_time if reset_time > 0.0 else None
+    blocked = bool(block_s > 0.0 and age_s is not None and age_s < block_s)
+    return {
+        "blocked": blocked,
+        "age_s": age_s,
+        "block_s": block_s,
+        "reset_pos": list(getattr(ctx, "control_pose_reset_pos", []) or []),
+    }
+
+
 def handle_udp_chat(server: "WulframServer", ctx: Optional["ClientContext"], data: bytes, addr: tuple):
     """Handle UDP COMM_REQ (0x20) for /s spawn and uplink commands."""
     if len(data) < 9:
@@ -1036,23 +1054,12 @@ def handle_spawn_at_point(server: "WulframServer", ctx: "ClientContext", spawn_p
             )
             return
 
-        try:
-            control_pose_block_s = float(
-                os.environ.get("WULFRAM_CONTROL_POSE_BLOCK_SPAWN_OVERRIDE_S", "45.0")
-            )
-        except (TypeError, ValueError):
-            control_pose_block_s = 45.0
-        control_pose_reset_time = float(getattr(ctx, "control_pose_reset_time", 0.0) or 0.0)
-        control_pose_age_s = now - control_pose_reset_time if control_pose_reset_time > 0.0 else None
-        if (
-            control_pose_block_s > 0.0
-            and control_pose_age_s is not None
-            and control_pose_age_s < control_pose_block_s
-        ):
+        control_pose_block = recent_control_pose_spawn_block(ctx, now=now)
+        if control_pose_block["blocked"]:
             print(
                 f"[SPAWN] Client {ctx.client_id}: Ignoring IN_GAME spawn override "
                 f"after recent control pose reset "
-                f"(age={control_pose_age_s:.2f}s < block={control_pose_block_s:.2f}s) "
+                f"(age={control_pose_block['age_s']:.2f}s < block={control_pose_block['block_s']:.2f}s) "
                 f"point={spawn_point_id} vehicle={vehicle_type}"
             )
             return
