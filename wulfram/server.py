@@ -11699,6 +11699,167 @@ class WulframServer:
             current_frame_pos = finite_triplet(pos)
             pre_step_frame_vel = finite_triplet(pre_vel)
             current_frame_vel = finite_triplet((vx, vy, vz))
+
+            def integrate_frame_phase_state(start_pos, start_vel, elapsed_s):
+                start_position = finite_triplet(start_pos)
+                start_velocity = finite_triplet(start_vel)
+                if start_position is None or start_velocity is None:
+                    return None, None
+                if (
+                    frame_dt > 0.0
+                    and pre_step_frame_vel is not None
+                    and current_frame_vel is not None
+                ):
+                    acc = (
+                        (current_frame_vel[0] - pre_step_frame_vel[0]) / frame_dt,
+                        (current_frame_vel[1] - pre_step_frame_vel[1]) / frame_dt,
+                        (current_frame_vel[2] - pre_step_frame_vel[2]) / frame_dt,
+                    )
+                else:
+                    acc = (0.0, 0.0, 0.0)
+                elapsed = max(0.0, float(elapsed_s or 0.0))
+                return (
+                    (
+                        start_position[0]
+                        + start_velocity[0] * elapsed
+                        + 0.5 * acc[0] * elapsed * elapsed,
+                        start_position[1]
+                        + start_velocity[1] * elapsed
+                        + 0.5 * acc[1] * elapsed * elapsed,
+                        start_position[2]
+                        + start_velocity[2] * elapsed
+                        + 0.5 * acc[2] * elapsed * elapsed,
+                    ),
+                    (
+                        start_velocity[0] + acc[0] * elapsed,
+                        start_velocity[1] + acc[1] * elapsed,
+                        start_velocity[2] + acc[2] * elapsed,
+                    ),
+                )
+
+            def preview_frame_phase_resolve_model(
+                *,
+                label,
+                selection,
+                candidate,
+                candidate_velocity,
+                time_s,
+                bucket_index,
+                pair_contact,
+                response_preview,
+            ):
+                collision_time = None
+                if time_s is not None:
+                    try:
+                        collision_time = max(0.0, min(frame_dt, float(time_s)))
+                    except (TypeError, ValueError, OverflowError):
+                        collision_time = None
+                remaining_time = (
+                    max(0.0, frame_dt - collision_time)
+                    if collision_time is not None
+                    else None
+                )
+                retest_probe = None
+                retest_contact = None
+                retest_reject = "nonfinite_retest_pose"
+                if current_frame_pos is not None:
+                    retest_probe = sample_pair_record_contact_at(
+                        current_frame_pos,
+                        velocity=current_frame_vel,
+                        contact_selection=selection,
+                    )
+                    retest_contact = retest_probe.get("contact")
+                    retest_reject = retest_probe.get("reject")
+                retest_accept = (
+                    retest_probe is not None
+                    and retest_probe.get("selected_raw_error") is None
+                    and retest_contact is not None
+                    and retest_reject == ""
+                    and retest_contact.penetration > self._PENETRATION_SLOP_DEFAULT
+                )
+                remaining_endpoint_pos = None
+                remaining_endpoint_vel = None
+                no_response_endpoint_pos = None
+                no_response_endpoint_vel = None
+                if remaining_time is not None:
+                    no_response_endpoint_pos, no_response_endpoint_vel = (
+                        integrate_frame_phase_state(
+                            candidate,
+                            candidate_velocity,
+                            remaining_time,
+                        )
+                    )
+                    if isinstance(response_preview, dict):
+                        remaining_start_pos = (
+                            finite_triplet(response_preview.get("post_contact_pos"))
+                            or finite_triplet(candidate)
+                        )
+                        remaining_start_vel = (
+                            finite_triplet(response_preview.get("post_contact_vel"))
+                            or finite_triplet(candidate_velocity)
+                        )
+                        if (
+                            response_preview.get("applied") is True
+                            and remaining_start_pos is not None
+                            and remaining_start_vel is not None
+                        ):
+                            remaining_endpoint_pos, remaining_endpoint_vel = (
+                                integrate_frame_phase_state(
+                                    remaining_start_pos,
+                                    remaining_start_vel,
+                                    remaining_time,
+                                )
+                            )
+
+                preview = {
+                    "enabled": True,
+                    "runtime_default": "off",
+                    "decompile_source": (
+                        "GUESS6_CollisionPairPool_process_all passes full "
+                        "frame_dt into GUESS6_CollisionPair_resolve; buckets "
+                        "order pairs only, and resolve continues entities for "
+                        "max(frame_dt - collision_time, 0)."
+                    ),
+                    "bucket_order_only": True,
+                    "bucket_center_probe_is_diagnostic": True,
+                    "label": label,
+                    "contact_selection": selection,
+                    "collision_time_s": collision_time,
+                    "frame_dt_s": frame_dt,
+                    "collision_pair_bucket": bucket_index,
+                    "remaining_after_resolve_s": remaining_time,
+                    "collision_time_pose": candidate,
+                    "collision_time_velocity": candidate_velocity,
+                    "resolve_retest_pose": current_frame_pos,
+                    "resolve_retest_velocity": current_frame_vel,
+                    "resolve_retest_reject": retest_reject,
+                    "resolve_retest_accept": retest_accept,
+                    "resolve_retest_contact": probe_contact_fields(
+                        retest_contact,
+                        center=current_frame_pos,
+                        z_lift_used=0.0,
+                    ),
+                    "response_preview_applied": (
+                        response_preview.get("applied")
+                        if isinstance(response_preview, dict)
+                        else None
+                    ),
+                    "remaining_endpoint_without_response_pos": (
+                        no_response_endpoint_pos
+                    ),
+                    "remaining_endpoint_without_response_vel": (
+                        no_response_endpoint_vel
+                    ),
+                    "post_response_remaining_endpoint_pos": remaining_endpoint_pos,
+                    "post_response_remaining_endpoint_vel": remaining_endpoint_vel,
+                    "candidate_had_contact": pair_contact is not None,
+                }
+                return {
+                    key: value
+                    for key, value in preview.items()
+                    if value not in ({}, None)
+                }
+
             if (
                 frame_dt > 0.0
                 and pre_step_frame_pos is not None
@@ -11780,6 +11941,16 @@ class WulframServer:
                             contact=pair_contact,
                             delta_contact=pair_delta_contact,
                         )
+                    resolve_phase_preview = preview_frame_phase_resolve_model(
+                        label=label,
+                        selection=selection,
+                        candidate=candidate,
+                        candidate_velocity=candidate_velocity,
+                        time_s=time_s,
+                        bucket_index=bucket_index,
+                        pair_contact=pair_contact,
+                        response_preview=response_preview,
+                    )
                     row = {
                         "label": label,
                         "pos": candidate,
@@ -11813,6 +11984,7 @@ class WulframServer:
                         ),
                         "accepted": accepted,
                         "response_preview": response_preview,
+                        "resolve_phase_preview": resolve_phase_preview,
                     }
                     row = {
                         key: value
@@ -11830,7 +12002,9 @@ class WulframServer:
                     "Report-first GUESS4_CBSP_edge_triangle_intersect selections "
                     "sampled at server frame reference poses and 30 "
                     "CollisionPair_record bucket centers before applying any terrain "
-                    "response."
+                    "response. Resolve-phase previews are report-only: bucket "
+                    "centers are diagnostic, while OG resolve retests at the "
+                    "post-step pose and continues the remaining frame time."
                 ),
                 "frame_dt_s": frame_dt,
                 "bucket_count": bucket_count,

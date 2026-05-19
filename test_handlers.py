@@ -9112,6 +9112,21 @@ def test_entity_world_collision_frame_phase_report_first_probe_is_read_only():
         assert preview["velocity_before"] == accepted["velocity"], preview
         assert "velocity_delta" in preview, preview
         assert "angular_delta" in preview, preview
+        resolve_preview = accepted["resolve_phase_preview"]
+        assert resolve_preview["runtime_default"] == "off", resolve_preview
+        assert resolve_preview["bucket_order_only"] is True, resolve_preview
+        assert resolve_preview["bucket_center_probe_is_diagnostic"] is True, resolve_preview
+        assert resolve_preview["collision_time_s"] == 0.5, resolve_preview
+        assert resolve_preview["frame_dt_s"] == 1.0, resolve_preview
+        assert resolve_preview["collision_pair_bucket"] == 15, resolve_preview
+        assert resolve_preview["remaining_after_resolve_s"] == 0.5, resolve_preview
+        assert resolve_preview["collision_time_pose"] == accepted["pos"], resolve_preview
+        assert resolve_preview["resolve_retest_pose"] == (1.0, 0.0, -1.0), resolve_preview
+        assert resolve_preview["resolve_retest_accept"] is False, resolve_preview
+        assert resolve_preview["response_preview_applied"] is True, resolve_preview
+        assert "post_response_remaining_endpoint_pos" in resolve_preview, resolve_preview
+        assert "remaining_endpoint_without_response_pos" in resolve_preview, resolve_preview
+        assert "full frame_dt" in resolve_preview["decompile_source"], resolve_preview
         assert getattr(ctx, "debug_last_motion_collision", {}) == {}
         bucket_row = frame_probe["results"]["pre_to_current_bucket_06_center"][
             "cbsp_mesh_edge_terrain_plane_probe"
