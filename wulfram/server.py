@@ -7603,6 +7603,16 @@ class WulframServer:
                 return None
             return sample_time - target_time if sample_time > 0.0 else None
 
+        def entry_has_movement(entry, *, threshold: float = 0.05) -> bool:
+            if not isinstance(entry, dict):
+                return False
+            try:
+                entry_fwd = float(entry.get("fwd", 0.0))
+                entry_strafe = float(entry.get("strafe", 0.0))
+            except (TypeError, ValueError, AttributeError, OverflowError):
+                return False
+            return abs(entry_fwd) > threshold or abs(entry_strafe) > threshold
+
         def movement_time_probe_fields(prefix: str, entry) -> dict:
             if not isinstance(entry, dict):
                 return {f"{prefix}_found": False}
@@ -7622,12 +7632,37 @@ class WulframServer:
                 f"{prefix}_client_tick": int(entry.get("client_tick", 0) or 0),
             }
 
+        nonzero_before = None
+        nonzero_after = None
+        nonzero_nearest = None
+        nonzero_nearest_error = None
+        for entry in history:
+            if not entry_has_movement(entry):
+                continue
+            try:
+                sample_time = float(entry.get("time", 0.0))
+            except (TypeError, ValueError, AttributeError, OverflowError):
+                continue
+            error = abs(sample_time - target_time)
+            if nonzero_nearest_error is None or error < nonzero_nearest_error:
+                nonzero_nearest = entry
+                nonzero_nearest_error = error
+            if sample_time <= target_time:
+                nonzero_before = entry
+            elif nonzero_after is None:
+                nonzero_after = entry
+
         selected = None
         bounded_after_applied = False
         bounded_after_reason = ""
         bounded_after_max = max(
             0.0,
             float(getattr(self, "remote_og_movement_input_after_max", 0.20) or 0.0),
+        )
+        nonzero_after_target_error = entry_target_error(nonzero_after)
+        nonzero_after_within_bounded_after_max = (
+            nonzero_after_target_error is not None
+            and nonzero_after_target_error <= bounded_after_max
         )
         if selection_policy == "nearest_to_target":
             selected = nearest
@@ -7682,11 +7717,23 @@ class WulframServer:
                 **movement_time_probe_fields("time_probe_before", before),
                 **movement_time_probe_fields("time_probe_after", after),
                 **movement_time_probe_fields("time_probe_nearest", nearest),
+                **movement_time_probe_fields(
+                    "time_probe_nonzero_before", nonzero_before
+                ),
+                **movement_time_probe_fields(
+                    "time_probe_nonzero_after", nonzero_after
+                ),
+                **movement_time_probe_fields(
+                    "time_probe_nonzero_nearest", nonzero_nearest
+                ),
                 "source": "delayed_remote_og_pre_history_zero",
                 "selection_policy": selection_policy,
                 "bounded_after_max_s": bounded_after_max,
                 "bounded_after_applied": bounded_after_applied,
                 "bounded_after_reason": bounded_after_reason,
+                "nonzero_after_within_bounded_after_max": (
+                    nonzero_after_within_bounded_after_max
+                ),
                 "history_len": len(history),
                 "target_time": target_time,
                 "latest_age_s": (now - latest_time) if latest_time > 0.0 else None,
@@ -7748,11 +7795,17 @@ class WulframServer:
             **movement_time_probe_fields("time_probe_before", before),
             **movement_time_probe_fields("time_probe_after", after),
             **movement_time_probe_fields("time_probe_nearest", nearest),
+            **movement_time_probe_fields("time_probe_nonzero_before", nonzero_before),
+            **movement_time_probe_fields("time_probe_nonzero_after", nonzero_after),
+            **movement_time_probe_fields("time_probe_nonzero_nearest", nonzero_nearest),
             "source": "delayed_remote_og_action_history",
             "selection_policy": selection_policy,
             "bounded_after_max_s": bounded_after_max,
             "bounded_after_applied": bounded_after_applied,
             "bounded_after_reason": bounded_after_reason,
+            "nonzero_after_within_bounded_after_max": (
+                nonzero_after_within_bounded_after_max
+            ),
             "history_len": len(history),
             "target_time": target_time,
             "selected_age_s": (now - selected_time) if selected_time > 0.0 else None,

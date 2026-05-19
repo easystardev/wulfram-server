@@ -4601,6 +4601,49 @@ def test_remote_og_movement_input_can_select_bounded_after_target():
     return True
 
 
+def test_remote_og_movement_input_reports_nonzero_time_candidates():
+    """Debug fields should expose late nonzero samples hidden behind neutral rows."""
+    server = WulframServer.__new__(WulframServer)
+    server.remote_og_movement_input_delay = 0.20
+    server.remote_og_movement_input_selection = "latest_before_target"
+    server.remote_og_movement_input_after_max = 0.12
+
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    now = time.monotonic()
+    ctx.movement_input_history.append({"time": now - 0.766, "fwd": 0.0, "strafe": 0.0})
+    ctx.movement_input_history.append({"time": now - 0.125, "fwd": 0.0, "strafe": 0.0})
+    ctx.movement_input_history.append({"time": now - 0.050, "fwd": 0.549333, "strafe": 0.0})
+
+    fwd, strafe, source = server._select_delayed_movement_input(
+        ctx,
+        current_fwd=0.549333,
+        current_strafe=0.0,
+        delay_s=server.remote_og_movement_input_delay,
+    )
+
+    selection = getattr(ctx, "debug_last_movement_input_selection", {})
+    assert source == "delayed_remote_og_action_history", source
+    assert fwd == 0.0, selection
+    assert strafe == 0.0, selection
+    assert selection["time_probe_after_found"] is True, selection
+    assert selection["time_probe_after_fwd"] == 0.0, selection
+    assert selection["time_probe_nearest_fwd"] == 0.0, selection
+    assert selection["time_probe_nonzero_before_found"] is False, selection
+    assert selection["time_probe_nonzero_after_found"] is True, selection
+    assert abs(selection["time_probe_nonzero_after_fwd"] - 0.549333) < 1e-6, selection
+    assert 0.14 <= selection["time_probe_nonzero_after_target_error_s"] <= 0.16, selection
+    assert selection["time_probe_nonzero_nearest_found"] is True, selection
+    assert selection["nonzero_after_within_bounded_after_max"] is False, selection
+
+    print("test_remote_og_movement_input_reports_nonzero_time_candidates: PASSED")
+    return True
+
+
 def test_remote_og_movement_input_tick_probe_reports_tick_domain_candidates():
     """Default-off tick probe should compare client-tick candidates without changing input."""
     server = WulframServer.__new__(WulframServer)
@@ -17343,6 +17386,7 @@ def main():
         test_remote_og_movement_input_delay_replays_prior_axis_sample,
         test_remote_og_movement_input_delay_can_probe_nearest_axis_sample,
         test_remote_og_movement_input_can_select_bounded_after_target,
+        test_remote_og_movement_input_reports_nonzero_time_candidates,
         test_remote_og_movement_input_tick_probe_reports_tick_domain_candidates,
         test_remote_og_movement_input_can_select_tick_domain_candidates,
         test_server_jump_jets_apply_fixed_step_rising_edge,
