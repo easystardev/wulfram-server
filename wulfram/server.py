@@ -11947,6 +11947,38 @@ class WulframServer:
             pre_step_frame_vel = finite_triplet(pre_vel)
             current_frame_vel = finite_triplet((vx, vy, vz))
 
+            def triplet_delta(start, end):
+                start_triplet = finite_triplet(start)
+                end_triplet = finite_triplet(end)
+                if start_triplet is None or end_triplet is None:
+                    return None
+                return (
+                    end_triplet[0] - start_triplet[0],
+                    end_triplet[1] - start_triplet[1],
+                    end_triplet[2] - start_triplet[2],
+                )
+
+            def triplet_span(delta):
+                delta_triplet = finite_triplet(delta)
+                if delta_triplet is None:
+                    return None
+                return math.sqrt(
+                    delta_triplet[0] * delta_triplet[0]
+                    + delta_triplet[1] * delta_triplet[1]
+                    + delta_triplet[2] * delta_triplet[2]
+                )
+
+            frame_pose_delta = triplet_delta(pre_step_frame_pos, current_frame_pos)
+            frame_pose_span_u = triplet_span(frame_pose_delta)
+            frame_velocity_delta = triplet_delta(pre_step_frame_vel, current_frame_vel)
+            frame_velocity_span_u = triplet_span(frame_velocity_delta)
+            if frame_pose_span_u is None:
+                frame_pose_span_verdict = "frame_pose_unavailable"
+            elif bucket_count > 1 and frame_pose_span_u <= 0.001:
+                frame_pose_span_verdict = "frame_pose_static"
+            else:
+                frame_pose_span_verdict = "frame_pose_varies"
+
             def integrate_frame_phase_state(start_pos, start_vel, elapsed_s):
                 start_position = finite_triplet(start_pos)
                 start_velocity = finite_triplet(start_vel)
@@ -12254,6 +12286,15 @@ class WulframServer:
                     "post-step pose and continues the remaining frame time."
                 ),
                 "frame_dt_s": frame_dt,
+                "frame_pose_start": pre_step_frame_pos,
+                "frame_pose_end": current_frame_pos,
+                "frame_pose_delta": frame_pose_delta,
+                "frame_pose_span_u": frame_pose_span_u,
+                "frame_pose_span_verdict": frame_pose_span_verdict,
+                "frame_velocity_start": pre_step_frame_vel,
+                "frame_velocity_end": current_frame_vel,
+                "frame_velocity_delta": frame_velocity_delta,
+                "frame_velocity_span_u": frame_velocity_span_u,
                 "bucket_count": bucket_count,
                 "bucket_center_sample_count": bucket_count,
                 "accepted_count": len(accepted_rows),

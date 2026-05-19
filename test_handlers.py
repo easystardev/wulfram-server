@@ -9355,6 +9355,20 @@ def test_entity_world_collision_frame_phase_report_first_probe_is_read_only():
         assert probe["pair_record_frame_phase_probe_enabled"] is True, probe
         frame_probe = probe["pair_record_frame_phase_probe"]
         assert frame_probe["runtime_default"] == "off", frame_probe
+        assert frame_probe["frame_pose_start"] == (0.0, 0.0, 0.0), frame_probe
+        assert frame_probe["frame_pose_end"] == (1.0, 0.0, -1.0), frame_probe
+        assert frame_probe["frame_pose_delta"] == (1.0, 0.0, -1.0), frame_probe
+        assert math.isclose(
+            frame_probe["frame_pose_span_u"],
+            math.sqrt(2.0),
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ), frame_probe
+        assert frame_probe["frame_pose_span_verdict"] == "frame_pose_varies", frame_probe
+        assert frame_probe["frame_velocity_start"] == (1.0, 0.0, -1.0), frame_probe
+        assert frame_probe["frame_velocity_end"] == (1.0, 0.0, -1.0), frame_probe
+        assert frame_probe["frame_velocity_delta"] == (0.0, 0.0, 0.0), frame_probe
+        assert frame_probe["frame_velocity_span_u"] == 0.0, frame_probe
         assert frame_probe["bucket_center_sample_count"] == 30, frame_probe
         assert frame_probe["accepted_count"] == 1, frame_probe
         accepted = frame_probe["first_accepted"]
