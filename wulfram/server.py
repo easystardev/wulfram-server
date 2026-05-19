@@ -11598,8 +11598,7 @@ class WulframServer:
                 "cbsp_mesh_edge_terrain_plane_probe",
                 "cbsp_mesh_edge_terrain_plane_traversal_probe",
             )
-            results = {}
-            accepted_rows = []
+            frame_candidates = []
             for label, candidate in reference_pose_candidates(pos):
                 candidate_velocity, velocity_fraction, velocity_source = (
                     reference_pose_candidate_velocity(
@@ -11608,6 +11607,71 @@ class WulframServer:
                         fallback=velocity,
                     )
                 )
+                frame_candidates.append(
+                    (
+                        label,
+                        candidate,
+                        candidate_velocity,
+                        velocity_fraction,
+                        velocity_source,
+                    )
+                )
+
+            pre_step_frame_pos = finite_triplet(pre_pos)
+            current_frame_pos = finite_triplet(pos)
+            pre_step_frame_vel = finite_triplet(pre_vel)
+            current_frame_vel = finite_triplet((vx, vy, vz))
+            if (
+                frame_dt > 0.0
+                and pre_step_frame_pos is not None
+                and current_frame_pos is not None
+            ):
+                for bucket_index in range(bucket_count):
+                    fraction = (float(bucket_index) + 0.5) / float(bucket_count)
+                    label = f"pre_to_current_bucket_{bucket_index:02d}_center"
+                    candidate = (
+                        pre_step_frame_pos[0]
+                        + (current_frame_pos[0] - pre_step_frame_pos[0]) * fraction,
+                        pre_step_frame_pos[1]
+                        + (current_frame_pos[1] - pre_step_frame_pos[1]) * fraction,
+                        pre_step_frame_pos[2]
+                        + (current_frame_pos[2] - pre_step_frame_pos[2]) * fraction,
+                    )
+                    if pre_step_frame_vel is not None and current_frame_vel is not None:
+                        candidate_velocity = (
+                            pre_step_frame_vel[0]
+                            + (current_frame_vel[0] - pre_step_frame_vel[0])
+                            * fraction,
+                            pre_step_frame_vel[1]
+                            + (current_frame_vel[1] - pre_step_frame_vel[1])
+                            * fraction,
+                            pre_step_frame_vel[2]
+                            + (current_frame_vel[2] - pre_step_frame_vel[2])
+                            * fraction,
+                        )
+                        velocity_source = "pre_to_current_bucket_center_fraction"
+                    else:
+                        candidate_velocity = velocity
+                        velocity_source = "fallback_bucket_center_velocity"
+                    frame_candidates.append(
+                        (
+                            label,
+                            candidate,
+                            candidate_velocity,
+                            fraction,
+                            velocity_source,
+                        )
+                    )
+
+            results = {}
+            accepted_rows = []
+            for (
+                label,
+                candidate,
+                candidate_velocity,
+                velocity_fraction,
+                velocity_source,
+            ) in frame_candidates:
                 time_s, bucket_index, bucket_bounds = bucket_for_fraction(
                     velocity_fraction
                 )
@@ -11674,11 +11738,13 @@ class WulframServer:
                 "runtime_default": "off",
                 "decompile_source": (
                     "Report-first GUESS4_CBSP_edge_triangle_intersect selections "
-                    "sampled at server frame reference poses before applying any "
-                    "terrain response."
+                    "sampled at server frame reference poses and 30 "
+                    "CollisionPair_record bucket centers before applying any terrain "
+                    "response."
                 ),
                 "frame_dt_s": frame_dt,
                 "bucket_count": bucket_count,
+                "bucket_center_sample_count": bucket_count,
                 "accepted_count": len(accepted_rows),
                 "first_accepted": accepted_rows[0] if accepted_rows else None,
                 "results": results,

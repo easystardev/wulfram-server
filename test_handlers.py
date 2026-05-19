@@ -9037,6 +9037,7 @@ def test_entity_world_collision_frame_phase_report_first_probe_is_read_only():
         assert probe["pair_record_frame_phase_probe_enabled"] is True, probe
         frame_probe = probe["pair_record_frame_phase_probe"]
         assert frame_probe["runtime_default"] == "off", frame_probe
+        assert frame_probe["bucket_center_sample_count"] == 30, frame_probe
         assert frame_probe["accepted_count"] == 1, frame_probe
         accepted = frame_probe["first_accepted"]
         assert accepted["label"] == "pre_to_current_50", accepted
@@ -9045,6 +9046,13 @@ def test_entity_world_collision_frame_phase_report_first_probe_is_read_only():
         assert accepted["contact_selection"] == "cbsp_mesh_edge_terrain_plane_probe", accepted
         assert accepted["contact"]["contact_cell"] == (7, 8), accepted
         assert accepted["contact"]["contact_cbsp_mesh_triangle_indices"] == (6, 8, 9), accepted
+        bucket_row = frame_probe["results"]["pre_to_current_bucket_06_center"][
+            "cbsp_mesh_edge_terrain_plane_probe"
+        ]
+        assert bucket_row["bucket_index"] == 6, bucket_row
+        assert 0.216 <= bucket_row["velocity_fraction"] <= 0.217, bucket_row
+        assert bucket_row["velocity_source"] == "pre_to_current_bucket_center_fraction", bucket_row
+        assert bucket_row["accepted"] is False, bucket_row
     finally:
         for key, value in old_env.items():
             if value is None:
