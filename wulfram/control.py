@@ -233,7 +233,7 @@ class ControlServer:
             'GAME_CLOCK': self._build_game_clock,
         }
 
-    def _get_active_client(self):
+    def _get_active_client(self, *, require_udp: bool = True):
         """Find the first connected client from the game server's client list.
 
         Returns (ctx, addr) or (None, None). This works even when
@@ -243,17 +243,17 @@ class ControlServer:
             return None, None
         with self.server.clients_lock:
             for c in self.server.clients.values():
-                if c.session and c.session.udp_addr:
+                if c.session and (not require_udp or c.session.udp_addr):
                     return c, c.session.udp_addr
         return None, None
 
-    def _get_client_by_id(self, client_id: int):
+    def _get_client_by_id(self, client_id: int, *, require_udp: bool = True):
         """Find a specific client by client_id. Returns (ctx, addr) or (None, None)."""
         if not self.server:
             return None, None
         with self.server.clients_lock:
             for c in self.server.clients.values():
-                if c.client_id == client_id and c.session and c.session.udp_addr:
+                if c.client_id == client_id and c.session and (not require_udp or c.session.udp_addr):
                     return c, c.session.udp_addr
         return None, None
 
@@ -3013,12 +3013,12 @@ Examples:
         ctx = None
         if args and args[0].lower().startswith("c") and args[0][1:].isdigit():
             target_id = int(args[0][1:])
-            ctx, _ = self._get_client_by_id(target_id)
+            ctx, _ = self._get_client_by_id(target_id, require_udp=False)
             if not ctx:
                 return f"Error: No client with id {target_id}"
             args = args[1:]
         else:
-            ctx, _ = self._get_active_client()
+            ctx, _ = self._get_active_client(require_udp=False)
         if not ctx:
             return "Error: No connected client"
         if not ctx.tcp_handler or not ctx.session:

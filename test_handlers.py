@@ -409,6 +409,52 @@ def test_control_pose_reset_updates_ground_override():
     return True
 
 
+def test_enter_game_can_target_team_select_tcp_only_client():
+    """The automation spawn path must resolve TEAM_SELECT clients before UDP exists."""
+    session = Session()
+    ctx = ClientContext(
+        client_id=5,
+        client_addr=("10.10.10.2", 52911),
+        session=session,
+        entity_id=0x153D,
+    )
+    ctx.tcp_handler = object()
+    ctx.player_pos = (4950.0, 5100.0, 5.0)
+
+    captured = {}
+
+    def spawn_wf_style(spawn_ctx, team_id, net_id, unit_type, pos, announce):
+        captured.update(
+            ctx=spawn_ctx,
+            team_id=team_id,
+            net_id=net_id,
+            unit_type=unit_type,
+            pos=pos,
+            announce=announce,
+        )
+
+    server = SimpleNamespace(
+        clients={5: ctx},
+        clients_lock=threading.Lock(),
+        next_entity_id=0x2000,
+        _spawn_wf_style=spawn_wf_style,
+    )
+    control = ControlServer.__new__(ControlServer)
+    control.server = server
+    control._sync_to_active_client = lambda: None
+
+    output = control._cmd_enter_game(["c5", "t2"])
+
+    assert "Entered game: client=5" in output, output
+    assert "udp=no" in output, output
+    assert captured["ctx"] is ctx, captured
+    assert captured["team_id"] == 2, captured
+    assert captured["net_id"] == 0x153D, captured
+    assert session.team_id == 2, session.team_id
+    print("test_enter_game_can_target_team_select_tcp_only_client: PASSED")
+    return True
+
+
 def test_tank_softbody_spawn_pose_does_not_pin_ground_override():
     """Softbody tanks should settle on terrain suspension, not a spawn Z clamp."""
     server = WulframServer.__new__(WulframServer)
@@ -17105,6 +17151,7 @@ def main():
         test_broadcast_player_stats_stays_tcp_only,
         test_remote_combat_observer_stats_gate_skips_nonparticipant_og,
         test_control_pos_exact_reset_targets_specific_client,
+        test_enter_game_can_target_team_select_tcp_only_client,
         test_control_pos_can_apply_live_tap_velocity,
         test_control_heading_set_preserves_yaw_sign_convention,
         test_solo_local_player_keepalive_shape_triggers_og_state_request_gate,
