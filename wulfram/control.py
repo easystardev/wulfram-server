@@ -302,6 +302,8 @@ class ControlServer:
         ctx.last_action_dump_time = now
         ctx.last_position_update = now
         ctx.last_heading_update = now
+        ctx.control_pose_reset_time = now
+        ctx.control_pose_reset_pos = ctx.player_pos
         ctx.player_aim_yaw = heading
         ctx.player_aim_pitch = 0.0
         ctx.player_aim_source = "control_pos"

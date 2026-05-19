@@ -1037,6 +1037,27 @@ def handle_spawn_at_point(server: "WulframServer", ctx: "ClientContext", spawn_p
             return
 
         try:
+            control_pose_block_s = float(
+                os.environ.get("WULFRAM_CONTROL_POSE_BLOCK_SPAWN_OVERRIDE_S", "45.0")
+            )
+        except (TypeError, ValueError):
+            control_pose_block_s = 45.0
+        control_pose_reset_time = float(getattr(ctx, "control_pose_reset_time", 0.0) or 0.0)
+        control_pose_age_s = now - control_pose_reset_time if control_pose_reset_time > 0.0 else None
+        if (
+            control_pose_block_s > 0.0
+            and control_pose_age_s is not None
+            and control_pose_age_s < control_pose_block_s
+        ):
+            print(
+                f"[SPAWN] Client {ctx.client_id}: Ignoring IN_GAME spawn override "
+                f"after recent control pose reset "
+                f"(age={control_pose_age_s:.2f}s < block={control_pose_block_s:.2f}s) "
+                f"point={spawn_point_id} vehicle={vehicle_type}"
+            )
+            return
+
+        try:
             min_interval = float(getattr(server, "spawn_point_override_min_interval", 0.0))
         except (TypeError, ValueError):
             min_interval = 0.0

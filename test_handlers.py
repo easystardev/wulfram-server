@@ -326,6 +326,46 @@ def test_spawn_at_point_honors_clicked_pad_when_default_configured():
             os.environ["WULFRAM_SPAWN_POS"] = old_spawn_pos
 
 
+def test_recent_control_pose_blocks_in_game_spawn_override():
+    """Late spawn-point packets must not undo a control-plane setup pose."""
+    old_block = os.environ.get("WULFRAM_CONTROL_POSE_BLOCK_SPAWN_OVERRIDE_S")
+    try:
+        os.environ["WULFRAM_CONTROL_POSE_BLOCK_SPAWN_OVERRIDE_S"] = "45"
+        server = WulframServer.__new__(WulframServer)
+        server.spawn_allow_point_override = True
+        server.spawn_point_override_min_interval = 0.0
+        server.get_spawn_points = lambda: [
+            {"oid": 7001, "team": 2, "x": 6000.0, "y": 6000.0, "z": 90.0},
+        ]
+        captured = {}
+        server._spawn_wf_style = lambda ctx, team_id, pos=None, **kwargs: captured.update(
+            team_id=team_id,
+            pos=pos,
+        )
+
+        session = Session(phase=Phase.IN_GAME, in_game=True, team_id=2, last_spawn_time=0.0)
+        ctx = ClientContext(
+            client_id=1,
+            client_addr=("127.0.0.1", 50000),
+            session=session,
+            entity_id=0x14EA,
+        )
+        ctx.control_pose_reset_time = time.monotonic()
+        ctx.control_pose_reset_pos = (3160.4343, 2463.2375, -33.4864)
+
+        handle_spawn_at_point(server, ctx, 7001, 0, ("127.0.0.1", 50000))
+
+        assert captured == {}, captured
+        assert session.phase == Phase.IN_GAME
+        print("test_recent_control_pose_blocks_in_game_spawn_override: PASSED")
+        return True
+    finally:
+        if old_block is None:
+            os.environ.pop("WULFRAM_CONTROL_POSE_BLOCK_SPAWN_OVERRIDE_S", None)
+        else:
+            os.environ["WULFRAM_CONTROL_POSE_BLOCK_SPAWN_OVERRIDE_S"] = old_block
+
+
 def test_map_entity_z_aligns_buried_entities_to_terrain():
     """Map-state buildings/spawn points below physics terrain should be lifted."""
     server = WulframServer.__new__(WulframServer)
@@ -16296,6 +16336,8 @@ def test_control_pos_exact_reset_targets_specific_client():
     assert ctx.injected_input is None, ctx.injected_input
     assert ctx.injected_turn is None, ctx.injected_turn
     assert ctx.prev_raw_turn_input == 0.0, ctx.prev_raw_turn_input
+    assert ctx.control_pose_reset_pos == (100.0, 200.0, 300.0), ctx.control_pose_reset_pos
+    assert ctx.control_pose_reset_time > 0.0, ctx.control_pose_reset_time
     assert ctx.player_pose["pos"] == (100.0, 200.0, 300.0), ctx.player_pose["pos"]
     assert ctx.player_pose["vel"] == (0.0, 0.0, 0.0), ctx.player_pose["vel"]
     assert abs(ctx.player_pose["yaw"] + math.radians(45.0)) < 1e-6, ctx.player_pose["yaw"]
@@ -17090,6 +17132,7 @@ def main():
         test_input_sync_diagnosis_counts_unsolicited_correction_stream,
         test_spawn_override_wins_over_map_spawn_points,
         test_spawn_at_point_honors_clicked_pad_when_default_configured,
+        test_recent_control_pose_blocks_in_game_spawn_override,
         test_map_entity_z_aligns_buried_entities_to_terrain,
         test_map_entity_z_preserves_raw_z_above_physics_terrain,
         test_map_entity_z_preserves_elevated_entities,
