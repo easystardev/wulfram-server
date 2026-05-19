@@ -7632,6 +7632,93 @@ class WulframServer:
                 f"{prefix}_client_tick": int(entry.get("client_tick", 0) or 0),
             }
 
+        def movement_history_window_fields(selected_entry) -> dict:
+            window_s = 0.75
+            max_entries = 16
+            candidates = []
+            for index, entry in enumerate(history):
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    sample_time = float(entry.get("time", 0.0))
+                except (TypeError, ValueError, AttributeError, OverflowError):
+                    continue
+                if sample_time <= 0.0:
+                    continue
+                target_error = sample_time - target_time
+                if abs(target_error) > window_s:
+                    continue
+                try:
+                    entry_fwd = float(entry.get("fwd", 0.0))
+                    entry_strafe = float(entry.get("strafe", 0.0))
+                except (TypeError, ValueError, AttributeError, OverflowError):
+                    entry_fwd = 0.0
+                    entry_strafe = 0.0
+                candidates.append(
+                    {
+                        "index": index,
+                        "time": sample_time,
+                        "target_error_s": target_error,
+                        "abs_target_error_s": abs(target_error),
+                        "age_s": now - sample_time,
+                        "fwd": entry_fwd,
+                        "strafe": entry_strafe,
+                        "client_tick": int(entry.get("client_tick", 0) or 0),
+                        "packet_type": entry.get("packet_type"),
+                        "selected": entry is selected_entry,
+                    }
+                )
+            total = len(candidates)
+            if total > max_entries:
+                selected_index = None
+                for idx, item in enumerate(candidates):
+                    if item.get("selected"):
+                        selected_index = idx
+                        break
+                if selected_index is None:
+                    keep = sorted(
+                        candidates,
+                        key=lambda item: (
+                            float(item.get("abs_target_error_s", 999.0)),
+                            int(item.get("index", 0)),
+                        ),
+                    )[:max_entries]
+                    keep_indices = {int(item["index"]) for item in keep}
+                else:
+                    half = max_entries // 2
+                    start = max(0, selected_index - half)
+                    end = min(total, start + max_entries)
+                    start = max(0, end - max_entries)
+                    keep_indices = {
+                        int(item["index"]) for item in candidates[start:end]
+                    }
+                candidates = [
+                    item for item in candidates if int(item["index"]) in keep_indices
+                ]
+            compact = []
+            for item in sorted(candidates, key=lambda row: int(row.get("index", 0))):
+                compact.append(
+                    {
+                        "index": int(item["index"]),
+                        "age_s": float(item["age_s"]),
+                        "target_error_s": float(item["target_error_s"]),
+                        "abs_target_error_s": float(item["abs_target_error_s"]),
+                        "future_of_target": float(item["target_error_s"]) > 0.0,
+                        "fwd": float(item["fwd"]),
+                        "strafe": float(item["strafe"]),
+                        "client_tick": int(item["client_tick"]),
+                        "packet_type": item.get("packet_type"),
+                        "selected": bool(item.get("selected")),
+                    }
+                )
+            return {
+                "movement_history_window_s": window_s,
+                "movement_history_window_count": len(compact),
+                "movement_history_window_total_count": total,
+                "movement_history_window_truncated": total > max_entries,
+                "movement_history_window": compact,
+            }
+
         nonzero_before = None
         nonzero_after = None
         nonzero_nearest = None
@@ -7726,6 +7813,7 @@ class WulframServer:
                 **movement_time_probe_fields(
                     "time_probe_nonzero_nearest", nonzero_nearest
                 ),
+                **movement_history_window_fields(None),
                 "source": "delayed_remote_og_pre_history_zero",
                 "selection_policy": selection_policy,
                 "bounded_after_max_s": bounded_after_max,
@@ -7798,6 +7886,7 @@ class WulframServer:
             **movement_time_probe_fields("time_probe_nonzero_before", nonzero_before),
             **movement_time_probe_fields("time_probe_nonzero_after", nonzero_after),
             **movement_time_probe_fields("time_probe_nonzero_nearest", nonzero_nearest),
+            **movement_history_window_fields(selected),
             "source": "delayed_remote_og_action_history",
             "selection_policy": selection_policy,
             "bounded_after_max_s": bounded_after_max,

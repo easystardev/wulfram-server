@@ -4495,6 +4495,13 @@ def test_remote_og_movement_input_delay_replays_prior_axis_sample():
     assert selection["time_probe_after_fwd"] == 0.5188, selection
     assert selection["selected_interval_contains_target"] is True, selection
     assert selection["selected_interval_end_target_error_s"] > 0.0, selection
+    assert selection["movement_history_window_s"] == 0.75, selection
+    assert selection["movement_history_window_count"] == 2, selection
+    assert selection["movement_history_window_total_count"] == 2, selection
+    assert selection["movement_history_window_truncated"] is False, selection
+    window = selection["movement_history_window"]
+    assert window[0]["fwd"] == 0.0 and window[0]["selected"] is True, window
+    assert window[1]["fwd"] == 0.5188 and window[1]["future_of_target"] is True, window
 
     ctx.client_addr = ("127.0.0.1", 50000)
     assert server._remote_og_movement_input_delay_for_ctx(ctx) == 0.0
@@ -4641,6 +4648,55 @@ def test_remote_og_movement_input_reports_nonzero_time_candidates():
     assert selection["nonzero_after_within_bounded_after_max"] is False, selection
 
     print("test_remote_og_movement_input_reports_nonzero_time_candidates: PASSED")
+    return True
+
+
+def test_remote_og_movement_input_history_window_is_bounded_near_target():
+    """Selection debug should carry enough nearby samples for offline policy replay."""
+    server = WulframServer.__new__(WulframServer)
+    server.remote_og_movement_input_delay = 0.20
+    server.remote_og_movement_input_selection = "latest_before_target"
+    server.remote_og_movement_input_after_max = 0.12
+
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    now = time.monotonic()
+    for index in range(24):
+        age = 0.95 - index * 0.04
+        ctx.movement_input_history.append(
+            {
+                "time": now - age,
+                "fwd": 0.5 if index >= 18 else 0.0,
+                "strafe": 0.0,
+                "packet_type": "ACTION_UPDATE",
+                "client_tick": 200000 + index,
+            }
+        )
+
+    fwd, strafe, source = server._select_delayed_movement_input(
+        ctx,
+        current_fwd=0.5,
+        current_strafe=0.0,
+        delay_s=server.remote_og_movement_input_delay,
+    )
+
+    selection = getattr(ctx, "debug_last_movement_input_selection", {})
+    assert source == "delayed_remote_og_action_history", source
+    assert fwd == 0.5, selection
+    assert strafe == 0.0, selection
+    window = selection["movement_history_window"]
+    assert selection["movement_history_window_total_count"] > 16, selection
+    assert selection["movement_history_window_count"] == 16, selection
+    assert selection["movement_history_window_truncated"] is True, selection
+    assert any(item["selected"] for item in window), window
+    assert all(abs(item["target_error_s"]) <= 0.75 for item in window), window
+    assert [item["index"] for item in window] == sorted(item["index"] for item in window), window
+
+    print("test_remote_og_movement_input_history_window_is_bounded_near_target: PASSED")
     return True
 
 
@@ -17387,6 +17443,7 @@ def main():
         test_remote_og_movement_input_delay_can_probe_nearest_axis_sample,
         test_remote_og_movement_input_can_select_bounded_after_target,
         test_remote_og_movement_input_reports_nonzero_time_candidates,
+        test_remote_og_movement_input_history_window_is_bounded_near_target,
         test_remote_og_movement_input_tick_probe_reports_tick_domain_candidates,
         test_remote_og_movement_input_can_select_tick_domain_candidates,
         test_server_jump_jets_apply_fixed_step_rising_edge,
