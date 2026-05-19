@@ -4396,6 +4396,76 @@ def test_remote_og_movement_input_tick_probe_reports_tick_domain_candidates():
     return True
 
 
+def test_remote_og_movement_input_can_select_tick_domain_candidates():
+    """Default-off tick-domain policies can drive replay from client tick timing."""
+    server = WulframServer.__new__(WulframServer)
+    server.remote_og_movement_input_delay = 0.10
+    server.remote_og_movement_input_tick_probe = False
+    server.remote_og_movement_input_stale_clamp = 0.0
+
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    ctx.last_client_tick = 100000
+    now = time.monotonic()
+    ctx.movement_input_history.append(
+        {
+            "time": now - 0.40,
+            "fwd": 0.0,
+            "strafe": 0.0,
+            "client_tick": 99700,
+        }
+    )
+    ctx.movement_input_history.append(
+        {
+            "time": now - 0.05,
+            "fwd": 0.5188,
+            "strafe": 0.0,
+            "client_tick": 99950,
+        }
+    )
+
+    server.remote_og_movement_input_selection = "latest_before_tick_target"
+    fwd, strafe, source = server._select_delayed_movement_input(
+        ctx,
+        current_fwd=0.5188,
+        current_strafe=0.0,
+        delay_s=server.remote_og_movement_input_delay,
+    )
+    selection = getattr(ctx, "debug_last_movement_input_selection", {})
+    assert source == "delayed_remote_og_action_history", source
+    assert fwd == 0.0, selection
+    assert strafe == 0.0, selection
+    assert selection["selection_policy"] == "latest_before_tick_target", selection
+    assert selection["tick_probe_enabled"] is True, selection
+    assert selection["tick_probe_target_client_tick"] == 99900, selection
+    assert selection["selected_client_tick"] == 99700, selection
+    assert selection["selected_tick_target_error_ms"] == -200, selection
+    assert selection["selected_tick_abs_target_error_ms"] == 200, selection
+
+    server.remote_og_movement_input_selection = "nearest_tick_target"
+    fwd, strafe, source = server._select_delayed_movement_input(
+        ctx,
+        current_fwd=0.5188,
+        current_strafe=0.0,
+        delay_s=server.remote_og_movement_input_delay,
+    )
+    selection = getattr(ctx, "debug_last_movement_input_selection", {})
+    assert source == "delayed_remote_og_action_history", source
+    assert abs(fwd - 0.5188) < 1e-6, selection
+    assert strafe == 0.0, selection
+    assert selection["selection_policy"] == "nearest_tick_target", selection
+    assert selection["selected_client_tick"] == 99950, selection
+    assert selection["selected_tick_target_error_ms"] == 50, selection
+    assert selection["selected_tick_abs_target_error_ms"] == 50, selection
+
+    print("test_remote_og_movement_input_can_select_tick_domain_candidates: PASSED")
+    return True
+
+
 def test_server_jump_jets_apply_fixed_step_rising_edge():
     """Opt-in jump jets should fire once on thrust rising edge inside motion step."""
     server = WulframServer.__new__(WulframServer)
@@ -16864,6 +16934,7 @@ def main():
         test_remote_og_movement_input_delay_replays_prior_axis_sample,
         test_remote_og_movement_input_delay_can_probe_nearest_axis_sample,
         test_remote_og_movement_input_tick_probe_reports_tick_domain_candidates,
+        test_remote_og_movement_input_can_select_tick_domain_candidates,
         test_server_jump_jets_apply_fixed_step_rising_edge,
         test_server_jump_jets_have_visible_peak_under_default_gravity,
         test_server_jump_jets_use_tank_body_up_direction,

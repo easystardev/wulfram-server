@@ -1131,6 +1131,24 @@ class WulframServer:
             "closest_to_target",
         }:
             self.remote_og_movement_input_selection = "nearest_to_target"
+        elif self.remote_og_movement_input_selection in {
+            "tick_before",
+            "tick_before_target",
+            "latest_before_tick",
+            "latest_before_tick_target",
+            "client_tick_before",
+            "client_tick_before_target",
+        }:
+            self.remote_og_movement_input_selection = "latest_before_tick_target"
+        elif self.remote_og_movement_input_selection in {
+            "tick_nearest",
+            "tick_nearest_target",
+            "nearest_tick",
+            "nearest_tick_target",
+            "client_tick_nearest",
+            "client_tick_nearest_target",
+        }:
+            self.remote_og_movement_input_selection = "nearest_tick_target"
         else:
             self.remote_og_movement_input_selection = "latest_before_target"
         print(f"[CONFIG] remote_og_movement_input_delay={self.remote_og_movement_input_delay:.2f}s")
@@ -7308,9 +7326,16 @@ class WulframServer:
             }
             return float(current_fwd), float(current_strafe), "current_slots_no_history"
 
-        def build_tick_probe() -> dict:
-            if not getattr(self, "remote_og_movement_input_tick_probe", False):
-                return {}
+        def entry_tick(entry) -> int | None:
+            try:
+                tick = int(entry.get("client_tick", 0) or 0)
+            except (TypeError, ValueError, AttributeError, OverflowError):
+                return None
+            return tick if tick > 0 else None
+
+        def build_tick_context(enabled: bool) -> dict:
+            if not enabled:
+                return {"debug": {}}
             try:
                 server_tick_now = int(get_ticks()) & 0xFFFFFFFF
             except (TypeError, ValueError, OverflowError):
@@ -7328,23 +7353,19 @@ class WulframServer:
                     )
             if current_client_tick <= 0:
                 return {
-                    "tick_probe_enabled": True,
-                    "tick_probe_reject": "no_current_client_tick",
-                    "tick_probe_server_tick": server_tick_now,
-                    "tick_probe_tick_offset": tick_offset,
-                    "tick_probe_last_client_tick": int(
-                        getattr(ctx, "last_client_tick", 0) or 0
-                    ),
+                    "debug": {
+                        "tick_probe_enabled": True,
+                        "tick_probe_reject": "no_current_client_tick",
+                        "tick_probe_server_tick": server_tick_now,
+                        "tick_probe_tick_offset": tick_offset,
+                        "tick_probe_last_client_tick": int(
+                            getattr(ctx, "last_client_tick", 0) or 0
+                        ),
+                    },
+                    "reject": "no_current_client_tick",
                 }
             delay_ms = max(0, int(round(delay * 1000.0)))
             target_client_tick = (current_client_tick - delay_ms) & 0xFFFFFFFF
-
-            def entry_tick(entry) -> int | None:
-                try:
-                    tick = int(entry.get("client_tick", 0) or 0)
-                except (TypeError, ValueError, AttributeError, OverflowError):
-                    return None
-                return tick if tick > 0 else None
 
             before = None
             nearest = None
@@ -7393,17 +7414,35 @@ class WulframServer:
             }
             out.update(fields("tick_probe_before", before))
             out.update(fields("tick_probe_nearest", nearest))
-            return out
+            return {
+                "debug": out,
+                "before": before,
+                "nearest": nearest,
+                "target_client_tick": target_client_tick,
+            }
 
-        tick_probe = build_tick_probe()
         target_time = now - delay
         selection_policy = getattr(
             self,
             "remote_og_movement_input_selection",
             "latest_before_target",
         )
-        if selection_policy not in {"latest_before_target", "nearest_to_target"}:
+        if selection_policy not in {
+            "latest_before_target",
+            "nearest_to_target",
+            "latest_before_tick_target",
+            "nearest_tick_target",
+        }:
             selection_policy = "latest_before_target"
+        tick_selection_enabled = selection_policy in {
+            "latest_before_tick_target",
+            "nearest_tick_target",
+        }
+        tick_context = build_tick_context(
+            bool(getattr(self, "remote_og_movement_input_tick_probe", False))
+            or tick_selection_enabled
+        )
+        tick_probe = tick_context.get("debug") if isinstance(tick_context, dict) else {}
         before = None
         after = None
         nearest = None
@@ -7444,6 +7483,10 @@ class WulframServer:
         selected = None
         if selection_policy == "nearest_to_target":
             selected = nearest
+        elif selection_policy == "latest_before_tick_target":
+            selected = tick_context.get("before") if isinstance(tick_context, dict) else None
+        elif selection_policy == "nearest_tick_target":
+            selected = tick_context.get("nearest") if isinstance(tick_context, dict) else None
         else:
             selected = before
 
@@ -7540,6 +7583,30 @@ class WulframServer:
             ),
             "selected_original_fwd": float(selected.get("fwd", 0.0)),
             "selected_original_strafe": float(selected.get("strafe", 0.0)),
+            "selected_tick_target_error_ms": (
+                self._tick_delta_signed(
+                    int(selected.get("client_tick", 0) or 0),
+                    int(tick_context.get("target_client_tick", 0) or 0),
+                )
+                if tick_selection_enabled
+                and isinstance(tick_context, dict)
+                and tick_context.get("target_client_tick") is not None
+                and int(selected.get("client_tick", 0) or 0) > 0
+                else None
+            ),
+            "selected_tick_abs_target_error_ms": (
+                abs(
+                    self._tick_delta_signed(
+                        int(selected.get("client_tick", 0) or 0),
+                        int(tick_context.get("target_client_tick", 0) or 0),
+                    )
+                )
+                if tick_selection_enabled
+                and isinstance(tick_context, dict)
+                and tick_context.get("target_client_tick") is not None
+                and int(selected.get("client_tick", 0) or 0) > 0
+                else None
+            ),
             "stale_clamp_s": stale_clamp,
             "stale_clamp_applied": stale_clamp_applied,
             "stale_clamp_reason": stale_clamp_reason,
