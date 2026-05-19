@@ -8955,6 +8955,108 @@ def test_entity_world_collision_pair_record_schedule_probe_reports_without_apply
     return True
 
 
+def test_entity_world_collision_frame_phase_report_first_probe_is_read_only():
+    """Frame-phase report-first probe should sample CBSP candidates without applying."""
+    env_keys = [
+        "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_FRAME_PHASE_PROBE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT_SELECTION",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_NORMAL_SOURCE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE",
+    ]
+    old_env = {key: os.environ.get(key) for key in env_keys}
+    try:
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK", None)
+        os.environ.pop("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT", None)
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_FRAME_PHASE_PROBE"] = "1"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT_SELECTION"] = "upward_min_depth"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_NORMAL_SOURCE"] = "mesh"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE"] = "mesh"
+
+        def fake_model_collision(center, *args, **kwargs):
+            selection = kwargs.get("contact_selection")
+            if (
+                selection == "cbsp_mesh_edge_terrain_plane_probe"
+                and 0.49 <= center[0] <= 0.51
+            ):
+                return TerrainContact(
+                    position=(center[0], 0.0, -2.0),
+                    normal=(0.0, 0.0, 1.0),
+                    penetration=1.0,
+                    sector_index=2,
+                    cell=(7, 8),
+                    normal_source="entity_cbsp_split",
+                    cbsp_split_normal=(0.0, 0.0, 1.0),
+                    terrain_face_normal=(0.0, 0.0, 1.0),
+                    mesh_face_normal=(0.0, 0.0, 1.0),
+                    entity_radial_normal=(0.0, 0.0, 1.0),
+                    cbsp_store_normal0=(0.0, 0.0, 1.0),
+                    cbsp_store_normal1=(0.0, 0.0, -1.0),
+                    cbsp_record_hit_source="cbsp_mesh_edge_terrain_plane_probe_ab",
+                    cbsp_mesh_triangle_indices=(6, 8, 9),
+                )
+            return None
+
+        server = WulframServer.__new__(WulframServer)
+        server._terrain_grid_collision = SimpleNamespace(
+            test_box_collision=lambda *args, **kwargs: None,
+            test_model_collision=fake_model_collision,
+        )
+        server._get_entity_world_half_extents = lambda ctx: (2.0, 2.0, 3.0)
+        server._get_entity_world_collision_model = lambda ctx: (
+            [],
+            SimpleNamespace(nodes=[object()], root=SimpleNamespace(radius=7.5)),
+            7.5,
+            3.0,
+        )
+        server._get_entity_dirty_threshold_sq = lambda ctx, half_extents: 999999.0
+
+        ctx = _fake_tank_collision_context()
+        ctx.player_heading = 0.0
+        ctx.player_pos = (0.0, 0.0, 0.0)
+        ctx.world_collision_ref_pos = (0.0, 0.0, 0.0)
+        ctx.spring_body_matrix = _matrix3_from_euler_xyz(0.0, 0.0, 0.0)
+
+        result = server._resolve_entity_world_collision(
+            ctx,
+            1.0,
+            0.0,
+            -1.0,
+            1.0,
+            0.0,
+            -1.0,
+            pre_pos=(0.0, 0.0, 0.0),
+            pre_vel=(1.0, 0.0, -1.0),
+            dt=1.0,
+        )
+
+        assert result == (1.0, 0.0, -1.0, 1.0, 0.0, -1.0), result
+        assert getattr(ctx, "debug_last_motion_collision", {}) == {}
+        probe = ctx.debug_last_terrain_contact_probe
+        assert probe["pair_record_frame_phase_probe_enabled"] is True, probe
+        frame_probe = probe["pair_record_frame_phase_probe"]
+        assert frame_probe["runtime_default"] == "off", frame_probe
+        assert frame_probe["accepted_count"] == 1, frame_probe
+        accepted = frame_probe["first_accepted"]
+        assert accepted["label"] == "pre_to_current_50", accepted
+        assert accepted["server_report_time_s"] == 0.5, accepted
+        assert accepted["bucket_index"] == 15, accepted
+        assert accepted["contact_selection"] == "cbsp_mesh_edge_terrain_plane_probe", accepted
+        assert accepted["contact"]["contact_cell"] == (7, 8), accepted
+        assert accepted["contact"]["contact_cbsp_mesh_triangle_indices"] == (6, 8, 9), accepted
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    print(
+        "test_entity_world_collision_frame_phase_report_first_probe_is_read_only: PASSED"
+    )
+    return True
+
+
 def test_entity_world_collision_spatial_ref_schedule_probe_reports_without_applying():
     """Spatial-reference schedule probe should report from ref pose without response."""
     env_keys = [
@@ -17065,6 +17167,7 @@ def main():
         test_entity_world_collision_pair_record_contact_can_continue_remaining_step_when_enabled,
         test_entity_world_collision_pair_record_continue_sweeps_transient_contact,
         test_entity_world_collision_pair_record_schedule_probe_reports_without_applying,
+        test_entity_world_collision_frame_phase_report_first_probe_is_read_only,
         test_entity_world_collision_spatial_ref_schedule_probe_reports_without_applying,
         test_entity_world_collision_pair_record_schedule_response_probe_is_read_only,
         test_entity_world_collision_phase_lookahead_probe_reports_future_pair_contact,

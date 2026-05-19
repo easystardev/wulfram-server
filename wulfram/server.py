@@ -10023,6 +10023,31 @@ class WulframServer:
                 "decompile",
             }
         )
+        pair_record_frame_phase_probe_mode = (
+            os.environ.get(
+                "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_FRAME_PHASE_PROBE",
+                "0",
+            )
+            .strip()
+            .lower()
+        )
+        pair_record_frame_phase_probe_enabled = (
+            pair_record_contact_enabled
+            and timing_ready
+            and pair_record_frame_phase_probe_mode
+            in {
+                "1",
+                "true",
+                "on",
+                "yes",
+                "probe",
+                "frame",
+                "phase",
+                "cbsp",
+                "report_first",
+                "decompile",
+            }
+        )
         pair_record_schedule_response_probe_mode = (
             os.environ.get(
                 "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_SCHEDULE_RESPONSE_PROBE",
@@ -10895,20 +10920,25 @@ class WulframServer:
                 min_speed=0.0,
             )
 
-        def sample_pair_record_contact_at(pos, *, velocity=None):
+        def sample_pair_record_contact_at(pos, *, velocity=None, contact_selection=None):
             raw_contact, raw_bounds_contact, raw_error = sample_raw_origin_contact_at(pos)
             pair_raw_contact = raw_contact
             pair_raw_bounds_contact = raw_bounds_contact
             pair_raw_error = raw_error
+            selected_pair_record_contact_selection = (
+                pair_record_contact_selection
+                if contact_selection is None
+                else str(contact_selection or "").strip().lower()
+            )
             if (
                 raw_error is None
-                and pair_record_contact_selection
-                and pair_record_contact_selection != model_contact_selection
+                and selected_pair_record_contact_selection
+                and selected_pair_record_contact_selection != model_contact_selection
             ):
                 pair_raw_contact, pair_raw_bounds_contact, pair_raw_error = (
                     sample_raw_origin_contact_at(
                         pos,
-                        contact_selection=pair_record_contact_selection,
+                        contact_selection=selected_pair_record_contact_selection,
                     )
                 )
                 if pair_raw_error is not None:
@@ -10944,6 +10974,7 @@ class WulframServer:
                     else None
                 ),
                 "selected_raw_error": pair_raw_error,
+                "contact_selection": selected_pair_record_contact_selection,
                 "reject": reject,
             }
 
@@ -11536,6 +11567,123 @@ class WulframServer:
                 }
             return output
 
+        def sample_frame_phase_report_first_probe(pos, *, velocity=None):
+            """Read-only report-first CBSP probe across the server frame phase."""
+
+            if not pair_record_frame_phase_probe_enabled:
+                return None
+            frame_dt = max(0.0, float(dt or 0.0))
+            bucket_count = 30
+
+            def bucket_for_fraction(fraction):
+                if fraction is None:
+                    return None, None, None
+                try:
+                    clamped = max(0.0, min(1.0, float(fraction)))
+                except (TypeError, ValueError, OverflowError):
+                    return None, None, None
+                if frame_dt <= 0.0:
+                    return None, None, None
+                time_s = frame_dt * clamped
+                bucket_index = int((time_s / frame_dt) * float(bucket_count))
+                bucket_index = max(0, min(bucket_count - 1, bucket_index))
+                bucket_width = frame_dt / float(bucket_count)
+                return (
+                    time_s,
+                    bucket_index,
+                    (bucket_width * float(bucket_index), bucket_width * float(bucket_index + 1)),
+                )
+
+            selections = (
+                "cbsp_mesh_edge_terrain_plane_probe",
+                "cbsp_mesh_edge_terrain_plane_traversal_probe",
+            )
+            results = {}
+            accepted_rows = []
+            for label, candidate in reference_pose_candidates(pos):
+                candidate_velocity, velocity_fraction, velocity_source = (
+                    reference_pose_candidate_velocity(
+                        label,
+                        candidate,
+                        fallback=velocity,
+                    )
+                )
+                time_s, bucket_index, bucket_bounds = bucket_for_fraction(
+                    velocity_fraction
+                )
+                selection_results = {}
+                for selection in selections:
+                    pair_probe = sample_pair_record_contact_at(
+                        candidate,
+                        velocity=candidate_velocity,
+                        contact_selection=selection,
+                    )
+                    pair_contact = pair_probe.get("contact")
+                    pair_delta_contact = pair_probe.get("delta_contact")
+                    reject = pair_probe.get("reject")
+                    accepted = (
+                        pair_probe.get("selected_raw_error") is None
+                        and pair_contact is not None
+                        and reject == ""
+                        and pair_contact.penetration > self._PENETRATION_SLOP_DEFAULT
+                    )
+                    row = {
+                        "label": label,
+                        "pos": candidate,
+                        "velocity": candidate_velocity,
+                        "velocity_fraction": velocity_fraction,
+                        "velocity_source": velocity_source,
+                        "server_report_time_s": time_s,
+                        "bucket_count": bucket_count,
+                        "bucket_index": bucket_index,
+                        "bucket_start_s": (
+                            None if bucket_bounds is None else bucket_bounds[0]
+                        ),
+                        "bucket_end_s": (
+                            None if bucket_bounds is None else bucket_bounds[1]
+                        ),
+                        "contact_selection": selection,
+                        "reject": reject,
+                        "selected_raw_error": pair_probe.get("selected_raw_error"),
+                        "selected_pair_contact_source": pair_probe.get(
+                            "selected_pair_contact_source"
+                        ),
+                        "contact": probe_contact_fields(
+                            pair_contact,
+                            center=candidate,
+                            z_lift_used=0.0,
+                        ),
+                        "delta_contact": probe_contact_fields(
+                            pair_delta_contact,
+                            center=candidate,
+                            z_lift_used=0.0,
+                        ),
+                        "accepted": accepted,
+                    }
+                    row = {
+                        key: value
+                        for key, value in row.items()
+                        if value not in ({}, None)
+                    }
+                    selection_results[selection] = row
+                    if accepted:
+                        accepted_rows.append(row)
+                results[label] = selection_results
+            return {
+                "enabled": True,
+                "runtime_default": "off",
+                "decompile_source": (
+                    "Report-first GUESS4_CBSP_edge_triangle_intersect selections "
+                    "sampled at server frame reference poses before applying any "
+                    "terrain response."
+                ),
+                "frame_dt_s": frame_dt,
+                "bucket_count": bucket_count,
+                "accepted_count": len(accepted_rows),
+                "first_accepted": accepted_rows[0] if accepted_rows else None,
+                "results": results,
+            }
+
         def select_reference_pose_pair_record_contact(pos, *, velocity=None):
             if not (
                 reference_pose_contact_response_enabled
@@ -11664,6 +11812,10 @@ class WulframServer:
                     or raw_error == "dirty_bounds_contact"
                 )
                 else sample_reference_pose_contacts(pos, velocity=(vx, vy, vz))
+            )
+            frame_phase_probe = sample_frame_phase_report_first_probe(
+                pos,
+                velocity=(vx, vy, vz),
             )
             ctx.debug_last_terrain_contact_probe = {
                 "reason": probe_reason,
@@ -11836,6 +11988,10 @@ class WulframServer:
                 "pair_record_spatial_ref_schedule_probe_enabled": (
                     pair_record_spatial_ref_schedule_probe_enabled
                 ),
+                "pair_record_frame_phase_probe_enabled": (
+                    pair_record_frame_phase_probe_enabled
+                ),
+                "pair_record_frame_phase_probe": frame_phase_probe,
                 "pair_record_schedule_response_probe_enabled": (
                     pair_record_schedule_response_probe_enabled
                 ),
