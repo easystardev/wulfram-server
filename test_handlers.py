@@ -9369,6 +9369,20 @@ def test_entity_world_collision_frame_phase_report_first_probe_is_read_only():
         assert frame_probe["frame_velocity_end"] == (1.0, 0.0, -1.0), frame_probe
         assert frame_probe["frame_velocity_delta"] == (0.0, 0.0, 0.0), frame_probe
         assert frame_probe["frame_velocity_span_u"] == 0.0, frame_probe
+        assert frame_probe["frame_pose_velocity_integrated_end"] == (
+            1.0,
+            0.0,
+            -1.0,
+        ), frame_probe
+        assert frame_probe["frame_pose_integrated_delta_from_source_end"] == (
+            0.0,
+            0.0,
+            0.0,
+        ), frame_probe
+        assert frame_probe["frame_pose_integrated_error_u"] == 0.0, frame_probe
+        assert frame_probe["frame_pose_motion_consistency_verdict"] == (
+            "frame_pose_matches_velocity_integration"
+        ), frame_probe
         assert frame_probe["bucket_center_sample_count"] == 30, frame_probe
         assert frame_probe["accepted_count"] == 1, frame_probe
         accepted = frame_probe["first_accepted"]

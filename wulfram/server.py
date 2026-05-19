@@ -11972,12 +11972,52 @@ class WulframServer:
             frame_pose_span_u = triplet_span(frame_pose_delta)
             frame_velocity_delta = triplet_delta(pre_step_frame_vel, current_frame_vel)
             frame_velocity_span_u = triplet_span(frame_velocity_delta)
+            frame_pose_velocity_integrated_end = None
+            if (
+                frame_dt > 0.0
+                and pre_step_frame_pos is not None
+                and pre_step_frame_vel is not None
+                and current_frame_vel is not None
+            ):
+                frame_pose_velocity_integrated_end = (
+                    pre_step_frame_pos[0]
+                    + 0.5
+                    * (pre_step_frame_vel[0] + current_frame_vel[0])
+                    * frame_dt,
+                    pre_step_frame_pos[1]
+                    + 0.5
+                    * (pre_step_frame_vel[1] + current_frame_vel[1])
+                    * frame_dt,
+                    pre_step_frame_pos[2]
+                    + 0.5
+                    * (pre_step_frame_vel[2] + current_frame_vel[2])
+                    * frame_dt,
+                )
+            frame_pose_integrated_delta_from_source_end = triplet_delta(
+                frame_pose_velocity_integrated_end,
+                current_frame_pos,
+            )
+            frame_pose_integrated_error_u = triplet_span(
+                frame_pose_integrated_delta_from_source_end
+            )
             if frame_pose_span_u is None:
                 frame_pose_span_verdict = "frame_pose_unavailable"
             elif bucket_count > 1 and frame_pose_span_u <= 0.001:
                 frame_pose_span_verdict = "frame_pose_static"
             else:
                 frame_pose_span_verdict = "frame_pose_varies"
+            if frame_pose_integrated_error_u is None:
+                frame_pose_motion_consistency_verdict = (
+                    "frame_pose_motion_consistency_unavailable"
+                )
+            elif frame_pose_integrated_error_u <= 0.1:
+                frame_pose_motion_consistency_verdict = (
+                    "frame_pose_matches_velocity_integration"
+                )
+            else:
+                frame_pose_motion_consistency_verdict = (
+                    "frame_pose_differs_from_velocity_integration"
+                )
 
             def integrate_frame_phase_state(start_pos, start_vel, elapsed_s):
                 start_position = finite_triplet(start_pos)
@@ -12295,6 +12335,16 @@ class WulframServer:
                 "frame_velocity_end": current_frame_vel,
                 "frame_velocity_delta": frame_velocity_delta,
                 "frame_velocity_span_u": frame_velocity_span_u,
+                "frame_pose_velocity_integrated_end": (
+                    frame_pose_velocity_integrated_end
+                ),
+                "frame_pose_integrated_delta_from_source_end": (
+                    frame_pose_integrated_delta_from_source_end
+                ),
+                "frame_pose_integrated_error_u": frame_pose_integrated_error_u,
+                "frame_pose_motion_consistency_verdict": (
+                    frame_pose_motion_consistency_verdict
+                ),
                 "bucket_count": bucket_count,
                 "bucket_center_sample_count": bucket_count,
                 "accepted_count": len(accepted_rows),
