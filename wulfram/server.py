@@ -11691,6 +11691,17 @@ class WulframServer:
                         and reject == ""
                         and pair_contact.penetration > self._PENETRATION_SLOP_DEFAULT
                     )
+                    response_preview = None
+                    if accepted:
+                        response_preview = preview_frame_phase_pair_response(
+                            label=label,
+                            pos=candidate,
+                            velocity=candidate_velocity,
+                            velocity_fraction=velocity_fraction,
+                            velocity_source=velocity_source,
+                            contact=pair_contact,
+                            delta_contact=pair_delta_contact,
+                        )
                     row = {
                         "label": label,
                         "pos": candidate,
@@ -11723,6 +11734,7 @@ class WulframServer:
                             z_lift_used=0.0,
                         ),
                         "accepted": accepted,
+                        "response_preview": response_preview,
                     }
                     row = {
                         key: value
@@ -12850,6 +12862,146 @@ class WulframServer:
                 "angular_delta": final_ang_delta,
             })
             return response_debug, True
+
+        def preview_frame_phase_pair_response(
+            *,
+            label,
+            pos,
+            velocity,
+            velocity_fraction,
+            velocity_source,
+            contact,
+            delta_contact=None,
+        ):
+            """Dry-run the pair-record response for an accepted frame-phase row."""
+
+            nonlocal vx, vy, vz
+            response_record = {
+                "enabled": True,
+                "runtime_default": "off",
+                "apply_enabled": False,
+                "label": label,
+                "velocity_fraction": velocity_fraction,
+                "velocity_source": velocity_source,
+            }
+            if contact is None:
+                response_record["reject"] = "no_pair_record_contact"
+                response_record["applied"] = False
+                return response_record
+
+            current_pos = (anchor[0], anchor[1], anchor[2])
+            current_vel = (vx, vy, vz)
+            current_ang = tuple(contact_angular_velocity)
+            pair_pos = finite_triplet(pos) or current_pos
+            pair_vel = finite_triplet(velocity) or current_vel
+            pair_dx = pair_pos[0] - current_pos[0]
+            pair_dy = pair_pos[1] - current_pos[1]
+            pair_dz = pair_pos[2] - current_pos[2]
+            response_record.update({
+                "pos": pair_pos,
+                "velocity_before": pair_vel,
+                "current_pos": current_pos,
+                "current_distance": math.sqrt(
+                    pair_dx * pair_dx + pair_dy * pair_dy + pair_dz * pair_dz
+                ),
+                "current_xy_distance": math.sqrt(pair_dx * pair_dx + pair_dy * pair_dy),
+                "current_z_delta": pair_dz,
+                "contact": probe_contact_fields(
+                    contact,
+                    center=pair_pos,
+                    z_lift_used=0.0,
+                ),
+            })
+
+            saved_body_ang_vel = getattr(ctx, "spring_body_ang_vel", None)
+            saved_yaw = getattr(ctx, "angular_vel_yaw", None)
+            saved_last_interp_tick = getattr(ctx, "rigid_body_last_interp_tick", None)
+            response_debug = {}
+            applied = False
+            post_contact_pos = None
+            post_contact_vel = None
+            post_contact_ang = None
+            try:
+                anchor[0], anchor[1], anchor[2] = pair_pos
+                vx, vy, vz = pair_vel
+                response_debug, applied = apply_raw_origin_fallback_contact(
+                    contact,
+                    projection_order=pair_record_contact_projection_order,
+                    delta_mode=pair_record_contact_delta_mode,
+                    delta_normal=(
+                        None
+                        if delta_contact is None
+                        else delta_contact.normal
+                    ),
+                    delta_normal_source=(
+                        None
+                        if delta_contact is None
+                        else getattr(delta_contact, "normal_source", None)
+                    ),
+                    angular_mode=pair_record_contact_angular_mode,
+                    closing_only=pair_record_contact_closing_only,
+                    max_velocity_delta=pair_record_contact_max_velocity_delta,
+                    max_vertical_delta=pair_record_contact_max_vertical_delta,
+                    vertical_delta_mode=pair_record_contact_vertical_delta_mode,
+                    max_speed=pair_record_contact_max_speed,
+                    max_angular_delta=pair_record_contact_max_angular_delta,
+                    friction=0.0,
+                )
+                post_contact_pos = (anchor[0], anchor[1], anchor[2])
+                post_contact_vel = (vx, vy, vz)
+                post_contact_ang = tuple(contact_angular_velocity)
+            finally:
+                anchor[0], anchor[1], anchor[2] = current_pos
+                vx, vy, vz = current_vel
+                contact_angular_velocity[0], contact_angular_velocity[1], contact_angular_velocity[2] = current_ang
+                ctx.spring_body_ang_vel = saved_body_ang_vel
+                ctx.angular_vel_yaw = saved_yaw
+                ctx.rigid_body_last_interp_tick = saved_last_interp_tick
+
+            velocity_delta = None
+            angular_delta = None
+            if post_contact_vel is not None:
+                velocity_delta = (
+                    post_contact_vel[0] - pair_vel[0],
+                    post_contact_vel[1] - pair_vel[1],
+                    post_contact_vel[2] - pair_vel[2],
+                )
+            if post_contact_ang is not None:
+                angular_delta = (
+                    post_contact_ang[0] - current_ang[0],
+                    post_contact_ang[1] - current_ang[1],
+                    post_contact_ang[2] - current_ang[2],
+                )
+            response_record.update({
+                "reject": "" if applied else "response_not_applied",
+                "applied": applied,
+                "post_contact_pos": post_contact_pos,
+                "post_contact_vel": post_contact_vel,
+                "post_contact_ang": post_contact_ang,
+                "velocity_delta": velocity_delta,
+                "angular_delta": angular_delta,
+                "preserved_position": True,
+            })
+            for key in (
+                "response",
+                "target_separation",
+                "constraint_selected_separation_speed_before",
+                "point_normal_velocity_before",
+                "raw_origin_fallback_velocity_delta_clamped",
+                "raw_origin_fallback_vertical_delta_clamped",
+                "raw_origin_fallback_angular_preserved",
+                "raw_origin_fallback_delta_mode",
+                "raw_origin_fallback_delta_normal",
+                "raw_origin_fallback_delta_normal_source",
+                "raw_origin_fallback_velocity_after_unclamped",
+                "raw_origin_fallback_velocity_delta_unclamped",
+                "raw_origin_fallback_velocity_delta_after_safety",
+                "raw_origin_fallback_angular_velocity_after_unclamped",
+                "raw_origin_fallback_angular_delta_after_safety",
+            ):
+                if key in response_debug:
+                    response_record[key] = response_debug.get(key)
+            return response_record
 
         def resolve_reference_pose_pair_response(reference_pair):
             nonlocal vx, vy, vz

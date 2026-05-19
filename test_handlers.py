@@ -9046,6 +9046,16 @@ def test_entity_world_collision_frame_phase_report_first_probe_is_read_only():
         assert accepted["contact_selection"] == "cbsp_mesh_edge_terrain_plane_probe", accepted
         assert accepted["contact"]["contact_cell"] == (7, 8), accepted
         assert accepted["contact"]["contact_cbsp_mesh_triangle_indices"] == (6, 8, 9), accepted
+        preview = accepted["response_preview"]
+        assert preview["runtime_default"] == "off", preview
+        assert preview["apply_enabled"] is False, preview
+        assert preview["preserved_position"] is True, preview
+        assert preview["label"] == "pre_to_current_50", preview
+        assert preview["pos"] == accepted["pos"], preview
+        assert preview["velocity_before"] == accepted["velocity"], preview
+        assert "velocity_delta" in preview, preview
+        assert "angular_delta" in preview, preview
+        assert getattr(ctx, "debug_last_motion_collision", {}) == {}
         bucket_row = frame_probe["results"]["pre_to_current_bucket_06_center"][
             "cbsp_mesh_edge_terrain_plane_probe"
         ]
