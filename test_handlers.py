@@ -41,6 +41,7 @@ from wulfram.weapons import (
     WeaponSystem,
     WeaponType,
     EntityType,
+    OG_DIRECT_TRIGGER_WEAPON_SLOTS,
     VEHICLE_PHYSICS_CONFIGS,
     Projectile,
     build_projectile_spawn_packet,
@@ -3400,6 +3401,59 @@ def test_weapon_system_og_direct_trigger_slot_fires_pulse_shell():
     assert projectiles[0].entity_type == EntityType.PULSE_SHELL
     assert energy_spent > 0.0
     print("test_weapon_system_og_direct_trigger_slot_fires_pulse_shell: PASSED")
+    return True
+
+
+def test_weapon_system_og_direct_trigger_slots_fire_promoted_projectiles():
+    """Promoted direct-fire slots should spawn the expected server projectile type."""
+    cases = [
+        (12, WeaponType.PULSE_CANNON, EntityType.PULSE_SHELL, "Pulse Shell"),
+        (13, WeaponType.PIERCER, EntityType.PIERCER, "Piercer"),
+        (14, WeaponType.THUMPER, EntityType.THUMPER, "Thumper"),
+        (16, WeaponType.HUNTER_SEEKER, EntityType.HUNTER, "Hunter"),
+        (17, WeaponType.MINE, EntityType.MINE, "Mine"),
+    ]
+    for trigger_slot, weapon_slot, entity_type, label in cases:
+        ws = WeaponSystem()
+        ws.player_pos = (4950.0, 5100.0, 5.0)
+        ws.player_rot = (0.0, 0.0, 0.0)
+        ws.player_team = 2
+        ws.behavior_slots[trigger_slot] = 1.0
+
+        projectiles, energy_spent = ws.update(dt=1.0, available_energy=100.0)
+
+        assert OG_DIRECT_TRIGGER_WEAPON_SLOTS[trigger_slot] == weapon_slot, (trigger_slot, weapon_slot)
+        assert len(projectiles) == 1, (label, projectiles)
+        assert projectiles[0].entity_type == entity_type, (label, projectiles[0])
+        assert energy_spent > 0.0, (label, energy_spent)
+        if entity_type == EntityType.MINE:
+            assert projectiles[0].vel == (0.0, 0.0, 0.0), projectiles[0].vel
+        else:
+            assert math.sqrt(sum(float(v) * float(v) for v in projectiles[0].vel)) > 0.0, projectiles[0].vel
+
+    print("test_weapon_system_og_direct_trigger_slots_fire_promoted_projectiles: PASSED")
+    return True
+
+
+def test_weapon_system_chain_gun_autocannon_fire_slot_hitscan_path():
+    """Chain Gun/autocannon is the current fire-slot hitscan path, not a number-key projectile."""
+    ws = WeaponSystem()
+    ws.player_pos = (4950.0, 5100.0, 5.0)
+    ws.player_rot = (0.0, 0.0, 0.0)
+    ws.player_team = 2
+    ws.current_weapon = WeaponType.CHAIN_GUN
+    fired = []
+    ws.on_chain_gun_fire = lambda **kwargs: fired.append(kwargs)
+    ws.behavior_slots[BehaviorSlot.FIRE] = 1.0
+
+    projectiles, energy_spent = ws.update(dt=1.0, available_energy=100.0)
+
+    assert WeaponType.CHAIN_GUN not in OG_DIRECT_TRIGGER_WEAPON_SLOTS.values()
+    assert projectiles == [], projectiles
+    assert len(fired) == 1, fired
+    assert fired[0]["pos"] == ws.player_pos, fired
+    assert energy_spent == 2.0, energy_spent
+    print("test_weapon_system_chain_gun_autocannon_fire_slot_hitscan_path: PASSED")
     return True
 
 
@@ -17230,6 +17284,27 @@ def test_comm_message_request_decodes_og_type2_build_command():
     return True
 
 
+def test_build_uplink_parser_accepts_slice_buildable_names():
+    """The four Crossroads T3 buildables should parse before live UI promotion."""
+    server = WulframServer.__new__(WulframServer)
+    cases = [
+        ('build 29002 "Power Cell" 0', EntityType.ENERGY_BUILDING, 0),
+        ('build 29002 "Repair Building" 1', EntityType.REPAIR_BUILDING, 1),
+        ('build 29002 "Fuel Building" 2', EntityType.FUEL_BUILDING, 2),
+        ('build 29002 "Gun Turret" 3', EntityType.GUN_TURRET, 3),
+    ]
+    for text, entity_type, slot in cases:
+        parsed = server._parse_build_uplink_command(text)
+        assert parsed["ok"] is True, (text, parsed)
+        assert parsed["action"] == "build", parsed
+        assert parsed["ship_oid"] == 29002, parsed
+        assert parsed["entity_type"] == int(entity_type), parsed
+        assert parsed["slot"] == slot, parsed
+
+    print("test_build_uplink_parser_accepts_slice_buildable_names: PASSED")
+    return True
+
+
 def test_build_uplink_command_creates_dynamic_building():
     """Accepted OG build commands should create and replicate a dynamic building."""
     ctx = _in_game_context()
@@ -17258,6 +17333,60 @@ def test_build_uplink_command_creates_dynamic_building():
     assert any(payload and payload[0] == 0x0E for payload, _addr in server.udp_handler.sent), server.udp_handler.sent
     assert any(payload and payload[0] == 0x2D for payload, _addr in server.udp_handler.sent), server.udp_handler.sent
     print("test_build_uplink_command_creates_dynamic_building: PASSED")
+    return True
+
+
+def test_build_uplink_commands_create_all_slice_buildable_types():
+    """All requested slice buildable types should enter the dynamic entity lifecycle."""
+    ctx = _in_game_context()
+    server = _minimal_build_uplink_server(ctx)
+    cases = [
+        ("Power Cell", EntityType.ENERGY_BUILDING, "energy", 0),
+        ("Repair Building", EntityType.REPAIR_BUILDING, "repair", 1),
+        ("Fuel Building", EntityType.FUEL_BUILDING, "fuel", 2),
+        ("Gun Turret", EntityType.GUN_TURRET, "turret", 3),
+    ]
+
+    created_oids = []
+    for sequence, (name, entity_type, service_kind, slot) in enumerate(cases, start=1):
+        packet = b"\x20\x00" + bytes([0x44 + sequence]) + b"\x00\x00" + _comm_request_body(
+            f'build 29002 "{name}" {slot}'
+        )
+        event = server._handle_comm_message_request(
+            ctx,
+            packet,
+            transport="udp",
+            body=packet[5:],
+            addr=ctx.session.udp_addr,
+            sequence=0x44 + sequence,
+        )
+
+        assert event["handled"] is True, (name, event)
+        assert event["result"]["ok"] is True, (name, event)
+        oid = int(event["result"]["oid"])
+        building = server._building_entities[oid]
+        source = server._dynamic_building_sources[oid]
+        assert int(building.entity_type) == int(entity_type), (name, event)
+        assert source["command"]["entity_name"] == name, source
+        assert source["slot"] == slot, source
+        if int(entity_type) == int(EntityType.GUN_TURRET):
+            classification = "turret"
+        elif int(entity_type) == int(EntityType.REPAIR_BUILDING):
+            classification = "repair"
+        elif int(entity_type) == int(EntityType.FUEL_BUILDING):
+            classification = "fuel"
+        elif int(entity_type) == int(EntityType.ENERGY_BUILDING):
+            classification = "energy"
+        else:
+            classification = ""
+        assert classification == service_kind, (name, classification, service_kind)
+        created_oids.append(oid)
+
+    assert len(created_oids) == 4, created_oids
+    assert set(created_oids) <= server._dynamic_building_ids
+    assert ctx.build_uplink_command_count == 4, ctx.build_uplink_command_count
+    assert len(server._building_lifecycle_events) == 4, server._building_lifecycle_events
+    print("test_build_uplink_commands_create_all_slice_buildable_types: PASSED")
     return True
 
 
@@ -17441,6 +17570,8 @@ def main():
         test_spawn_entry_transition_stays_off_by_default,
         test_control_game_clock_builder_matches_packet_signature,
         test_weapon_system_og_direct_trigger_slot_fires_pulse_shell,
+        test_weapon_system_og_direct_trigger_slots_fire_promoted_projectiles,
+        test_weapon_system_chain_gun_autocannon_fire_slot_hitscan_path,
         test_weapon_system_held_fire_repeats_on_cooldown,
         test_weapon_system_accepts_empty_action_update_keepalive,
         test_weapon_system_slot5_release_preserves_og_slider_value,
@@ -17657,7 +17788,9 @@ def main():
         test_health_control_uses_server_heartbeat_helper,
         test_energy_control_sets_absolute_or_fractional_energy,
         test_comm_message_request_decodes_og_type2_build_command,
+        test_build_uplink_parser_accepts_slice_buildable_names,
         test_build_uplink_command_creates_dynamic_building,
+        test_build_uplink_commands_create_all_slice_buildable_types,
         test_dynamic_powercell_service_restores_energy_with_ambient_regen_disabled,
         test_dynamic_building_damage_control_destroys_and_records_delete,
         test_uplink_mvp_bootstrap_sends_minimal_status_packets,
