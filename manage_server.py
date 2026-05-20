@@ -225,15 +225,20 @@ def start_server(foreground=False):
 
         PID_FILE.write_text(str(proc.pid))
 
-        # Wait a moment and verify it started
-        time.sleep(1)
-        if is_port_in_use(PORT):
-            print(f"[MANAGER] Server started (PID {proc.pid})")
-            return True
-        else:
-            print(f"[MANAGER] ERROR: Server failed to start")
-            tail_log(20)
-            return False
+        # Imports and map/collision setup can take more than a second on a
+        # cold run, so poll before reporting a failed background start.
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            if is_port_in_use(PORT):
+                print(f"[MANAGER] Server started (PID {proc.pid})")
+                return True
+            if proc.poll() is not None:
+                break
+            time.sleep(0.25)
+
+        print(f"[MANAGER] ERROR: Server failed to start")
+        tail_log(20)
+        return False
 
 
 def clear_client_logs():
