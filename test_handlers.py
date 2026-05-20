@@ -17269,6 +17269,10 @@ def _minimal_build_uplink_server(ctx: ClientContext) -> WulframServer:
     server._build_uplink_command_events = []
     server._building_lifecycle_events = []
     server._uplink_ships = {}
+    server._building_collision = SimpleNamespace(available=False)
+    server._terrain_grid_collision = None
+    server._static_world_raycast_root = None
+    server.remote_combat_observer_packets = True
     server._terrain_ground_z_at = lambda _x, _y: 4.0
     server._rebuild_static_world_raycast_index = lambda: None
     return server
@@ -17500,6 +17504,54 @@ def test_dynamic_building_damage_control_destroys_and_records_delete():
     actions = [item.get("action") for item in lifecycle if int(item.get("oid", 0) or 0) == oid]
     assert actions == ["create", "damage", "destroy"], lifecycle
     print("test_dynamic_building_damage_control_destroys_and_records_delete: PASSED")
+    return True
+
+
+def test_dynamic_building_projectile_damage_destroys_and_records_delete():
+    """Projectile-code-path lifecycle gate should record projectile-sourced destroy evidence."""
+    ctx = _in_game_context()
+    ctx.session.username = "ProjTester"
+    server = _minimal_build_uplink_server(ctx)
+    server._rebuild_static_world_raycast_index = WulframServer._rebuild_static_world_raycast_index.__get__(
+        server,
+        WulframServer,
+    )
+    packet = b"\x20\x00\x45\x00\x00" + _comm_request_body('build 29002 "Power Cell" 0')
+    event = server._handle_comm_message_request(
+        ctx,
+        packet,
+        transport="udp",
+        body=packet[5:],
+        addr=ctx.session.udp_addr,
+        sequence=0x45,
+    )
+    oid = int(event["result"]["oid"])
+    server._rebuild_static_world_raycast_index()
+
+    control = ControlServer(port=0)
+    control.server = server
+    result = json.loads(control._cmd_building_projectile_damage([str(oid), "destroy", "heavy", "c1"]))
+
+    assert result["ok"] is True, result
+    assert result["removed"] is True, result
+    assert result["projectile_type"] == "HEAVY_MISSILE", result
+    assert len(result["shots"]) >= 2, result
+    assert oid not in server._building_entities, result
+    assert oid not in server._dynamic_building_ids, result
+    assert server._uplink_ships[2]["cargo"][0] == 40, server._uplink_ships[2]
+    assert any(payload and payload[0] == 0x15 and oid.to_bytes(4, "big") in payload for payload, _addr in server.udp_handler.sent), server.udp_handler.sent
+
+    lifecycle = json.loads(control._cmd_building_events(["json"]))
+    events = [item for item in lifecycle if int(item.get("oid", 0) or 0) == oid]
+    actions = [item.get("action") for item in events]
+    sources = [str(item.get("source") or "") for item in events if item.get("action") in {"damage", "destroy"}]
+    assert actions[0] == "create", lifecycle
+    assert "damage" in actions, lifecycle
+    assert actions[-1] == "destroy", lifecycle
+    assert all(source.startswith("projectile:") for source in sources), sources
+    assert events[-1]["delete_sent"] == 1, events[-1]
+    assert events[-1]["removed"] is True, events[-1]
+    print("test_dynamic_building_projectile_damage_destroys_and_records_delete: PASSED")
     return True
 
 
@@ -17828,6 +17880,7 @@ def main():
         test_build_uplink_commands_create_all_slice_buildable_types,
         test_dynamic_powercell_service_restores_energy_with_ambient_regen_disabled,
         test_dynamic_building_damage_control_destroys_and_records_delete,
+        test_dynamic_building_projectile_damage_destroys_and_records_delete,
         test_uplink_mvp_bootstrap_sends_minimal_status_packets,
         test_buildings_json_exposes_playable_slice_observability,
     ]

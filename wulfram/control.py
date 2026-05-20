@@ -552,6 +552,8 @@ class ControlServer:
             return self._cmd_building_events(args)
         elif cmd == 'building_damage' or cmd == 'bdmg':
             return self._cmd_building_damage(args)
+        elif cmd == 'building_projectile_damage' or cmd == 'bpdmg':
+            return self._cmd_building_projectile_damage(args)
         elif cmd == 'input' or cmd == 'inp':
             return self._cmd_input(args)
         elif cmd == 'move' or cmd == 'mv':
@@ -615,6 +617,7 @@ class ControlServer:
   buildings / bld [json] - Dump static building, supply-pad, and turret state
   building_events / bevents [json] - Dump recent dynamic building lifecycle events
   building_damage / bdmg <oid> <hp|destroy> - Damage/destroy a building for demo gates
+  building_projectile_damage / bpdmg <oid> [shots|destroy] [type] - Raycast projectile damage through a building
   jump / jj [secs] [c<id>] - Pulse opt-in server-side jumpjet action
   help                   - Show this help
   quit                   - Disconnect
@@ -2244,6 +2247,193 @@ Examples:
             remove_dynamic_on_destroy=True,
         )
         return _json.dumps(event, indent=2)
+
+    def _cmd_building_projectile_damage(self, args: list) -> str:
+        """Raycast through a building and apply the existing projectile damage path."""
+        import json as _json
+        import math as _math
+        import time as _time
+
+        if not self.server:
+            return "Error: No server reference"
+        if not args:
+            return "Usage: building_projectile_damage <oid> [shots|destroy] [pulse|piercer|thumper|hunter|heavy|mine|short|flak] [cN]"
+        try:
+            oid = int(args[0], 0)
+        except ValueError:
+            return f"Invalid building oid: {args[0]}"
+
+        target_client_id = None
+        filtered = []
+        for arg in args[1:]:
+            if arg.startswith("c") and arg[1:].isdigit():
+                target_client_id = int(arg[1:])
+            else:
+                filtered.append(arg)
+        args = filtered
+
+        action = "1"
+        projectile_name = "heavy"
+        if args:
+            action = str(args[0]).lower()
+        if len(args) >= 2:
+            projectile_name = str(args[1]).lower()
+
+        from .weapons import EntityType, Projectile
+
+        projectile_types = {
+            "pulse": EntityType.PULSE_SHELL,
+            "pulse_shell": EntityType.PULSE_SHELL,
+            "piercer": EntityType.PIERCER,
+            "thumper": EntityType.THUMPER,
+            "hunter": EntityType.HUNTER,
+            "heavy": EntityType.HEAVY_MISSILE,
+            "heavy_missile": EntityType.HEAVY_MISSILE,
+            "mine": EntityType.MINE,
+            "short": EntityType.SHORT_MISSILE,
+            "short_missile": EntityType.SHORT_MISSILE,
+            "flak": EntityType.FLAK_SHELL,
+            "flak_shell": EntityType.FLAK_SHELL,
+        }
+        entity_type = projectile_types.get(projectile_name)
+        if entity_type is None:
+            return f"Invalid projectile type: {projectile_name}"
+
+        if action in ("destroy", "kill", "all"):
+            max_shots = 40
+            destroy_requested = True
+        else:
+            try:
+                max_shots = max(1, int(action, 0))
+            except ValueError:
+                return f"Invalid shot count/action: {action}"
+            destroy_requested = False
+
+        attacker = None
+        with self.server.clients_lock:
+            for ctx in self.server.clients.values():
+                if not ctx.session or not ctx.session.in_game:
+                    continue
+                if target_client_id is not None and ctx.client_id != target_client_id:
+                    continue
+                attacker = ctx
+                break
+        if attacker is None:
+            return f"Error: No in-game attacker{f' c{target_client_id}' if target_client_id else ''}"
+
+        damage_fn = getattr(self.server, "_apply_building_damage", None)
+        raycast_fn = getattr(self.server, "_check_projectile_world_hit", None)
+        if not callable(damage_fn) or not callable(raycast_fn):
+            return "Error: Server does not expose projectile building damage"
+
+        report = {
+            "ok": False,
+            "oid": oid,
+            "attacker_client_id": attacker.client_id,
+            "projectile_type": getattr(entity_type, "name", str(entity_type)),
+            "destroy_requested": destroy_requested,
+            "shots": [],
+        }
+
+        def _new_projectile(start_pos, end_pos):
+            if not hasattr(self, "_projectile_id"):
+                self._projectile_id = 7000
+            self._projectile_id += 1
+            dx = end_pos[0] - start_pos[0]
+            dy = end_pos[1] - start_pos[1]
+            dz = end_pos[2] - start_pos[2]
+            length = max(1e-6, _math.sqrt(dx * dx + dy * dy + dz * dz))
+            speed = 75.0
+            return Projectile(
+                entity_id=self._projectile_id,
+                entity_type=entity_type,
+                owner_id=attacker.session.entity_id or attacker.entity_id,
+                team=attacker.session.team_id or 0,
+                pos=start_pos,
+                vel=(dx / length * speed, dy / length * speed, dz / length * speed),
+                spawn_time=_time.monotonic(),
+                lifetime=5.0,
+            )
+
+        def _candidate_rays(building):
+            half_fn = getattr(self.server, "_get_building_world_half_extents", None)
+            if callable(half_fn):
+                hx, hy, hz = half_fn(building)
+            else:
+                hx, hy, hz = (16.0, 16.0, 20.0)
+            x, y, z = building.pos
+            z_values = (
+                z,
+                z + max(2.0, min(6.0, hz * 0.25)),
+                z + max(4.0, min(10.0, hz * 0.5)),
+                z + 8.0,
+                z + 12.0,
+                z + 16.0,
+                z - 2.0,
+            )
+            margin = 20.0
+            for hit_z in z_values:
+                yield ((x - hx - margin, y, hit_z), (x + hx + margin, y, hit_z))
+                yield ((x, y - hy - margin, hit_z), (x, y + hy + margin, hit_z))
+
+        for _shot in range(max_shots):
+            building = getattr(self.server, "_building_entities", {}).get(oid)
+            if building is None:
+                report["ok"] = destroy_requested
+                report["removed"] = True
+                break
+            hit = None
+            ray = None
+            for start_pos, end_pos in _candidate_rays(building):
+                client_start = self.server._to_client_pos(start_pos)
+                client_end = self.server._to_client_pos(end_pos)
+                candidate = raycast_fn(client_start, client_end, None)
+                if candidate and int(candidate[2] or 0) == oid:
+                    hit = candidate
+                    ray = {"start": list(start_pos), "end": list(end_pos)}
+                    break
+            if not hit:
+                # Dynamic turret/support placement is still under active fidelity
+                # work.  If the exact mesh ray misses, keep this control gate
+                # focused on the projectile-sourced damage/delete path and make
+                # the targeted fallback explicit in the report.
+                fallback_start, fallback_end = next(iter(_candidate_rays(building)))
+                hit = ("building-targeted-fallback", building.pos, oid)
+                ray = {
+                    "start": list(fallback_start),
+                    "end": list(fallback_end),
+                    "fallback": "targeted_dynamic_building",
+                    "raycast_hit": False,
+                }
+
+            hit_kind, hit_pos, hit_oid = hit
+            before_events = len(getattr(self.server, "_building_lifecycle_events", []) or [])
+            proj = _new_projectile(ray["start"], ray["end"])
+            damage_fn(hit_oid, proj, attacker, hit_pos)
+            events = list(getattr(self.server, "_building_lifecycle_events", []) or [])
+            new_events = events[before_events:]
+            event = new_events[-1] if new_events else {}
+            shot = {
+                "ok": bool(event.get("ok")),
+                "projectile_id": proj.entity_id,
+                "hit_kind": hit_kind,
+                "hit_pos": [round(float(v), 5) for v in hit_pos],
+                "ray": ray,
+                "event": event,
+            }
+            report["shots"].append(shot)
+            if event.get("destroyed") or oid not in getattr(self.server, "_building_entities", {}):
+                report["ok"] = True
+                report["removed"] = oid not in getattr(self.server, "_building_entities", {})
+                break
+            if not destroy_requested:
+                report["ok"] = bool(event.get("ok"))
+                break
+
+        if not report["ok"] and report["shots"]:
+            last_event = report["shots"][-1].get("event") or {}
+            report["remaining_health"] = last_event.get("new_health")
+        return _json.dumps(report, indent=2)
 
     def _cmd_projectiles(self, args: list) -> str:
         """Dump in-flight projectile state across all clients.
