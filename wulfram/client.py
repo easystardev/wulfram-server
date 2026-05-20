@@ -164,6 +164,10 @@ class ClientContext:
     last_weapon_fire_projectile_types: list = field(default_factory=list)
     last_weapon_fire_energy_spent: float = 0.0
     last_weapon_fire_input: dict = field(default_factory=dict)
+    hitscan_fire_count: int = 0
+    last_hitscan_fire_time: float = 0.0
+    last_hitscan_weapon_name: str = ""
+    last_hitscan_fire_input: dict = field(default_factory=dict)
     projectile_update_packet_count: int = 0
     last_projectile_update_time: float = 0.0
     last_projectile_update_id: int = 0

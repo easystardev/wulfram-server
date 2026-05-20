@@ -16926,6 +16926,32 @@ def test_client_weapon_fire_telemetry_records_input_projectiles():
     return True
 
 
+def test_client_hitscan_fire_telemetry_records_placeholder_fire():
+    """Instant-hit/placeholder fire should leave structured audit telemetry."""
+    server = WulframServer.__new__(WulframServer)
+    session = Session()
+    session.username = "OgChain"
+    session.team_id = 2
+    ctx = ClientContext(
+        client_id=12,
+        client_addr=("10.10.10.2", 52731),
+        session=session,
+        entity_id=0x612,
+    )
+    ctx.weapon_system = WeaponSystem()
+    ctx.weapon_system.behavior_slots[BehaviorSlot.FIRE] = 1.0
+
+    server._on_chain_gun_fire(ctx, ctx.player_pos, (0.0, 0.0, 0.0), ctx.session.team_id)
+
+    assert ctx.hitscan_fire_count == 1
+    assert ctx.last_hitscan_weapon_name == "Chain Gun"
+    assert ctx.last_hitscan_fire_input["fire"] == 1.0
+    assert ctx.last_hitscan_fire_input["active_slots"][str(BehaviorSlot.FIRE)] == 1.0
+    assert ctx.last_hitscan_fire_input["direct_slots"] == {}
+    print("test_client_hitscan_fire_telemetry_records_placeholder_fire: PASSED")
+    return True
+
+
 def test_players_json_includes_transport_addresses():
     """Control `players json` should expose client and UDP addresses for diagnostics."""
     server = SimpleNamespace(
@@ -16964,6 +16990,10 @@ def test_players_json_includes_transport_addresses():
     ctx.last_weapon_fire_projectile_types = ["PULSE_SHELL"]
     ctx.last_weapon_fire_energy_spent = 8.0
     ctx.last_weapon_fire_input = {"direct_slots": {"12": 1.0}}
+    ctx.hitscan_fire_count = 1
+    ctx.last_hitscan_fire_time = time.monotonic() - 0.4
+    ctx.last_hitscan_weapon_name = "Chain Gun"
+    ctx.last_hitscan_fire_input = {"fire": 1.0}
     ctx.projectile_update_packet_count = 3
     ctx.last_projectile_update_time = time.monotonic() - 0.25
     ctx.last_projectile_update_id = 7001
@@ -16996,6 +17026,10 @@ def test_players_json_includes_transport_addresses():
     assert entry["telemetry"]["last_weapon_fire_projectile_types"] == ["PULSE_SHELL"]
     assert entry["telemetry"]["last_weapon_fire_energy_spent"] == 8.0
     assert entry["telemetry"]["last_weapon_fire_input"]["direct_slots"]["12"] == 1.0
+    assert entry["telemetry"]["hitscan_fire_count"] == 1
+    assert entry["telemetry"]["last_hitscan_fire_age_s"] is not None
+    assert entry["telemetry"]["last_hitscan_weapon_name"] == "Chain Gun"
+    assert entry["telemetry"]["last_hitscan_fire_input"]["fire"] == 1.0
     assert entry["telemetry"]["projectile_update_packets"] == 3
     assert entry["telemetry"]["last_projectile_update_age_s"] is not None
     assert entry["telemetry"]["last_projectile_update_id"] == 7001
@@ -17784,6 +17818,7 @@ def main():
         test_tick_loop_start_guard_allows_one_live_thread,
         test_tick_pacer_preserves_capped_catchup_backlog,
         test_client_weapon_fire_telemetry_records_input_projectiles,
+        test_client_hitscan_fire_telemetry_records_placeholder_fire,
         test_players_json_includes_transport_addresses,
         test_health_control_uses_server_heartbeat_helper,
         test_energy_control_sets_absolute_or_fractional_energy,

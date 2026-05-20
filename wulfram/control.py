@@ -1815,6 +1815,10 @@ Examples:
                         0.0,
                     ),
                     "last_weapon_fire_input": getattr(ctx, "last_weapon_fire_input", {}) or {},
+                    "hitscan_fire_count": getattr(ctx, "hitscan_fire_count", 0),
+                    "last_hitscan_fire_age_s": _age(getattr(ctx, "last_hitscan_fire_time", 0.0)),
+                    "last_hitscan_weapon_name": getattr(ctx, "last_hitscan_weapon_name", ""),
+                    "last_hitscan_fire_input": getattr(ctx, "last_hitscan_fire_input", {}) or {},
                     "projectile_update_packets": getattr(ctx, "projectile_update_packet_count", 0),
                     "last_projectile_update_age_s": _age(
                         getattr(ctx, "last_projectile_update_time", 0.0)

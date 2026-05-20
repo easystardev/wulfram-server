@@ -6496,6 +6496,28 @@ class WulframServer:
         """Callback when weapon fires (instant hit or placeholder for projectiles)."""
         weapon_name = weapon_name or "Chain Gun"
         print(f"[WEAPON] {weapon_name} fired! pos={pos}")
+        if ctx is not None and ctx.weapon_system is not None:
+            ws = ctx.weapon_system
+            active_slots = {
+                str(idx): float(value)
+                for idx, value in enumerate(ws.behavior_slots)
+                if abs(float(value)) > 0.001
+            }
+            direct_slots = {
+                str(idx): float(ws.behavior_slots[idx])
+                for idx in OG_DIRECT_TRIGGER_WEAPON_SLOTS
+                if idx < len(ws.behavior_slots) and abs(float(ws.behavior_slots[idx])) > 0.001
+            }
+            ctx.hitscan_fire_count = int(getattr(ctx, "hitscan_fire_count", 0) or 0) + 1
+            ctx.last_hitscan_fire_time = time.monotonic()
+            ctx.last_hitscan_weapon_name = str(weapon_name)
+            ctx.last_hitscan_fire_input = {
+                "active_slots": active_slots,
+                "direct_slots": direct_slots,
+                "fire": float(ws.behavior_slots[BehaviorSlot.FIRE]),
+                "thrust": float(tank_softbody_control_slot_value(ws.behavior_slots)),
+                "jumpjet": float(ws.behavior_slots[BehaviorSlot.JUMPJET]),
+            }
         # Python-client-only debug feedback; suppress for OG clients.
         if ctx.tcp_handler and self._debug_comm_allowed_for_client(ctx):
             if weapon_name == "Chain Gun":
