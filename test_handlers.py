@@ -16926,12 +16926,14 @@ def test_client_weapon_fire_telemetry_records_input_projectiles():
     return True
 
 
-def test_client_hitscan_fire_telemetry_records_placeholder_fire():
-    """Instant-hit/placeholder fire should leave structured audit telemetry."""
+def test_client_hitscan_fire_telemetry_records_fire():
+    """Instant-hit fire should leave structured audit telemetry."""
     server = WulframServer.__new__(WulframServer)
+    server.clients_lock = threading.Lock()
     session = Session()
     session.username = "OgChain"
     session.team_id = 2
+    session.in_game = True
     ctx = ClientContext(
         client_id=12,
         client_addr=("10.10.10.2", 52731),
@@ -16940,6 +16942,7 @@ def test_client_hitscan_fire_telemetry_records_placeholder_fire():
     )
     ctx.weapon_system = WeaponSystem()
     ctx.weapon_system.behavior_slots[BehaviorSlot.FIRE] = 1.0
+    server.clients = {ctx.client_id: ctx}
 
     server._on_chain_gun_fire(ctx, ctx.player_pos, (0.0, 0.0, 0.0), ctx.session.team_id)
 
@@ -16948,7 +16951,45 @@ def test_client_hitscan_fire_telemetry_records_placeholder_fire():
     assert ctx.last_hitscan_fire_input["fire"] == 1.0
     assert ctx.last_hitscan_fire_input["active_slots"][str(BehaviorSlot.FIRE)] == 1.0
     assert ctx.last_hitscan_fire_input["direct_slots"] == {}
-    print("test_client_hitscan_fire_telemetry_records_placeholder_fire: PASSED")
+    print("test_client_hitscan_fire_telemetry_records_fire: PASSED")
+    return True
+
+
+def test_client_hitscan_fire_damages_lane_target():
+    """Chain Gun should damage the nearest in-lane target without projectile traffic."""
+    server = WulframServer.__new__(WulframServer)
+    server.clients_lock = threading.Lock()
+
+    attacker_session = Session(phase=Phase.IN_GAME, in_game=True, team_id=2)
+    attacker_session.username = "OgChain"
+    attacker = ClientContext(
+        client_id=12,
+        client_addr=("10.10.10.2", 52731),
+        session=attacker_session,
+        entity_id=0x612,
+    )
+    attacker.player_pos = (2600.0, 3040.0, 63.0)
+    attacker.weapon_system = WeaponSystem()
+    attacker.weapon_system.behavior_slots[BehaviorSlot.FIRE] = 1.0
+
+    target_session = Session(phase=Phase.IN_GAME, in_game=True, team_id=2)
+    target_session.username = "Target"
+    target = ClientContext(
+        client_id=13,
+        client_addr=("127.0.0.1", 52732),
+        session=target_session,
+        entity_id=0x613,
+    )
+    target.player_pos = (2635.0, 3040.0, 63.0)
+    server.clients = {attacker.client_id: attacker, target.client_id: target}
+
+    server._on_chain_gun_fire(attacker, attacker.player_pos, (0.0, 0.0, 0.0), attacker.session.team_id)
+
+    assert attacker.hitscan_fire_count == 1
+    assert target.player_health == 0.8
+    assert target.last_damage_source == "hitscan:Chain Gun"
+    assert target.last_damage_amount == 0.20
+    print("test_client_hitscan_fire_damages_lane_target: PASSED")
     return True
 
 
@@ -17870,7 +17911,8 @@ def main():
         test_tick_loop_start_guard_allows_one_live_thread,
         test_tick_pacer_preserves_capped_catchup_backlog,
         test_client_weapon_fire_telemetry_records_input_projectiles,
-        test_client_hitscan_fire_telemetry_records_placeholder_fire,
+        test_client_hitscan_fire_telemetry_records_fire,
+        test_client_hitscan_fire_damages_lane_target,
         test_players_json_includes_transport_addresses,
         test_health_control_uses_server_heartbeat_helper,
         test_energy_control_sets_absolute_or_fractional_energy,

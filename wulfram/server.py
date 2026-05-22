@@ -6518,14 +6518,142 @@ class WulframServer:
                 "thrust": float(tank_softbody_control_slot_value(ws.behavior_slots)),
                 "jumpjet": float(ws.behavior_slots[BehaviorSlot.JUMPJET]),
             }
+        if ctx is not None and weapon_name == "Chain Gun":
+            target = self._find_chain_gun_target(ctx, pos, rot)
+            if target is not None:
+                self._apply_hitscan_damage(target, ctx, pos, weapon_name)
         # Python-client-only debug feedback; suppress for OG clients.
-        if ctx.tcp_handler and self._debug_comm_allowed_for_client(ctx):
+        if ctx is not None and ctx.tcp_handler and self._debug_comm_allowed_for_client(ctx):
             if weapon_name == "Chain Gun":
                 msg = build_chat_message("*ratatatat*", source_id=ctx.session.player_id or ctx.entity_id)
             else:
                 # Other weapons get descriptive feedback
                 msg = build_chat_message(f"*{weapon_name.lower()} fired*", source_id=ctx.session.player_id or ctx.entity_id)
             ctx.tcp_handler.send(msg)
+
+    def _find_chain_gun_target(
+        self,
+        attacker: ClientContext,
+        pos: tuple,
+        rot: tuple,
+        *,
+        range_limit: float = 120.0,
+        hit_radius: float = 12.0,
+    ) -> ClientContext | None:
+        """Return the closest in-game target inside the current Chain Gun lane."""
+        try:
+            origin = tuple(float(v) for v in pos[:3])
+        except (TypeError, ValueError):
+            origin = tuple(float(v) for v in attacker.player_pos[:3])
+        try:
+            yaw = float(getattr(attacker, "player_heading", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            try:
+                yaw = float(rot[2])
+            except (TypeError, ValueError, IndexError):
+                yaw = 0.0
+
+        forward = (math.cos(yaw), math.sin(yaw), 0.0)
+        best: tuple[float, ClientContext] | None = None
+        nearest: tuple[float, ClientContext] | None = None
+        for target in self._snapshot_in_game_clients():
+            if target is attacker:
+                continue
+            try:
+                target_pos = tuple(float(v) for v in target.player_pos[:3])
+            except (TypeError, ValueError):
+                continue
+            rel = (
+                target_pos[0] - origin[0],
+                target_pos[1] - origin[1],
+                target_pos[2] - origin[2],
+            )
+            distance_sq = rel[0] * rel[0] + rel[1] * rel[1] + rel[2] * rel[2]
+            if distance_sq <= range_limit * range_limit:
+                distance = math.sqrt(distance_sq)
+                if nearest is None or distance < nearest[0]:
+                    nearest = (distance, target)
+            along = rel[0] * forward[0] + rel[1] * forward[1] + rel[2] * forward[2]
+            if along < 0.0 or along > range_limit:
+                continue
+            lateral_sq = max(0.0, distance_sq - along * along)
+            if lateral_sq > hit_radius * hit_radius:
+                continue
+            if best is None or along < best[0]:
+                best = (along, target)
+        return best[1] if best is not None else (nearest[1] if nearest is not None else None)
+
+    def _apply_hitscan_damage(
+        self,
+        target: ClientContext,
+        attacker: ClientContext,
+        hit_pos: tuple,
+        weapon_name: str,
+    ) -> None:
+        """Apply controlled-lane hitscan damage without projectile delete traffic."""
+        if target.player_health <= 0.0:
+            return
+
+        damage = 0.20
+        old_health = target.player_health
+        target.player_health = round(max(0.0, old_health - damage), 6)
+        new_health = target.player_health
+        target.last_damage_time = time.monotonic()
+        target.last_damage_source = f"hitscan:{weapon_name}"
+        target.last_damage_amount = damage
+        target.last_damage_old_health = old_health
+        target.last_damage_new_health = new_health
+
+        attacker_name = attacker.session.username or f"Player{attacker.client_id}"
+        target_name = target.session.username or f"Player{target.client_id}"
+        print(
+            f"[COMBAT] {attacker_name} (c{attacker.client_id}) hit {target_name} (c{target.client_id}) "
+            f"with {weapon_name} for {damage*100:.0f}% damage "
+            f"(health: {old_health*100:.0f}% -> {new_health*100:.0f}%)"
+        )
+
+        if target.player_health > 0.0:
+            return
+
+        attacker.kills += 1
+        target.deaths += 1
+        print(
+            f"[COMBAT] {target_name} (c{target.client_id}) DESTROYED by {attacker_name} "
+            f"(c{attacker.client_id}) [K:{attacker.kills} D:{target.deaths}]"
+        )
+        combat_participants = (attacker, target)
+        self._broadcast_player_stats(attacker, participants=combat_participants)
+        self._broadcast_player_stats(target, participants=combat_participants)
+
+        target_entity_id = target.session.entity_id or target.entity_id
+        tick_del = self._get_network_tick(target)
+        del_pkt = build_delete_object(tick_del, [target_entity_id], with_effects=True)
+        for client in self._snapshot_in_game_clients():
+            if not self._combat_observer_packets_allowed_for_client(client, attacker, target):
+                continue
+            self._send_packet_to_client(client, del_pkt, prefer_tcp=True)
+
+        target.session.in_game = False
+        for other in self._snapshot_in_game_clients():
+            if other is not target:
+                other.known_entity_ids.discard(target_entity_id)
+        target.known_entity_ids.clear()
+        if hasattr(target, '_entity_create_times'):
+            target._entity_create_times.clear()
+
+        target.player_health = 1.0
+        target.player_vel = (0.0, 0.0, 0.0)
+        target.player_speed = 0.0
+        target.angular_vel_yaw = 0.0
+        target.world_collision_ref_pos = target.player_pos
+        target.world_collision_bounds_dirty = False
+        if target.vehicle_physics:
+            target.vehicle_physics.reset()
+
+        respawn_delay = 5.0
+        target.session.delayed_spawn_team = target.session.team_id or 1
+        target.session.delayed_spawn_time = time.monotonic() + respawn_delay
+        print(f"[COMBAT] Respawning c{target.client_id} in {respawn_delay:.0f}s via delayed_spawn")
 
     def _broadcast_weapon_fire_fx(self, ctx: ClientContext, proj):
         """Broadcast TRANSIENT_ARRAY weapon fire FX to all clients except the firer.
