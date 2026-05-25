@@ -688,6 +688,7 @@ def test_projectile_fire_pose_uses_replay_history_when_available():
     server.up_axis = "z"
     server.pos_offset = 0.0
     server.projectile_aim_source = "body"
+    server.projectile_body_pitch = False
     server.use_client_ticks = False
     server.viewpoint_timeout = 0.5
     server.aim_hold_time = 0.5
@@ -719,6 +720,47 @@ def test_projectile_fire_pose_uses_replay_history_when_available():
     assert aim_src == "body"
     assert pose_src == "history"
     print("test_projectile_fire_pose_uses_replay_history_when_available: PASSED")
+    return True
+
+
+def test_projectile_body_source_can_opt_into_body_pitch():
+    """Default-off body-pitch gate should preserve replay pose pitch when enabled."""
+    server = WulframServer.__new__(WulframServer)
+    server.up_axis = "z"
+    server.pos_offset = 0.0
+    server.projectile_aim_source = "body"
+    server.projectile_body_pitch = True
+    server.use_client_ticks = False
+    server.viewpoint_timeout = 0.5
+    server.aim_hold_time = 0.5
+
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("127.0.0.1", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    ctx.player_pos = (50.0, 60.0, 7.0)
+    ctx.player_heading = 2.0
+    ctx.player_pose["roll"] = 0.4
+    ctx.player_pose["pitch"] = 0.2
+    ctx.player_aim_source = "init"
+    ctx.player_aim_time = 0.0
+    ctx.authoritative_state_history.append({
+        "tick": 1000,
+        "time": time.monotonic(),
+        "pos": (10.0, 20.0, 3.0),
+        "vel": (1.0, 0.0, 0.0),
+        "rot": (0.1, 0.2, 1.25),
+    })
+
+    pos, rot, aim_src, pose_src = server._select_weapon_fire_pose(ctx, 1000)
+
+    assert pos == (10.0, 20.0, 3.0), pos
+    assert rot == (0.1, 0.2, 1.25), rot
+    assert aim_src == "body_pitch"
+    assert pose_src == "history"
+    print("test_projectile_body_source_can_opt_into_body_pitch: PASSED")
     return True
 
 
@@ -3401,6 +3443,27 @@ def test_weapon_system_og_direct_trigger_slot_fires_pulse_shell():
     assert projectiles[0].entity_type == EntityType.PULSE_SHELL
     assert energy_spent > 0.0
     print("test_weapon_system_og_direct_trigger_slot_fires_pulse_shell: PASSED")
+    return True
+
+
+def test_weapon_system_pulse_shell_respects_pitch_when_enabled():
+    """The server body-pitch gate must reach the projectile velocity math."""
+    ws = WeaponSystem()
+    ws.player_pos = (4950.0, 5100.0, 5.0)
+    ws.player_rot = (0.0, -0.2, 0.0)
+    ws.player_team = 2
+    ws.use_pitch = True
+    ws.behavior_slots[12] = 1.0
+
+    projectiles, energy_spent = ws.update(dt=1.0, available_energy=100.0)
+
+    assert len(projectiles) == 1
+    projectile = projectiles[0]
+    assert projectile.entity_type == EntityType.PULSE_SHELL
+    assert projectile.vel[2] > 10.0, projectile.vel
+    assert abs(projectile.vel[2] - (75.0 * math.sin(0.2))) < 0.001, projectile.vel
+    assert energy_spent > 0.0
+    print("test_weapon_system_pulse_shell_respects_pitch_when_enabled: PASSED")
     return True
 
 
@@ -17651,6 +17714,7 @@ def main():
         test_tank_softbody_spawn_pose_does_not_pin_ground_override,
         test_pulse_shell_default_spawn_uses_recovered_muzzle_offset,
         test_projectile_fire_pose_uses_replay_history_when_available,
+        test_projectile_body_source_can_opt_into_body_pitch,
         test_remote_spawn_points_use_udp_not_tcp,
         test_send_initial_game_data_og_bootstrap_order,
         test_remote_want_updates_suppresses_empty_tcp_update_array,
@@ -17697,6 +17761,7 @@ def main():
         test_spawn_entry_transition_stays_off_by_default,
         test_control_game_clock_builder_matches_packet_signature,
         test_weapon_system_og_direct_trigger_slot_fires_pulse_shell,
+        test_weapon_system_pulse_shell_respects_pitch_when_enabled,
         test_weapon_system_og_direct_trigger_slots_fire_promoted_projectiles,
         test_weapon_system_chain_gun_autocannon_fire_slot_hitscan_path,
         test_weapon_system_held_fire_repeats_on_cooldown,

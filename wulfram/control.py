@@ -923,6 +923,7 @@ Examples:
         if not args:
             lines = ["Heading/aim parameters:"]
             lines.append(f"  aim_source       = {self.server.projectile_aim_source}")
+            lines.append(f"  body_pitch       = {int(getattr(self.server, 'projectile_body_pitch', False))}")
             if ws:
                 lines.append(f"  heading_offset   = {math.degrees(ws.heading_offset):.1f}deg")
                 lines.append(f"  aim_yaw_offset   = {math.degrees(ws.aim_yaw_offset):.1f}deg")

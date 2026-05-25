@@ -434,6 +434,10 @@ class WulframServer:
         # Default to body-aligned firing for stability. Slot/viewpoint aim remains
         # available via env toggles for targeted experiments.
         self.projectile_aim_source = os.environ.get("WULFRAM_PROJECTILE_AIM_SOURCE", "body").lower()
+        # Decompile-backed firing math uses the entity rotation matrix
+        # (entity +0x30/+0x34/+0x38), but the playable slice keeps the previous
+        # yaw-only body source unless this live OG gate flag is enabled.
+        self.projectile_body_pitch = os.environ.get("WULFRAM_PROJECTILE_BODY_PITCH", "0") == "1"
         self.projectiles_enabled = os.environ.get("WULFRAM_PROJECTILES_ENABLED", "1") == "1"
         self.remote_projectiles = os.environ.get("WULFRAM_REMOTE_PROJECTILES", "1") == "1"
         self.remote_combat_observer_packets = (
@@ -1202,6 +1206,7 @@ class WulframServer:
             f"projectile_local_stats={int(self.projectile_local_stats)} "
             f"projectile_spawn_snap={int(self.projectile_spawn_snap)} "
             f"projectile_aim_source={self.projectile_aim_source} "
+            f"projectile_body_pitch={int(self.projectile_body_pitch)} "
             f"use_slot_aim={int(self.use_slot_aim)}"
         )
         print(
@@ -6256,9 +6261,9 @@ class WulframServer:
         aim_pitch, aim_yaw, aim_src = self._get_aim_rotation(ctx)
         aim_label = aim_src
         if self.projectile_aim_source == "body":
-            aim_pitch = 0.0
+            aim_pitch = body_pitch if getattr(self, "projectile_body_pitch", False) else 0.0
             aim_yaw = body_yaw
-            aim_label = "body"
+            aim_label = "body_pitch" if getattr(self, "projectile_body_pitch", False) else "body"
         elif self.projectile_aim_source == "viewpoint":
             aim_pitch = ctx.player_aim_pitch
             aim_yaw = ctx.player_aim_yaw
@@ -6301,6 +6306,7 @@ class WulframServer:
             ctx.weapon_system.player_pos = fire_pos
             ctx.weapon_system.player_rot = fire_rot
             ctx.weapon_system.projectile_aim_source = aim_src
+            ctx.weapon_system.use_pitch = bool(getattr(self, "projectile_body_pitch", False))
 
             # Weapon spawning with wulf-forge encoding
             if self.projectiles_enabled:
@@ -6383,6 +6389,7 @@ class WulframServer:
             ctx.weapon_system.player_pos = fire_pos
             ctx.weapon_system.player_rot = fire_rot
             ctx.weapon_system.projectile_aim_source = aim_src
+            ctx.weapon_system.use_pitch = bool(getattr(self, "projectile_body_pitch", False))
 
             # Weapon spawning with wulf-forge encoding
             if self.projectiles_enabled:
