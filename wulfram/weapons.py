@@ -109,6 +109,7 @@ class WeaponSystem:
             WeaponType.THUMPER: 16.0,
             WeaponType.MORTAR: 12.0,
             WeaponType.PIERCER: 10.0,
+            EntityType.CALTROP: 4.0,
         }
         self.default_weapon_energy_cost: float = 8.0
 
@@ -135,6 +136,10 @@ class WeaponSystem:
             WeaponType.MINE: {
                 "speed": 0.0, "entity_type": EntityType.MINE,
                 "lifetime": 30.0, "cooldown": 2.0,
+            },
+            EntityType.CALTROP: {
+                "speed": 80.0, "entity_type": EntityType.CALTROP,
+                "lifetime": 30.0, "cooldown": 1.0,
             },
             WeaponType.GUIDED_MISSILE: {
                 "speed": 80.0, "entity_type": EntityType.HEAVY_MISSILE,
@@ -826,7 +831,8 @@ class WeaponSystem:
             fwd_y = -math.sin(pitch)
             fwd_z = math.cos(pitch) * math.sin(yaw)
 
-        # Mines drop at player position with zero velocity
+        # Mines drop at player position with zero velocity. Caltrops launch as
+        # short-lived homing bombs and are steered by the server update loop.
         if entity_type == EntityType.MINE:
             spawn_x, spawn_y, spawn_z = self.player_pos
             vel_x, vel_y, vel_z = 0.0, 0.0, 0.0

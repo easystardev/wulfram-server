@@ -118,6 +118,11 @@ class WulframServer:
     The UDP handler is shared across all clients.
     """
 
+    @staticmethod
+    def _projectile_body_pitch_enabled_from_env() -> bool:
+        """Return the default-on projectile pitch gate, preserving env opt-out."""
+        return os.environ.get("WULFRAM_PROJECTILE_BODY_PITCH", "1") != "0"
+
     def __init__(self, host: str = None, port: int = 2627):
         server_config.configure_core_server(self, host, port)
         self.logger = PacketLogger()
@@ -437,7 +442,7 @@ class WulframServer:
         # Decompile-backed firing math uses the entity rotation matrix
         # (entity +0x30/+0x34/+0x38), but the playable slice keeps the previous
         # yaw-only body source unless this live OG gate flag is enabled.
-        self.projectile_body_pitch = os.environ.get("WULFRAM_PROJECTILE_BODY_PITCH", "0") == "1"
+        self.projectile_body_pitch = self._projectile_body_pitch_enabled_from_env()
         self.projectiles_enabled = os.environ.get("WULFRAM_PROJECTILES_ENABLED", "1") == "1"
         self.remote_projectiles = os.environ.get("WULFRAM_REMOTE_PROJECTILES", "1") == "1"
         self.remote_combat_observer_packets = (
@@ -20098,6 +20103,9 @@ class WulframServer:
                     if proj not in ctx.active_projectiles:
                         break
 
+                if proj.entity_type == EntityType.CALTROP:
+                    self._steer_caltrop_projectile(proj, ctx, dt)
+
                 # Update projectile position for hit detection
                 # (build_projectile_update_packet also updates proj.pos,
                 #  but we need the position current before hit check)
@@ -20255,6 +20263,55 @@ class WulframServer:
                 return target
         return None
 
+    def _steer_caltrop_projectile(
+        self,
+        proj,
+        owner_ctx: ClientContext,
+        dt: float,
+        *,
+        range_limit: float = 200.0,
+        speed: float = 80.0,
+    ) -> Optional[ClientContext]:
+        """Nudge Caltrops toward the nearest visible tank inside the OG help range."""
+        try:
+            origin = tuple(float(v) for v in proj.pos[:3])
+        except (TypeError, ValueError):
+            return None
+        best: tuple[float, ClientContext, tuple[float, float, float]] | None = None
+        range_sq = range_limit * range_limit
+        for target in self._snapshot_in_game_clients():
+            if target is owner_ctx:
+                continue
+            try:
+                target_pos = self._to_client_pos(target.player_pos)
+                rel = (
+                    float(target_pos[0]) - origin[0],
+                    float(target_pos[1]) - origin[1],
+                    float(target_pos[2]) - origin[2],
+                )
+            except (TypeError, ValueError, IndexError):
+                continue
+            dist_sq = rel[0] * rel[0] + rel[1] * rel[1] + rel[2] * rel[2]
+            if dist_sq <= 1e-6 or dist_sq > range_sq:
+                continue
+            if best is None or dist_sq < best[0]:
+                best = (dist_sq, target, rel)
+        if best is None:
+            return None
+
+        dist = math.sqrt(best[0])
+        direction = (best[2][0] / dist, best[2][1] / dist, best[2][2] / dist)
+        desired = (direction[0] * speed, direction[1] * speed, direction[2] * speed)
+        # Caltrops should visibly home, but avoid frame-to-frame right-angle
+        # snaps in UPDATE_ARRAY rotation by blending toward the desired vector.
+        blend = min(1.0, max(0.0, dt * 6.0))
+        proj.vel = (
+            proj.vel[0] + (desired[0] - proj.vel[0]) * blend,
+            proj.vel[1] + (desired[1] - proj.vel[1]) * blend,
+            proj.vel[2] + (desired[2] - proj.vel[2]) * blend,
+        )
+        return best[1]
+
     def _apply_damage(self, target: ClientContext, proj, attacker: ClientContext) -> None:
         """Apply damage from a projectile hit and broadcast effects.
 
@@ -20285,6 +20342,7 @@ class WulframServer:
             EntityType.HUNTER: 0.25,         # 25% — homing missile
             EntityType.HEAVY_MISSILE: 0.50,  # 50% — heavy ordnance
             EntityType.MINE: 0.40,           # 40% — proximity mine
+            EntityType.CALTROP: 0.10,        # 10% — light homing bomblet
             EntityType.SHORT_MISSILE: 0.15,  # 15% — short range missile
             EntityType.FLAK_SHELL: 0.10,     # 10% — flak
         }
@@ -20460,6 +20518,7 @@ class WulframServer:
             EntityType.HUNTER: 70.0,
             EntityType.HEAVY_MISSILE: 200.0,
             EntityType.MINE: 150.0,
+            EntityType.CALTROP: 25.0,
             EntityType.SHORT_MISSILE: 30.0,
             EntityType.FLAK_SHELL: 20.0,
         }

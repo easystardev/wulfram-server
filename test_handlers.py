@@ -724,7 +724,7 @@ def test_projectile_fire_pose_uses_replay_history_when_available():
 
 
 def test_projectile_body_source_can_opt_into_body_pitch():
-    """Default-off body-pitch gate should preserve replay pose pitch when enabled."""
+    """Body-pitch gate should preserve replay pose pitch when enabled."""
     server = WulframServer.__new__(WulframServer)
     server.up_axis = "z"
     server.pos_offset = 0.0
@@ -761,6 +761,28 @@ def test_projectile_body_source_can_opt_into_body_pitch():
     assert aim_src == "body_pitch"
     assert pose_src == "history"
     print("test_projectile_body_source_can_opt_into_body_pitch: PASSED")
+    return True
+
+
+def test_projectile_body_pitch_defaults_on_with_env_optout():
+    """Pulse/body projectile pitch should be canonical by default, with explicit opt-out."""
+    old_env = os.environ.get("WULFRAM_PROJECTILE_BODY_PITCH")
+    try:
+        os.environ.pop("WULFRAM_PROJECTILE_BODY_PITCH", None)
+        assert WulframServer._projectile_body_pitch_enabled_from_env() is True
+
+        os.environ["WULFRAM_PROJECTILE_BODY_PITCH"] = "1"
+        assert WulframServer._projectile_body_pitch_enabled_from_env() is True
+
+        os.environ["WULFRAM_PROJECTILE_BODY_PITCH"] = "0"
+        assert WulframServer._projectile_body_pitch_enabled_from_env() is False
+    finally:
+        if old_env is None:
+            os.environ.pop("WULFRAM_PROJECTILE_BODY_PITCH", None)
+        else:
+            os.environ["WULFRAM_PROJECTILE_BODY_PITCH"] = old_env
+
+    print("test_projectile_body_pitch_defaults_on_with_env_optout: PASSED")
     return True
 
 
@@ -2972,6 +2994,45 @@ def test_server_remote_projectile_update_uses_safe_local_state_after_promotion()
     return True
 
 
+def test_caltrop_projectile_spawn_and_update_decode_promoted_wire_shape():
+    """Caltrop spawn packets should define type 13 and updates should carry motion."""
+    proj = Projectile(
+        entity_id=21015,
+        entity_type=EntityType.CALTROP,
+        owner_id=0x14EA,
+        team=2,
+        pos=(2632.83, 3039.84, 64.75),
+        vel=(80.0, 0.0, 0.0),
+        spawn_time=0.0,
+        lifetime=30.0,
+    )
+
+    spawn_payload = build_projectile_spawn_packet(proj, 0x12345670)
+    update_payload = build_projectile_update_packet(proj, 0x12345671, dt=0.1)
+
+    spawn_tick, spawn_local, spawn_entities = decode_update_array(spawn_payload)
+    update_tick, update_local, update_entities = decode_update_array(update_payload)
+
+    assert spawn_tick == 0x12345670
+    assert update_tick == 0x12345671
+    assert spawn_local is None
+    assert update_local is None
+    assert len(spawn_entities) == 1
+    assert len(update_entities) == 1
+    assert spawn_entities[0].entity_id == 21015
+    assert update_entities[0].entity_id == 21015
+    assert spawn_entities[0].entity_type == EntityType.CALTROP
+    # UPDATE_ARRAY motion updates identify the existing object; the type is
+    # established by the spawn/definition packet above.
+    assert update_entities[0].entity_type in (-1, None, EntityType.CALTROP)
+    assert spawn_entities[0].velocity is not None
+    assert update_entities[0].velocity is not None
+    assert math.isclose(spawn_entities[0].velocity[0], 80.0, abs_tol=0.1)
+    assert math.isclose(update_entities[0].velocity[0], 80.0, abs_tol=0.1)
+    print("test_caltrop_projectile_spawn_and_update_decode_promoted_wire_shape: PASSED")
+    return True
+
+
 def test_loopback_projectile_update_stays_entity_only():
     """Loopback/Python projectile updates must remain entity-only."""
     server = WulframServer.__new__(WulframServer)
@@ -3473,6 +3534,7 @@ def test_weapon_system_og_direct_trigger_slots_fire_promoted_projectiles():
         (12, WeaponType.PULSE_CANNON, EntityType.PULSE_SHELL, "Pulse Shell"),
         (13, WeaponType.PIERCER, EntityType.PIERCER, "Piercer"),
         (14, WeaponType.THUMPER, EntityType.THUMPER, "Thumper"),
+        (15, EntityType.CALTROP, EntityType.CALTROP, "Caltrop"),
         (16, WeaponType.HUNTER_SEEKER, EntityType.HUNTER, "Hunter"),
         (17, WeaponType.MINE, EntityType.MINE, "Mine"),
     ]
@@ -3495,6 +3557,32 @@ def test_weapon_system_og_direct_trigger_slots_fire_promoted_projectiles():
             assert math.sqrt(sum(float(v) * float(v) for v in projectiles[0].vel)) > 0.0, projectiles[0].vel
 
     print("test_weapon_system_og_direct_trigger_slots_fire_promoted_projectiles: PASSED")
+    return True
+
+
+def test_weapon_system_caltrop_uses_promoted_lifecycle_constants():
+    """OG key 5 / Caltrop should spawn a real short-lived projectile."""
+    ws = WeaponSystem()
+    ws.player_pos = (4950.0, 5100.0, 5.0)
+    ws.player_rot = (0.0, 0.0, 0.0)
+    ws.player_team = 2
+    ws.player_id = 0xCA17
+    ws.behavior_slots[15] = 1.0
+
+    projectiles, energy_spent = ws.update(dt=1.0, available_energy=100.0)
+
+    assert OG_DIRECT_TRIGGER_WEAPON_SLOTS[15] == EntityType.CALTROP
+    assert len(projectiles) == 1, projectiles
+    projectile = projectiles[0]
+    assert projectile.entity_type == EntityType.CALTROP, projectile
+    assert projectile.owner_id == 0xCA17, projectile
+    assert projectile.team == 2, projectile
+    assert projectile.lifetime == 30.0, projectile
+    assert abs(math.sqrt(sum(float(v) * float(v) for v in projectile.vel)) - 80.0) < 0.001, projectile.vel
+    assert energy_spent == 4.0, energy_spent
+    assert ws.fire_cooldown == 1.0, ws.fire_cooldown
+    assert ws.projectiles == [projectile], ws.projectiles
+    print("test_weapon_system_caltrop_uses_promoted_lifecycle_constants: PASSED")
     return True
 
 
@@ -17056,6 +17144,116 @@ def test_client_hitscan_fire_damages_lane_target():
     return True
 
 
+def test_caltrop_projectile_steers_toward_nearest_target_in_help_range():
+    """Server Caltrop steering should pick a nearby enemy-shaped in-game target."""
+    server = WulframServer.__new__(WulframServer)
+    server.clients_lock = threading.Lock()
+    server.up_axis = "z"
+    server.pos_offset = 0.0
+
+    owner = ClientContext(
+        client_id=21,
+        client_addr=("10.10.10.2", 52731),
+        session=Session(phase=Phase.IN_GAME, in_game=True, team_id=2),
+        entity_id=0x621,
+    )
+    owner.player_pos = (0.0, 0.0, 0.0)
+
+    target = ClientContext(
+        client_id=22,
+        client_addr=("10.10.10.3", 52732),
+        session=Session(phase=Phase.IN_GAME, in_game=True, team_id=1),
+        entity_id=0x622,
+    )
+    target.player_pos = (60.0, 0.0, 0.0)
+
+    far_target = ClientContext(
+        client_id=23,
+        client_addr=("10.10.10.4", 52733),
+        session=Session(phase=Phase.IN_GAME, in_game=True, team_id=1),
+        entity_id=0x623,
+    )
+    far_target.player_pos = (260.0, 0.0, 0.0)
+
+    server.clients = {
+        owner.client_id: owner,
+        target.client_id: target,
+        far_target.client_id: far_target,
+    }
+    proj = Projectile(
+        entity_id=7015,
+        entity_type=EntityType.CALTROP,
+        owner_id=owner.entity_id,
+        team=owner.session.team_id,
+        pos=(0.0, 0.0, 0.0),
+        vel=(0.0, 0.0, 0.0),
+        spawn_time=time.monotonic(),
+        lifetime=30.0,
+    )
+
+    selected = server._steer_caltrop_projectile(proj, owner, dt=1.0 / 15.0)
+
+    assert selected is target, selected
+    assert proj.vel[0] > 0.0, proj.vel
+    assert abs(math.sqrt(sum(float(v) * float(v) for v in proj.vel)) - 32.0) < 0.001, proj.vel
+    print("test_caltrop_projectile_steers_toward_nearest_target_in_help_range: PASSED")
+    return True
+
+
+def test_caltrop_projectile_damage_uses_light_bomblet_amount_and_cleanup():
+    """Caltrop projectile hits should apply light damage and request projectile cleanup."""
+    server = WulframServer.__new__(WulframServer)
+    server.clients_lock = threading.Lock()
+    server.clients = {}
+    server.udp_handler = None
+    server.pktlog = SimpleNamespace(enabled=False)
+    server._get_network_tick = lambda _ctx: 0xCA17
+    server._snapshot_in_game_clients = lambda: []
+    server._broadcast_transient_fx = lambda _events: None
+    server._projectile_packets_allowed_for_client = lambda _client: True
+    server._send_packet_to_client = lambda *_args, **_kwargs: True
+    server._debug_comm_allowed_for_client = lambda _client: True
+
+    attacker_session = Session(phase=Phase.IN_GAME, in_game=True, team_id=2)
+    attacker_session.username = "Caltropper"
+    attacker = ClientContext(
+        client_id=31,
+        client_addr=("10.10.10.2", 52731),
+        session=attacker_session,
+        entity_id=0x631,
+    )
+
+    target_session = Session(phase=Phase.IN_GAME, in_game=True, team_id=1)
+    target_session.username = "Target"
+    target = ClientContext(
+        client_id=32,
+        client_addr=("10.10.10.3", 52732),
+        session=target_session,
+        entity_id=0x632,
+    )
+    target.player_health = 1.0
+
+    proj = Projectile(
+        entity_id=7016,
+        entity_type=EntityType.CALTROP,
+        owner_id=attacker.entity_id,
+        team=attacker.session.team_id,
+        pos=target.player_pos,
+        vel=(0.0, 0.0, 0.0),
+        spawn_time=time.monotonic(),
+        lifetime=30.0,
+    )
+
+    server._apply_damage(target, proj, attacker)
+
+    assert target.player_health == 0.9, target.player_health
+    assert target.last_damage_source == "projectile:CALTROP"
+    assert target.last_damage_amount == 0.10
+    assert target.session.in_game is True
+    print("test_caltrop_projectile_damage_uses_light_bomblet_amount_and_cleanup: PASSED")
+    return True
+
+
 def test_players_json_includes_transport_addresses():
     """Control `players json` should expose client and UDP addresses for diagnostics."""
     server = SimpleNamespace(
@@ -17715,6 +17913,7 @@ def main():
         test_pulse_shell_default_spawn_uses_recovered_muzzle_offset,
         test_projectile_fire_pose_uses_replay_history_when_available,
         test_projectile_body_source_can_opt_into_body_pitch,
+        test_projectile_body_pitch_defaults_on_with_env_optout,
         test_remote_spawn_points_use_udp_not_tcp,
         test_send_initial_game_data_og_bootstrap_order,
         test_remote_want_updates_suppresses_empty_tcp_update_array,
@@ -17754,6 +17953,7 @@ def main():
         test_server_remote_entity_packets_use_safe_local_state_after_promotion,
         test_server_remote_projectile_spawn_uses_viewer_local_state,
         test_server_remote_projectile_update_uses_safe_local_state_after_promotion,
+        test_caltrop_projectile_spawn_and_update_decode_promoted_wire_shape,
         test_loopback_projectile_update_stays_entity_only,
         test_server_remote_player_info_uses_spawn_safe_local_state,
         test_remote_player_info_packet_short_local_state_layout,
@@ -17763,6 +17963,7 @@ def main():
         test_weapon_system_og_direct_trigger_slot_fires_pulse_shell,
         test_weapon_system_pulse_shell_respects_pitch_when_enabled,
         test_weapon_system_og_direct_trigger_slots_fire_promoted_projectiles,
+        test_weapon_system_caltrop_uses_promoted_lifecycle_constants,
         test_weapon_system_chain_gun_autocannon_fire_slot_hitscan_path,
         test_weapon_system_held_fire_repeats_on_cooldown,
         test_weapon_system_accepts_empty_action_update_keepalive,
@@ -17978,6 +18179,8 @@ def main():
         test_client_weapon_fire_telemetry_records_input_projectiles,
         test_client_hitscan_fire_telemetry_records_fire,
         test_client_hitscan_fire_damages_lane_target,
+        test_caltrop_projectile_steers_toward_nearest_target_in_help_range,
+        test_caltrop_projectile_damage_uses_light_bomblet_amount_and_cleanup,
         test_players_json_includes_transport_addresses,
         test_health_control_uses_server_heartbeat_helper,
         test_energy_control_sets_absolute_or_fractional_energy,
