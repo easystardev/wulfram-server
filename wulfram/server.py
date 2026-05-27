@@ -7552,6 +7552,7 @@ class WulframServer:
                     "strafe": float(strafe_input),
                     "packet_type": packet_type,
                     "client_tick": int(client_tick or 0),
+                    "action_sequence": int(ctx.action_packet_count),
                 }
             )
         ctx.last_decoded_input = {
@@ -8965,7 +8966,136 @@ class WulframServer:
         ctx.player_pose["vel"] = ctx.player_vel
         if getattr(ctx, "vehicle_physics", None) is not None:
             ctx.vehicle_physics.angular_velocity = ctx.angular_vel_yaw
+        controller_now = time.monotonic()
+        movement_history = getattr(ctx, "movement_input_history", None)
+        try:
+            movement_history_len = len(movement_history or [])
+        except TypeError:
+            movement_history_len = 0
+        latest_history = None
+        if movement_history:
+            try:
+                latest_history = list(movement_history)[-1]
+            except (IndexError, TypeError):
+                latest_history = None
+        if not isinstance(latest_history, dict):
+            latest_history = {}
+        latest_nonzero_history = None
+        if movement_history:
+            try:
+                for entry in reversed(list(movement_history)):
+                    if not isinstance(entry, dict):
+                        continue
+                    try:
+                        entry_fwd = float(entry.get("fwd", 0.0) or 0.0)
+                        entry_strafe = float(entry.get("strafe", 0.0) or 0.0)
+                    except (TypeError, ValueError, OverflowError):
+                        continue
+                    if abs(entry_fwd) > 0.05 or abs(entry_strafe) > 0.05:
+                        latest_nonzero_history = entry
+                        break
+            except TypeError:
+                latest_nonzero_history = None
+        if not isinstance(latest_nonzero_history, dict):
+            latest_nonzero_history = {}
+        latest_history_time = 0.0
+        try:
+            latest_history_time = float(latest_history.get("time", 0.0) or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            latest_history_time = 0.0
+        latest_nonzero_history_time = 0.0
+        try:
+            latest_nonzero_history_time = float(
+                latest_nonzero_history.get("time", 0.0) or 0.0
+            )
+        except (TypeError, ValueError, OverflowError):
+            latest_nonzero_history_time = 0.0
+        last_action_time = float(getattr(ctx, "last_action_packet_time", 0.0) or 0.0)
+        last_nonzero_time = float(
+            getattr(ctx, "last_nonzero_move_input_time", 0.0) or 0.0
+        )
+        last_decoded_input = getattr(ctx, "last_decoded_input", {}) or {}
+        if not isinstance(last_decoded_input, dict):
+            last_decoded_input = {}
+        try:
+            last_decoded_fwd = float(last_decoded_input.get("fwd", 0.0) or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            last_decoded_fwd = 0.0
+        try:
+            last_decoded_strafe = float(last_decoded_input.get("strafe", 0.0) or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            last_decoded_strafe = 0.0
+
         ctx.debug_last_controller_step = {
+            "controller_time": controller_now,
+            "controller_tick": ctx.session.tick if ctx.session else None,
+            "controller_physics_step_count": getattr(ctx, "physics_step_count", 0),
+            "action_packet_count_at_controller": getattr(
+                ctx, "action_packet_count", 0
+            ),
+            "action_update_count_at_controller": getattr(
+                ctx, "action_update_count", 0
+            ),
+            "action_dump_count_at_controller": getattr(ctx, "action_dump_count", 0),
+            "last_action_packet_type_at_controller": getattr(
+                ctx, "last_action_packet_type", ""
+            ),
+            "last_action_client_tick_at_controller": getattr(
+                ctx, "last_action_packet_client_tick", 0
+            ),
+            "last_action_age_s_at_controller": (
+                max(0.0, controller_now - last_action_time)
+                if last_action_time > 0.0
+                else None
+            ),
+            "last_nonzero_move_input_age_s_at_controller": (
+                max(0.0, controller_now - last_nonzero_time)
+                if last_nonzero_time > 0.0
+                else None
+            ),
+            "movement_history_len_at_controller": movement_history_len,
+            "movement_history_latest_age_s_at_controller": (
+                max(0.0, controller_now - latest_history_time)
+                if latest_history_time > 0.0
+                else None
+            ),
+            "movement_history_latest_fwd_at_controller": float(
+                latest_history.get("fwd", 0.0) or 0.0
+            ),
+            "movement_history_latest_strafe_at_controller": float(
+                latest_history.get("strafe", 0.0) or 0.0
+            ),
+            "movement_history_latest_client_tick_at_controller": int(
+                latest_history.get("client_tick", 0) or 0
+            ),
+            "movement_history_latest_packet_type_at_controller": latest_history.get(
+                "packet_type", ""
+            ),
+            "movement_history_latest_action_sequence_at_controller": int(
+                latest_history.get("action_sequence", 0) or 0
+            ),
+            "movement_history_latest_nonzero_age_s_at_controller": (
+                max(0.0, controller_now - latest_nonzero_history_time)
+                if latest_nonzero_history_time > 0.0
+                else None
+            ),
+            "movement_history_latest_nonzero_fwd_at_controller": float(
+                latest_nonzero_history.get("fwd", 0.0) or 0.0
+            ),
+            "movement_history_latest_nonzero_strafe_at_controller": float(
+                latest_nonzero_history.get("strafe", 0.0) or 0.0
+            ),
+            "movement_history_latest_nonzero_client_tick_at_controller": int(
+                latest_nonzero_history.get("client_tick", 0) or 0
+            ),
+            "movement_history_latest_nonzero_packet_type_at_controller": (
+                latest_nonzero_history.get("packet_type", "")
+            ),
+            "movement_history_latest_nonzero_action_sequence_at_controller": int(
+                latest_nonzero_history.get("action_sequence", 0) or 0
+            ),
+            "last_decoded_forward_input_at_controller": last_decoded_fwd,
+            "last_decoded_strafe_input_at_controller": last_decoded_strafe,
             "turn_input": (
                 self.turn_sign * ctx.injected_turn
                 if ctx.injected_turn is not None
@@ -10533,6 +10663,58 @@ class WulframServer:
                 "cbsp",
                 "report_first",
                 "decompile",
+            }
+        )
+        selected_row_phase_trace_mode = (
+            os.environ.get(
+                "WULFRAM_ENTITY_TERRAIN_SELECTED_ROW_PHASE_TRACE",
+                "0",
+            )
+            .strip()
+            .lower()
+        )
+        selected_row_phase_trace_enabled = (
+            pair_record_contact_enabled
+            and selected_row_phase_trace_mode
+            in {
+                "1",
+                "true",
+                "on",
+                "yes",
+                "trace",
+                "selected",
+                "selected_row",
+                "phase",
+                "decompile",
+            }
+        )
+        pair_record_frame_phase_resolve_preview_mode = (
+            os.environ.get(
+                "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_FRAME_PHASE_RESOLVE_PREVIEW",
+                "all",
+            )
+            .strip()
+            .lower()
+        )
+        pair_record_frame_phase_resolve_preview_all = (
+            pair_record_frame_phase_resolve_preview_mode
+            in {
+                "1",
+                "true",
+                "on",
+                "yes",
+                "all",
+                "always",
+            }
+        )
+        pair_record_frame_phase_resolve_preview_accepted = (
+            pair_record_frame_phase_resolve_preview_all
+            or pair_record_frame_phase_resolve_preview_mode
+            in {
+                "accepted",
+                "accepted_only",
+                "contact",
+                "contacts",
             }
         )
         pair_record_schedule_response_probe_mode = (
@@ -12422,16 +12604,20 @@ class WulframServer:
                             contact=pair_contact,
                             delta_contact=pair_delta_contact,
                         )
-                    resolve_phase_preview = preview_frame_phase_resolve_model(
-                        label=label,
-                        selection=selection,
-                        candidate=candidate,
-                        candidate_velocity=candidate_velocity,
-                        time_s=time_s,
-                        bucket_index=bucket_index,
-                        pair_contact=pair_contact,
-                        response_preview=response_preview,
-                    )
+                    resolve_phase_preview = None
+                    if pair_record_frame_phase_resolve_preview_all or (
+                        accepted and pair_record_frame_phase_resolve_preview_accepted
+                    ):
+                        resolve_phase_preview = preview_frame_phase_resolve_model(
+                            label=label,
+                            selection=selection,
+                            candidate=candidate,
+                            candidate_velocity=candidate_velocity,
+                            time_s=time_s,
+                            bucket_index=bucket_index,
+                            pair_contact=pair_contact,
+                            response_preview=response_preview,
+                        )
                     row = {
                         "label": label,
                         "pos": candidate,
@@ -12509,6 +12695,9 @@ class WulframServer:
                 ),
                 "bucket_count": bucket_count,
                 "bucket_center_sample_count": bucket_count,
+                "resolve_preview_mode": (
+                    pair_record_frame_phase_resolve_preview_mode
+                ),
                 "accepted_count": len(accepted_rows),
                 "first_accepted": accepted_rows[0] if accepted_rows else None,
                 "results": results,
@@ -12647,6 +12836,143 @@ class WulframServer:
                 pos,
                 velocity=(vx, vy, vz),
             )
+
+            def selected_row_contact_phase_trace():
+                if not selected_row_phase_trace_enabled:
+                    return None
+                controller = getattr(ctx, "debug_last_controller_step", None)
+                if not isinstance(controller, dict):
+                    controller = {}
+                trace = {
+                    "enabled": True,
+                    "runtime_default": "off",
+                    "mode": selected_row_phase_trace_mode,
+                    "decompile_source": (
+                        "Selected-row phase trace for the server pose/contact "
+                        "context that feeds CollisionPair_record. It is "
+                        "report-only and does not change contact selection or "
+                        "response."
+                    ),
+                    "controller_time": controller.get("controller_time"),
+                    "controller_tick": controller.get("controller_tick"),
+                    "controller_physics_step_count": controller.get(
+                        "controller_physics_step_count"
+                    ),
+                    "action_packet_count_at_controller": controller.get(
+                        "action_packet_count_at_controller"
+                    ),
+                    "last_action_client_tick_at_controller": controller.get(
+                        "last_action_client_tick_at_controller"
+                    ),
+                    "last_action_age_s_at_controller": controller.get(
+                        "last_action_age_s_at_controller"
+                    ),
+                    "movement_history_latest_nonzero_age_s_at_controller": (
+                        controller.get(
+                            "movement_history_latest_nonzero_age_s_at_controller"
+                        )
+                    ),
+                    "movement_history_latest_nonzero_fwd_at_controller": (
+                        controller.get(
+                            "movement_history_latest_nonzero_fwd_at_controller"
+                        )
+                    ),
+                    "frame_dt_s": dt,
+                    "pre_step_pos": pre_pos,
+                    "pre_step_vel": pre_vel,
+                    "selected_pos": pos,
+                    "selected_vel": (vx, vy, vz),
+                    "dirty_reference_pos": dirty_dispatch_debug.get(
+                        "dirty_reference_pos"
+                    ),
+                    "dirty_current_pos": dirty_dispatch_debug.get(
+                        "dirty_current_pos"
+                    ),
+                    "heading": heading,
+                    "body_matrix": model_contact_rotation_matrix,
+                    "model_contact_rotation_source": model_contact_rotation_source,
+                    "model_contact_rotation_mode": model_contact_rotation_mode,
+                    "model_contact_selection": model_contact_selection,
+                    "pair_record_contact_selection": pair_record_contact_selection,
+                    "pair_record_contact_reject": pair_record_contact_reject,
+                    "pair_record_selected_raw_error": (
+                        pair_record_selected_raw_error
+                    ),
+                    "pair_record_selected_pair_contact_source": (
+                        pair_record_selected_pair_contact_source
+                    ),
+                    "pair_record_contact_source_family": (
+                        getattr(pair_record_contact, "cbsp_record_hit_source", None)
+                        if pair_record_contact is not None
+                        else None
+                    ),
+                    "pair_record_selected_raw_source_family": (
+                        getattr(
+                            pair_record_selected_raw_contact,
+                            "cbsp_record_hit_source",
+                            None,
+                        )
+                        if pair_record_selected_raw_contact is not None
+                        else None
+                    ),
+                    "pair_record_raw_contact": probe_contact_fields(
+                        pair_record_raw_contact,
+                        center=raw_center,
+                        z_lift_used=0.0,
+                    ),
+                    "pair_record_selected_raw_contact": probe_contact_fields(
+                        pair_record_selected_raw_contact,
+                        center=raw_center,
+                        z_lift_used=0.0,
+                    ),
+                    "pair_record_selected_raw_bounds_contact": probe_contact_fields(
+                        pair_record_selected_raw_bounds_contact,
+                        center=raw_center,
+                        z_lift_used=0.0,
+                    ),
+                    "pair_record_contact": probe_contact_fields(
+                        pair_record_contact,
+                        center=raw_center,
+                        z_lift_used=0.0,
+                    ),
+                    "pair_record_delta_contact": probe_contact_fields(
+                        pair_record_delta_contact,
+                        center=raw_center,
+                        z_lift_used=0.0,
+                    ),
+                    "selected_row_contact_accept": (
+                        pair_record_contact is not None
+                        and pair_record_contact_reject == ""
+                    ),
+                    "selected_row_lifted_contact": lifted_contact is not None,
+                    "selected_row_raw_contact": raw_contact is not None,
+                    "selected_row_raw_bounds_contact": raw_bounds_contact is not None,
+                    "selected_row_raycast_contact": (
+                        isinstance(raycast_probe, dict)
+                        and raycast_probe.get("contact") is not None
+                    ),
+                    "selected_row_probe_reason": probe_reason,
+                    "frame_phase_probe_enabled": (
+                        pair_record_frame_phase_probe_enabled
+                    ),
+                    "frame_phase_probe_result_count": (
+                        len(frame_phase_probe.get("results", {}))
+                        if isinstance(frame_phase_probe, dict)
+                        else 0
+                    ),
+                    "frame_phase_probe_accepted_count": (
+                        frame_phase_probe.get("accepted_count")
+                        if isinstance(frame_phase_probe, dict)
+                        else None
+                    ),
+                }
+                return {
+                    key: value
+                    for key, value in trace.items()
+                    if value not in ({}, None)
+                }
+
+            selected_phase_trace = selected_row_contact_phase_trace()
             ctx.debug_last_terrain_contact_probe = {
                 "reason": probe_reason,
                 "origin_mode": origin_mode,
@@ -12822,6 +13148,10 @@ class WulframServer:
                     pair_record_frame_phase_probe_enabled
                 ),
                 "pair_record_frame_phase_probe": frame_phase_probe,
+                "selected_row_phase_trace_enabled": (
+                    selected_row_phase_trace_enabled
+                ),
+                "selected_row_phase_trace": selected_phase_trace,
                 "pair_record_schedule_response_probe_enabled": (
                     pair_record_schedule_response_probe_enabled
                 ),
@@ -16401,6 +16731,20 @@ class WulframServer:
                                     "pair_record_continue_probe_result"
                                 ] = "no_interval_contact"
                             probe_debug.update(schedule_update)
+                            selected_trace = probe_debug.get(
+                                "selected_row_phase_trace"
+                            )
+                            if isinstance(selected_trace, dict):
+                                selected_trace.update({
+                                    "pair_record_schedule_probe_result": (
+                                        schedule_update.get(
+                                            "pair_record_schedule_probe_result"
+                                        )
+                                    ),
+                                    "pair_record_schedule_response_probe_enabled": (
+                                        pair_record_schedule_response_probe_enabled
+                                    ),
+                                })
                         else:
                             collision_time_s = direct_pair_schedule_probe.get(
                                 "collision_time_s"
@@ -16534,6 +16878,97 @@ class WulframServer:
                                     ),
                                 })
                             probe_debug.update(schedule_update)
+                            selected_trace = probe_debug.get(
+                                "selected_row_phase_trace"
+                            )
+                            if isinstance(selected_trace, dict):
+                                schedule_contact = direct_pair_schedule_probe.get(
+                                    "contact"
+                                )
+                                selected_trace.update({
+                                    "pair_record_schedule_probe_result": (
+                                        schedule_update.get(
+                                            "pair_record_schedule_probe_result"
+                                        )
+                                    ),
+                                    "pair_record_schedule_collision_time_s": (
+                                        collision_time_s
+                                    ),
+                                    "pair_record_schedule_step_dt_s": frame_dt,
+                                    "pair_record_schedule_remaining_time_s": (
+                                        remaining_time_s
+                                    ),
+                                    "pair_record_schedule_bucket_count": bucket_count,
+                                    "pair_record_schedule_bucket_index": bucket_index,
+                                    "pair_record_schedule_bucket_start_s": (
+                                        bucket_start_s
+                                    ),
+                                    "pair_record_schedule_bucket_end_s": (
+                                        bucket_end_s
+                                    ),
+                                    "pair_record_schedule_collision_at_start": (
+                                        direct_pair_schedule_probe.get(
+                                            "collision_at_start"
+                                        )
+                                    ),
+                                    "pair_record_schedule_contact_source_family": (
+                                        getattr(
+                                            schedule_contact,
+                                            "cbsp_record_hit_source",
+                                            None,
+                                        )
+                                        if schedule_contact is not None
+                                        else None
+                                    ),
+                                    "pair_record_schedule_contact": (
+                                        probe_contact_fields(
+                                            schedule_contact,
+                                            center=direct_pair_schedule_probe.get(
+                                                "pos"
+                                            ),
+                                            z_lift_used=0.0,
+                                        )
+                                    ),
+                                    "pair_record_schedule_contact_pos": (
+                                        direct_pair_schedule_probe.get("pos")
+                                    ),
+                                    "pair_record_schedule_contact_vel_before": (
+                                        direct_pair_schedule_probe.get("velocity")
+                                    ),
+                                    "pair_record_schedule_response_probe_enabled": (
+                                        pair_record_schedule_response_probe_enabled
+                                    ),
+                                    "pair_record_schedule_response_probe_result": (
+                                        schedule_update.get(
+                                            "pair_record_schedule_response_probe_result"
+                                        )
+                                    ),
+                                    "pair_record_schedule_response_probe_applied": (
+                                        schedule_update.get(
+                                            "pair_record_schedule_response_probe_applied"
+                                        )
+                                    ),
+                                    "pair_record_schedule_response_probe_velocity_delta": (
+                                        schedule_update.get(
+                                            "pair_record_schedule_response_probe_velocity_delta"
+                                        )
+                                    ),
+                                    "pair_record_schedule_response_probe_angular_delta": (
+                                        schedule_update.get(
+                                            "pair_record_schedule_response_probe_angular_delta"
+                                        )
+                                    ),
+                                    "pair_record_schedule_response_probe_post_contact_pos": (
+                                        schedule_update.get(
+                                            "pair_record_schedule_response_probe_post_contact_pos"
+                                        )
+                                    ),
+                                    "pair_record_schedule_response_probe_endpoint_pos": (
+                                        schedule_update.get(
+                                            "pair_record_schedule_response_probe_endpoint_pos"
+                                        )
+                                    ),
+                                })
                 if (
                     direct_pair_timing is not None
                     or (

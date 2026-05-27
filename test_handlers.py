@@ -9375,6 +9375,8 @@ def test_entity_world_collision_pair_record_schedule_probe_reports_without_apply
         "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_TIMED_CONTACT",
         "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTINUE_REMAINING",
         "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_SCHEDULE_PROBE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_SCHEDULE_RESPONSE_PROBE",
+        "WULFRAM_ENTITY_TERRAIN_SELECTED_ROW_PHASE_TRACE",
         "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT_SELECTION",
         "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_NORMAL_SOURCE",
         "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE",
@@ -9389,6 +9391,8 @@ def test_entity_world_collision_pair_record_schedule_probe_reports_without_apply
         os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_TIMED_CONTACT"] = "0"
         os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTINUE_REMAINING"] = "0"
         os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_SCHEDULE_PROBE"] = "1"
+        os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_SCHEDULE_RESPONSE_PROBE"] = "1"
+        os.environ["WULFRAM_ENTITY_TERRAIN_SELECTED_ROW_PHASE_TRACE"] = "1"
         os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT_SELECTION"] = "upward_min_depth"
         os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_NORMAL_SOURCE"] = "mesh"
         os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE"] = "mesh"
@@ -9465,6 +9469,18 @@ def test_entity_world_collision_pair_record_schedule_probe_reports_without_apply
         ] == probe["pair_record_schedule_remaining_time_s"], probe
         assert probe["pair_record_schedule_contact_sweep_scan"] is True, probe
         assert probe["pair_record_schedule_contact"]["contact_cell"] == (7, 8), probe
+        assert probe["selected_row_phase_trace_enabled"] is True, probe
+        trace = probe["selected_row_phase_trace"]
+        assert trace["runtime_default"] == "off", trace
+        assert trace["selected_pos"] == (1.0, 0.0, -1.0), trace
+        assert trace["pre_step_pos"] == (0.0, 0.0, 0.0), trace
+        assert trace["pair_record_contact_reject"] == "no_raw_origin_contact", trace
+        assert trace["pair_record_schedule_probe_result"] == "interval_contact", trace
+        assert 0.44 <= trace["pair_record_schedule_collision_time_s"] <= 0.46, trace
+        assert trace["pair_record_schedule_bucket_index"] == 13, trace
+        assert trace["pair_record_schedule_contact"]["contact_cell"] == (7, 8), trace
+        assert trace["pair_record_schedule_response_probe_enabled"] is True, trace
+        assert "pair_record_schedule_response_probe_result" in trace, trace
         assert "pair_record_continue_probe_result" not in probe, probe
     finally:
         for key, value in old_env.items():
@@ -9484,6 +9500,7 @@ def test_entity_world_collision_frame_phase_report_first_probe_is_read_only():
         "WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK",
         "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT",
         "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_FRAME_PHASE_PROBE",
+        "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_FRAME_PHASE_RESOLVE_PREVIEW",
         "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT_SELECTION",
         "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_NORMAL_SOURCE",
         "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_DELTA_NORMAL_SOURCE",
@@ -9492,6 +9509,10 @@ def test_entity_world_collision_frame_phase_report_first_probe_is_read_only():
     try:
         os.environ.pop("WULFRAM_ENTITY_TERRAIN_RAW_ORIGIN_FALLBACK", None)
         os.environ.pop("WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT", None)
+        os.environ.pop(
+            "WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_FRAME_PHASE_RESOLVE_PREVIEW",
+            None,
+        )
         os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_FRAME_PHASE_PROBE"] = "1"
         os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_CONTACT_SELECTION"] = "upward_min_depth"
         os.environ["WULFRAM_ENTITY_TERRAIN_PAIR_RECORD_NORMAL_SOURCE"] = "mesh"
@@ -17284,6 +17305,26 @@ def test_players_json_includes_transport_addresses():
     ctx.state_sync_reply_count = 2
     ctx.state_sync_view_reply_count = 2
     ctx.last_decoded_input = {"fwd": 0.5, "strafe": 0.0}
+    ctx.movement_input_history.append(
+        {
+            "time": time.monotonic() - 0.5,
+            "packet_type": "ACTION_DUMP",
+            "client_tick": 1100,
+            "action_sequence": 2,
+            "fwd": 0.0,
+            "strafe": 0.0,
+        }
+    )
+    ctx.movement_input_history.append(
+        {
+            "time": time.monotonic() - 0.25,
+            "packet_type": "ACTION_UPDATE",
+            "client_tick": 1122,
+            "action_sequence": 3,
+            "fwd": 0.5,
+            "strafe": 0.0,
+        }
+    )
     ctx.weapon_fire_count = 1
     ctx.last_weapon_fire_time = time.monotonic() - 0.5
     ctx.last_weapon_fire_source = "ACTION_UPDATE"
@@ -17320,6 +17361,17 @@ def test_players_json_includes_transport_addresses():
     assert entry["telemetry"]["state_sync_replies"] == 2
     assert entry["telemetry"]["state_sync_view_replies"] == 2
     assert entry["telemetry"]["last_input"]["fwd"] == 0.5
+    assert entry["telemetry"]["movement_input_history_len"] == 2
+    assert entry["telemetry"]["movement_input_history_nonzero_count"] == 1
+    assert entry["telemetry"]["movement_input_history_latest_nonzero_age_s"] is not None
+    assert entry["telemetry"]["movement_input_history_latest_nonzero"]["fwd"] == 0.5
+    assert (
+        entry["telemetry"]["movement_input_history_latest_nonzero"][
+            "action_sequence"
+        ]
+        == 3
+    )
+    assert entry["telemetry"]["movement_input_history_tail"][-1]["client_tick"] == 1122
     assert entry["telemetry"]["weapon_fire_count"] == 1
     assert entry["telemetry"]["last_weapon_fire_age_s"] is not None
     assert entry["telemetry"]["last_weapon_fire_source"] == "ACTION_UPDATE"

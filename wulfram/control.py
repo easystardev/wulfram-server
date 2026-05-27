@@ -1746,7 +1746,45 @@ Examples:
                     continue
                 phase = ctx.session.phase.name if ctx.session else "NONE"
                 movement_history_tail = []
-                for item in list(getattr(ctx, "movement_input_history", []) or [])[-16:]:
+                movement_history = list(
+                    getattr(ctx, "movement_input_history", []) or []
+                )
+                latest_nonzero_history = None
+                for item in reversed(movement_history):
+                    if not isinstance(item, dict):
+                        continue
+                    try:
+                        fwd = float(item.get("fwd", 0.0) or 0.0)
+                        strafe = float(item.get("strafe", 0.0) or 0.0)
+                    except (TypeError, ValueError, OverflowError):
+                        continue
+                    if abs(fwd) > 0.05 or abs(strafe) > 0.05:
+                        latest_nonzero_history = item
+                        break
+                latest_nonzero_history_age = None
+                if isinstance(latest_nonzero_history, dict):
+                    try:
+                        latest_nonzero_history_age = round(
+                            max(
+                                0.0,
+                                now - float(latest_nonzero_history.get("time", 0.0)),
+                            ),
+                            3,
+                        )
+                    except (TypeError, ValueError, OverflowError):
+                        latest_nonzero_history_age = None
+                nonzero_history_count = 0
+                for item in movement_history:
+                    if not isinstance(item, dict):
+                        continue
+                    try:
+                        fwd = float(item.get("fwd", 0.0) or 0.0)
+                        strafe = float(item.get("strafe", 0.0) or 0.0)
+                    except (TypeError, ValueError, OverflowError):
+                        continue
+                    if abs(fwd) > 0.05 or abs(strafe) > 0.05:
+                        nonzero_history_count += 1
+                for item in movement_history[-16:]:
                     if not isinstance(item, dict):
                         continue
                     item_time = item.get("time", 0.0)
@@ -1759,6 +1797,9 @@ Examples:
                             "age_s": None if age is None else round(age, 3),
                             "packet_type": item.get("packet_type", ""),
                             "client_tick": int(item.get("client_tick", 0) or 0),
+                            "action_sequence": int(
+                                item.get("action_sequence", 0) or 0
+                            ),
                             "fwd": float(item.get("fwd", 0.0) or 0.0),
                             "strafe": float(item.get("strafe", 0.0) or 0.0),
                         }
@@ -1798,6 +1839,26 @@ Examples:
                     "last_position_change_age_s": _age(getattr(ctx, "last_position_update", 0.0)),
                     "position_changes": getattr(ctx, "position_change_count", 0),
                     "last_input": getattr(ctx, "last_decoded_input", {}) or {},
+                    "movement_input_history_len": len(movement_history),
+                    "movement_input_history_nonzero_count": nonzero_history_count,
+                    "movement_input_history_latest_nonzero_age_s": latest_nonzero_history_age,
+                    "movement_input_history_latest_nonzero": (
+                        {
+                            "packet_type": latest_nonzero_history.get("packet_type", ""),
+                            "client_tick": int(
+                                latest_nonzero_history.get("client_tick", 0) or 0
+                            ),
+                            "action_sequence": int(
+                                latest_nonzero_history.get("action_sequence", 0) or 0
+                            ),
+                            "fwd": float(latest_nonzero_history.get("fwd", 0.0) or 0.0),
+                            "strafe": float(
+                                latest_nonzero_history.get("strafe", 0.0) or 0.0
+                            ),
+                        }
+                        if isinstance(latest_nonzero_history, dict)
+                        else None
+                    ),
                     "movement_input_history_tail": movement_history_tail,
                     "weapon_fire_count": getattr(ctx, "weapon_fire_count", 0),
                     "last_weapon_fire_age_s": _age(getattr(ctx, "last_weapon_fire_time", 0.0)),
