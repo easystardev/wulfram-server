@@ -8232,6 +8232,14 @@ class WulframServer:
         """
         import math
 
+        # Default-off sub-phase timing (collision vs building vs attitude) to localize
+        # the rough-cell controller-cadence cost. Gated by WULFRAM_UPP_PHASE_TIMING.
+        _upp_timing = os.environ.get("WULFRAM_UPP_PHASE_TIMING", "0") == "1"
+        if _upp_timing:
+            ctx._upp_collision_ms = 0.0
+            ctx._upp_building_ms = 0.0
+            ctx._upp_attitude_ms = 0.0
+
         self._repair_recent_control_pose_jump(ctx, "controller_tick_pre")
         dt = dt_override if dt_override > 0 else 1.0 / self.tick_rate_hz
 
@@ -8774,11 +8782,35 @@ class WulframServer:
         ctx._world_collision_step_pre_pos = pre_pos
         ctx._world_collision_step_pre_vel = pre_vel
         ctx._world_collision_step_dt = dt
+        _upp_t0 = time.perf_counter() if _upp_timing else 0.0
+        # Arm the per-step collision wall-clock budget so a single physics step's
+        # swept-TOI + multi-hypothesis contact resolution cannot stall the controller
+        # tick (rough-cell deep contact costs 100-1500 ms/step otherwise). Once the
+        # deadline passes, further test_model_collision queries report no-contact and
+        # the resolution finishes with what it found; the next tick re-resolves.
+        tgc = getattr(self, "_terrain_grid_collision", None)
+        if tgc is not None:
+            try:
+                _coll_budget_ms = float(
+                    os.environ.get("WULFRAM_ENTITY_TERRAIN_CONTACT_TIME_BUDGET_MS", "25")
+                    or 25.0
+                )
+            except ValueError:
+                _coll_budget_ms = 25.0
+            tgc._query_deadline = (
+                time.perf_counter() + _coll_budget_ms / 1000.0
+                if _coll_budget_ms > 0.0
+                else None
+            )
         try:
             new_x, new_y, new_z, new_vel_x, new_vel_y, new_vel_z = self._resolve_entity_world_collision(
                 ctx, new_x, new_y, new_z, new_vel_x, new_vel_y, new_vel_z
             )
         finally:
+            if tgc is not None:
+                tgc._query_deadline = None
+            if _upp_timing:
+                ctx._upp_collision_ms = (time.perf_counter() - _upp_t0) * 1000.0
             for attr_name in (
                 "_world_collision_step_pre_pos",
                 "_world_collision_step_pre_vel",
@@ -8927,8 +8959,11 @@ class WulframServer:
                 }
 
         # Building AABB collision (matching client-side)
+        _upp_tb = time.perf_counter() if _upp_timing else 0.0
         new_x, new_y, new_vel_x, new_vel_y = self._check_building_collisions(
             ctx, new_x, new_y, new_z, new_vel_x, new_vel_y)
+        if _upp_timing:
+            ctx._upp_building_ms = (time.perf_counter() - _upp_tb) * 1000.0
 
         # Terrain/world contact response can still push the tank back below the
         # terrain plane after the initial post-integrate clamp. Keep the final
@@ -9287,6 +9322,7 @@ class WulframServer:
             "pos": ctx.player_pos,
             "vel": ctx.player_vel,
         }
+        _upp_ta = time.perf_counter() if _upp_timing else 0.0
         body_attitude = self._update_player_surface_attitude(
             ctx,
             ctx.player_heading,
@@ -9300,6 +9336,8 @@ class WulframServer:
             ),
             spring_state_override=spring_state_for_attitude,
         )
+        if _upp_timing:
+            ctx._upp_attitude_ms = (time.perf_counter() - _upp_ta) * 1000.0
         ctx.debug_last_controller_step["body_rotation_source"] = body_attitude["source"]
         ctx.debug_last_controller_step["body_rotation"] = body_attitude["rotation"]
         ctx.debug_last_controller_step["body_up"] = body_attitude["up"]
@@ -21535,6 +21573,21 @@ class WulframServer:
         # accumulator to guarantee exactly tick_rate_hz ticks per wall-clock second.
         next_tick_time = time.monotonic()
         tick_period = 1.0 / self.tick_rate_hz if self.tick_rate_hz > 0 else 0.1
+        # Default-off per-step phase timing probe (physics vs network-send split).
+        # Used to localize rough-terrain controller-cadence collapse. Never on by default.
+        _phase_timing = os.environ.get("WULFRAM_TICK_PHASE_TIMING", "0") == "1"
+        _phase_timing_threshold_ms = float(
+            os.environ.get("WULFRAM_TICK_PHASE_TIMING_MS", "40") or 40.0
+        )
+        _phase_timing_path = os.environ.get(
+            "WULFRAM_TICK_PHASE_TIMING_LOG",
+            r"C:\Users\wstri\dev\wolfram\tick_phase_timing.log",
+        )
+        _phase_t0 = 0.0
+        _phase_t_upp = 0.0
+        _phase_t_phys = 0.0
+        # NOTE: use perf_counter (QPC, sub-us) NOT monotonic (GetTickCount64,
+        # 15.6 ms resolution on Windows) so the split is not clock-quantized.
         # Physics steps once per tick at native 30Hz (no accumulator needed).
         ctx.physics_step_count = 0
         last_physics_wall_time = time.monotonic()
@@ -21623,6 +21676,8 @@ class WulframServer:
                 # Matches client's 30Hz accumulator stepping.
                 physics_dt = 1.0 / self.tick_rate_hz
 
+                if _phase_timing:
+                    _phase_t0 = time.perf_counter()
                 ctx.physics_step_count += 1
                 old_heading = ctx.player_heading
 
@@ -21672,12 +21727,17 @@ class WulframServer:
 
                 if move_dt > 1e-6:
                     self._update_player_position(ctx, dt_override=move_dt, heading_override=move_heading)
+                if _phase_timing:
+                    _phase_t_upp = time.perf_counter()
                 self._resolve_entity_entity_collisions(ctx)
                 self._update_player_aim(ctx)
                 self._regen_player_energy(ctx, physics_dt)
                 self._update_supply_buildings(ctx, physics_dt)
                 if os.environ.get("WULFRAM_TURRET_AI", "1") == "1":
                     self._update_turret_ai()
+
+                if _phase_timing:
+                    _phase_t_phys = time.perf_counter()
 
                 # Send debug sync state for measuring client-server divergence
                 if self.debug_sync:
@@ -22372,6 +22432,30 @@ class WulframServer:
                         f"[TICK-HEALTH] t={ctx.session.tick} type={pkt_type} "
                         f"udp={udp_addr} mask={mask_note} health_bytes={health_hex}"
                     )
+
+                if _phase_timing:
+                    _phase_t_end = time.perf_counter()
+                    _iter_ms = (_phase_t_end - _phase_t0) * 1000.0
+                    if _iter_ms >= _phase_timing_threshold_ms:
+                        _upp_ms = (_phase_t_upp - _phase_t0) * 1000.0
+                        _rest_phys_ms = (_phase_t_phys - _phase_t_upp) * 1000.0
+                        _send_ms = (_phase_t_end - _phase_t_phys) * 1000.0
+                        _coll = getattr(ctx, "_upp_collision_ms", 0.0)
+                        _bld = getattr(ctx, "_upp_building_ms", 0.0)
+                        _att = getattr(ctx, "_upp_attitude_ms", 0.0)
+                        try:
+                            with open(_phase_timing_path, "a") as _ptf:
+                                _ptf.write(
+                                    f"tick={ctx.session.tick} step={ctx.physics_step_count} "
+                                    f"iter_ms={_iter_ms:.2f} upp_ms={_upp_ms:.2f} "
+                                    f"collision_ms={_coll:.2f} building_ms={_bld:.2f} "
+                                    f"attitude_ms={_att:.2f} "
+                                    f"rest_phys_ms={_rest_phys_ms:.2f} send_ms={_send_ms:.2f} "
+                                    f"pos=({ctx.player_pos[0]:.1f},{ctx.player_pos[1]:.1f},"
+                                    f"{ctx.player_pos[2]:.1f})\n"
+                                )
+                        except Exception:
+                            pass
 
                 # Wall-clock pacing: preserve a capped fixed-step backlog when late.
                 next_tick_time, sleep_dt = self._advance_tick_pacer(

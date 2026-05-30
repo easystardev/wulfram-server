@@ -17,6 +17,7 @@ still keeps inferred pieces around contact recording and response ordering.
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -221,6 +222,9 @@ class TerrainGridCollision:
         self.height_offset = height_offset
         self.sector_rows = sector_rows
         self.sector_cols = sector_cols
+        # Per-step collision wall-clock budget (set by the server each physics step).
+        self._query_deadline = None
+        self._query_deadline_hits = 0
         normal_source = str(model_contact_normal_source or "mesh").strip().lower()
         self.model_contact_normal_source = (
             "terrain"
@@ -640,6 +644,20 @@ class TerrainGridCollision:
         contact_selection: str = "first",
     ) -> Optional[TerrainContact]:
         """Test sectorized terrain triangles against an entity collision mesh."""
+        # Per-step collision wall-clock budget. The swept-TOI + multi-hypothesis
+        # contact resolution issues dozens of these full mesh-vs-terrain CBSP queries
+        # per physics step; on a thrust-loaded tank grinding rough terrain that costs
+        # 100-1500 ms/step in CPython and collapses the 30 Hz controller cadence to
+        # ~3-8 Hz (the OG client runs the same physics at ~40 Hz). Once the step's
+        # deadline passes, further queries report "no contact" so the resolution
+        # finishes with what it already found and the tick stays real-time; the next
+        # tick re-resolves. Never triggers in normal play / unit tests (a single query
+        # is sub-millisecond). Set via WULFRAM_ENTITY_TERRAIN_CONTACT_TIME_BUDGET_MS=0.
+        # See docs/goal-runs/2026-05-30-controller-cadence-rootcause.md.
+        _deadline = getattr(self, "_query_deadline", None)
+        if _deadline is not None and time.perf_counter() > _deadline:
+            self._query_deadline_hits = getattr(self, "_query_deadline_hits", 0) + 1
+            return None
         if not self._all_finite((*center, heading, bounding_radius)):
             return None
         model_matrix = self._coerce_rotation_matrix(rotation_matrix)
@@ -1221,6 +1239,15 @@ class TerrainGridCollision:
         return None
 
     def _iter_cell_triangles(self, cell_x: int, cell_y: int):
+        # Per-step collision wall-clock budget (see test_model_collision). This is the
+        # common chokepoint every collision query iterates through, so checking the
+        # deadline here bounds even a single query that straddles many terrain cells
+        # (the rough-cell deep-contact case): once the deadline passes the generator
+        # yields no further triangles, so the resolution finishes with what it found.
+        _deadline = getattr(self, "_query_deadline", None)
+        if _deadline is not None and time.perf_counter() > _deadline:
+            self._query_deadline_hits = getattr(self, "_query_deadline_hits", 0) + 1
+            return
         x0 = cell_x * self.cell_x
         x1 = (cell_x + 1) * self.cell_x
         y0 = cell_y * self.cell_y
