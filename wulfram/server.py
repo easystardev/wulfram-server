@@ -5444,8 +5444,7 @@ class WulframServer:
                     packet = ctx.tcp_handler.recv()
                     if packet and len(packet) >= 2 and packet[0] == PacketType.LOGIN_REQUEST:
                         username, _ = handlers.decode_lp_string(packet, 2)
-                        if username:
-                            ctx.session.username = username
+                        handlers.apply_submitted_username(ctx.session, username)
                         break
                     elif packet and len(packet) >= 1 and packet[0] == PacketType.HELLO:
                         pending_hellos.append(packet)
@@ -5582,11 +5581,11 @@ class WulframServer:
             if pkt_type == PacketType.BPS:
                 self._handle_bps(ctx, packet)
             elif pkt_type == PacketType.LOGIN_REQUEST:
-                # Ignore late login packets once we've entered team select
-                if not ctx.session.login_complete:
-                    self._handle_login_request(ctx, packet)
-                else:
-                    print("[GAME] Ignoring LOGIN_REQUEST after login complete")
+                # A late LOGIN_REQUEST after team select is a re-login. Route it
+                # through the handler so a changed username is HONORED (behavior
+                # (c)) instead of dropped; the handler's login_complete branch
+                # re-acks with LOGIN_STATUS(8) and applies any new handle.
+                self._handle_login_request(ctx, packet)
             elif pkt_type == PacketType.WANT_UPDATES:
                 self._handle_want_updates(ctx, packet)
             elif pkt_type == PacketType.REINCARNATE:

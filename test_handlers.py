@@ -872,6 +872,61 @@ def test_remote_want_updates_suppresses_empty_tcp_update_array():
     return True
 
 
+def _build_login_request(username: str, password: str = "", sub_type: int = 0x00) -> bytes:
+    """Build a LOGIN_REQUEST (0x21) packet with length-prefixed strings."""
+    def lp(s: str) -> bytes:
+        encoded = s.encode("ascii") + b"\x00"
+        return struct.pack(">H", len(encoded)) + encoded
+
+    return bytes([0x21, sub_type]) + lp(username) + lp(password)
+
+
+def test_relogin_honors_changed_username_and_remembers_last():
+    """Behavior (c): a re-login on the same connection must HONOR a changed
+    username (not stay stuck on the first/cached one) while remembering the
+    last name as a default."""
+    from wulfram.handlers import handle_login_request
+
+    class DummyTCP:
+        def __init__(self):
+            self.sent = []
+
+        def send(self, payload):
+            self.sent.append(payload)
+
+    session = Session()
+    ctx = ClientContext(
+        client_id=3,
+        client_addr=("10.10.10.2", 50000),
+        session=session,
+        entity_id=1337,
+    )
+    ctx.tcp_handler = DummyTCP()
+    server = SimpleNamespace()
+
+    # First login: client submits "Alice" (sub_type 0 -> server requests password).
+    handle_login_request(server, ctx, _build_login_request("Alice"))
+    assert session.username == "Alice", session.username
+    assert session.last_username == "Alice", session.last_username
+    # First-login path still works: server asked for the password (LOGIN_STATUS 1).
+    assert any(p[:1] == b"\x22" and p[-1] == 1 for p in ctx.tcp_handler.sent), ctx.tcp_handler.sent
+
+    # Complete login, then the player returns to the handle screen and re-logs
+    # in with a DIFFERENT username on the SAME connection.
+    session.login_complete = True
+    ctx.tcp_handler.sent.clear()
+    handle_login_request(server, ctx, _build_login_request("Bob"))
+
+    # The NEW username must be applied (not silently kept as "Alice").
+    assert session.username == "Bob", f"sticky username: {session.username!r}"
+    assert session.last_username == "Bob", session.last_username
+    # And the client is re-acked with LOGIN_STATUS(8) so it doesn't time out.
+    assert any(p[:1] == b"\x22" and p[-1] == 8 for p in ctx.tcp_handler.sent), ctx.tcp_handler.sent
+
+    print("test_relogin_honors_changed_username_and_remembers_last: PASSED")
+    return True
+
+
 def test_remote_spawn_create_update_array_avoids_tcp():
     """Remote spawn pre-creation UPDATE_ARRAY should stay off TCP when UDP is ready."""
 
@@ -18071,6 +18126,7 @@ def main():
         test_remote_spawn_points_use_udp_not_tcp,
         test_send_initial_game_data_og_bootstrap_order,
         test_remote_want_updates_suppresses_empty_tcp_update_array,
+        test_relogin_honors_changed_username_and_remembers_last,
         test_build_chat_message_comm_layout,
         test_player_chat_respawn_despawns_and_clears_cached_spawn,
         test_build_update_array_remote_heartbeat_shape,

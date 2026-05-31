@@ -36,6 +36,10 @@ class Session:
 
     # Login state
     username: str = ""
+    # Last username this session has seen (remembered default for re-login).
+    # Behavior (c): we REMEMBER the prior name but always HONOR a freshly
+    # submitted one, so a returning player can change their handle.
+    last_username: str = ""
     session_key: str = ""
     login_password_requested: bool = False
     login_game_service_requested: bool = False
@@ -87,6 +91,9 @@ class Session:
         self.phase = Phase.DISCONNECTED
         self.connected_at = time.monotonic()
         self.username = ""
+        # Intentionally preserve last_username across reset so it can serve as a
+        # remembered default for re-login. The active username is always cleared
+        # so a fresh LOGIN must re-supply (and may change) the handle.
         self.session_key = ""
         self.login_password_requested = False
         self.login_game_service_requested = False

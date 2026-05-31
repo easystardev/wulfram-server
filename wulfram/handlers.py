@@ -279,6 +279,22 @@ def handle_hello(server: "WulframServer", ctx: "ClientContext", packet: bytes):
         ctx.tcp_handler.send(build_hello_session_key(key))
 
 
+def apply_submitted_username(session, username: str) -> bool:
+    """Adopt a freshly submitted username, remembering it as the default.
+
+    Behavior (c) for the "sticky username" problem: the server REMEMBERS the
+    last username (``session.last_username``) so it can be used as a default,
+    but always HONORS whatever the client submits on a LOGIN so a returning
+    player can CHANGE their handle. Returns True if a non-empty username was
+    applied.
+    """
+    if not username:
+        return False
+    session.username = username
+    session.last_username = username
+    return True
+
+
 def handle_login_request(server: "WulframServer", ctx: "ClientContext", packet: bytes):
     """Handle LOGIN_REQUEST packet."""
     if len(packet) < 2:
@@ -289,7 +305,20 @@ def handle_login_request(server: "WulframServer", ctx: "ClientContext", packet: 
         # OG game-service flow: client sends LOGIN_REQUEST after bootstrap.
         # Respond with LOGIN_STATUS(8) so the client knows login succeeded.
         # Without this response, the client times out → Protocol Mismatch.
-        print(f"[LOGIN] Client {ctx.client_id}: Late LOGIN_REQUEST after login complete → sending LOGIN_STATUS(8)")
+        #
+        # Behavior (c): a re-login on the same connection (player returns to the
+        # handle screen and resubmits) must HONOR a changed username instead of
+        # silently keeping the first/cached one. Parse the resubmitted handle and
+        # apply it before acknowledging, so the name is never "stuck".
+        if len(packet) >= 2:
+            resubmitted, _ = decode_lp_string(packet, 2)
+            if resubmitted and resubmitted != session.username:
+                apply_submitted_username(session, resubmitted)
+                print(
+                    f"[LOGIN] Client {ctx.client_id}: re-login changed username "
+                    f"-> {resubmitted!r}"
+                )
+        print(f"[LOGIN] Client {ctx.client_id}: Late LOGIN_REQUEST after login complete -> sending LOGIN_STATUS(8)")
         ctx.tcp_handler.send(build_login_status(8, is_donor=True))
         return
 
@@ -298,8 +327,7 @@ def handle_login_request(server: "WulframServer", ctx: "ClientContext", packet: 
     username, offset = decode_lp_string(packet, offset)
     password, offset = decode_lp_string(packet, offset)
 
-    if username:
-        session.username = username
+    apply_submitted_username(session, username)
 
     # Parse optional game-service extra data (subtypes 2/3/4)
     extra_count = None
