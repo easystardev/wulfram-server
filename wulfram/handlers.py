@@ -879,9 +879,9 @@ def _player_chat_cmd_respawn(server: "WulframServer", ctx: "ClientContext", args
 
 
 def _player_chat_cmd_help(server: "WulframServer", ctx: "ClientContext", args: list) -> None:
-    """/help: list the available player chat commands."""
-    listing = ", ".join(f"/{name}" for name in PLAYER_CHAT_COMMANDS_HELP)
-    _send_chat_reply(ctx, f"Commands: {listing}")
+    """help: list the available player chat commands."""
+    listing = ", ".join(PLAYER_CHAT_COMMANDS_HELP)
+    _send_chat_reply(ctx, f"Commands: {listing} (type the word, or prefix with !)")
 
 
 # Player-facing chat command table. Each handler receives (server, ctx, args)
@@ -893,33 +893,56 @@ PLAYER_CHAT_COMMANDS = {
     "help": _player_chat_cmd_help,
 }
 
-# Canonical command names shown by /help (aliases like /rs are omitted).
+# Canonical command names shown by help (aliases like rs are omitted).
 PLAYER_CHAT_COMMANDS_HELP = ("respawn", "help")
+
+# Optional leading punctuation a player may type before a command. The OG client
+# intercepts a leading '/' as a whisper-destination selector (it never reaches
+# the server), so players use a bare keyword or one of these prefixes. The Python
+# client can still send a literal '/respawn'. '!' / '.' are forwarded verbatim by
+# the OG client as ordinary message text.
+_PLAYER_CMD_PREFIXES = ("/", "!", ".")
 
 
 def dispatch_player_chat_command(
     server: "WulframServer", ctx: Optional["ClientContext"], text: str
 ) -> bool:
-    """Parse and dispatch a '/'-prefixed player chat command (self-scoped).
+    """Parse and dispatch a self-scoped player chat command, transport-agnostic.
 
-    Returns True if the message was consumed as a player command (the caller
-    must stop processing it), or False if it is not a player command and should
-    fall through to legacy handling below (e.g. the '/s spawn' shortcut).
-    Unknown '/commands' get a polite chat reply and are consumed (return True).
+    Works for whatever a comm message carries — a bare keyword (``respawn``), a
+    prefixed token (``!respawn`` / ``/respawn``), in any send mode. Returns True
+    if the message was consumed as a player command (caller must stop), or False
+    if it is ordinary chat / a non-command (e.g. the ``/s spawn`` shortcut) that
+    should fall through to legacy handling.
+
+    Safety: a *bare* unknown word is ordinary chat — left untouched (returns
+    False, no reply). Only an explicitly *prefixed* unknown token gets a polite
+    "unknown command" reply, so normal conversation never trips a command.
     """
-    if ctx is None or not text.startswith("/"):
+    if ctx is None or not text:
         return False
-    parts = text[1:].split()
+    stripped = text.strip()
+    if not stripped:
+        return False
+
+    had_prefix = stripped[0] in _PLAYER_CMD_PREFIXES
+    if had_prefix:
+        stripped = stripped[1:].strip()
+    parts = stripped.split()
     if not parts:
         return False
+
     name = parts[0].lower()
-    # '/s ...' is a legacy spawn/uplink shortcut handled by the caller.
+    # '/s ...' (and bare 's ...') is the legacy spawn/uplink shortcut; not ours.
     if name == "s":
         return False
+
     handler = PLAYER_CHAT_COMMANDS.get(name)
     if handler is None:
-        _send_chat_reply(ctx, f"Unknown command: /{name} (try /help)")
-        return True
+        if had_prefix:
+            _send_chat_reply(ctx, f"Unknown command: {name} (try 'help')")
+            return True
+        return False  # bare unknown word → ordinary chat, leave it alone
     handler(server, ctx, parts[1:])
     return True
 
@@ -957,8 +980,10 @@ def handle_udp_chat(server: "WulframServer", ctx: Optional["ClientContext"], dat
 
     cmd = msg.strip()
 
-    # Player-facing slash commands (/respawn, /rs, /help, ...) act on this
-    # player's own ctx only. '/s ...' falls through to the legacy path below.
+    # Player self-commands (respawn/help) normally run via the shared comm
+    # handler above (covers TCP + UDP). This is a fallback for the bare-UDP path
+    # if that handler is absent; it only runs when the comm handler did not
+    # already consume the message. '/s ...' falls through to the legacy path.
     if dispatch_player_chat_command(server, ctx, cmd):
         return
 

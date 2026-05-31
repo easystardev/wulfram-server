@@ -521,6 +521,23 @@ def handle_comm_message_request(
         return event
 
     text = str(decoded.get("text") or "")
+
+    # Player self-commands (respawn/help) ride ordinary chat text, so they work
+    # over any transport (TCP / UDP / reliable-UDP) and any send mode — unlike a
+    # leading '/', which the OG client eats as a whisper-destination selector and
+    # never sends. Checked before the build-uplink type-2 gate and independent of
+    # the MVP flag so respawn always works.
+    if handlers.dispatch_player_chat_command(server, ctx, text):
+        event["handled"] = True
+        event["player_command"] = text
+        if ctx is not None:
+            ctx.last_player_chat_command = text
+        print(
+            f"[CHAT-CMD] c{getattr(ctx, 'client_id', '?')} {transport} "
+            f"text={text!r} -> handled"
+        )
+        return event
+
     msg_type = int(decoded.get("message_type") or 0)
     if msg_type != 2:
         return event

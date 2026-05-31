@@ -1126,16 +1126,79 @@ def test_player_chat_respawn_despawns_and_clears_cached_spawn():
     assert ctx3.session.phase == Phase.IN_GAME
     assert ctx3.pending_respawn_pos == wonked_pos  # untouched
 
-    # 4) Unknown /commands get a polite reply, not a despawn.
+    # 4) Unknown PREFIXED commands get a polite reply, not a despawn.
     sent4 = []
     ctx4 = _make_spawned_chat_ctx(sent4, wonked_pos)
     server._snapshot_in_game_clients = lambda: [ctx4]
-    handle_udp_chat(server, ctx4, _build_comm_req_packet("/wibble"), addr)
+    handle_udp_chat(server, ctx4, _build_comm_req_packet("!wibble"), addr)
     assert not any(p[:1] == b"\x15" for p in sent4), "unknown command must not despawn"
     unknown_chat = [p for p in sent4 if p[:1] == b"\x1F"]
     assert unknown_chat and b"Unknown command" in unknown_chat[-1], unknown_chat
 
+    # 5) BARE keyword 'respawn' (the OG-client path — no leading '/', which the
+    #    OG client would eat as a whisper destination) must despawn.
+    sent5 = []
+    ctx5 = _make_spawned_chat_ctx(sent5, wonked_pos)
+    server._snapshot_in_game_clients = lambda: [ctx5]
+    handle_udp_chat(server, ctx5, _build_comm_req_packet("respawn"), addr)
+    assert any(p[:1] == b"\x15" for p in sent5), "bare 'respawn' should despawn"
+    assert ctx5.pending_respawn_pos is None
+
+    # 6) '!respawn' prefix also works.
+    sent6 = []
+    ctx6 = _make_spawned_chat_ctx(sent6, wonked_pos)
+    server._snapshot_in_game_clients = lambda: [ctx6]
+    handle_udp_chat(server, ctx6, _build_comm_req_packet("!respawn"), addr)
+    assert any(p[:1] == b"\x15" for p in sent6), "'!respawn' should despawn"
+
+    # 7) A bare UNKNOWN word is ordinary chat — no despawn, no 'unknown' reply.
+    sent7 = []
+    ctx7 = _make_spawned_chat_ctx(sent7, wonked_pos)
+    server._snapshot_in_game_clients = lambda: [ctx7]
+    handle_udp_chat(server, ctx7, _build_comm_req_packet("respawning soon lol"), addr)
+    assert not any(p[:1] == b"\x15" for p in sent7), "multi-word chat must not despawn"
+    assert ctx7.session.phase == Phase.IN_GAME
+
     print("test_player_chat_respawn_despawns_and_clears_cached_spawn: PASSED")
+    return True
+
+
+def test_player_chat_respawn_via_tcp_comm_handler():
+    """The real Python client sends COMM_MESSAGE_REQUEST over TCP, and the OG
+    client only sends plain text — both arrive via the shared comm handler.
+    A plain 'respawn' through that TCP path must despawn the player."""
+    wonked_pos = (1111.0, 2222.0, -3.0)
+
+    server = WulframServer.__new__(WulframServer)
+    server.up_axis = "z"
+    server.spawn_height = 5.0
+    server._get_network_tick = lambda ctx: 99
+    server._snapshot_in_game_clients = lambda: [ctx]
+    server.build_uplink_mvp = False  # respawn must work even with MVP disabled
+    server._build_uplink_command_events = []
+
+    control = ControlServer.__new__(ControlServer)
+    control.server = server
+    server.control_server = control
+
+    sent = []
+    ctx = _make_spawned_chat_ctx(sent, wonked_pos)
+
+    # TCP COMM_MESSAGE_REQUEST body: message_type(u16) + flags(u16) + lp_string.
+    # Use message_type=4 (ALL) to prove it is NOT gated to team(2) like uplink.
+    text = b"respawn"
+    body = struct.pack(">H", 4) + struct.pack(">H", 0) + struct.pack(">H", len(text)) + text
+    packet = b"\x20" + body
+
+    event = server._handle_tcp_comm_message_request(ctx, packet)
+
+    assert event.get("handled") is True, event
+    assert any(p[:1] == b"\x15" for p in sent), "TCP 'respawn' should despawn"
+    assert ctx.pending_respawn_pos is None
+    assert ctx.session.phase == Phase.TEAM_SELECT
+    assert any(p[:1] == b"\x1F" and b"Despawning" in p for p in sent), "expected chat reply"
+
+    print("test_player_chat_respawn_via_tcp_comm_handler: PASSED")
     return True
 
 
@@ -18129,6 +18192,7 @@ def main():
         test_relogin_honors_changed_username_and_remembers_last,
         test_build_chat_message_comm_layout,
         test_player_chat_respawn_despawns_and_clears_cached_spawn,
+        test_player_chat_respawn_via_tcp_comm_handler,
         test_build_update_array_remote_heartbeat_shape,
         test_server_remote_heartbeat_helper_keeps_full_local_state,
         test_server_remote_heartbeat_helper_pre_state_request_is_spawn_safe,
