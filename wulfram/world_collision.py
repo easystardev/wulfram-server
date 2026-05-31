@@ -225,6 +225,9 @@ class TerrainGridCollision:
         # Per-step collision wall-clock budget (set by the server each physics step).
         self._query_deadline = None
         self._query_deadline_hits = 0
+        # Cache of precomputed per-CBSP-node mesh triangles (vertices/normal/plane-d).
+        # The entity collision mesh is static, so these are recomputed-once not per query.
+        self._node_mesh_cache: dict = {}
         normal_source = str(model_contact_normal_source or "mesh").strip().lower()
         self.model_contact_normal_source = (
             "terrain"
@@ -1379,6 +1382,39 @@ class TerrainGridCollision:
             abs(axis[2]) * half_extents[2]
         )
 
+    def _node_mesh_triangles(self, node, vertices):
+        """Precompute (and cache) the static per-CBSP-leaf-node mesh triangles with their
+        face normal and plane-d. These depend only on the (static) entity collision mesh,
+        but the scalar path rebuilt them on every query (cross/normalize/dot + vertex
+        attribute access for every mesh triangle of every visited node). id(node) is a
+        stable key because the cbsp_tree/vertices come from the cached collision model.
+        Degenerate (zero-normal) triangles are skipped here exactly as the scalar leaf
+        loop skipped them (they can never produce a contact). Parity-preserving."""
+        cache = self._node_mesh_cache
+        cached = cache.get(id(node))
+        if cached is not None:
+            return cached
+        nverts = len(vertices)
+        result = []
+        for mesh_tri_indices in node.triangles:
+            i0, i1, i2 = mesh_tri_indices
+            if i0 >= nverts or i1 >= nverts or i2 >= nverts:
+                continue
+            v0 = vertices[i0]; v1 = vertices[i1]; v2 = vertices[i2]
+            mesh_tri = (
+                (v0.x, v0.y, v0.z),
+                (v1.x, v1.y, v1.z),
+                (v2.x, v2.y, v2.z),
+            )
+            mesh_normal_raw = _cross3(_sub3(mesh_tri[1], mesh_tri[0]), _sub3(mesh_tri[2], mesh_tri[0]))
+            mesh_normal = _normalize3(mesh_normal_raw)
+            if mesh_normal is None:
+                continue
+            mesh_plane_d = -_dot3(mesh_normal, mesh_tri[0])
+            result.append((mesh_tri_indices, mesh_tri, mesh_normal, mesh_plane_d))
+        cache[id(node)] = result
+        return result
+
     def _triangle_cbsp_contact(
         self,
         tri_local,
@@ -1449,8 +1485,13 @@ class TerrainGridCollision:
                 ),
             )
 
+        _copysign = math.copysign
+
         def signbits_differ(value_a: float, value_b: float) -> bool:
-            return _signbit(value_a) != _signbit(value_b)
+            # Inlined _signbit (bit-identical): removes ~1.2M nested-call frames per 600
+            # CBSP queries in the edge-straddle tests, keeping copysign sign-bit semantics
+            # (handles -0.0) exactly as _signbit. See test_collision_parity.py.
+            return (_copysign(1.0, value_a) < 0.0) != (_copysign(1.0, value_b) < 0.0)
 
         def edge_crosses_plane(dist_a: float, dist_b: float) -> bool:
             return signbits_differ(dist_a, dist_b)
@@ -1498,23 +1539,9 @@ class TerrainGridCollision:
             if len(clip_points) > 2:
                 clip_points = clip_points[:2]
 
-            for mesh_tri_indices in node.triangles:
-                i0, i1, i2 = mesh_tri_indices
-                if i0 >= len(vertices) or i1 >= len(vertices) or i2 >= len(vertices):
-                    continue
-                mesh_tri = (
-                    (vertices[i0].x, vertices[i0].y, vertices[i0].z),
-                    (vertices[i1].x, vertices[i1].y, vertices[i1].z),
-                    (vertices[i2].x, vertices[i2].y, vertices[i2].z),
-                )
+            for mesh_tri_indices, mesh_tri, mesh_normal, mesh_plane_d in self._node_mesh_triangles(node, vertices):
                 if not self._triangle_overlaps_aabb(mesh_tri, tri_aabb_min, tri_aabb_max):
                     continue
-
-                mesh_normal_raw = _cross3(_sub3(mesh_tri[1], mesh_tri[0]), _sub3(mesh_tri[2], mesh_tri[0]))
-                mesh_normal = _normalize3(mesh_normal_raw)
-                if mesh_normal is None:
-                    continue
-                mesh_plane_d = -_dot3(mesh_normal, mesh_tri[0])
 
                 for clip_index, clip_point in enumerate(clip_points):
                     if point_inside_mesh_triangle(clip_point, mesh_tri, mesh_normal):
@@ -2319,30 +2346,39 @@ class TerrainGridCollision:
 
     @staticmethod
     def _segment_triangle_intersection(p0, p1, tri, eps: float = 1e-6):
-        edge1 = _sub3(tri[1], tri[0])
-        edge2 = _sub3(tri[2], tri[0])
-        direction = _sub3(p1, p0)
-        h = _cross3(direction, edge2)
-        det = _dot3(edge1, h)
+        # Inlined Moeller-Trumbore (bit-identical to the _sub3/_cross3/_dot3 form):
+        # eliminates ~9 scalar-helper calls/invocation (this is ~3-4 of every collision
+        # query in the rough-cell hot path). See test_collision_parity.py.
+        t0 = tri[0]
+        t0x = t0[0]; t0y = t0[1]; t0z = t0[2]
+        t1 = tri[1]; t2 = tri[2]
+        e1x = t1[0] - t0x; e1y = t1[1] - t0y; e1z = t1[2] - t0z
+        e2x = t2[0] - t0x; e2y = t2[1] - t0y; e2z = t2[2] - t0z
+        p0x = p0[0]; p0y = p0[1]; p0z = p0[2]
+        dx = p1[0] - p0x; dy = p1[1] - p0y; dz = p1[2] - p0z
+        # h = cross(direction, edge2)
+        hx = dy * e2z - dz * e2y
+        hy = dz * e2x - dx * e2z
+        hz = dx * e2y - dy * e2x
+        det = e1x * hx + e1y * hy + e1z * hz
         if -eps < det < eps:
             return None
         inv_det = 1.0 / det
-        s = _sub3(p0, tri[0])
-        u = inv_det * _dot3(s, h)
+        sx = p0x - t0x; sy = p0y - t0y; sz = p0z - t0z
+        u = inv_det * (sx * hx + sy * hy + sz * hz)
         if u < -eps or u > 1.0 + eps:
             return None
-        q = _cross3(s, edge1)
-        v = inv_det * _dot3(direction, q)
+        # q = cross(s, edge1)
+        qx = sy * e1z - sz * e1y
+        qy = sz * e1x - sx * e1z
+        qz = sx * e1y - sy * e1x
+        v = inv_det * (dx * qx + dy * qy + dz * qz)
         if v < -eps or (u + v) > 1.0 + eps:
             return None
-        t = inv_det * _dot3(edge2, q)
+        t = inv_det * (e2x * qx + e2y * qy + e2z * qz)
         if t < -eps or t > 1.0 + eps:
             return None
-        return (
-            p0[0] + direction[0] * t,
-            p0[1] + direction[1] * t,
-            p0[2] + direction[2] * t,
-        )
+        return (p0x + dx * t, p0y + dy * t, p0z + dz * t)
 
     @staticmethod
     def _point_plane_distance(point, tri, normal) -> float:
@@ -2350,12 +2386,24 @@ class TerrainGridCollision:
 
     @staticmethod
     def _point_in_triangle(point, tri, normal, eps: float = 1e-5) -> bool:
+        # Inlined (bit-identical to the _sub3/_cross3/_dot3 form): for each edge,
+        # dot(normal, cross(edge, point-start)) must be >= -eps. ~12 scalar-helper
+        # calls/invocation removed; this is one of the hottest leaves. See
+        # test_collision_parity.py.
+        nx = normal[0]; ny = normal[1]; nz = normal[2]
+        px = point[0]; py = point[1]; pz = point[2]
+        neg_eps = -eps
         for idx in range(3):
             start = tri[idx]
             end = tri[(idx + 1) % 3]
-            edge = _sub3(end, start)
-            to_point = _sub3(point, start)
-            if _dot3(normal, _cross3(edge, to_point)) < -eps:
+            sx = start[0]; sy = start[1]; sz = start[2]
+            edx = end[0] - sx; edy = end[1] - sy; edz = end[2] - sz
+            tpx = px - sx; tpy = py - sy; tpz = pz - sz
+            # cross(edge, to_point)
+            cx = edy * tpz - edz * tpy
+            cy = edz * tpx - edx * tpz
+            cz = edx * tpy - edy * tpx
+            if nx * cx + ny * cy + nz * cz < neg_eps:
                 return False
         return True
 
@@ -2409,35 +2457,67 @@ class TerrainGridCollision:
         return cls._guess7_point_in_triangle_terms(point, ordered, normal)
 
     def _triangles_intersection_point(self, tri_a, tri_b):
-        for idx in range(3):
-            hit = self._segment_triangle_intersection(tri_a[idx], tri_a[(idx + 1) % 3], tri_b)
-            if hit is not None:
-                return hit
-        for idx in range(3):
-            hit = self._segment_triangle_intersection(tri_b[idx], tri_b[(idx + 1) % 3], tri_a)
-            if hit is not None:
-                return hit
-
+        # Parity-preserving separating-plane early-reject. If every vertex of one triangle
+        # is strictly on one side of the OTHER triangle's plane, no edge of either triangle
+        # can cross the other (so all 6 segment-triangle tests below would miss). In that
+        # case skip the 6 segment tests — but still run the coplanar vertex checks exactly
+        # as before, so the result is identical to the original for every pair (separated
+        # pairs returned via the segments-miss + coplanar path anyway). This skips the
+        # expensive segment sweep for the many near-but-not-crossing pairs in deep contact.
+        # Strict (> 0 / < 0) so a vertex on the plane never triggers a skip. The two face
+        # normals are computed up front here instead of only in the coplanar tail.
+        # See test_collision_parity.py.
         normal_b = _normalize3(_cross3(_sub3(tri_b[1], tri_b[0]), _sub3(tri_b[2], tri_b[0])))
+        normal_a = _normalize3(_cross3(_sub3(tri_a[1], tri_a[0]), _sub3(tri_a[2], tri_a[0])))
+        separated = False
+        if normal_b is not None:
+            db = -_dot3(normal_b, tri_b[0])
+            a0 = _dot3(normal_b, tri_a[0]) + db
+            a1 = _dot3(normal_b, tri_a[1]) + db
+            a2 = _dot3(normal_b, tri_a[2]) + db
+            if (a0 > 0.0 and a1 > 0.0 and a2 > 0.0) or (a0 < 0.0 and a1 < 0.0 and a2 < 0.0):
+                separated = True
+        if not separated and normal_a is not None:
+            da = -_dot3(normal_a, tri_a[0])
+            b0 = _dot3(normal_a, tri_b[0]) + da
+            b1 = _dot3(normal_a, tri_b[1]) + da
+            b2 = _dot3(normal_a, tri_b[2]) + da
+            if (b0 > 0.0 and b1 > 0.0 and b2 > 0.0) or (b0 < 0.0 and b1 < 0.0 and b2 < 0.0):
+                separated = True
+
+        if not separated:
+            for idx in range(3):
+                hit = self._segment_triangle_intersection(tri_a[idx], tri_a[(idx + 1) % 3], tri_b)
+                if hit is not None:
+                    return hit
+            for idx in range(3):
+                hit = self._segment_triangle_intersection(tri_b[idx], tri_b[(idx + 1) % 3], tri_a)
+                if hit is not None:
+                    return hit
+
         if normal_b is not None and abs(self._point_plane_distance(tri_a[0], tri_b, normal_b)) <= 1e-5:
             if self._point_in_triangle(tri_a[0], tri_b, normal_b):
                 return tri_a[0]
-        normal_a = _normalize3(_cross3(_sub3(tri_a[1], tri_a[0]), _sub3(tri_a[2], tri_a[0])))
         if normal_a is not None and abs(self._point_plane_distance(tri_b[0], tri_a, normal_a)) <= 1e-5:
             if self._point_in_triangle(tri_b[0], tri_a, normal_a):
                 return tri_b[0]
         return None
 
     def _terrain_triangle_vertex_contact(self, terrain_tri, mesh_tri, terrain_normal):
-        plane_vertex = terrain_tri[0]
+        # Inlined _dot3/_sub3 (bit-identical). Runs per mesh triangle on the steep-cell
+        # fallback path. See test_collision_parity.py.
+        p0 = terrain_tri[0]
+        p0x = p0[0]; p0y = p0[1]; p0z = p0[2]
+        nx = terrain_normal[0]; ny = terrain_normal[1]; nz = terrain_normal[2]
         for vertex in mesh_tri:
-            penetration = -_dot3(terrain_normal, _sub3(vertex, plane_vertex))
+            vx = vertex[0]; vy = vertex[1]; vz = vertex[2]
+            penetration = -(nx * (vx - p0x) + ny * (vy - p0y) + nz * (vz - p0z))
             if penetration <= 0.0:
                 continue
             projected = (
-                vertex[0] + terrain_normal[0] * penetration,
-                vertex[1] + terrain_normal[1] * penetration,
-                vertex[2] + terrain_normal[2] * penetration,
+                vx + nx * penetration,
+                vy + ny * penetration,
+                vz + nz * penetration,
             )
             if self._point_in_triangle(projected, terrain_tri, terrain_normal):
                 return projected, penetration

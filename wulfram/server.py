@@ -8783,20 +8783,23 @@ class WulframServer:
         ctx._world_collision_step_pre_vel = pre_vel
         ctx._world_collision_step_dt = dt
         _upp_t0 = time.perf_counter() if _upp_timing else 0.0
-        # Arm the per-step collision wall-clock budget so a single physics step's
-        # swept-TOI + multi-hypothesis contact resolution cannot stall the controller
-        # tick (rough-cell deep contact costs 100-1500 ms/step otherwise). Once the
-        # deadline passes, further test_model_collision queries report no-contact and
-        # the resolution finishes with what it found; the next tick re-resolves.
+        # Per-step collision wall-clock budget. DEFAULT OFF (0) now that the CBSP hot
+        # path is fast enough (the rough-H180 deep-stuck physics step resolves in ~4.6 ms
+        # median / 7.5 ms total after the inlining + separating-plane early-reject +
+        # static-geometry caches; see docs/goal-runs/2026-05-31-collision-perf-port.md),
+        # so collision runs UNBUDGETED and deterministic by default. Set
+        # WULFRAM_ENTITY_TERRAIN_CONTACT_TIME_BUDGET_MS to a positive millisecond value to
+        # re-enable it as a safety cap (it then truncates any step's contact resolution at
+        # that wall-clock deadline, trading determinism for a bounded worst case).
         tgc = getattr(self, "_terrain_grid_collision", None)
         if tgc is not None:
             try:
                 _coll_budget_ms = float(
-                    os.environ.get("WULFRAM_ENTITY_TERRAIN_CONTACT_TIME_BUDGET_MS", "25")
-                    or 25.0
+                    os.environ.get("WULFRAM_ENTITY_TERRAIN_CONTACT_TIME_BUDGET_MS", "0")
+                    or 0.0
                 )
             except ValueError:
-                _coll_budget_ms = 25.0
+                _coll_budget_ms = 0.0
             tgc._query_deadline = (
                 time.perf_counter() + _coll_budget_ms / 1000.0
                 if _coll_budget_ms > 0.0
@@ -9502,6 +9505,25 @@ class WulframServer:
         penetration_limit = max(bounding_radius * 1.25, 8.0)
         return normal_z < 0.1 and contact.penetration > penetration_limit
 
+    def _cached_mesh_aabb_half_extents(self, vertices):
+        """mesh_aabb_half_extents_from_vertices is a pure function of the (static)
+        collision-model vertices but was recomputed every physics step (~525 vertex
+        reads/call, a large fraction of the rough-cell collision cost). The model
+        vertices are held by _entity_collision_model_cache, so id(vertices) is a stable
+        cache key. Parity: returns the identical value, just memoised."""
+        if vertices is None:
+            return None
+        cache = getattr(self, "_mesh_aabb_half_extents_cache", None)
+        if cache is None:
+            cache = {}
+            self._mesh_aabb_half_extents_cache = cache
+        key = id(vertices)
+        cached = cache.get(key)
+        if cached is None:
+            cached = (mesh_aabb_half_extents_from_vertices(vertices), True)
+            cache[key] = cached
+        return cached[0]
+
     def _resolve_entity_world_collision(
         self,
         ctx,
@@ -9735,7 +9757,7 @@ class WulframServer:
         if collision_model is not None:
             vertices, cbsp_tree, bounding_radius, z_lift = collision_model
             inertia_half_extents = (
-                mesh_aabb_half_extents_from_vertices(vertices) or half_extents
+                self._cached_mesh_aabb_half_extents(vertices) or half_extents
             )
         else:
             vertices = None
@@ -22483,6 +22505,22 @@ class WulframServer:
 def main():
     """Entry point."""
     server = WulframServer()
+    # Latency: the per-step terrain collision allocates millions of short-lived tuples
+    # (CBSP vector math), so generational GC sweeps of the large, permanent startup heap
+    # (loaded terrain/collision meshes) cause intermittent multi-10ms pauses on the
+    # controller tick. Freeze the startup heap into the permanent generation so GC no
+    # longer rescans it, and relax the gen-0 threshold so collections are rarer. Pure
+    # latency tuning — no behaviour/parity change. Disable via WULFRAM_GC_TUNE=0.
+    if os.environ.get("WULFRAM_GC_TUNE", "1") != "0":
+        try:
+            import gc
+
+            gc.collect()
+            gc.freeze()
+            gc.set_threshold(50000, 500, 500)
+            print("[GC] froze startup heap, gen0 threshold=50000 (latency tuning)")
+        except Exception as exc:
+            print(f"[GC] tuning failed: {exc}")
     server.start()
 
 
