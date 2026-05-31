@@ -817,6 +817,85 @@ def recent_control_pose_spawn_block(ctx: "ClientContext", now: Optional[float] =
     }
 
 
+def _send_chat_reply(ctx: Optional["ClientContext"], text: str) -> bool:
+    """Send a chat-message reply to a single player's own client.
+
+    Self-scoped: writes only to the given ctx's TCP handler. Returns True if a
+    packet was queued, False if there was no client to send to.
+    """
+    if ctx is None or not getattr(ctx, "tcp_handler", None):
+        return False
+    source_id = (ctx.session.player_id if ctx.session else 0) or ctx.entity_id or 0
+    ctx.tcp_handler.send(build_chat_message(text, source_id=source_id))
+    return True
+
+
+def _player_chat_cmd_respawn(server: "WulframServer", ctx: "ClientContext", args: list) -> None:
+    """/respawn (/rs): despawn the player's own tank and return them to the
+    team/map screen for a FRESH map spawn.
+
+    Delegates to ControlServer._despawn_client, which removes the entity,
+    cancels any scheduled respawn, and CLEARS ctx.pending_respawn_pos so the
+    next spawn comes from the team map spawn point (not the pre-despawn pos).
+    """
+    control = getattr(server, "control_server", None)
+    despawn = getattr(control, "_despawn_client", None) if control is not None else None
+    if callable(despawn):
+        despawn(ctx)
+    else:
+        # Defensive fallback: at minimum, never let a stale cached spawn
+        # position survive a /respawn request.
+        if hasattr(ctx, "pending_respawn_pos"):
+            ctx.pending_respawn_pos = None
+    _send_chat_reply(ctx, "Despawning - pick a spawn point")
+
+
+def _player_chat_cmd_help(server: "WulframServer", ctx: "ClientContext", args: list) -> None:
+    """/help: list the available player chat commands."""
+    listing = ", ".join(f"/{name}" for name in PLAYER_CHAT_COMMANDS_HELP)
+    _send_chat_reply(ctx, f"Commands: {listing}")
+
+
+# Player-facing chat command table. Each handler receives (server, ctx, args)
+# and may ONLY act on the player's own ctx — no operator/privileged commands are
+# reachable from the chat path. Extend by adding entries here (e.g. /who later).
+PLAYER_CHAT_COMMANDS = {
+    "respawn": _player_chat_cmd_respawn,
+    "rs": _player_chat_cmd_respawn,
+    "help": _player_chat_cmd_help,
+}
+
+# Canonical command names shown by /help (aliases like /rs are omitted).
+PLAYER_CHAT_COMMANDS_HELP = ("respawn", "help")
+
+
+def dispatch_player_chat_command(
+    server: "WulframServer", ctx: Optional["ClientContext"], text: str
+) -> bool:
+    """Parse and dispatch a '/'-prefixed player chat command (self-scoped).
+
+    Returns True if the message was consumed as a player command (the caller
+    must stop processing it), or False if it is not a player command and should
+    fall through to legacy handling below (e.g. the '/s spawn' shortcut).
+    Unknown '/commands' get a polite chat reply and are consumed (return True).
+    """
+    if ctx is None or not text.startswith("/"):
+        return False
+    parts = text[1:].split()
+    if not parts:
+        return False
+    name = parts[0].lower()
+    # '/s ...' is a legacy spawn/uplink shortcut handled by the caller.
+    if name == "s":
+        return False
+    handler = PLAYER_CHAT_COMMANDS.get(name)
+    if handler is None:
+        _send_chat_reply(ctx, f"Unknown command: /{name} (try /help)")
+        return True
+    handler(server, ctx, parts[1:])
+    return True
+
+
 def handle_udp_chat(server: "WulframServer", ctx: Optional["ClientContext"], data: bytes, addr: tuple):
     """Handle UDP COMM_REQ (0x20) for /s spawn and uplink commands."""
     if len(data) < 9:
@@ -849,6 +928,12 @@ def handle_udp_chat(server: "WulframServer", ctx: Optional["ClientContext"], dat
             return
 
     cmd = msg.strip()
+
+    # Player-facing slash commands (/respawn, /rs, /help, ...) act on this
+    # player's own ctx only. '/s ...' falls through to the legacy path below.
+    if dispatch_player_chat_command(server, ctx, cmd):
+        return
+
     if cmd.lower().startswith("/s "):
         cmd = cmd[3:].strip()
 

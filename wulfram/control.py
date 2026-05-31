@@ -2888,6 +2888,67 @@ Examples:
         print(f"[RESPAWN] Scheduled respawn for c{ctx.client_id} in {respawn_delay:.0f}s")
         return f"spawn={pos_str} -- respawning in {respawn_delay:.0f}s"
 
+    def _despawn_client(self, ctx) -> str:
+        """Despawn a single client's tank and return them to TEAM_SELECT.
+
+        Removes the entity from every client (DELETE_OBJECT), cancels any
+        pending/delayed respawn, resets server-side physics state, and CLEARS
+        ``ctx.pending_respawn_pos`` so the next spawn is resolved from the
+        team's real map spawn point rather than the pre-despawn position
+        (see WulframServer._auto_join_team, which prefers pending_respawn_pos).
+
+        This is the shared core for the operator ``despawn`` command and the
+        player-facing ``/respawn`` chat command. The caller is responsible for
+        choosing which ``ctx`` to act on (self-only for the player path).
+        Returns a status string.
+        """
+        entity_id = ctx.entity_id or (ctx.session.entity_id if ctx.session else 0)
+        if not entity_id:
+            # Even with no live entity, drop any stale cached spawn position so
+            # the next spawn cannot reuse a wonked location.
+            ctx.pending_respawn_pos = None
+            return f"Client {ctx.client_id}: no entity to despawn"
+
+        # Send DELETE_OBJECT to all clients
+        delete_pkt = build_delete_object(
+            tick=self.server._get_network_tick(ctx),
+            entity_ids=[entity_id],
+            with_effects=True,
+        )
+        if ctx.tcp_handler:
+            ctx.tcp_handler.send(delete_pkt)
+        for other in self.server._snapshot_in_game_clients():
+            if other is ctx:
+                continue
+            other.known_entity_ids.discard(entity_id)
+            if other.tcp_handler:
+                other.tcp_handler.send(delete_pkt)
+
+        # Reset session state — no delayed respawn
+        ctx.session.in_game = False
+        ctx.session.phase = Phase.TEAM_SELECT
+        ctx.session.entity_id = 0
+        # Cancel any pending delayed spawn
+        ctx.session.delayed_spawn_time = 0
+        ctx.session.delayed_spawn_team = 0
+        # Reset physics state
+        ctx.player_health = 1.0
+        ctx.player_vel = (0.0, 0.0, 0.0)
+        ctx.player_speed = 0.0
+        ctx.player_heading = 0.0
+        ctx.angular_vel_yaw = 0.0
+        ctx.world_collision_ref_pos = ctx.player_pos
+        ctx.world_collision_bounds_dirty = False
+        # Clear cached spawn position so the next spawn uses the team map
+        # spawn point, not the (possibly wonked) pre-despawn location.
+        ctx.pending_respawn_pos = None
+        if ctx.vehicle_physics:
+            ctx.vehicle_physics.heading = 0.0
+            ctx.vehicle_physics._angular_velocity = 0.0
+
+        print(f"[DESPAWN] Client {ctx.client_id} entity {entity_id} removed, phase->TEAM_SELECT")
+        return f"Client {ctx.client_id}: despawned entity {entity_id}, now TEAM_SELECT"
+
     def _cmd_despawn(self, args: list) -> str:
         """Kill and despawn a player without re-spawning.
 
@@ -2903,53 +2964,11 @@ Examples:
         if not self.server:
             return "Error: No server reference"
 
-        def _despawn_one(ctx) -> str:
-            entity_id = ctx.entity_id or (ctx.session.entity_id if ctx.session else 0)
-            if not entity_id:
-                return f"Client {ctx.client_id}: no entity to despawn"
-
-            # Send DELETE_OBJECT to all clients
-            delete_pkt = build_delete_object(
-                tick=self.server._get_network_tick(ctx),
-                entity_ids=[entity_id],
-                with_effects=True,
-            )
-            if ctx.tcp_handler:
-                ctx.tcp_handler.send(delete_pkt)
-            for other in self.server._snapshot_in_game_clients():
-                if other is ctx:
-                    continue
-                other.known_entity_ids.discard(entity_id)
-                if other.tcp_handler:
-                    other.tcp_handler.send(delete_pkt)
-
-            # Reset session state — no delayed respawn
-            ctx.session.in_game = False
-            ctx.session.phase = Phase.TEAM_SELECT
-            ctx.session.entity_id = 0
-            # Cancel any pending delayed spawn
-            ctx.session.delayed_spawn_time = 0
-            ctx.session.delayed_spawn_team = 0
-            # Reset physics state
-            ctx.player_health = 1.0
-            ctx.player_vel = (0.0, 0.0, 0.0)
-            ctx.player_speed = 0.0
-            ctx.player_heading = 0.0
-            ctx.angular_vel_yaw = 0.0
-            ctx.world_collision_ref_pos = ctx.player_pos
-            ctx.world_collision_bounds_dirty = False
-            if ctx.vehicle_physics:
-                ctx.vehicle_physics.heading = 0.0
-                ctx.vehicle_physics._angular_velocity = 0.0
-
-            print(f"[DESPAWN] Client {ctx.client_id} entity {entity_id} removed, phase→TEAM_SELECT")
-            return f"Client {ctx.client_id}: despawned entity {entity_id}, now TEAM_SELECT"
-
         # Handle "despawn all"
         if args and args[0].lower() == "all":
             results = []
             for c in self.server._snapshot_in_game_clients():
-                results.append(_despawn_one(c))
+                results.append(self._despawn_client(c))
             return "\n".join(results) if results else "No in-game clients"
 
         # Target specific client or active client
@@ -2962,7 +2981,7 @@ Examples:
         if not ctx:
             return "Error: No connected client"
 
-        return _despawn_one(ctx)
+        return self._despawn_client(ctx)
 
     def _cmd_kick(self, args: list) -> str:
         """Kick a player: despawn their entity and force-disconnect.

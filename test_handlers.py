@@ -982,6 +982,108 @@ def test_build_chat_message_comm_layout():
     return True
 
 
+def _build_comm_req_packet(text: str, seq: int = 1, source: int = 0x1000) -> bytes:
+    """Build a COMM_REQ (0x20) UDP packet carrying a chat string.
+
+    Layout mirrors handle_udp_chat's parser: opcode, seq(2), length(2),
+    source(2), 2 filler bytes, then a length-prefixed string at offset 9.
+    """
+    msg_bytes = text.encode("ascii")
+    head = struct.pack(">H", seq) + struct.pack(">H", 0) + struct.pack(">H", source) + b"\x00\x00"
+    payload = struct.pack(">H", len(msg_bytes)) + msg_bytes
+    return b"\x20" + head + payload
+
+
+def _make_spawned_chat_ctx(sent_packets: list, wonked_pos):
+    """Build a minimal in-game ClientContext with a packet-capturing tcp_handler."""
+    session = Session(phase=Phase.IN_GAME, in_game=True, team_id=2)
+    session.player_id = 0x2222
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("127.0.0.1", 50000),
+        session=session,
+        entity_id=0x14EA,
+    )
+    ctx.player_pos = wonked_pos
+    ctx.vehicle_physics = None
+    ctx.tcp_handler = SimpleNamespace(send=lambda pkt: sent_packets.append(pkt))
+    ctx.pending_respawn_pos = wonked_pos  # the stuck location to be cleared
+    return ctx
+
+
+def test_player_chat_respawn_despawns_and_clears_cached_spawn():
+    """/respawn from a player must despawn their tank, clear the cached spawn
+    position so the next spawn uses the team map spawn point, and confirm via
+    chat — while leaving normal (non-slash) chat unaffected."""
+    from wulfram.handlers import handle_udp_chat
+
+    wonked_pos = (4242.0, 1313.0, -77.0)
+
+    server = WulframServer.__new__(WulframServer)
+    server.udp_handler = None  # skip the UDP ACK send path
+    server.up_axis = "z"
+    server.spawn_height = 5.0
+    server._get_network_tick = lambda ctx: 1234
+    server._snapshot_in_game_clients = lambda: [active_ctx]
+
+    control = ControlServer.__new__(ControlServer)
+    control.server = server
+    server.control_server = control
+
+    sent = []
+    active_ctx = _make_spawned_chat_ctx(sent, wonked_pos)
+    addr = ("127.0.0.1", 50000)
+
+    # 1) /respawn through the real chat handler.
+    handle_udp_chat(server, active_ctx, _build_comm_req_packet("/respawn"), addr)
+
+    delete_pkts = [p for p in sent if p[:1] == b"\x15"]  # DELETE_OBJECT (0x15)
+    chat_pkts = [p for p in sent if p[:1] == b"\x1F"]    # COMM_MESSAGE (0x1F)
+    assert delete_pkts, f"expected a DELETE_OBJECT, sent opcodes={[p[0] for p in sent]}"
+    # Cached/pending spawn position cleared so the next spawn is map-resolved.
+    assert active_ctx.pending_respawn_pos is None, active_ctx.pending_respawn_pos
+    # Returned to the team/map screen for a fresh re-pick, no scheduled respawn.
+    assert active_ctx.session.phase == Phase.TEAM_SELECT
+    assert active_ctx.session.in_game is False
+    assert active_ctx.session.delayed_spawn_time == 0
+    # A confirmation chat was queued back to the player.
+    assert chat_pkts, "expected a chat confirmation packet"
+    assert b"Despawning" in chat_pkts[-1], chat_pkts[-1]
+
+    # _auto_join_team would now resolve a fresh map spawn (pending pos is gone),
+    # not the pre-despawn wonked location.
+    assert active_ctx.pending_respawn_pos != wonked_pos
+
+    # 2) The alias /rs behaves identically.
+    sent2 = []
+    ctx2 = _make_spawned_chat_ctx(sent2, wonked_pos)
+    server._snapshot_in_game_clients = lambda: [ctx2]
+    handle_udp_chat(server, ctx2, _build_comm_req_packet("/rs"), addr)
+    assert any(p[:1] == b"\x15" for p in sent2), "/rs should despawn too"
+    assert ctx2.pending_respawn_pos is None
+
+    # 3) A normal (non-slash) chat message must NOT despawn the player.
+    sent3 = []
+    ctx3 = _make_spawned_chat_ctx(sent3, wonked_pos)
+    server._snapshot_in_game_clients = lambda: [ctx3]
+    handle_udp_chat(server, ctx3, _build_comm_req_packet("hello team"), addr)
+    assert not any(p[:1] == b"\x15" for p in sent3), "plain chat must not despawn"
+    assert ctx3.session.phase == Phase.IN_GAME
+    assert ctx3.pending_respawn_pos == wonked_pos  # untouched
+
+    # 4) Unknown /commands get a polite reply, not a despawn.
+    sent4 = []
+    ctx4 = _make_spawned_chat_ctx(sent4, wonked_pos)
+    server._snapshot_in_game_clients = lambda: [ctx4]
+    handle_udp_chat(server, ctx4, _build_comm_req_packet("/wibble"), addr)
+    assert not any(p[:1] == b"\x15" for p in sent4), "unknown command must not despawn"
+    unknown_chat = [p for p in sent4 if p[:1] == b"\x1F"]
+    assert unknown_chat and b"Unknown command" in unknown_chat[-1], unknown_chat
+
+    print("test_player_chat_respawn_despawns_and_clears_cached_spawn: PASSED")
+    return True
+
+
 def test_build_update_array_remote_heartbeat_shape():
     """Low-level heartbeat builder still supports the legacy single-entity stub shape."""
     payload = build_update_array_heartbeat(
@@ -17970,6 +18072,7 @@ def main():
         test_send_initial_game_data_og_bootstrap_order,
         test_remote_want_updates_suppresses_empty_tcp_update_array,
         test_build_chat_message_comm_layout,
+        test_player_chat_respawn_despawns_and_clears_cached_spawn,
         test_build_update_array_remote_heartbeat_shape,
         test_server_remote_heartbeat_helper_keeps_full_local_state,
         test_server_remote_heartbeat_helper_pre_state_request_is_spawn_safe,
