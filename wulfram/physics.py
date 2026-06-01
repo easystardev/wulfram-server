@@ -7,12 +7,14 @@ Rodrigues construction, float32 matrix multiply, and atan2 euler extraction.
 
 Per-frame cycle (from decompile):
   1. Torque accumulator zeroed (entity[0x48-0x50] cleared after previous frame)
-  2. Yaw torque = turn_mobility * (float)turn_adjust * yaw_axis  (line 23103)
+  2. Yaw torque = turn_mobility * (float)turn_adjust * yaw_axis
+     (TankVehicle_apply_physics, Vehicles.c:1336; torque add pattern Vehicles.c:1425)
      - turn_adjust read as double, cast to float32 BEFORE multiply
   3. Entity_get_rotation_matrix: dirty-check euler vs prev_euler, rebuild if changed
-  4. Physics_substep_integrate_angular (lines 28804-28877):
-     - Substep loop: max 40ms or dt*0.5 if dt > 80ms
-     - Matrix3_integrate_angular per substep (lines 28704-28796):
+     (GUESS6_Entity_get_rotation_matrix, Entities/Core.c:656)
+  4. Physics_substep_integrate_angular (Physics.c:5264):
+     - Substep loop: max 40ms or dt*0.5 if dt > 80ms (Physics.c:5298-5300)
+     - Matrix3_integrate_angular per substep (Physics.c:5169):
        a. scaled_omega = ang_vel * (float)dt
        b. delta_R = Matrix3_from_axis_angle(scaled_omega)  [Rodrigues, float32]
        c. new_R = delta_R * old_R  [9 dot products, float32 intermediates]
@@ -23,13 +25,19 @@ Per-frame cycle (from decompile):
   5. Save euler to prev_euler cache (entity+0xA0)
   6. Torque accumulator zeroed for next frame
 
-Client references (from azurefishy decompile):
-  - GUESS3_Matrix3_from_axis_angle (addr 0x004f1150): Rodrigues formula, float32
-  - GUESS5_Matrix3_integrate_angular (addr 0x004f12c0): Full angular integration
-  - GUESS5_Physics_substep_integrate_angular (addr 0x004f14a0): Substep loop + damping
-  - GUESS5_Matrix3_from_euler_xyz (addr 0x004350c0): Euler→matrix rebuild
-  - GUESS3_Math_normalize_angle_radians (addr 0x004f0da0): Iterative [0, 2*pi]
-  - GUESS2_Vec3_normalize_safe (addr 0x004e1c00): Euler extraction via atan2
+Client references (azurefishy-src file:line; verified 2026-06-01):
+  - GUESS3_Matrix3_from_axis_angle      System/Core/Math.c:2774   Rodrigues formula, float32
+  - GUESS5_Matrix3_integrate_angular    Game/Simulation/Physics.c:5169  Full angular integration
+  - GUESS5_Physics_substep_integrate_angular  Game/Simulation/Physics.c:5264  Substep loop + damping
+  - GUESS6_GameSim_substep_update       Game/Simulation/Physics.c:1974  Outer frame-delta splitter
+  - GUESS5_Matrix3_from_euler_xyz       System/Core/Math.c:606    Euler→matrix rebuild
+  - GUESS3_Math_normalize_angle_radians System/Core/Math.c:2744   Iterative [0, 2*pi]
+  - GUESS2_Vec3_normalize_safe          System/Core/Math.c:2358   Euler extraction via atan2
+  - GUESS6_Entity_get_rotation_matrix   Game/Simulation/Entities/Core.c:656  Dirty-check matrix accessor
+
+NOTE: Earlier docstrings cited raw Ghidra addresses (0x004f1150, ...) and line numbers
+(28804-28877, 25514-25574) from a superseded flat decompile dump no longer in the tree.
+Those have been repointed to the organized azurefishy-src source above.
 """
 
 import array as _array
@@ -54,7 +62,7 @@ F32_TWO_PI = _f32(6.2831855)
 def _normalize_angle_client(angle: float) -> float:
     """Normalize angle to [0, 2*pi] matching client's Math_normalize_angle_radians.
 
-    From decompile (addr 0x004f0da0):
+    From decompile (GUESS3_Math_normalize_angle_radians, System/Core/Math.c:2744):
       - Safety clamp: |angle| > 20000 → 0.0
       - Iterative add/subtract of 6.2831855f (float32 2*pi)
       - All operations in float32
@@ -80,7 +88,7 @@ def _normalize_angle_0_2pi(angle: float) -> float:
 def _matrix3_from_euler_xyz(ex: float, ey: float, ez: float) -> list:
     """Build 3x3 rotation matrix from euler XYZ angles.
 
-    Matches GUESS5_Matrix3_from_euler_xyz (addr 0x004350c0).
+    Matches GUESS5_Matrix3_from_euler_xyz (System/Core/Math.c:606).
     XYZ intrinsic rotation order: R = Rz * Ry * Rx.
 
     Input euler angles: X=roll, Y=pitch, Z=heading.
@@ -113,7 +121,7 @@ def _matrix3_from_euler_xyz(ex: float, ey: float, ez: float) -> list:
 def _matrix3_from_axis_angle(omega_x: float, omega_y: float, omega_z: float) -> list:
     """Build 3x3 rotation matrix from axis-angle vector via Rodrigues formula.
 
-    Matches GUESS3_Matrix3_from_axis_angle (addr 0x004f1150).
+    Matches GUESS3_Matrix3_from_axis_angle (System/Core/Math.c:2774).
     Input: axis-angle vector (3 float32 values). Angle = ||vector||, axis = vector/||vector||.
     Output: 9-element list (float32 values), row-major.
 
@@ -163,7 +171,7 @@ def _matrix3_from_axis_angle(omega_x: float, omega_y: float, omega_z: float) -> 
 def _extract_euler_angles(m: list) -> tuple:
     """Extract XYZ euler angles from 3x3 rotation matrix.
 
-    Matches GUESS2_Vec3_normalize_safe (addr 0x004e1c00) which is actually
+    Matches GUESS2_Vec3_normalize_safe (System/Core/Math.c:2358) which is actually
     euler extraction via atan2, despite its misleading name. The atan2 arguments
     come from the rotation matrix elements on the FPU stack.
 
@@ -238,7 +246,7 @@ class VehiclePhysics:
     def _maybe_rebuild_matrix(self):
         """Dirty-check: if euler changed externally, rebuild matrix from euler.
 
-        Matches client's Entity_get_rotation_matrix (line 18028):
+        Matches client's GUESS6_Entity_get_rotation_matrix (Entities/Core.c:656):
           if (cached_euler != current_euler) → Matrix3_from_euler_xyz()
         """
         if (self._euler[0] != self._prev_euler[0] or
@@ -267,7 +275,7 @@ class VehiclePhysics:
     def step_f32(self, torque: float, dt: float):
         """Step with full rotation matrix pipeline matching client's x86 code.
 
-        Matches GUESS5_Matrix3_integrate_angular (addr 0x004f12c0):
+        Matches GUESS5_Matrix3_integrate_angular (Game/Simulation/Physics.c:5169):
           1. scaled_omega = ang_vel * (float)dt
           2. delta_R = Matrix3_from_axis_angle(scaled_omega)
           3. new_R = delta_R * old_R  (float32 dot products)
@@ -345,8 +353,9 @@ class VehiclePhysics:
         self._prev_euler[2] = self._euler[2]
 
         # 8. Compute effective angular acceleration and update velocity
-        # Client: damping_torque = -ang_vel * damp_coeff (line 28861)
-        #         effective_accel = angular_acceleration + damping_torque (line 28864)
+        # Client: damping_torque = -ang_vel * damp_coeff (Physics.c:5169 integrator;
+        #         damping mode in Physics.c:5264 substep, coeff at physics_config+0x7C)
+        #         effective_accel = angular_acceleration + damping_torque
         #         ang_vel += effective_accel * (float)dt
         damping = _f32(_f32(-ang_vel) * f_damp)
         effective = _f32(f_torque + damping)
@@ -357,13 +366,15 @@ class VehiclePhysics:
     def step_client_substeps(self, torque: float, frame_dt: float, use_f32: bool = False):
         """Step physics using the client's two-level substep algorithm.
 
-        Outer: GUESS5_GameSim_substep_update (lines 25514-25574)
-          - elapsed clamped to 550ms, split into 1-5 substeps of <=110ms each
-          - Each outer substep: TankVehicle_apply_physics() (re-adds torque) + physics tick
+        Outer: GUESS6_GameSim_substep_update (Game/Simulation/Physics.c:1974)
+          - elapsed clamped to 550ms (0x226), substep_count = elapsed/110 (0x6E) + 1,
+            capped at 5; uniform time_per_step with the remainder on the last step
+          - Each outer substep: TankVehicle_apply_physics() (Vehicles.c:1336, re-adds
+            torque) via vehicle-client VTable+0x0C, then physics tick
           - Torque ACCUMULATES across outer substeps (entity[0x50] += torque each time)
 
-        Inner: GUESS5_Physics_substep_integrate_angular (lines 28804-28877)
-          - max substep = 0.04s (40ms), or dt*0.5 if dt > 0.08s
+        Inner: GUESS5_Physics_substep_integrate_angular (Game/Simulation/Physics.c:5264)
+          - max substep = 0.04s (40ms), or dt*0.5 if dt > 0.08s (Physics.c:5298-5300)
           - Subtraction loop until remainder
 
         Args:

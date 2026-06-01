@@ -979,6 +979,15 @@ class WulframServer:
             self.player_info_local_state_mode = "auto"
         self.player_info_local_state = self.player_info_local_state_mode != "off"
         # Wulf-forge does NOT send PLAYER(spectator=0) during spawn.
+        # KEEP THIS 0 FOR OG CLIENTS. =1 sends build_player(spectator=False) AFTER the
+        # IN_GAME transition (see _spawn_wf_style ~4618). On the OG client a PLAYER (0x17)
+        # packet re-runs LocalPlayer_initialize, which tears down the in-game view and
+        # bounces the client straight back to team-select ("flicker -> back to map, can't
+        # spawn"), orphaning the just-spawned tank (looks like a "duplicate spectator copy
+        # of yourself"). Empirically confirmed 2026-06-01 on the VM OG client: sending this
+        # one packet to an in-game client kicked it to team-select; =0 spawns stay in-game.
+        # It was added to try to fix the duplicate-spectator artifact but did NOT fix it and
+        # caused the worse bounce. Do not re-enable for real clients.
         self.spawn_send_player_active = os.environ.get("WULFRAM_SPAWN_PLAYER_ACTIVE", "0") == "1"
         # Local-state weapon type (entity type index). Default is 0 (Tank).
         # Tank (0): pool_entry[2]=9 â†’ 9 ammo bits + weapon_def+0x170=1 â†’ 16 turret bits.
@@ -1392,7 +1401,7 @@ class WulframServer:
             self.damp_coeff = 2.0
 
         # Linear velocity damping coefficients.
-        # From RigidBody_integrate_position (Physics.c:5120-5134, damped mode):
+        # From RigidBody_integrate_position (Game/Simulation/Physics.c:6032, damped mode):
         #   effective_acc = impulse - vel * linear_damp
         #   pos += vel * dt + 0.5 * effective_acc * dtÂ²
         #   vel += effective_acc * dt
@@ -8212,11 +8221,20 @@ class WulframServer:
         """
         Simulate player position using damped persistent velocity model.
 
-        Matches client's RigidBody_integrate_position (Physics.c:5101-5136):
+        Matches client's RigidBody_integrate_position (Game/Simulation/Physics.c:6032;
+        core math Vec3_integrate_motion at Physics.c:5124). Verified bit-exact 2026-06-01:
           1. Vehicle controller computes per-frame impulse (zeroed each frame)
-          2. effective_acc = impulse - vel * linear_damp  (damped mode, flag 0xc0+3)
-          3. pos += vel * dt + 0.5 * effective_acc * dtÂ²  (Verlet integration)
+          2. effective_acc = impulse - vel * linear_damp  (damped mode, PhysicsStateFlags+3;
+             decompile reads single linear_damping from PhysicsConfig+0x78)
+          3. pos += vel * dt + 0.5 * effective_acc * dtÂ²  (semi-implicit Euler)
           4. vel += effective_acc * dt  (velocity persists across frames)
+        ORDER (verified faithful 2026-06-01, tick loop ~21586): heading is stepped FIRST
+        (step_client_substeps) then this runs, matching decompile RigidBody_step (Physics.c:6088,
+        angular before position). heading_override passes the OLD (pre-integration) heading so
+        thrust direction uses it — also faithful, since decompile TankVehicle_apply_physics
+        accumulates the impulse (entity+0x24) BEFORE RigidBody_step runs.
+        NOTE: linear_damp is hardcoded 1.5 (env-overridable), not parsed from BEHAVIOR; the
+        decompile reads per-entity PhysicsConfig+0x78. 1.5 is OG-tank-verified; non-tank may differ.
 
         Entity layout:
           entity[0x0c] = position (persistent)
@@ -8700,7 +8718,8 @@ class WulframServer:
                 impulse_y = 0.0
 
         # Damped effective acceleration: acc = impulse - vel * linear_damp
-        # (from RigidBody_integrate_position, damped mode at Physics.c:5126-5129)
+        # (from RigidBody_integrate_position damped mode, Game/Simulation/Physics.c:6032;
+        #  decompile reads linear_damping from PhysicsConfig+0x78. Verified 2026-06-01.)
         acc_x = impulse_x - vel_x * horizontal_damp
         acc_y = impulse_y - vel_y * horizontal_damp
         acc_z = impulse_z - vel_z * linear_damp
@@ -8717,7 +8736,8 @@ class WulframServer:
         pre_vel = (vel_x, vel_y, vel_z)
 
         # Verlet integration: pos += vel * dt + 0.5 * acc * dtÂ²
-        # (from Vec3_integrate_motion, Physics.c:4396-4410)
+        # (semi-implicit Euler, from Vec3_integrate_motion, Game/Simulation/Physics.c:5124,
+        #  called by RigidBody_integrate_position. Bit-exact verified 2026-06-01.)
         x, y, z = ctx.player_pos
         half_dt2 = 0.5 * dt * dt
         new_x = x + vel_x * dt + acc_x * half_dt2
