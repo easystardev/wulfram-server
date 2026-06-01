@@ -114,6 +114,12 @@ class Terrain:
         plane. This intentionally differs from bilinear interpolation on rough
         cells and keeps spring/clamp sampling aligned with terrain collision.
         """
+        if not (math.isfinite(wx) and math.isfinite(wy)):
+            # TOTAL PRIMITIVE GUARD: never let a non-finite sample coordinate reach
+            # int(math.floor(NaN)) below and crash a caller's thread (tick loop,
+            # UDP loop, control plane). Return flat ground + up normal. Fires only
+            # on already-broken (non-finite) input. (A3 soak, 2026-06-01.)
+            return 0.0, (0.0, 0.0, 1.0)
         gx = int(math.floor(wx * self.inv_cell_x))
         gz = int(math.floor(wy * self.inv_cell_z))
         gx = max(0, min(gx, self.num_x - 2))

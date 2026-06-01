@@ -3231,7 +3231,36 @@ class WulframServer:
                 )
             try:
                 for packet in packets:
-                    self._handle_single_udp_packet(ctx, packet, addr)
+                    try:
+                        self._handle_single_udp_packet(ctx, packet, addr)
+                    except (ConnectionResetError, ConnectionAbortedError,
+                            BrokenPipeError, OSError) as conn_err:
+                        # EXPECTED disconnect race: a client closed mid-datagram and
+                        # a handler tried to TCP/UDP send to its torn-down socket
+                        # (e.g. WinError 10054). Benign — log one concise line, no
+                        # traceback, and keep serving every other client.
+                        cid = ctx.client_id if ctx is not None else "?"
+                        ptype = packet[0] if packet else -1
+                        print(
+                            f"[UDP] Client {cid}: dropped packet "
+                            f"(type=0x{ptype:02X}) after connection-closed: {conn_err!r}"
+                        )
+                    except Exception as packet_err:
+                        # RESILIENCE BOUNDARY: _udp_loop is a SINGLE shared thread
+                        # serving every client's UDP. A per-packet handler error must
+                        # never propagate out of this loop, or the thread dies and
+                        # UDP stops for ALL clients (server-wide gameplay wedge,
+                        # observed in the A3 soak 2026-06-01 when a killed client
+                        # raced _handle_weapon_demand). An UNEXPECTED error still
+                        # gets a full traceback so real bugs stay visible.
+                        import traceback
+                        cid = ctx.client_id if ctx is not None else "?"
+                        ptype = packet[0] if packet else -1
+                        print(
+                            f"[UDP] Client {cid}: dropped packet "
+                            f"(type=0x{ptype:02X}) after handler error: {packet_err!r}"
+                        )
+                        traceback.print_exc()
             finally:
                 if ctx is not None:
                     ctx._datagram_active_movement_input = False
@@ -8260,6 +8289,33 @@ class WulframServer:
         self._repair_recent_control_pose_jump(ctx, "controller_tick_pre")
         dt = dt_override if dt_override > 0 else 1.0 / self.tick_rate_hz
 
+        # PHYSICS SANITY GUARD: a spring/suspension instability on rough or steep
+        # terrain can drive a tank's velocity (then position) to inf/NaN. A NaN
+        # then crashes the per-tick suspension sample EVERY tick — caught by the
+        # tick loop, but it spams a traceback ~10x/s and freezes that tank — and a
+        # NaN position would poison replication to every other client. Reset a
+        # non-finite tank state to a finite, safe value so it self-heals once
+        # instead of recurring forever. This fires ONLY on already-broken
+        # (non-finite) state, so it cannot affect normal finite physics parity.
+        # Surfaced by the A3 multi-client soak (2026-06-01).
+        if not all(math.isfinite(v) for v in ctx.player_vel):
+            print(f"[PHYSICS] Client {ctx.client_id}: non-finite velocity "
+                  f"{tuple(ctx.player_vel)} -> reset to 0")
+            ctx.player_vel = [0.0, 0.0, 0.0]
+        if not all(math.isfinite(p) for p in ctx.player_pos):
+            fx = ctx.player_pos[0] if math.isfinite(ctx.player_pos[0]) else 5050.0
+            fy = ctx.player_pos[1] if math.isfinite(ctx.player_pos[1]) else 5000.0
+            safe_z = 5.0
+            if self.terrain is not None:
+                try:
+                    safe_z = float(self.terrain.get_height(fx, fy)) + 5.0
+                except Exception:
+                    safe_z = 5.0
+            print(f"[PHYSICS] Client {ctx.client_id}: non-finite position -> "
+                  f"clamp to ({fx:.1f},{fy:.1f},{safe_z:.1f})")
+            ctx.player_pos = [fx, fy, safe_z]
+            ctx.player_vel = [0.0, 0.0, 0.0]
+
         # Read movement input (slot 2 = forward, slot 3 = strafe)
         raw_throttle_input = 0.0
         raw_strafe_input = 0.0
@@ -9011,6 +9067,37 @@ class WulframServer:
             ctx.world_collision_ref_pos = (new_x, new_y, new_z)
 
         old_pos = ctx.player_pos
+        # ROOT PHYSICS SANITY CLAMP: a spring/suspension instability on rough or
+        # steep terrain can grow the integrated velocity past float32 range (->
+        # inf via _f32) and then position to inf/NaN. A non-finite pos/vel then
+        # crashes EVERY downstream consumer of it — the turn-torque terrain
+        # sample, the suspension curve, and the wire serializers — on both the
+        # per-client tick loop and the shared UDP thread. Commit ONLY finite,
+        # magnitude-bounded state so a diverging tank self-heals instead of
+        # poisoning the whole server. The speed cap (~40x max tank speed) and the
+        # non-finite resets fire only on already-broken physics, so they never
+        # change normal finite play. Surfaced by the A3 soak (2026-06-01).
+        _MAX_TANK_SPEED = 1000.0
+        if not math.isfinite(new_vel_x):
+            new_vel_x = 0.0
+        if not math.isfinite(new_vel_y):
+            new_vel_y = 0.0
+        if not math.isfinite(new_vel_z):
+            new_vel_z = 0.0
+        new_vel_x = max(-_MAX_TANK_SPEED, min(_MAX_TANK_SPEED, new_vel_x))
+        new_vel_y = max(-_MAX_TANK_SPEED, min(_MAX_TANK_SPEED, new_vel_y))
+        new_vel_z = max(-_MAX_TANK_SPEED, min(_MAX_TANK_SPEED, new_vel_z))
+        if not (math.isfinite(new_x) and math.isfinite(new_y) and math.isfinite(new_z)):
+            try:
+                fx = old_pos[0] if math.isfinite(old_pos[0]) else 5050.0
+                fy = old_pos[1] if math.isfinite(old_pos[1]) else 5000.0
+                fz = old_pos[2] if math.isfinite(old_pos[2]) else 50.0
+            except Exception:
+                fx, fy, fz = 5050.0, 5000.0, 50.0
+            print(f"[PHYSICS] Client {ctx.client_id}: non-finite integrated position "
+                  f"({new_x},{new_y},{new_z}) -> hold ({fx:.1f},{fy:.1f},{fz:.1f}), zero vel")
+            new_x, new_y, new_z = fx, fy, fz
+            new_vel_x = new_vel_y = new_vel_z = 0.0
         ctx.player_pos = (new_x, new_y, new_z)
         ctx.player_vel = (new_vel_x, new_vel_y, new_vel_z)
         ctx.player_speed = vehicle_runtime_speed(
@@ -20924,7 +21011,13 @@ class WulframServer:
         chat_pkt = build_chat_message(hit_msg, source_id=attacker.session.player_id or attacker.entity_id)
         for client in self._snapshot_in_game_clients():
             if client.tcp_handler and self._debug_comm_allowed_for_client(client):
-                client.tcp_handler.send(chat_pkt)
+                # Crash-safe send: a client killed mid-combat leaves a dead socket;
+                # a raw .send() here re-raises (WinError 10054) and kills this
+                # per-projectile thread (leaking the projectile + spamming a
+                # traceback). Route through the helper, which logs and skips.
+                # (A3 soak, 2026-06-01.)
+                self._send_packet_to_client(client, chat_pkt, prefer_tcp=True,
+                                            allow_udp_fallback=False)
 
         # Send health refresh to ALL surviving clients (attacker etc.)
         # Projectile UPDATE_ARRAY packets include per-viewer health, but once
@@ -20961,7 +21054,10 @@ class WulframServer:
             kill_chat = build_chat_message(kill_msg, source_id=attacker.session.player_id or attacker.entity_id)
             for client in self._snapshot_in_game_clients():
                 if client.tcp_handler and self._debug_comm_allowed_for_client(client):
-                    client.tcp_handler.send(kill_chat)
+                    # Crash-safe (see HIT chat above): never let a dead socket
+                    # kill the projectile thread.
+                    self._send_packet_to_client(client, kill_chat, prefer_tcp=True,
+                                                allow_udp_fallback=False)
 
             # Broadcast updated stats for attacker and target
             combat_participants = (attacker, target)
