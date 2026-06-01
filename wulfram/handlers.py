@@ -197,6 +197,16 @@ def _get_login_bootstrap_mode(ctx: "ClientContext") -> str:
     if mode not in ("minimal", "og", "hybrid"):
         mode = "hybrid"
     if mode == "hybrid":
+        # Route by client TYPE, not network location. The real OG client is
+        # identified by its game-service login flow (LOGIN_REQUEST sub_type
+        # 0x01 -> 0x03, which sets login_game_service_requested); the Python
+        # client uses sub_type 0x00. An OG client run on the SAME host (loopback)
+        # still needs the OG bootstrap — its spectator PLAYER identity is what
+        # lets it finish "Processing Player Map". Keying purely on loopback sent
+        # such a client the minimal bootstrap and hung it on that screen.
+        session = getattr(ctx, "session", None)
+        if session is not None and getattr(session, "login_game_service_requested", False):
+            return "og"
         return "minimal" if _is_loopback_client(ctx) else "og"
     return mode
 

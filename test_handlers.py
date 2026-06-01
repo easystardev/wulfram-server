@@ -978,6 +978,40 @@ def test_remote_spawn_create_update_array_avoids_tcp():
     return True
 
 
+def test_login_bootstrap_mode_routes_og_client_by_login_flow():
+    """A real OG client (game-service login, sub_type 0x01->0x03) must get the
+    OG bootstrap even on loopback — otherwise it lacks the spectator PLAYER
+    identity and hangs at 'Processing Player Map'. The Python client (sub_type
+    0x00) stays on minimal."""
+    from wulfram.handlers import _get_login_bootstrap_mode
+
+    old = os.environ.get("WULFRAM_LOGIN_BOOTSTRAP")
+    try:
+        os.environ.pop("WULFRAM_LOGIN_BOOTSTRAP", None)  # default = hybrid
+
+        def _ctx(addr, game_service):
+            s = Session()
+            s.login_game_service_requested = game_service
+            return SimpleNamespace(client_addr=addr, session=s)
+
+        # OG client (game-service) on loopback -> og (the fix).
+        assert _get_login_bootstrap_mode(_ctx(("127.0.0.1", 5), True)) == "og"
+        # Python client (no game-service) on loopback -> minimal (preserved).
+        assert _get_login_bootstrap_mode(_ctx(("127.0.0.1", 5), False)) == "minimal"
+        # Remote client -> og regardless (preserved).
+        assert _get_login_bootstrap_mode(_ctx(("10.10.10.2", 5), False)) == "og"
+        # Explicit override still wins over the heuristic.
+        os.environ["WULFRAM_LOGIN_BOOTSTRAP"] = "minimal"
+        assert _get_login_bootstrap_mode(_ctx(("10.10.10.2", 5), True)) == "minimal"
+        print("test_login_bootstrap_mode_routes_og_client_by_login_flow: PASSED")
+        return True
+    finally:
+        if old is None:
+            os.environ.pop("WULFRAM_LOGIN_BOOTSTRAP", None)
+        else:
+            os.environ["WULFRAM_LOGIN_BOOTSTRAP"] = old
+
+
 def test_send_initial_game_data_og_bootstrap_order():
     """Remote OG bootstrap should stop at the team-select-safe packet set."""
     old_mode = os.environ.get("WULFRAM_LOGIN_BOOTSTRAP")
@@ -18187,6 +18221,7 @@ def main():
         test_projectile_body_source_can_opt_into_body_pitch,
         test_projectile_body_pitch_defaults_on_with_env_optout,
         test_remote_spawn_points_use_udp_not_tcp,
+        test_login_bootstrap_mode_routes_og_client_by_login_flow,
         test_send_initial_game_data_og_bootstrap_order,
         test_remote_want_updates_suppresses_empty_tcp_update_array,
         test_relogin_honors_changed_username_and_remembers_last,
