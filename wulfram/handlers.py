@@ -901,7 +901,13 @@ def _player_chat_cmd_respawn(server: "WulframServer", ctx: "ClientContext", args
 def _player_chat_cmd_help(server: "WulframServer", ctx: "ClientContext", args: list) -> None:
     """help: list the available player chat commands."""
     listing = ", ".join(PLAYER_CHAT_COMMANDS_HELP)
-    _send_chat_reply(ctx, f"Commands: {listing} (type the word, or prefix with !)")
+    # Tell players to type the BARE keyword. The OG client's Chat_preprocess_input
+    # eats any line starting with its command-prefix char (routes it to the local
+    # ignore/filter/kudos processor and never transmits it), and a leading '/' is a
+    # whisper-destination selector — so '!respawn'/'/respawn' can be swallowed
+    # client-side. A bare word always reaches the server. (azurefishy-src
+    # ChatSystem.c GUESS5_Chat_preprocess_input.)
+    _send_chat_reply(ctx, f"Commands: {listing} -- type the bare word (e.g. respawn), no leading ! or /")
 
 
 # Player-facing chat command table. Each handler receives (server, ctx, args)
@@ -916,11 +922,13 @@ PLAYER_CHAT_COMMANDS = {
 # Canonical command names shown by help (aliases like rs are omitted).
 PLAYER_CHAT_COMMANDS_HELP = ("respawn", "help")
 
-# Optional leading punctuation a player may type before a command. The OG client
-# intercepts a leading '/' as a whisper-destination selector (it never reaches
-# the server), so players use a bare keyword or one of these prefixes. The Python
-# client can still send a literal '/respawn'. '!' / '.' are forwarded verbatim by
-# the OG client as ordinary message text.
+# Optional leading punctuation the SERVER will strip if a prefixed command does
+# arrive (e.g. from the Python client, which does no client-side parsing). NOTE:
+# the real OG client mostly CANNOT use these — Chat_preprocess_input eats a line
+# starting with '/' (whisper-destination selector) or its command-prefix char
+# (routes to the local ignore/filter/kudos processor, never transmits). So OG
+# players must type the BARE keyword (respawn). These prefixes are accepted on
+# the off chance one reaches us, but the bare keyword is the canonical path.
 _PLAYER_CMD_PREFIXES = ("/", "!", ".")
 
 
