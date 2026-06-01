@@ -688,6 +688,16 @@ def _send_team_switch_roster(
     if not getattr(server, "team_switch_send_roster", False):
         return
     session = ctx.session
+    if session.roster_sent:
+        # The OG client APPENDS ADD_TO_ROSTER as a new row (no dedup by id), so a
+        # second add for the same player makes a duplicate roster row -- the "copy
+        # of yourself as a spectator" bug. The real UI flow calls this from BOTH
+        # handle_team_switch (team click) AND handle_reincarnate_tcp (flag click),
+        # so guard the re-add. roster_sent resets on full session reset (reconnect),
+        # and the OG client keeps roster rows across death, so a respawn correctly
+        # does NOT re-add an already-listed player. (Confirmed roster-only, not a
+        # world entity: server tracks a single entity for the client.)
+        return
     player_id = session.player_id or ctx.entity_id
     name = session.username or f"Player{ctx.client_id}"
     if _safe_tcp_send(
