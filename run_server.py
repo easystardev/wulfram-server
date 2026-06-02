@@ -34,4 +34,10 @@ if os.environ.get("WULFRAM_FAULTHANDLER", "1") == "1":
 from wulfram.server import main
 
 if __name__ == "__main__":
+    # Optional golden-trace capture (WULFRAM_GOLDEN_CAPTURE=<path>): monkeypatch the
+    # physics kernel to log per-step I/O for harvesting a real OG-client corpus.
+    # No-op unless the env is set; zero footprint on server.py / physics.py.
+    if os.environ.get("WULFRAM_GOLDEN_CAPTURE", "").strip():
+        from wulfram import golden_capture
+        golden_capture.install()
     main()
