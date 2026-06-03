@@ -152,9 +152,9 @@ class WulframServer:
             self.spawn_delay_seconds = float(os.environ.get("WULFRAM_SPAWN_DELAY", "6.0"))
         except ValueError:
             self.spawn_delay_seconds = 6.0
-        # Default to server-side team-select spawn for stability; explicit spawn-point
-        # selection is still available by setting WULFRAM_SPAWN_ON_TEAM_SELECT=0.
-        self.spawn_on_team_select = os.environ.get("WULFRAM_SPAWN_ON_TEAM_SELECT", "1") == "1"
+        # Spawn is driven by the explicit map-flag click (REINCARNATE subtype 0x00 ->
+        # handlers.handle_spawn_at_point). Team-select no longer auto-spawns. Combat
+        # respawn still uses the delayed_spawn mechanism in the game loop.
         self.team_switch_send_reincarnate = os.environ.get("WULFRAM_TEAM_SWITCH_REINCARNATE", "1") == "1"
         self.team_switch_send_update_stats = (
             os.environ.get("WULFRAM_TEAM_SWITCH_UPDATE_STATS", "1").strip().lower()
@@ -294,9 +294,8 @@ class WulframServer:
         auto_login_env = os.environ.get("WULFRAM_AUTO_LOGIN")
         if auto_login_env is not None:
             FEATURES.auto_login = auto_login_env.strip().lower() not in ("0", "false", "off", "no")
-        auto_join_env = os.environ.get("WULFRAM_AUTO_JOIN_TEAM")
-        if auto_join_env is not None:
-            FEATURES.auto_join_team = auto_join_env.strip().lower() not in ("0", "false", "off", "no")
+        # WULFRAM_AUTO_JOIN_TEAM removed: auto-join/auto-spawn caused client crashes and
+        # spawn-under-terrain bugs. Clients spawn via the explicit spawn-point flow only.
         # Client/world offset for position alignment (default to 0 for pure server-space).
         if self.up_axis == "z":
             try:
@@ -912,7 +911,6 @@ class WulframServer:
             f"spawn_height={self.spawn_height:.1f} ground_level={self.ground_level:.1f} "
             f"world_bound={self.world_bound:.1f} "
             f"spawn_set_ground={int(self.spawn_sets_ground_level)} "
-            f"spawn_on_team_select={int(self.spawn_on_team_select)} "
             f"spawn_point_override={int(self.spawn_allow_point_override)} "
             f"team_switch_reincarnate={int(self.team_switch_send_reincarnate)} "
             f"team_switch_roster={int(self.team_switch_send_roster)} "
@@ -1481,6 +1479,66 @@ class WulframServer:
         if self.correction_mode not in ("full", "rot_only", "pos_only", "dual_entity", "view_update", "view_update_define"):
             self.correction_mode = "view_update"
 
+        # ── OG-faithful GATED-RARE correction gate (GOAL 2, 2026-06-02) ──────
+        # The OG client corrects RARELY and reactively. The proactive streams
+        # above (spawn burst, movement-correction interval, STATE_REQUEST replies)
+        # each camera-clamp/zero-velocity on the OG client; on a zero-latency
+        # loopback client that flood freezes rendering. When this gate is enabled
+        # (default), those proactive timers no longer emit VIEW_UPDATE corrections.
+        # Instead a single correction fires only when the authoritative state has
+        # genuinely DIVERGED beyond a threshold (accumulated server-only,
+        # non-input-predictable displacement — terrain-Z clamp / collision push —
+        # since the last correction), and corrections are hard-rate-limited so a
+        # zero-latency client cannot be flooded even under rapid STATE_REQUEST/fire.
+        # The gate is IDENTICAL for every client; the loopback fix falls out of the
+        # rate cap, not a client-type branch.
+        self.correction_gate_enabled = os.environ.get("WULFRAM_CORRECTION_GATE", "1").strip().lower() not in ("0", "off", "false", "no")
+        try:
+            # Accumulated divergence (units) required to admit a correction.
+            self.correction_divergence_pos = float(os.environ.get("WULFRAM_CORRECTION_DIVERGENCE_POS", "1.5"))
+        except ValueError:
+            self.correction_divergence_pos = 1.5
+        if self.correction_divergence_pos <= 0.0:
+            self.correction_divergence_pos = 1.5
+        try:
+            # Accumulated heading divergence (degrees) required to admit a correction.
+            self.correction_divergence_heading_deg = float(os.environ.get("WULFRAM_CORRECTION_DIVERGENCE_HEADING", "12.0"))
+        except ValueError:
+            self.correction_divergence_heading_deg = 12.0
+        try:
+            # Hard floor between any two corrections to a client (rate cap, seconds).
+            self.correction_min_interval = float(os.environ.get("WULFRAM_CORRECTION_MIN_INTERVAL", "0.2"))
+        except ValueError:
+            self.correction_min_interval = 0.2
+        if self.correction_min_interval < 0.0:
+            self.correction_min_interval = 0.0
+        try:
+            # Per-tick noise floor: server-only displacement below this is treated
+            # as float/quantization noise and ignored (keeps flat ground at ~0).
+            self.correction_divergence_floor = float(os.environ.get("WULFRAM_CORRECTION_DIVERGENCE_FLOOR", "0.02"))
+        except ValueError:
+            self.correction_divergence_floor = 0.02
+        if self.correction_divergence_floor < 0.0:
+            self.correction_divergence_floor = 0.0
+        try:
+            # Per-tick multiplicative decay of the divergence accumulator so
+            # transient/slow noise bleeds off and never reaches threshold; only
+            # genuine spikes or sustained divergence trip the gate.
+            self.correction_divergence_decay = float(os.environ.get("WULFRAM_CORRECTION_DIVERGENCE_DECAY", "0.98"))
+        except ValueError:
+            self.correction_divergence_decay = 0.98
+        self.correction_divergence_decay = min(1.0, max(0.0, self.correction_divergence_decay))
+        # Debug counters for empirical flat-ground verification of the gate.
+        self.correction_gate_debug = os.environ.get("WULFRAM_CORRECTION_GATE_DEBUG", "0").strip().lower() in ("1", "on", "true", "yes")
+
+        print(
+            f"[CONFIG-CORRECTION-GATE] enabled={int(self.correction_gate_enabled)} "
+            f"divergence_pos={self.correction_divergence_pos}u "
+            f"divergence_heading={self.correction_divergence_heading_deg}deg "
+            f"min_interval={self.correction_min_interval}s "
+            f"floor={self.correction_divergence_floor}u decay={self.correction_divergence_decay}"
+        )
+
         print(
             f"[CONFIG-HEADING] turn_adjust={self.turn_adjust} turn_sign={self.turn_sign} "
             f"deadzone={self.turn_deadzone} damp_coeff={self.damp_coeff} "
@@ -1553,6 +1611,32 @@ class WulframServer:
         if delta & 0x80000000:
             delta -= 0x100000000
         return delta
+
+    def _accumulate_correction_divergence(self, ctx: ClientContext, clamp_dz: float) -> None:
+        """Accumulate server-only (client-unpredictable) displacement for the
+        reactive correction gate (GOAL 2, 2026-06-02).
+
+        `clamp_dz` is the magnitude the terrain-Z safety clamp pushed the tank
+        this physics step — the canonical client/server divergence on this map
+        (server clamps Z to terrain; the OG client uses a spring-damper). The
+        accumulator decays every call so transient float/quantization noise
+        bleeds off and never reaches threshold; only a genuine spike (collision/
+        teleport-scale push) or sustained divergence (driving across rough
+        terrain) trips the gate. Flat open ground keeps this at ~0 because the
+        clamp rarely fires there and small dips stay under the noise floor.
+        """
+        if not getattr(self, "correction_gate_enabled", False):
+            return
+        accum = float(getattr(ctx, "divergence_accum_pos", 0.0) or 0.0) * self.correction_divergence_decay
+        dz = abs(float(clamp_dz or 0.0))
+        if dz > self.correction_divergence_floor:
+            accum += dz
+            if self.correction_gate_debug:
+                ctx._divergence_clamp_events = int(getattr(ctx, "_divergence_clamp_events", 0) or 0) + 1
+                ctx._divergence_clamp_max = max(
+                    float(getattr(ctx, "_divergence_clamp_max", 0.0) or 0.0), dz
+                )
+        ctx.divergence_accum_pos = accum
 
     def _record_authoritative_state(self, ctx: ClientContext, *, tick: int) -> None:
         """Cache recent authoritative states for replay-aligned sync replies."""
@@ -1858,7 +1942,9 @@ class WulframServer:
         elif mode in ("force", "wf"):
             include_local_state = True
         elif mode == "auto-remote":
-            include_local_state = not handlers._is_loopback_client(ctx)
+            # OG clients (incl. loopback play.bat) need local_state; only genuine
+            # Python test clients take the entity-only path.
+            include_local_state = handlers._is_og_client(ctx)
         else:
             include_local_state = self._local_state_payload_is_safe_for_weapon(
                 weapon_type,
@@ -2261,7 +2347,7 @@ class WulframServer:
             include_vel=has_vel,
             include_rot=has_rot,
             include_spin=has_rot,
-            spin=(0.0, 0.0, 0.0),
+            spin=(0.0, 0.0, 0.0) if os.environ.get("WULFRAM_GOAL6_LEGACY") == "1" else (0.0, 0.0, ctx.angular_vel_yaw),
             include_local_state=include_local_state,
             include_entity_vitals=False,
             weapon_id=local_weapon_type,
@@ -2364,10 +2450,11 @@ class WulframServer:
         reject the fully expanded tank local-state on packets that do not also
         carry the local-player sync entity block, so keep these on the same
         short-form-safe shape as the projectile/update-array compatibility path.
-        Loopback/Python clients keep the existing entity-only path to preserve
-        the currently working decoder behavior.
+        Only genuine Python test clients keep the entity-only path; a real OG
+        client (including one on loopback, e.g. play.bat) must get the local-state
+        prefix or its end-of-packet local-player sync reads garbage health.
         """
-        if handlers._is_loopback_client(ctx):
+        if not handlers._is_og_client(ctx):
             return False, {}
 
         return True, dict(
@@ -2393,8 +2480,11 @@ class WulframServer:
         block that the promoted heartbeat path uses. Keep remote projectile
         packets on the same short-form-safe local-state shape as spawn-time
         heartbeats even after the viewer has been promoted to full sync.
+
+        Gate on OG-vs-Python (not loopback) so a loopback OG client (play.bat)
+        still gets the local-state prefix it needs.
         """
-        if handlers._is_loopback_client(ctx):
+        if not handlers._is_og_client(ctx):
             return False, {}
 
         return True, dict(
@@ -2614,6 +2704,39 @@ class WulframServer:
         """Return a snapshot list of in-game clients (thread-safe)."""
         return [c for c in self._snapshot_clients() if c.session and c.session.in_game]
 
+    @staticmethod
+    def _is_conn_reset(err) -> bool:
+        """True when an error means the peer's TCP socket is definitively dead."""
+        if isinstance(err, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)):
+            return True
+        s = str(err)
+        return ("10054" in s or "10053" in s or "forcibly closed" in s
+                or "aborted by the software" in s or "Broken pipe" in s)
+
+    def _reap_dead_client(self, ctx: ClientContext, reason: str = "") -> None:
+        """Mark a client whose TCP socket is dead for teardown.
+
+        Setting running=False makes its game loop exit, which runs the normal
+        _handle_client cleanup: broadcast DELETE_OBJECT for its entity (removing
+        the ghost tank), drop it from the roster/clients, free its UDP mapping.
+        Closing the socket unblocks the loop's recv/getpeername immediately.
+        Without this, a crashed/reconnected client lingers as a zombie session
+        (endless TCP-send-failed spam, duplicate identities, ghost tanks).
+        """
+        if not getattr(ctx, "running", False):
+            return
+        print(f"[SERVER] Client {ctx.client_id}: reaping dead TCP session ({reason})")
+        ctx.running = False
+        try:
+            if ctx.tcp_handler and ctx.tcp_handler.sock:
+                try:
+                    ctx.tcp_handler.sock.shutdown(socket.SHUT_RDWR)
+                except Exception:
+                    pass
+                ctx.tcp_handler.sock.close()
+        except Exception:
+            pass
+
     def _send_packet_to_client(
         self,
         ctx: ClientContext,
@@ -2630,6 +2753,10 @@ class WulframServer:
                 sent = True
             except Exception as tcp_err:
                 print(f"[MULTI] Client {ctx.client_id}: TCP send failed ({tcp_err})")
+                if self._is_conn_reset(tcp_err):
+                    # Socket is dead — reap instead of spamming this every tick.
+                    self._reap_dead_client(ctx, reason="tcp_send_reset")
+                    return False
         if not sent and allow_udp_fallback and self.udp_handler and ctx.session.udp_addr:
             try:
                 self.udp_handler.send_to(payload, ctx.session.udp_addr)
@@ -3327,7 +3454,11 @@ class WulframServer:
             if ctx.tcp_handler:
                 try:
                     ctx.tcp_handler.send(build_ping_request())
-                except Exception:
+                except Exception as ping_err:
+                    # A failed keepalive ping means the socket is gone; reap so the
+                    # session is cleaned up instead of lingering as a zombie.
+                    if self._is_conn_reset(ping_err):
+                        self._reap_dead_client(ctx, reason="ping_send_reset")
                     break
 
     def _start_ping_loop(self, ctx: ClientContext):
@@ -4012,6 +4143,10 @@ class WulframServer:
         ctx.last_state_sync_rot = None
         ctx.last_correction_send = 0.0
         ctx.force_correction_once = False
+        # Gated-rare correction divergence accumulators (GOAL 2). Reset on
+        # spawn so the respawn pose discontinuity doesn't read as divergence.
+        ctx.divergence_accum_pos = 0.0
+        ctx.divergence_accum_heading = 0.0
         ctx.authoritative_state_history.clear()
         ctx.player_yaw = 0.0
         ctx.player_heading = 0.0
@@ -4184,6 +4319,48 @@ class WulframServer:
             f"{', WORLD_STATS' if sent_world_stats else ''})"
         )
 
+    def _separate_from_live_tanks(self, ctx: ClientContext, pos: tuple, min_sep: float = 30.0) -> tuple:
+        """Return a spawn position clear of every other live tank.
+
+        Returns ``pos`` unchanged when nothing else is in-game or the point is
+        already clear (so single-client and distinct-flag spawns are untouched).
+        Otherwise spirals outward deterministically (no RNG) until clear.
+        """
+        if not pos or len(pos) < 3:
+            return pos
+        others = []
+        for other in self._snapshot_in_game_clients():
+            if other is ctx:
+                continue
+            op = getattr(other, "player_pos", None)
+            if op and len(op) >= 2:
+                others.append(op)
+        if not others:
+            return pos
+
+        def _clear(px: float, py: float) -> bool:
+            return all(
+                (px - ox) ** 2 + (py - oy) ** 2 >= min_sep * min_sep
+                for ox, oy, *_ in others
+            )
+
+        x, y, z = pos[0], pos[1], pos[2]
+        if _clear(x, y):
+            return pos
+        for ring in range(1, 6):
+            for k in range(8):
+                ang = (k / 8.0) * 2.0 * math.pi
+                px = x + math.cos(ang) * min_sep * ring
+                py = y + math.sin(ang) * min_sep * ring
+                if _clear(px, py):
+                    print(
+                        f"[SPAWN] Client {ctx.client_id}: separated spawn "
+                        f"({x:.1f},{y:.1f}) -> ({px:.1f},{py:.1f}) to avoid stacking"
+                    )
+                    return (px, py, z)
+        print(f"[SPAWN] Client {ctx.client_id}: could not find clear spawn near ({x:.1f},{y:.1f})")
+        return pos
+
     def _spawn_wf_style(self, ctx: ClientContext, team_id: int, net_id: Optional[int] = None,
                          unit_type: int = 0,
                          pos: Optional[tuple] = None,
@@ -4249,6 +4426,22 @@ class WulframServer:
             )
             spawn_pos = (spawn_pos[0], spawn_pos[1], terrain_z)
 
+        # Anti-stack safety: never place a tank on top of another live tank. Two
+        # tanks at the same point collide on arrival -> instant death, and the
+        # spawning client never coexists with the other, which silently breaks
+        # roster + remote-entity replication (the "can't see each other" symptom).
+        # Only nudges on actual overlap, so single-client parity spawns and
+        # distinct map-flag spawns are unaffected.
+        spawn_pos = self._separate_from_live_tanks(ctx, spawn_pos)
+
+        # Terrain-safe height (upward-only): never let a spawn sit below the map
+        # surface, which causes continuous collision damage on arrival.
+        if self.up_axis == "z":
+            ground_z = self._terrain_ground_z_at(spawn_pos[0], spawn_pos[1])
+            if ground_z is not None and spawn_pos[2] < ground_z:
+                print(f"[SPAWN] Raising spawn Z {spawn_pos[2]:.1f} -> {ground_z:.1f} (terrain-safe)")
+                spawn_pos = (spawn_pos[0], spawn_pos[1], ground_z)
+
         ctx.player_pos = spawn_pos
         ctx.player_pose["pos"] = spawn_pos
         if hasattr(ctx, "record_pose_reset"):
@@ -4269,6 +4462,10 @@ class WulframServer:
         ctx.last_state_sync_rot = None
         ctx.last_correction_send = 0.0
         ctx.force_correction_once = False
+        # Gated-rare correction divergence accumulators (GOAL 2). Reset on
+        # spawn so the respawn pose discontinuity doesn't read as divergence.
+        ctx.divergence_accum_pos = 0.0
+        ctx.divergence_accum_heading = 0.0
         ctx.authoritative_state_history.clear()
 
         ctx.player_health = 1.0
@@ -5903,7 +6100,18 @@ class WulframServer:
         if self._remote_movement_input_active(ctx, now=now):
             return
 
-        include_view_update = self._should_send_state_sync_view_update(ctx)
+        # GOAL 2: under the gated-rare correction model the STATE_REQUEST reply
+        # must NOT proactively emit a VIEW_UPDATE (camera-clamp) correction or
+        # queue a correction burst — on fire the OG client spams STATE_REQUEST,
+        # which previously flooded a zero-latency loopback client into a render
+        # stall. Reply with the plain UPDATE_ARRAY snapshot only (HUD/local-state,
+        # no camera clamp); any genuine divergence is handled by the tick-loop
+        # divergence gate under its hard rate cap. Legacy proactive replies remain
+        # available for A/B via WULFRAM_CORRECTION_GATE=0.
+        if self.correction_gate_enabled:
+            include_view_update = False
+        else:
+            include_view_update = self._should_send_state_sync_view_update(ctx)
         self._send_state_sync_snapshot(
             ctx,
             reason="state_request",
@@ -6699,10 +6907,9 @@ class WulframServer:
         if target.vehicle_physics:
             target.vehicle_physics.reset()
 
-        respawn_delay = 5.0
-        target.session.delayed_spawn_team = target.session.team_id or 1
-        target.session.delayed_spawn_time = time.monotonic() + respawn_delay
-        print(f"[COMBAT] Respawning c{target.client_id} in {respawn_delay:.0f}s via delayed_spawn")
+        # GOAL 4: death/deploy state, no auto-spawn. Player redeploys on flag-click
+        # (REINCARNATE 0x00 -> handle_spawn_at_point) on their preserved team.
+        self._enter_death_deploy_state(target)
 
     def _broadcast_weapon_fire_fx(self, ctx: ClientContext, proj):
         """Broadcast TRANSIENT_ARRAY weapon fire FX to all clients except the firer.
@@ -9047,22 +9254,30 @@ class WulframServer:
         # terrain plane after the initial post-integrate clamp. Keep the final
         # authoritative pose on or above terrain before replication.
         final_ground_clamped = False
+        # GOAL 2 gate: the terrain-Z safety clamp is the canonical server-only,
+        # client-unpredictable displacement (server clamps Z to terrain; the OG
+        # client uses a spring-damper). The magnitude pushed up here is the
+        # divergence signal the reactive correction gate accumulates.
+        ground_clamp_dz = 0.0
         if self.up_axis == "z":
             if self.terrain and not use_ground_override:
                 terrain_z = self._terrain_physics_ground_z_at(new_x, new_y)
             else:
                 terrain_z = ground_level
             if new_z < terrain_z:
+                ground_clamp_dz = terrain_z - new_z
                 new_z = terrain_z
                 final_ground_clamped = True
                 if new_vel_z < 0.0:
                     new_vel_z = 0.0
         else:
             if new_y < ground_level:
+                ground_clamp_dz = ground_level - new_y
                 new_y = ground_level
                 final_ground_clamped = True
                 if new_vel_y < 0.0:
                     new_vel_y = 0.0
+        self._accumulate_correction_divergence(ctx, ground_clamp_dz)
         if final_ground_clamped:
             ctx.world_collision_ref_pos = (new_x, new_y, new_z)
 
@@ -21101,13 +21316,111 @@ class WulframServer:
             if target.vehicle_physics:
                 target.vehicle_physics.reset()
 
-            # Use game loop's delayed spawn mechanism (instead of background thread).
-            # The game loop checks delayed_spawn_team every 0.5s and calls
-            # _auto_join_team -> _spawn_wf_style when the time arrives.
-            respawn_delay = 5.0
-            target.session.delayed_spawn_team = target.session.team_id or 1
-            target.session.delayed_spawn_time = time.monotonic() + respawn_delay
-            print(f"[COMBAT] Respawning c{target.client_id} in {respawn_delay:.0f}s via delayed_spawn")
+            # GOAL 4: death/deploy state, no auto-spawn. Player redeploys on flag-click
+            # (REINCARNATE 0x00 -> handle_spawn_at_point) on their preserved team. This
+            # replaces the old delayed_spawn auto-flow (instant respawn + team_id-or-1
+            # neutral-team coercion).
+            self._enter_death_deploy_state(target)
+
+    def _enter_death_deploy_state(self, target: ClientContext) -> int:
+        """Put a just-killed client into the death/deploy screen WITHOUT auto-spawning.
+
+        GOAL 4: combat respawn used to reuse the *initial-deploy* auto-flow that we
+        already retired for fresh spawns -- it set
+        ``delayed_spawn_team = team_id or 1`` + ``delayed_spawn_time = now+5s``, which
+        the tick loop fired via ``_auto_join_team`` with no death countdown and no
+        flag-click. Two failures fell out of that:
+          1. Instant respawn (no death screen) because the timer just re-spawned you.
+          2. "Neutral/wrong team" because ``team_id or 1`` silently coerces a 0/missing
+             team to red(1) -- and that same coercion also leaks into the UPDATE_STATS
+             broadcast (``_broadcast_player_stats`` sends ``team_id or 1``), which writes
+             ``PlayerEntry+0x08`` on every client (Social.c:5501) and would re-corrupt
+             the GOAL 3 roster fix.
+
+        We now mirror the explicit flag-click deploy model: cancel any auto-spawn timer,
+        PRESERVE the player's team across death, and leave IN_GAME for TEAM_SELECT so the
+        next REINCARNATE 0x00 (map-flag click -> ``handle_spawn_at_point``) is treated as
+        a fresh deploy rather than the "Already spawned" IN_GAME branch. No
+        ``_is_loopback_client`` fork (exit condition e): identical for every client.
+
+        Returns the preserved team_id (for logging/assertions).
+        """
+        sess = target.session
+        # PRESERVE team across death. Never zero it, never default it here -- the
+        # redeploy must land on the SAME team. handle_spawn_at_point reads the clicked
+        # flag's team and falls back to this preserved value.
+        preserved_team = sess.team_id
+        # Belt-and-suspenders: make sure no stale auto-spawn timer can fire. THIS is the
+        # line that used to schedule the instant respawn; we explicitly clear it instead.
+        sess.delayed_spawn_team = 0
+        sess.delayed_spawn_time = 0.0
+        sess.pending_spawn_team_id = 0
+        # Re-roster on redeploy. The OG client empties its in-game player list when it
+        # drops to the team-select/deploy screen on death (the deploy screen shows
+        # "0 players"), so the surviving roster entry is gone. ADD_TO_ROSTER is gated by
+        # session.roster_sent (sent once per session, server.py ~4507) -> without this
+        # reset the redeploy never re-asserts the entry and the P-scoreboard stays empty
+        # after respawn (looks like a team-corruption regression but is really a
+        # roster-resend gap). Clearing the flag makes the next _spawn_wf_style re-send it.
+        sess.roster_sent = False
+        # Leave IN_GAME -> death/deploy. in_game bool is already cleared by the caller;
+        # move the phase enum too so server state is consistent and the next flag-click
+        # spawn is not rejected as a duplicate.
+        sess.in_game = False
+        if sess.phase == Phase.IN_GAME:
+            sess.transition_to(Phase.TEAM_SELECT)
+        print(
+            f"[COMBAT] c{target.client_id} -> death/deploy "
+            f"(team={preserved_team} preserved, awaiting flag-click redeploy; no auto-spawn)"
+        )
+        return preserved_team
+
+    def _kill_player_for_deploy(self, target: ClientContext, *, attacker: ClientContext = None,
+                                reason: str = "control") -> None:
+        """Full death sequence ending in the GOAL-4 death/deploy state (no auto-spawn).
+
+        Mirrors the combat-kill cleanup (stats, DELETE_OBJECT with explosion, entity
+        bookkeeping, server-state reset) and then hands off to
+        ``_enter_death_deploy_state`` so the victim must redeploy via an explicit
+        flag-click on their preserved team. Used by the ``damage``/``dmg`` control
+        command so a control-port kill exercises the SAME path as a real projectile
+        kill (otherwise a control-kill would leave the session IN_GAME and the redeploy
+        guard would reject the flag-click as a duplicate spawn).
+        """
+        target.deaths += 1
+        participants = (attacker, target) if attacker is not None else (target,)
+        if attacker is not None:
+            attacker.kills += 1
+            self._broadcast_player_stats(attacker, participants=participants)
+        self._broadcast_player_stats(target, participants=participants)
+
+        target_entity_id = target.session.entity_id or target.entity_id
+        tick_del = self._get_network_tick(target)
+        del_pkt = build_delete_object(tick_del, [target_entity_id], with_effects=True)
+        for client in self._snapshot_in_game_clients():
+            if not self._combat_observer_packets_allowed_for_client(client, *participants):
+                continue
+            self._send_packet_to_client(client, del_pkt, prefer_tcp=True)
+
+        target.session.in_game = False
+        for other in self._snapshot_in_game_clients():
+            if other is not target:
+                other.known_entity_ids.discard(target_entity_id)
+        target.known_entity_ids.clear()
+        if hasattr(target, '_entity_create_times'):
+            target._entity_create_times.clear()
+
+        target.player_health = 1.0
+        target.player_vel = (0.0, 0.0, 0.0)
+        target.player_speed = 0.0
+        target.angular_vel_yaw = 0.0
+        target.world_collision_ref_pos = target.player_pos
+        target.world_collision_bounds_dirty = False
+        if target.vehicle_physics:
+            target.vehicle_physics.reset()
+
+        print(f"[COMBAT] c{target.client_id} killed ({reason}) [D:{target.deaths}]")
+        self._enter_death_deploy_state(target)
 
     def _apply_building_damage(self, building_oid, proj, attacker: ClientContext, hit_pos: tuple):
         """Apply damage from a projectile to a building.
@@ -21385,8 +21698,9 @@ class WulframServer:
                 best_target.world_collision_bounds_dirty = False
                 if best_target.vehicle_physics:
                     best_target.vehicle_physics.reset()
-                best_target.session.delayed_spawn_team = best_target.session.team_id or 1
-                best_target.session.delayed_spawn_time = time.monotonic() + 5.0
+                # GOAL 4: death/deploy state, no auto-spawn (turret kill). Redeploy on
+                # flag-click on the preserved team.
+                self._enter_death_deploy_state(best_target)
 
     def _get_aim_rotation(self, ctx: ClientContext) -> tuple:
         """Return (pitch, yaw, source) for aiming/projectiles."""
@@ -21594,7 +21908,7 @@ class WulframServer:
         # otherwise OG client reads past local_state â†’ bitstream
         # misalignment â†’ protocol mismatch crash (especially on TCP).
         ls = self._get_local_state_kwargs(ctx)
-        if self.update_local_state_mode == "wf" and not handlers._is_loopback_client(ctx):
+        if self.update_local_state_mode == "wf" and handlers._is_og_client(ctx):
             ls["weapon_id"] = self._get_spawn_tank_weapon_type(ctx)
             ls["ammo_count_bits"] = 0
             ls["ammo_count"] = 0
@@ -21728,6 +22042,14 @@ class WulframServer:
         # Physics steps once per tick at native 30Hz (no accumulator needed).
         ctx.physics_step_count = 0
         last_physics_wall_time = time.monotonic()
+        # Real-time physics-rate accumulator (perf_counter = sub-us; monotonic is
+        # 16ms-coarse on Windows). See GOAL 6: the tick loop free-runs faster than
+        # tick_rate_hz under load, so stepping a fixed 1/30 dt every raw tick made
+        # the server integrate ~1.05 sim-seconds per real second and over-rotate
+        # every turn. The accumulator runs 0/1/2 fixed steps per tick so simulated
+        # time tracks wall-clock, matching the client's LocalPhysics.step.
+        phys_accum_last = time.perf_counter()
+        phys_accumulator = 0.0
         # (frame_locked mode removed â€” not part of original decompile)
 
         while ctx.running and ctx.session.in_game:
@@ -21809,61 +22131,90 @@ class WulframServer:
                 ctx.prev_raw_turn_input = raw_input
 
                 # === PHYSICS STEPPING ===
-                # Physics steps once per server tick at native 30Hz (dt=1/tick_rate).
-                # Matches client's 30Hz accumulator stepping.
+                # Advance physics at EXACTLY real-time via a wall-clock accumulator
+                # stepping fixed 1/tick_rate increments (GOAL 6). The tick loop free-
+                # runs faster than tick_rate_hz under load (measured 31.5Hz vs the
+                # client's 30Hz); stepping a fixed dt every raw tick over-integrated
+                # ~1.05 sim-seconds per real second, so the server out-rotated the
+                # client on every turn and compounded a multi-degree heading drift.
+                # Run 0/1/2 fixed steps per tick so simulated time == wall-clock time,
+                # matching the client's LocalPhysics.step accumulator on both sides.
                 physics_dt = 1.0 / self.tick_rate_hz
+
+                _pc_now = time.perf_counter()
+                phys_accumulator += max(0.0, _pc_now - phys_accum_last)
+                phys_accum_last = _pc_now
+                # Cap backlog at the client's 0.55s elapsed clamp (<=5 catch-up steps).
+                _max_backlog = 5.0 * physics_dt
+                if phys_accumulator > _max_backlog:
+                    phys_accumulator = _max_backlog
+                n_phys_steps = int(phys_accumulator / physics_dt)
+                phys_accumulator -= n_phys_steps * physics_dt
+                if os.environ.get("WULFRAM_GOAL6_LEGACY") == "1":
+                    # A/B baseline: legacy fixed-dt one-step-per-raw-tick behavior.
+                    n_phys_steps = 1
+                    phys_accumulator = 0.0
 
                 if _phase_timing:
                     _phase_t0 = time.perf_counter()
-                ctx.physics_step_count += 1
-                old_heading = ctx.player_heading
 
-                # Live ACTION_UPDATE packets arrive asynchronously relative to the
-                # 30 Hz tick loop. If turning changed partway through this wall-clock
-                # tick window, split the simulated 30 Hz step so the pre-change
-                # slice uses the previous turn input and only the remainder uses
-                # the latest input.
+                # Split window uses monotonic (the clock turn_input_change_time is
+                # stamped with); it is a coarse sub-tick refinement, kept decoupled
+                # from the perf_counter rate accumulator above.
                 step_wall_now = time.monotonic()
                 step_wall_dt = max(1e-6, step_wall_now - last_physics_wall_time)
-                transition_time = float(getattr(ws, "turn_input_change_time", 0.0) or 0.0)
-                prev_turn_slot = float(getattr(ws, "turn_input_prev_value", 0.0) or 0.0)
-                prev_turn_input = self._normalize_turn_input_value(ctx, prev_turn_slot)
-                split_turn_step = (
-                    transition_time > last_physics_wall_time and
-                    transition_time < step_wall_now and
-                    abs(prev_turn_input - raw_input) > 0.001
-                )
-                move_dt = physics_dt
-                move_heading = old_heading
-                if split_turn_step:
-                    pre_ratio = (transition_time - last_physics_wall_time) / step_wall_dt
-                    pre_ratio = max(0.0, min(1.0, pre_ratio))
-                    pre_dt = physics_dt * pre_ratio
-                    post_dt = physics_dt - pre_dt
-                    prev_torque = self._compute_turn_torque(ctx, prev_turn_input)
-                    if pre_dt > 1e-6:
-                        physics.step_client_substeps(prev_torque, pre_dt, use_f32=use_f32)
-                        self._sync_heading_physics_to_context(ctx, physics)
-                        self._update_player_position(ctx, dt_override=pre_dt, heading_override=old_heading)
-                        move_heading = ctx.player_heading
-                    if post_dt > 1e-6:
-                        physics.step_client_substeps(torque, post_dt, use_f32=use_f32)
-                    move_dt = post_dt
-                    ws.turn_input_change_time = 0.0
-                    if self.debug_sync:
-                        print(
-                            f"[YAW-SPLIT] c{ctx.client_id} "
-                            f"old={prev_turn_input:.3f} new={raw_input:.3f} "
-                            f"pre_dt={pre_dt * 1000.0:.1f}ms post_dt={post_dt * 1000.0:.1f}ms"
-                        )
-                else:
-                    physics.step_client_substeps(torque, physics_dt, use_f32=use_f32)
                 last_physics_wall_time = step_wall_now
+                _window_start = step_wall_now - step_wall_dt
 
-                self._sync_heading_physics_to_context(ctx, physics)
+                old_heading = ctx.player_heading
+                move_dt = 0.0
+                move_heading = old_heading
+                for _phys_i in range(n_phys_steps):
+                    ctx.physics_step_count += 1
+                    old_heading = ctx.player_heading
 
-                if move_dt > 1e-6:
-                    self._update_player_position(ctx, dt_override=move_dt, heading_override=move_heading)
+                    # Live ACTION_UPDATE packets arrive asynchronously relative to the
+                    # tick loop. If turning changed partway through this tick's wall
+                    # window, split the first sub-step so the pre-change slice uses the
+                    # previous turn input and the remainder uses the latest input.
+                    transition_time = float(getattr(ws, "turn_input_change_time", 0.0) or 0.0)
+                    prev_turn_slot = float(getattr(ws, "turn_input_prev_value", 0.0) or 0.0)
+                    prev_turn_input = self._normalize_turn_input_value(ctx, prev_turn_slot)
+                    split_turn_step = (
+                        _phys_i == 0 and
+                        transition_time > _window_start and
+                        transition_time < step_wall_now and
+                        abs(prev_turn_input - raw_input) > 0.001
+                    )
+                    move_dt = physics_dt
+                    move_heading = old_heading
+                    if split_turn_step:
+                        pre_ratio = (transition_time - _window_start) / step_wall_dt
+                        pre_ratio = max(0.0, min(1.0, pre_ratio))
+                        pre_dt = physics_dt * pre_ratio
+                        post_dt = physics_dt - pre_dt
+                        prev_torque = self._compute_turn_torque(ctx, prev_turn_input)
+                        if pre_dt > 1e-6:
+                            physics.step_client_substeps(prev_torque, pre_dt, use_f32=use_f32)
+                            self._sync_heading_physics_to_context(ctx, physics)
+                            self._update_player_position(ctx, dt_override=pre_dt, heading_override=old_heading)
+                            move_heading = ctx.player_heading
+                        if post_dt > 1e-6:
+                            physics.step_client_substeps(torque, post_dt, use_f32=use_f32)
+                        move_dt = post_dt
+                        ws.turn_input_change_time = 0.0
+                        if self.debug_sync:
+                            print(
+                                f"[YAW-SPLIT] c{ctx.client_id} "
+                                f"old={prev_turn_input:.3f} new={raw_input:.3f} "
+                                f"pre_dt={pre_dt * 1000.0:.1f}ms post_dt={post_dt * 1000.0:.1f}ms"
+                            )
+                    else:
+                        physics.step_client_substeps(torque, physics_dt, use_f32=use_f32)
+
+                    self._sync_heading_physics_to_context(ctx, physics)
+                    if move_dt > 1e-6:
+                        self._update_player_position(ctx, dt_override=move_dt, heading_override=move_heading)
                 if _phase_timing:
                     _phase_t_upp = time.perf_counter()
                 self._resolve_entity_entity_collisions(ctx)
@@ -21934,7 +22285,13 @@ class WulframServer:
                 # Periodic status for debugging (every 30 seconds)
                 if ctx.session.tick % 900 == 0:  # ~30 seconds at 30Hz
                     input_status = "IDLE" if (abs(fwd_input) < 0.01 and abs(strafe_input) < 0.01) else "ACTIVE"
-                    print(f"[STATUS] Client {ctx.client_id}: pos={ctx.player_pos} input={input_status}(fwd={fwd_input:.2f},strafe={strafe_input:.2f}) stuck={stuck_duration:.0f}s")
+                    print(
+                        f"[STATUS] Client {ctx.client_id}: pos={ctx.player_pos} "
+                        f"input={input_status}(fwd={fwd_input:.2f},strafe={strafe_input:.2f}) "
+                        f"stuck={stuck_duration:.0f}s "
+                        f"corrections={int(getattr(ctx, 'correction_send_count', 0) or 0)} "
+                        f"divergence_accum={float(getattr(ctx, 'divergence_accum_pos', 0.0) or 0.0):.3f}u"
+                    )
 
                 tick = self._get_network_tick(ctx)
                 self._record_authoritative_state(ctx, tick=tick)
@@ -21963,45 +22320,72 @@ class WulframServer:
                     ctx,
                     now=now,
                 )
-                burst_due = (
-                    burst_remaining > 0
-                    and not active_movement_correction_suppressed
-                    and (now - ctx.last_correction_send) >= burst_interval
-                )
-                movement_interval = float(getattr(self, "movement_correction_interval", 0.0) or 0.0)
-                movement_window = float(getattr(self, "movement_correction_window", 0.0) or 0.0)
-                recent_move_input_time = float(getattr(ctx, "last_nonzero_move_input_time", 0.0) or 0.0)
-                movement_correction_recent = (
-                    movement_interval > 0
-                    and recent_move_input_time > 0.0
-                    and (now - recent_move_input_time) <= movement_window
-                    and not handlers._is_loopback_client(ctx)
-                )
-                movement_correction_due = (
-                    movement_correction_recent
-                    and not active_movement_correction_suppressed
-                    and (now - ctx.last_correction_send) >= movement_interval
-                )
-                interval_correction_due = (
-                    self.correction_interval > 0
-                    and not active_movement_correction_suppressed
-                    and (now - ctx.last_correction_send) >= self.correction_interval
-                )
                 correction_reason = ""
-                if getattr(ctx, "force_correction_once", False):
-                    correction_reason = "forced"
-                elif burst_due:
-                    correction_reason = "burst"
-                elif movement_correction_due:
-                    correction_reason = "movement"
-                elif interval_correction_due:
-                    correction_reason = "interval"
-                correction_due = (
-                    getattr(ctx, "force_correction_once", False)
-                    or burst_due
-                    or movement_correction_due
-                    or interval_correction_due
-                )
+                force_due = bool(getattr(ctx, "force_correction_once", False))
+                if self.correction_gate_enabled:
+                    # OG-faithful GATED-RARE reactive correction (GOAL 2). No
+                    # proactive timer streams: emit a VIEW_UPDATE only when the
+                    # authoritative state has genuinely DIVERGED (accumulated
+                    # server-only, client-unpredictable displacement — terrain-Z
+                    # clamp / collision push — since the last correction) beyond a
+                    # threshold, and never faster than the hard rate cap. The gate
+                    # is IDENTICAL for every client: a zero-latency loopback client
+                    # is bounded by the same cap, with no _is_loopback_client fork.
+                    accum_pos = float(getattr(ctx, "divergence_accum_pos", 0.0) or 0.0)
+                    accum_heading_deg = math.degrees(
+                        abs(float(getattr(ctx, "divergence_accum_heading", 0.0) or 0.0))
+                    )
+                    rate_ok = (now - ctx.last_correction_send) >= self.correction_min_interval
+                    diverged = (
+                        accum_pos >= self.correction_divergence_pos
+                        or accum_heading_deg >= self.correction_divergence_heading_deg
+                    )
+                    divergence_correction_due = diverged and rate_ok
+                    if force_due:
+                        correction_reason = "forced"
+                    elif divergence_correction_due:
+                        correction_reason = "divergence"
+                    correction_due = force_due or divergence_correction_due
+                else:
+                    # Legacy proactive streams — A/B only (WULFRAM_CORRECTION_GATE=0).
+                    burst_due = (
+                        burst_remaining > 0
+                        and not active_movement_correction_suppressed
+                        and (now - ctx.last_correction_send) >= burst_interval
+                    )
+                    movement_interval = float(getattr(self, "movement_correction_interval", 0.0) or 0.0)
+                    movement_window = float(getattr(self, "movement_correction_window", 0.0) or 0.0)
+                    recent_move_input_time = float(getattr(ctx, "last_nonzero_move_input_time", 0.0) or 0.0)
+                    movement_correction_recent = (
+                        movement_interval > 0
+                        and recent_move_input_time > 0.0
+                        and (now - recent_move_input_time) <= movement_window
+                        and not handlers._is_loopback_client(ctx)
+                    )
+                    movement_correction_due = (
+                        movement_correction_recent
+                        and not active_movement_correction_suppressed
+                        and (now - ctx.last_correction_send) >= movement_interval
+                    )
+                    interval_correction_due = (
+                        self.correction_interval > 0
+                        and not active_movement_correction_suppressed
+                        and (now - ctx.last_correction_send) >= self.correction_interval
+                    )
+                    if force_due:
+                        correction_reason = "forced"
+                    elif burst_due:
+                        correction_reason = "burst"
+                    elif movement_correction_due:
+                        correction_reason = "movement"
+                    elif interval_correction_due:
+                        correction_reason = "interval"
+                    correction_due = (
+                        force_due
+                        or burst_due
+                        or movement_correction_due
+                        or interval_correction_due
+                    )
                 if self.update_on_change:
                     pos_changed = any(abs(a - b) > self.update_epsilon for a, b in zip(send_pos, ctx.last_sent_pos))
                     vel_changed = any(abs(a - b) > self.update_epsilon for a, b in zip(ctx.player_vel, ctx.last_sent_vel))
@@ -22278,6 +22662,11 @@ class WulframServer:
                         )
                         ctx.last_correction_send = now
                         ctx.force_correction_once = False
+                        # Gate consumed the divergence: clear the accumulators so a
+                        # single correction settles the client before the next can fire.
+                        ctx.divergence_accum_pos = 0.0
+                        ctx.divergence_accum_heading = 0.0
+                        ctx.correction_send_count = int(getattr(ctx, "correction_send_count", 0) or 0) + 1
                         if burst_remaining > 0:
                             ctx.correction_burst_remaining = burst_remaining - 1
                         if correction_reason == "movement":

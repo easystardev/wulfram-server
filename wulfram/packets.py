@@ -222,24 +222,44 @@ def build_add_to_roster(player_id: int, entity_id: int, name: str, team: int,
                         clan: str = "", kills: int = 0, deaths: int = 0) -> bytes:
     """Build ADD_TO_ROSTER packet (0x1A).
 
-    Format per decompile (GUESS5_PacketHandler_ADD_TO_ROSTER):
-      u32 player_oid, u32 team_id, u16 kills, u16 deaths,
-      string name, string clan, u16 stat_a, u16 stat_b,
-      fixed16 ping, u32 flags
+    Wire field order, read by GUESS5_PacketHandler_ADD_TO_ROSTER (Handlers.c:622):
+      u32 f1, u32 f2, u16 f3, u16 f4, string name, string clan,
+      u16 f5, u16 f6, fixed16 ping, u32 flags.
+
+    GOAL 3 (verified empirically 2026-06-02 by raw-injecting variants and reading
+    the OG P-key scoreboard): the handler passes these POSITIONALLY to
+    PlayerEntry_create (Social.c:5199), whose stored offsets are what the
+    scoreboard render + team-count actually read. The decompiler's positional arg
+    order is REAL (not a Ghidra artifact). The resulting field->offset->meaning is:
+
+      f1 (u32) -> +0x0C player_id        (scoreboard record[3])
+      f2 (u32) -> +0x10 clan_id          (NOT a team field; unused for display)
+      f3 (u16) -> +0x08 team_id          <-- the SCOREBOARD TEAM FILTER (1=red/2=blue)
+      f4 (u16) -> +0x14 stats_flags
+      name     -> +0x00 name             (record[0])
+      clan     -> +0x04 clan_name        (record[1])
+      f5 (u16) -> +0x18 kills            (record[6], displayed)
+      f6 (u16) -> +0x1C deaths           (record[7], displayed)
+
+    The row renders only when +0x08 == team_info+0x18 (hardcoded 1/2). Previously
+    this packed `team` into f2 and `kills` into f3, so every entry's filter-team
+    became `kills` (0) -> matched neither column -> the roster stayed empty (and
+    the top team-count read 0/0). Putting `team` in f3 makes the player appear on
+    the correct team; kills/deaths now go in f5/f6.
     """
     name_bytes = (name + '\x00').encode('ascii')
     clan_bytes = (clan + '\x00').encode('ascii')
     payload = b'\x1A'
-    payload += struct.pack(">I", player_id)
-    payload += struct.pack(">I", team & 0xFFFFFFFF)
-    payload += struct.pack(">H", kills & 0xFFFF)
-    payload += struct.pack(">H", deaths & 0xFFFF)
+    payload += struct.pack(">I", player_id)        # f1 -> +0x0C player_id
+    payload += struct.pack(">I", 0)                # f2 -> +0x10 clan_id (unused)
+    payload += struct.pack(">H", team & 0xFFFF)    # f3 -> +0x08 team filter (1/2)
+    payload += struct.pack(">H", 0)                # f4 -> +0x14 stats_flags
     payload += struct.pack(">H", len(name_bytes)) + name_bytes
     payload += struct.pack(">H", len(clan_bytes)) + clan_bytes
-    payload += struct.pack(">H", 0)       # stat_a
-    payload += struct.pack(">H", 0)       # stat_b
-    payload += pack_fixed16(0.0)          # ping
-    payload += struct.pack(">I", 0)       # flags
+    payload += struct.pack(">H", kills & 0xFFFF)   # f5 -> +0x18 kills (displayed)
+    payload += struct.pack(">H", deaths & 0xFFFF)  # f6 -> +0x1C deaths (displayed)
+    payload += pack_fixed16(0.0)                   # ping
+    payload += struct.pack(">I", 0)                # flags
     return payload
 
 

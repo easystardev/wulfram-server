@@ -173,8 +173,12 @@ def _build_server_d_handshake(ctx: Optional["ClientContext"]) -> bytes:
     return b"\x03" + bytes(payload)
 
 
-def _is_loopback_client(ctx: "ClientContext") -> bool:
-    """Return True when the TCP peer is loopback/local-only."""
+def _tcp_peer_is_loopback(ctx: "ClientContext") -> bool:
+    """Literal network-location check: is the TCP peer a loopback address?
+
+    Use this ONLY for genuine location logic. Do NOT use it as a proxy for
+    "this is the Python test client" — see _is_loopback_client below.
+    """
     addr = getattr(ctx, "client_addr", None)
     if not addr:
         return False
@@ -183,6 +187,34 @@ def _is_loopback_client(ctx: "ClientContext") -> bool:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return host.lower() == "localhost"
+
+
+def _is_loopback_client(ctx: "ClientContext") -> bool:
+    """RETIRED FORK (2026-06-02): always returns False.
+
+    This was used as a proxy for "this is the Python test client", routing it to
+    a simplified, non-OG-faithful wire path. That was a wrong turn: the Python
+    client is meant to be a byte-accurate OG clone, so EVERY client now takes the
+    single OG-faithful path. Forcing False here retires the fork in one place;
+    the ~34 call sites collapse to their OG branch (dead loopback branches get
+    deleted as Stage-2 cleanup). Python clients will receive OG-faithful bytes
+    they may not yet decode — that is expected; the py client gets fixed to match.
+    For real location needs use _tcp_peer_is_loopback. To revert, return that.
+    """
+    return False
+
+
+def _is_og_client(ctx: "ClientContext") -> bool:
+    """True when this peer is the real OG client (vs a Python test client).
+
+    Identity is the login flow, NOT the network address: an OG client run on the
+    same host (loopback, e.g. play.bat) is still an OG client and needs the OG
+    replication paths (local-state prefix on remote/projectile UPDATE_ARRAYs),
+    while only the Python test client uses the short entity-only path. Keying on
+    loopback alone misroutes a loopback OG client and corrupts its local health
+    read (red-health desync). Mirrors _get_login_bootstrap_mode's TYPE routing.
+    """
+    return _get_login_bootstrap_mode(ctx) == "og"
 
 
 def _get_login_bootstrap_mode(ctx: "ClientContext") -> str:
@@ -449,32 +481,6 @@ def _safe_tcp_send(ctx: "ClientContext", payload: bytes, label: str = "") -> boo
         return False
 
 
-def _schedule_team_select_spawn(server: "WulframServer", ctx: "ClientContext", team_id: int, reason: str) -> None:
-    """Schedule/queue auto-spawn for legacy team-select flow."""
-    session = ctx.session
-    if not getattr(server, "spawn_on_team_select", False):
-        session.pending_spawn_team_id = 0
-        return
-
-    now = time.monotonic()
-    wants_updates = session.want_updates_received or session.want_updates_handled
-    if wants_updates:
-        session.pending_spawn_team_id = 0
-        session.delayed_spawn_team = team_id
-        session.delayed_spawn_time = now + server.spawn_delay_seconds
-        print(
-            f"[SPAWN] Client {ctx.client_id}: Scheduled delayed spawn in "
-            f"{server.spawn_delay_seconds:.1f}s for team {team_id} ({reason})"
-        )
-        return
-
-    session.pending_spawn_team_id = team_id
-    print(
-        f"[SPAWN] Client {ctx.client_id}: Deferred spawn for team {team_id} "
-        f"until WANT_UPDATES ({reason})"
-    )
-
-
 def handle_bps(server: "WulframServer", ctx: "ClientContext", packet: bytes):
     """Handle BPS (bandwidth/rate) packet."""
     session = ctx.session
@@ -570,42 +576,13 @@ def handle_want_updates(server: "WulframServer", ctx: "ClientContext", packet: b
                 "UDP D_HANDSHAKE + TRANSLATION_ACK complete"
             )
 
-    # Optional legacy path: spawn directly from team-select state.
-    if session.pending_spawn_team_id:
-        if getattr(server, "spawn_on_team_select", False):
-            team = session.pending_spawn_team_id
-            session.pending_spawn_team_id = 0
-            session.delayed_spawn_time = now + server.spawn_delay_seconds
-            session.delayed_spawn_team = team
-            print(
-                f"[GAME] Client {ctx.client_id}: Scheduled spawn in "
-                f"{server.spawn_delay_seconds:.1f}s for team {team} (team select)"
-            )
-            session.want_updates_handled = True
-            session.want_updates_handled_time = now
-            return
-        print(
-            f"[GAME] Client {ctx.client_id}: pending team-select spawn ignored "
-            "(spawn_on_team_select=0)"
-        )
-        session.pending_spawn_team_id = 0
-
     session.want_updates_handled = True
     session.want_updates_handled_time = now
-
-    # Auto-join team (alternate between team 1 and 2 for multiplayer)
-    if FEATURES.auto_join_team:
-        # Alternate by client_id: odd=team1, even=team2
-        team = 1 + ((ctx.client_id - 1) % 2)  # client 1 -> team 1, client 2 -> team 2
-        spawn_delay_seconds = getattr(server, "spawn_delay_seconds", 6.0)
-        session.delayed_spawn_time = now + spawn_delay_seconds
-        session.delayed_spawn_team = team
-        print(
-            f"[GAME] Client {ctx.client_id}: Scheduled auto-spawn in "
-            f"{spawn_delay_seconds:.1f}s for team {team}"
-        )
-    else:
-        print(f"[GAME] Client {ctx.client_id}: Auto-spawn disabled")
+    # Spawn is driven entirely by the explicit spawn-point / REINCARNATE flow
+    # (see handle_team_switch + handle_spawn_at_point). The legacy auto-spawn-on-
+    # team-select and auto_join_team timer paths were removed: they could fire
+    # before world/collision data was ready and crash the client.
+    print(f"[GAME] Client {ctx.client_id}: ready; awaiting explicit spawn-point selection")
 
 
 def handle_reincarnate_tcp(server: "WulframServer", ctx: "ClientContext", packet: bytes):
@@ -626,7 +603,6 @@ def handle_reincarnate_tcp(server: "WulframServer", ctx: "ClientContext", packet
     session.team_id = team_id
     if session.player_id == 0:
         session.player_id = ctx.entity_id
-    _schedule_team_select_spawn(server, ctx, team_id, reason="tcp_reincarnate")
     _send_team_switch_roster(server, ctx, team_id)
     _send_team_switch_update_stats(server, ctx, team_id)
 
@@ -1148,7 +1124,6 @@ def handle_team_switch(server: "WulframServer", ctx: "ClientContext", team_id: i
     session.team_id = team_id
     if session.player_id == 0:
         session.player_id = ctx.entity_id
-    _schedule_team_select_spawn(server, ctx, team_id, reason="udp_team_switch")
     _send_team_switch_roster(server, ctx, team_id)
     _send_team_switch_update_stats(server, ctx, team_id, addr)
 
@@ -1170,31 +1145,10 @@ def handle_team_switch(server: "WulframServer", ctx: "ClientContext", team_id: i
                 print(f"[TCP] Team {team_id} switch acked with REINCARNATE 0x11 (fallback)")
 
     _send_post_reincarnate_entry_packets(server, ctx)
-
-    if getattr(server, "spawn_on_team_select", False):
-        print(
-            f"[UDP] Team {team_id} selected - spawn_on_team_select=1 "
-            "(legacy auto-spawn path)"
-        )
-    else:
-        # Explicit spawn-point flow: if the client never sends subtype-0 REINCARNATE,
-        # schedule a bounded fallback spawn to avoid getting stuck in entry-map UI.
-        force_after = float(getattr(server, "spawn_force_after", 0.0) or 0.0)
-        if force_after > 0.0:
-            now = time.monotonic()
-            base = session.want_updates_time if session.want_updates_time > 0.0 else now
-            session.delayed_spawn_team = team_id
-            session.delayed_spawn_time = max(base + force_after, now + 0.5)
-            session.spawn_wait_logged = False
-            wait_s = max(0.0, session.delayed_spawn_time - now)
-            anchor = "WANT_UPDATES" if session.want_updates_time > 0.0 else "team-switch"
-            print(
-                f"[UDP] Team {team_id} explicit-spawn fallback scheduled in "
-                f"{wait_s:.1f}s (anchor={anchor})"
-            )
-        print(
-            f"[UDP] Team {team_id} selected - waiting for explicit spawn-point packet"
-        )
+    # No auto-spawn here: selecting a team only acks + sends roster/stats. The player
+    # deploys by clicking a map flag, which sends REINCARNATE subtype 0x00 ->
+    # handle_spawn_at_point (see handle_reincarnate_udp).
+    print(f"[UDP] Team {team_id} selected - awaiting map-flag spawn click")
 
 
 def handle_spawn_at_point(server: "WulframServer", ctx: "ClientContext", spawn_point_id: int, vehicle_type: int, addr: tuple):

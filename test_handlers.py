@@ -3593,8 +3593,12 @@ def test_udp_team_switch_can_reassert_roster_without_entry_packets():
     handle_team_switch(server, ctx, 2, ("10.10.10.2", 59507))
 
     assert [payload[0] for payload in ctx.tcp_handler.sent] == [0x1A]
-    assert ctx.tcp_handler.sent[0][1:5] == b"\x00\x00\x05\x39"
-    assert ctx.tcp_handler.sent[0][5:9] == b"\x00\x00\x00\x02"
+    assert ctx.tcp_handler.sent[0][1:5] == b"\x00\x00\x05\x39"  # f1 = player_id
+    # GOAL 3 fix: the OG scoreboard team filter (PlayerEntry+0x08) is fed by wire
+    # field-3 (u16), NOT field-2. f2 (bytes 5-9) is now 0 (clan_id); the team (2)
+    # lives in the u16 at bytes 9-11.
+    assert ctx.tcp_handler.sent[0][5:9] == b"\x00\x00\x00\x00"  # f2 = clan_id (unused)
+    assert ctx.tcp_handler.sent[0][9:11] == b"\x00\x02"          # f3 = team filter
     assert session.team_id == 2
     print("test_udp_team_switch_can_reassert_roster_without_entry_packets: PASSED")
     return True

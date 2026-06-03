@@ -2792,26 +2792,25 @@ Examples:
 
         print(
             f"[DAMAGE] Client {ctx.client_id}: "
-            f"{old_health*100:.0f}% → {new_health*100:.0f}% (dmg={amount*100:.0f}%)"
+            f"{old_health*100:.0f}% -> {new_health*100:.0f}% (dmg={amount*100:.0f}%)"
         )
 
-        # If dead, delete entity
+        # If dead, run the full GOAL-4 death sequence: DELETE + cleanup + death/deploy
+        # state (no auto-spawn). This routes the control-port kill through the SAME path
+        # as a real projectile kill so the redeploy must come from an explicit flag-click
+        # on the preserved team -- exactly what we want to test.
         if ctx.player_health <= 0.0:
             entity_id = ctx.session.entity_id or ctx.entity_id
-            delete_pkt = build_delete_object(
-                tick=self.server._get_network_tick(ctx),
-                entity_ids=[entity_id],
-                with_effects=True,
-            )
-            for client in self.server._snapshot_in_game_clients():
-                self.server._send_packet_to_client(client, delete_pkt, prefer_tcp=True)
+            preserved_team = ctx.session.team_id if ctx.session else 0
+            self.server._kill_player_for_deploy(ctx, reason="control:dmg")
             return (
-                f"Client {ctx.client_id}: {old_health*100:.0f}% → DEAD "
-                f"(entity {entity_id} deleted with explosion)"
+                f"Client {ctx.client_id}: {old_health*100:.0f}% -> DEAD "
+                f"(entity {entity_id} deleted; death/deploy, team {preserved_team} "
+                f"preserved, awaiting flag-click redeploy)"
             )
 
         return (
-            f"Client {ctx.client_id}: {old_health*100:.0f}% → {new_health*100:.0f}%"
+            f"Client {ctx.client_id}: {old_health*100:.0f}% -> {new_health*100:.0f}%"
         )
 
     def _do_respawn(self, ctx, pos: tuple = None, offset_x: float = 0.0, team: int = None) -> str:
@@ -4190,6 +4189,11 @@ Examples:
                     lines.insert(0, f"client_id={ctx.client_id}")
                 steps = getattr(ctx, "physics_step_count", "?")
                 lines.append(f"physics_steps={steps}")
+                lines.append(
+                    f"corrections={int(getattr(ctx, 'correction_send_count', 0) or 0)} "
+                    f"divergence_accum={float(getattr(ctx, 'divergence_accum_pos', 0.0) or 0.0):.3f}u "
+                    f"state_requests={int(getattr(ctx, 'state_request_count', 0) or 0)}"
+                )
                 return "\n".join(lines)
             except Exception as e:
                 import traceback
@@ -4479,7 +4483,7 @@ Examples:
                 self.server.udp_handler.send_to(packet, ctx.session.udp_addr)
 
             return (
-                f"Client {ctx.client_id}: health {old_health*100:.0f}% → {new_health*100:.0f}%"
+                f"Client {ctx.client_id}: health {old_health*100:.0f}% -> {new_health*100:.0f}%"
             )
 
         # Show health for specific or all clients

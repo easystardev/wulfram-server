@@ -180,10 +180,10 @@ class Features:
     send_spawn_points: bool = False  # Wulf-forge baseline: no spawn point entities
     send_player_on_login: bool = False
     send_world_stats_on_login: bool = False
-    # Default off: auto-spawn can trigger before world collision data is ready and crash the client.
-    # Spawn should come from explicit REINCARNATE flow (team switch + spawn point selection).
+    # Auto-spawn can trigger before world collision data is ready and crash the client.
+    # Spawn must come from the explicit REINCARNATE flow (team switch + spawn point
+    # selection); the auto_join_team feature was removed for that reason.
     auto_login: bool = False
-    auto_join_team: bool = False
     tick_loop_enabled: bool = True  # ENABLED - sends health/energy heartbeat
     send_update_array_empty: bool = False  # DISABLED - heartbeat is preferred
     wulfforge_compat: bool = False  # When True, minimize to wulf-forge behavior
@@ -199,7 +199,6 @@ class Features:
 
         for env_key, attr in [
             ("WULFRAM_AUTO_LOGIN", "auto_login"),
-            ("WULFRAM_AUTO_JOIN_TEAM", "auto_join_team"),
             ("WULFRAM_TICK_LOOP_ENABLED", "tick_loop_enabled"),
             ("WULFRAM_SEND_BEHAVIOR", "send_behavior_packet"),
             ("WULFRAM_SEND_TRANSLATION", "send_translation_packet"),
@@ -228,7 +227,6 @@ class Features:
             self.send_spawn_points = False
             self.send_player_on_login = False
             self.send_world_stats_on_login = False
-            self.auto_join_team = True
             self.tick_loop_enabled = False  # wulf-forge doesn't have a tick loop
             self.send_update_array_empty = False  # wulf-forge doesn't send UPDATE_ARRAY
             print("[FEATURES] Wulf-forge compatibility mode ENABLED")
