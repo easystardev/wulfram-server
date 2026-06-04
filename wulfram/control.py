@@ -4184,7 +4184,12 @@ Examples:
                     strafe = ws.behavior_slots[BehaviorSlot.MOVING_SIDEWAYS]
                     lines.insert(0, f"client_id={ctx.client_id}")
                     lines.append(f"input: turn={turn:.3f} fwd={fwd:.3f} strafe={strafe:.3f}")
-                    lines.append(f"frame_dt={ws.avg_frame_dt*1000:.1f}ms")
+                    _eff = ws.effective_frame_dt(30.0)
+                    _meas = getattr(ws, "measured_frame_dt", 0.0) or 0.0
+                    lines.append(
+                        f"frame_dt={ws.avg_frame_dt*1000:.1f}ms "
+                        f"measured={_meas*1000:.1f}ms step_dt={_eff*1000:.1f}ms"
+                    )
                 else:
                     lines.insert(0, f"client_id={ctx.client_id}")
                 steps = getattr(ctx, "physics_step_count", "?")

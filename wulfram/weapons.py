@@ -78,9 +78,17 @@ class WeaponSystem:
         self.turn_input_change_client_tick: int = 0  # client tick (ms) at last TURNING change
         self.prev_action_client_tick: int = 0  # previous ACTION_UPDATE client tick (ms)
         self.client_frame_dt: float = 0.0  # client frame duration at last turn change (seconds)
-        # Client frame dt — cannot be measured from packets (INPUT_FEEDBACK is 200ms
-        # throttled, not per-frame; frame counter is always 0). Must be configured.
-        # Tunable via WULFRAM_CLIENT_FRAME_DT_MS env var.
+        # GOAL 7: per-client render-frame period, measured live from ACTION packet
+        # (Δclient_tick_ms / Δframe_counter) when the client carries an incrementing
+        # frame counter (the py client does). Stays 0 ("unmeasured") for clients that
+        # send a static frame counter (e.g. the OG client) — those fall back to the
+        # configured avg_frame_dt. EMA-smoothed; see note_action_frame_timing().
+        self.measured_frame_dt: float = 0.0  # seconds, 0 = not yet measured
+        self._fdt_prev_tick: int = 0
+        self._fdt_prev_frame: int = 0
+        # Client frame dt — when not measurable from packets (e.g. the OG client whose
+        # frame counter is static, INPUT_FEEDBACK is 200ms-throttled) we fall back to
+        # this configured value. Tunable via WULFRAM_CLIENT_FRAME_DT_MS env var.
         self.prev_dump_tick: int = 0
         self.input_feedback_count: int = 0  # INPUT_FEEDBACK packets since last ACTION_DUMP
         frame_dt_ms = float(os.environ.get("WULFRAM_CLIENT_FRAME_DT_MS", "84"))
@@ -268,6 +276,7 @@ class WeaponSystem:
             reader = BitReader(data[1:])
             tick = reader.read_bits(32)
             frame = reader.read_bits(32)
+            self.note_action_frame_timing(tick, frame)  # GOAL 7: measure frame_dt
 
             # Debug: capture raw values before decoding
             raw_values = {}
@@ -341,6 +350,59 @@ class WeaponSystem:
             traceback.print_exc()
             return False
 
+    def note_action_frame_timing(self, tick: int, frame: int) -> None:
+        """GOAL 7: update the measured per-client render-frame period.
+
+        ACTION packets carry the client's millisecond clock (``tick``) and a
+        monotonic render-frame counter (``frame``). Δtick / Δframe is the real
+        per-frame period, independent of the network send stride (dumps every N
+        frames still yield Δtick/Δframe = frame_period). Clients with a static
+        frame counter (Δframe == 0, e.g. the OG client) leave ``measured_frame_dt``
+        at 0 so the caller falls back to the configured ``avg_frame_dt``.
+        """
+        prev_tick = self._fdt_prev_tick
+        prev_frame = self._fdt_prev_frame
+        self._fdt_prev_tick = tick
+        self._fdt_prev_frame = frame
+        if prev_tick <= 0 or prev_frame <= 0 or tick <= 0 or frame <= 0:
+            return
+        d_frame = frame - prev_frame
+        d_tick = tick - prev_tick  # milliseconds (client monotonic clock)
+        if d_frame <= 0 or d_tick <= 0:
+            return
+        period_s = (d_tick / d_frame) / 1000.0
+        # Reject implausible periods (clock wrap, packet bursts): keep within
+        # [~120fps, ~5fps] which brackets every real client frame rate.
+        if period_s < (1.0 / 120.0) or period_s > 0.20:
+            return
+        if self.measured_frame_dt <= 0.0:
+            self.measured_frame_dt = period_s
+        else:
+            # EMA so a single jittery interval cannot swing the step rate.
+            self.measured_frame_dt = 0.85 * self.measured_frame_dt + 0.15 * period_s
+
+    def effective_frame_dt(self, tick_rate_hz: float) -> float:
+        """Per-client physics-step chunk (seconds): the client's render-frame period.
+
+        Prefers the live Δtick/Δframe measurement, falls back to the configured
+        ``avg_frame_dt`` (the validated OG estimate), then to the server tick period.
+
+        Snap-to-tick-rate: a client that effectively runs at the server tick rate
+        (within 20%) is stepped at EXACTLY the tick period. The py client runs the
+        same fixed-30Hz physics accumulator this server does, so it must be stepped
+        at 1/30 for its step count to match (a jittery ~34ms estimate would
+        under-step it). Only a genuinely slower client (the OG WARP client at ~84ms,
+        ~2.5x the tick period) keeps its own coarser frame rate. This is a rate-based
+        rule applied to every client identically — not a client-type branch.
+        """
+        server_dt = 1.0 / tick_rate_hz if tick_rate_hz > 0 else 1.0 / 30.0
+        fdt = self.measured_frame_dt if self.measured_frame_dt > 0.0 else self.avg_frame_dt
+        if fdt <= 0.0:
+            return server_dt
+        if abs(fdt - server_dt) <= 0.2 * server_dt:
+            return server_dt
+        return fdt
+
     def decode_action_update(self, data: bytes) -> bool:
         """
         Decode ACTION_UPDATE packet (0x0A).
@@ -360,6 +422,7 @@ class WeaponSystem:
             frame = reader.read_bits(32)
         except ValueError:
             return False
+        self.note_action_frame_timing(tick, frame)  # GOAL 7: measure frame_dt
 
         self.client_frame_counter = frame
         if count == 0:

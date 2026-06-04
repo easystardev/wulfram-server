@@ -2051,7 +2051,23 @@ class WulframServer:
             pt_angle = 0.0
             st_angle = 0.0
 
-        if self._wf_remote_heartbeat_entity_mode(ctx) and not is_view_update:
+        # GOAL 7: the remote-sync entity path sends the OG client its OWN entity record
+        # (id, is_manned, mask=0) every heartbeat, which the OG treats as "zero my
+        # angular velocity" — stomping its predicted turn ~10x (confirmed: removing the
+        # per-player heartbeat made the OG match the server 1.00). In steady state (no
+        # transform to deliver) drop that record and send local_state HUD only, so the OG
+        # predicts its turn freely; corrections (pos/rot present) still deliver via the
+        # entity path. py does not reconcile to this record (sustained drift unchanged).
+        _goal7_drop_stomp_entity = (
+            os.environ.get("WULFRAM_GOAL7_LEGACY") != "1"
+            and rot is None
+            and pos is None
+        )
+        if (
+            self._wf_remote_heartbeat_entity_mode(ctx)
+            and not is_view_update
+            and not _goal7_drop_stomp_entity
+        ):
             remote_pos = pos
             remote_vel = None
             remote_rot = rot
@@ -2086,6 +2102,20 @@ class WulframServer:
         use_local_entity_when_no_transform = False
         include_entities = True
         if minimal_remote:
+            include_entities = False
+
+        # GOAL 7: the periodic heartbeat's dummy entity (0xFFFFFFFE, mask=0) makes the
+        # OG client ZERO its predicted angular velocity every ~100ms (confirmed live:
+        # with the per-player heartbeat off the OG matched the server 1.00 vs ~13°/147°
+        # with it on; the server torque path is faithful — Vehicles.c:1425 raw yaw —
+        # so the OG's real rate equals the server and the under-rotation was this stomp).
+        # Send local_state HUD with ZERO entities (no dummy to stomp) when there is no
+        # transform to deliver, so the OG predicts its turn freely. py does not reconcile
+        # to a dummy mask=0 entity, and remote-entity visibility uses a separate path, so
+        # this is universal (no client fork) and preserves HUD + remotes. Corrections
+        # (which carry pos/rot) keep their entity record. A/B: WULFRAM_GOAL7_LEGACY=1.
+        _has_transform = (rot is not None) or (pos is not None)
+        if os.environ.get("WULFRAM_GOAL7_LEGACY") != "1" and not _has_transform:
             include_entities = False
 
         return build_update_array_heartbeat(
@@ -2346,7 +2376,14 @@ class WulframServer:
             include_pos=has_pos,
             include_vel=has_vel,
             include_rot=has_rot,
-            include_spin=has_rot,
+            # GOAL 7: optionally carry the real yaw spin in every local heartbeat (not
+            # only when rotation is included) — tested as a hypothesis that the OG client
+            # zeros its ang_vel on a spin-less local UPDATE_ARRAY ("heartbeat mask=0 zeros
+            # angular velocity"). TESTED 2026-06-03: had NO effect on the OG under-rotation
+            # (server 150.7° / OG 13.5° unchanged with WULFRAM_HEARTBEAT_SPIN=1), so the
+            # stomp hypothesis is NOT the cause; default OFF to keep heartbeat behavior
+            # unchanged. Left as an A/B lever.
+            include_spin=(has_rot or os.environ.get("WULFRAM_HEARTBEAT_SPIN", "0") == "1"),
             spin=(0.0, 0.0, 0.0) if os.environ.get("WULFRAM_GOAL6_LEGACY") == "1" else (0.0, 0.0, ctx.angular_vel_yaw),
             include_local_state=include_local_state,
             include_entity_vitals=False,
@@ -22141,19 +22178,46 @@ class WulframServer:
                 # matching the client's LocalPhysics.step accumulator on both sides.
                 physics_dt = 1.0 / self.tick_rate_hz
 
+                # === GOAL 7: per-client frame-rate-matched physics stepping ===
+                # The client integrates physics once per RENDER FRAME, subdividing the
+                # real frame delta in GUESS6_GameSim_substep_update (azurefishy-src
+                # Physics.c:1974): one outer pass of substep_count = delta/110ms + 1
+                # (capped 5), each inner-split at 40ms (or dt*0.5 for dt>80ms), with
+                # ang_vel += accel*substep_dt (Physics.c:5169/5264). The server must
+                # advance simulated time in chunks of THIS client's frame_dt so the
+                # outer/inner substep STRUCTURE and f32-quantization boundaries match
+                # the client's per-frame integration exactly — not merely the total
+                # simulated time. At ~84ms (OG WARP) vs ~33ms (py @30Hz) the resulting
+                # rotation differs only ~1.3% (the coarser frame rotates slightly MORE
+                # under explicit Euler): the premise's "2.5x over-rotation from step
+                # count" does NOT exist because torque AND heading are both dt-scaled.
+                # This change aligns that ~1.3% residual to the real per-frame client
+                # behavior. GOAL-6's real-time accumulator is preserved (sim-time ==
+                # wall-time); only the per-step chunk changes from a fixed 1/30 to the
+                # client's actual frame rate. WULFRAM_GOAL7_LEGACY=1 restores 1/30.
+                goal7_legacy = os.environ.get("WULFRAM_GOAL7_LEGACY") == "1"
+                if goal7_legacy:
+                    step_dt = physics_dt
+                else:
+                    step_dt = ctx.weapon_system.effective_frame_dt(self.tick_rate_hz)
+                    # Clamp to the client's own bounds: a ~120fps floor and the 550ms
+                    # outer-delta clamp GameSim_substep_update enforces (Physics.c:1974).
+                    step_dt = max(1.0 / 120.0, min(step_dt, 0.55))
+
                 _pc_now = time.perf_counter()
                 phys_accumulator += max(0.0, _pc_now - phys_accum_last)
                 phys_accum_last = _pc_now
                 # Cap backlog at the client's 0.55s elapsed clamp (<=5 catch-up steps).
-                _max_backlog = 5.0 * physics_dt
+                _max_backlog = 5.0 * step_dt
                 if phys_accumulator > _max_backlog:
                     phys_accumulator = _max_backlog
-                n_phys_steps = int(phys_accumulator / physics_dt)
-                phys_accumulator -= n_phys_steps * physics_dt
+                n_phys_steps = int(phys_accumulator / step_dt)
+                phys_accumulator -= n_phys_steps * step_dt
                 if os.environ.get("WULFRAM_GOAL6_LEGACY") == "1":
                     # A/B baseline: legacy fixed-dt one-step-per-raw-tick behavior.
                     n_phys_steps = 1
                     phys_accumulator = 0.0
+                    step_dt = physics_dt
 
                 if _phase_timing:
                     _phase_t0 = time.perf_counter()
@@ -22186,13 +22250,13 @@ class WulframServer:
                         transition_time < step_wall_now and
                         abs(prev_turn_input - raw_input) > 0.001
                     )
-                    move_dt = physics_dt
+                    move_dt = step_dt
                     move_heading = old_heading
                     if split_turn_step:
                         pre_ratio = (transition_time - _window_start) / step_wall_dt
                         pre_ratio = max(0.0, min(1.0, pre_ratio))
-                        pre_dt = physics_dt * pre_ratio
-                        post_dt = physics_dt - pre_dt
+                        pre_dt = step_dt * pre_ratio
+                        post_dt = step_dt - pre_dt
                         prev_torque = self._compute_turn_torque(ctx, prev_turn_input)
                         if pre_dt > 1e-6:
                             physics.step_client_substeps(prev_torque, pre_dt, use_f32=use_f32)
@@ -22210,7 +22274,7 @@ class WulframServer:
                                 f"pre_dt={pre_dt * 1000.0:.1f}ms post_dt={post_dt * 1000.0:.1f}ms"
                             )
                     else:
-                        physics.step_client_substeps(torque, physics_dt, use_f32=use_f32)
+                        physics.step_client_substeps(torque, step_dt, use_f32=use_f32)
 
                     self._sync_heading_physics_to_context(ctx, physics)
                     if move_dt > 1e-6:
