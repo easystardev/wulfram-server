@@ -7495,6 +7495,12 @@ class WulframServer:
         target_roll, target_pitch, _yaw_from_matrix = _extract_euler_angles(matrix)
         target_roll = _normalize_angle_client(target_roll)
         target_pitch = _normalize_angle_client(target_pitch)
+        # CH2 slope-attitude diagnosis: stash the live terrain-normal target + the
+        # gradient it was derived from so the `attitude` control command can show
+        # where the forward/pitch component diverges (read-only debug).
+        ctx.debug_attitude_target = (
+            target_roll, target_pitch, self.tank_spring_attitude_model, dh_dx, dh_dy,
+        )
         if snap:
             roll = target_roll
             pitch = target_pitch

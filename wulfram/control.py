@@ -505,6 +505,8 @@ class ControlServer:
             return self._cmd_spread(args)
         elif cmd == 'pos' or cmd == 'player_pos':
             return self._cmd_player_pos(args)
+        elif cmd == 'attitude' or cmd == 'att':
+            return self._cmd_attitude(args)
         elif cmd == 'reset_pos' or cmd == 'rp':
             return self._cmd_reset_pos(args)
         elif cmd == 'spawn_entity' or cmd == 'entity':
@@ -4076,6 +4078,46 @@ Examples:
             print(f"[SPREAD] Shell {i+1}/{count}: yaw={yaw_deg:.0f}° vel=({vx:.1f},{vy:.1f},{vz:.1f})")
 
         return f"Fired {count} shells in spread pattern from ({x:.0f},{y:.0f},{z:.0f}): {', '.join(results)}"
+
+    def _cmd_attitude(self, args: list) -> str:
+        """Dump the live body-attitude derivation (CH2 slope pitch-flip diagnosis).
+
+        Read-only: shows player_pose roll/pitch, the computed terrain-normal target
+        (ctx.debug_attitude_target), the footprint avg_normal + per-point normals
+        (ctx.debug_last_spring_state), so we can see WHERE the live forward/pitch
+        component diverges from the geometric target.
+        """
+        if not self.server:
+            return "Error: No server reference"
+        import math
+        ctx = None
+        rem = list(args)
+        if rem and rem[0].lower().startswith("c") and rem[0][1:].isdigit():
+            ctx, _ = self._get_client_by_id(int(rem[0][1:]))
+        else:
+            ctx, _ = self._get_active_client()
+        if not ctx:
+            return "Error: No active client"
+        pose = getattr(ctx, "player_pose", {}) or {}
+        lines = [
+            f"client_id={ctx.client_id} pos=({ctx.player_pos[0]:.1f},{ctx.player_pos[1]:.1f},{ctx.player_pos[2]:.2f}) "
+            f"heading={math.degrees(-ctx.player_heading):.2f}deg",
+            f"player_pose: roll={math.degrees(float(pose.get('roll',0.0) or 0.0)):+.3f}deg "
+            f"pitch={math.degrees(float(pose.get('pitch',0.0) or 0.0)):+.3f}deg",
+        ]
+        tgt = getattr(ctx, "debug_attitude_target", None)
+        if tgt:
+            lines.append(f"target (terrain-normal): roll={math.degrees(tgt[0]):+.3f}deg "
+                         f"pitch={math.degrees(tgt[1]):+.3f}deg  model={tgt[2]}")
+            lines.append(f"  derived dh_dx={tgt[3]:+.5f} dh_dy={tgt[4]:+.5f}")
+        ss = getattr(ctx, "debug_last_spring_state", None)
+        if isinstance(ss, dict):
+            lines.append(f"avg_normal={ss.get('avg_normal')} rot_source={ss.get('rotation_source')}")
+            for i, s in enumerate(ss.get("samples", []) or []):
+                lines.append(f"  pt{i} sample_xy={s.get('sample_xy')} normal={s.get('normal')}")
+        else:
+            lines.append("(no debug_last_spring_state — attitude not sampled this tick)")
+        return "\n".join(lines)
 
     def _cmd_reset_pos(self, args: list) -> str:
         """Reset player position to spawn location."""
