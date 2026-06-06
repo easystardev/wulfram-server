@@ -46,7 +46,7 @@ import math
 # exactly one place — shared/wulfram2_protocol/sim_kernel/rotation.py. This
 # module is a thin adapter that imports them under the legacy private names the
 # rest of the server uses, so server and client can never silently diverge.
-from wulfram2_protocol.sim_kernel.rotation import (  # noqa: F401
+from wulfram2_protocol.sim_kernel import (  # noqa: F401  (backend gated by WULFRAM_NATIVE_KERNEL)
     F32_TWO_PI,
     extract_euler_angles as _extract_euler_angles,
     f32 as _f32,
