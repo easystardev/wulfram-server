@@ -1,0 +1,93 @@
+{
+ "corpus": "C:\\Users\\wstri\\dev\\wolfram\\server\\ch2-og-corpus",
+ "asserts": {
+  "input": {
+   "assert": "input",
+   "pass": true,
+   "n": 6,
+   "rows": [
+    {
+     "control": "forward",
+     "slot": 2,
+     "og_val": 0.549,
+     "raw": 32750,
+     "roundtrip_exact": true,
+     "slot_payload_ok": true,
+     "pass": true
+    },
+    {
+     "control": "back",
+     "slot": 2,
+     "og_val": -0.488,
+     "raw": 32783,
+     "roundtrip_exact": true,
+     "slot_payload_ok": true,
+     "pass": true
+    },
+    {
+     "control": "strafe_left",
+     "slot": 3,
+     "og_val": -0.488,
+     "raw": 32783,
+     "roundtrip_exact": true,
+     "slot_payload_ok": true,
+     "pass": true
+    },
+    {
+     "control": "strafe_right",
+     "slot": 3,
+     "og_val": 0.549,
+     "raw": 32750,
+     "roundtrip_exact": true,
+     "slot_payload_ok": true,
+     "pass": true
+    },
+    {
+     "control": "turn_left",
+     "slot": 1,
+     "og_val": -0.58,
+     "raw": 32787,
+     "roundtrip_exact": true,
+     "slot_payload_ok": true,
+     "pass": true
+    },
+    {
+     "control": "turn_right",
+     "slot": 1,
+     "og_val": 0.641,
+     "raw": 32746,
+     "roundtrip_exact": true,
+     "slot_payload_ok": true,
+     "pass": true
+    }
+   ],
+   "residual": "ACTION_UPDATE client_tick+frame header is non-deterministic (monotonic ms); full-packet byte-identity to the OG is impossible by construction. Slot-payload bits are exact."
+  },
+  "pose": {
+   "assert": "pose",
+   "bitexact_server_kernel": {
+    "pass": true,
+    "n": 1906,
+    "passed": 1906,
+    "reseeds": 0,
+    "first_divergence": null,
+    "method": "sequence replay through one VehiclePhysics (matrix carries)"
+   },
+   "og_fidelity_residual": {
+    "note": "OG client (x86 x87/SSE) vs python kernel is NOT bit-exact; GOAL-7/9 measured ~0.99 hull-yaw ratio. Reported as a fidelity residual, not a bit-exact gate.",
+    "regime_compare": [
+     {
+      "og_first_yaw_deg": 0.0,
+      "og_last_yaw_deg": -24.41,
+      "og_sweep_deg": -24.41,
+      "harness_sweep_deg": -33.08,
+      "og_over_harness_ratio": 0.738
+     }
+    ],
+    "og_pose_read_ok": 38,
+    "og_pose_total": 38
+   },
+   "pass": true
+  }
+ }
+}

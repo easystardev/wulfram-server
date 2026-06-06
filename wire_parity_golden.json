@@ -1,0 +1,219 @@
+{
+ "contract": "codec + quantizers + replication echo + TRANSIENT_ARRAY",
+ "encoding": "packet bytes as hex (exact)",
+ "tick_regime": "WULFRAM_USE_CLIENT_TICKS (ticks are explicit builder args)",
+ "seeded_from": "ch2-og-corpus.pose.ndjson",
+ "transient_legacy": "0",
+ "case_count": 31,
+ "cases": [
+  {
+   "kind": "update_array_player_update",
+   "label": "idle/pre#0",
+   "tick": 711000,
+   "hex": "0e000ad958800100404000014e60700007995418283ff97800000000000780000000000000"
+  },
+  {
+   "kind": "update_array_player_update",
+   "label": "idle/hold#1",
+   "tick": 711084,
+   "hex": "0e000ad9ac800100404000014e60700007995418283ff97800000000000780000000000000"
+  },
+  {
+   "kind": "update_array_player_update",
+   "label": "idle/hold#2",
+   "tick": 711168,
+   "hex": "0e000ada00800100404000014e60700007995418283ff97800000000000780000000000000"
+  },
+  {
+   "kind": "update_array_player_update",
+   "label": "idle/post#3",
+   "tick": 711252,
+   "hex": "0e000ada54800100404000014e60700007995418283ff97800000000000780000000000000"
+  },
+  {
+   "kind": "update_array_player_update",
+   "label": "forward/pre#4",
+   "tick": 711336,
+   "hex": "0e000adaa8800100404000014e60700007995418283ff97800000000000780000000000000"
+  },
+  {
+   "kind": "update_array_player_update",
+   "label": "forward/hold#5",
+   "tick": 711420,
+   "hex": "0e000adafc800100404000014e60700007995418283ff97800000000000780000000000000"
+  },
+  {
+   "kind": "update_array_player_update",
+   "label": "forward/hold#6",
+   "tick": 711504,
+   "hex": "0e000adb50800100404000014e60700007987098283ff97800000000000780000000000000"
+  },
+  {
+   "kind": "update_array_player_update",
+   "label": "forward/post#7",
+   "tick": 711588,
+   "hex": "0e000adba4800100404000014e60700007986898283ff97800000000000780000000000000"
+  },
+  {
+   "kind": "update_array_player_update",
+   "label": "back/pre#8",
+   "tick": 711672,
+   "hex": "0e000adbf8800100404000014e60700007986898283ff97800000000000780000000000000"
+  },
+  {
+   "kind": "update_array_player_update",
+   "label": "back/hold#9",
+   "tick": 711756,
+   "hex": "0e000adc4c800100404000014e60700007986898283ff97800000000000780000000000000"
+  },
+  {
+   "kind": "update_array_player_update",
+   "label": "back/hold#10",
+   "tick": 711840,
+   "hex": "0e000adca0800100404000014e6070000798e918283ff97800000000000780000000000000"
+  },
+  {
+   "kind": "update_array_player_update",
+   "label": "back/post#11",
+   "tick": 711924,
+   "hex": "0e000adcf4800100404000014e6070000798f398283ff97800000000000780000000000000"
+  },
+  {
+   "kind": "update_array_player_update",
+   "label": "turn_left/pre#12",
+   "tick": 712008,
+   "hex": "0e000add48800100404000014e6070000798f418283ff97800000000000780000000000000"
+  },
+  {
+   "kind": "update_array_player_update",
+   "label": "turn_left/hold#13",
+   "tick": 712092,
+   "hex": "0e000add9c800100404000014e6070000798f418283ff9f8000000000007bfa1bff4191300"
+  },
+  {
+   "kind": "update_array_player_update",
+   "label": "turn_left/post#14",
+   "tick": 712176,
+   "hex": "0e000addf0800100404000014e6070000798f418283ff9780000000000078036802c980c80"
+  },
+  {
+   "kind": "update_array_player_update",
+   "label": "turn_right/pre#15",
+   "tick": 712260,
+   "hex": "0e000ade44800100404000014e6070000798f418283ff978000000000007bfff002c180900"
+  },
+  {
+   "kind": "update_array_player_update",
+   "label": "turn_right/hold#16",
+   "tick": 712344,
+   "hex": "0e000ade98800100404000014e6070000798f418283ff97800000000000780b5bff480fd00"
+  },
+  {
+   "kind": "update_array_player_update",
+   "label": "turn_right/post#17",
+   "tick": 712428,
+   "hex": "0e000adeec800100404000014e6070000798f418283ff978000000000007bff1002e02ac00"
+  },
+  {
+   "kind": "update_array_player_update",
+   "label": "fwd_turn_right/pre#18",
+   "tick": 712512,
+   "hex": "0e000adf40800100404000014e6070000798f418283ff978000000000007bfff3fff82b580"
+  },
+  {
+   "kind": "update_array_player_update",
+   "label": "fwd_turn_right/hold#19",
+   "tick": 712596,
+   "hex": "0e000adf94800100404000014e60700007990c186e3ff9780000000000078069bfef336900"
+  },
+  {
+   "kind": "update_array_player_update",
+   "label": "fwd_turn_right/post#20",
+   "tick": 712680,
+   "hex": "0e000adfe8800100404000014e60700007990f986cbff978000000000007bff43fffb3e600"
+  },
+  {
+   "kind": "update_array_player_update",
+   "label": "fwd_turn_left/pre#21",
+   "tick": 712764,
+   "hex": "0e000ae03c800100404000014e60700007990f986c3ff978000000000007802e002c33e800"
+  },
+  {
+   "kind": "update_array_player_update",
+   "label": "fwd_turn_left/hold#22",
+   "tick": 712848,
+   "hex": "0e000ae090800100404000014e60700007995c984abff978000000000007bf423fe9066080"
+  },
+  {
+   "kind": "update_array_player_update",
+   "label": "fwd_turn_left/post#23",
+   "tick": 712932,
+   "hex": "0e000ae0e4800100404000014e60700007995f1852bff9f8000000000007803f0035051100"
+  },
+  {
+   "kind": "update_array_heartbeat",
+   "label": "beat#0",
+   "tick": 711000,
+   "hex": "0e000ad958800100407fffffffa0000000"
+  },
+  {
+   "kind": "update_array_heartbeat",
+   "label": "beat#1",
+   "tick": 711084,
+   "hex": "0e000ad9ac800100407fffffffa0000000"
+  },
+  {
+   "kind": "update_array_heartbeat",
+   "label": "beat#2",
+   "tick": 711168,
+   "hex": "0e000ada00800100407fffffffa0000000"
+  },
+  {
+   "kind": "update_array_heartbeat",
+   "label": "beat#3",
+   "tick": 711252,
+   "hex": "0e000ada54800100407fffffffa0000000"
+  },
+  {
+   "kind": "transient_array",
+   "label": "fx#0",
+   "hex": "0d010001988c19543ff9414e40",
+   "roundtrip": [
+    {
+     "type": 1,
+     "has_pos": true,
+     "entity_id": 1337
+    }
+   ]
+  },
+  {
+   "kind": "transient_array",
+   "label": "fx#1",
+   "hex": "0d010000414e40",
+   "roundtrip": [
+    {
+     "type": 0,
+     "has_pos": false,
+     "entity_id": 1337
+    }
+   ]
+  },
+  {
+   "kind": "transient_array",
+   "label": "fx#2",
+   "hex": "0d02000a973199973ff2c1f4800065d766684ffe505390",
+   "roundtrip": [
+    {
+     "type": 10,
+     "has_pos": true,
+     "entity_id": 2002
+    },
+    {
+     "type": 1,
+     "has_pos": true,
+     "entity_id": 1337
+    }
+   ]
+  }
+ ]
+}

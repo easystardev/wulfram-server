@@ -1530,6 +1530,36 @@ class WulframServer:
         self.correction_divergence_decay = min(1.0, max(0.0, self.correction_divergence_decay))
         # Debug counters for empirical flat-ground verification of the gate.
         self.correction_gate_debug = os.environ.get("WULFRAM_CORRECTION_GATE_DEBUG", "0").strip().lower() in ("1", "on", "true", "yes")
+        # GOAL 8: per-step suspension/Z instrumentation (default OFF).
+        self.goal8_zdebug = os.environ.get("WULFRAM_GOAL8_ZDEBUG", "0").strip().lower() in ("1", "on", "true", "yes")
+        try:
+            self.goal8_zdebug_every = int(os.environ.get("WULFRAM_GOAL8_ZDEBUG_EVERY", "15") or 15)
+        except ValueError:
+            self.goal8_zdebug_every = 15
+        # GOAL 8 (2026-06-04): sub-step the position/suspension integration to the OG
+        # inner-substep size so the vertical hover spring matches the client's
+        # GameSim_substep_update (Physics.c:1974, ~40ms inner) instead of overshooting
+        # when integrated at the coarse outer client-frame dt (~84ms on OG WARP). The
+        # coarse step makes the nonlinear hover spring ring ~2u on any displacement
+        # (e.g. the spawn-height vs equilibrium mismatch) — the live DO idle Z bounce.
+        # Legacy=1 restores the single full-dt step (A/B). Default = fixed.
+        self.goal8_legacy = os.environ.get("WULFRAM_GOAL8_LEGACY", "0").strip().lower() in ("1", "on", "true", "yes")
+        try:
+            # Inner sub-step cap (seconds). Default = server tick period; empirically
+            # a 0.95u spawn displacement rings ~0.46u at 33ms vs ~2.08u at 84ms.
+            self.goal8_substep_cap_s = float(os.environ.get("WULFRAM_GOAL8_SUBSTEP_CAP_MS", "")) / 1000.0
+        except ValueError:
+            self.goal8_substep_cap_s = 1.0 / max(1.0, self.tick_rate_hz)
+        if self.goal8_substep_cap_s <= 0.0:
+            self.goal8_substep_cap_s = 1.0 / max(1.0, self.tick_rate_hz)
+        try:
+            # Only substep the vertical-stabilizing path when the tank is near-
+            # stationary (horizontal speed below this). Active driving/coasting keeps
+            # the legacy single full-dt step so the coast trajectory the client
+            # reconciles against is unchanged. 0 disables the speed gate (always sub).
+            self.goal8_substep_speed_max = float(os.environ.get("WULFRAM_GOAL8_SUBSTEP_SPEED_MAX", "0.5"))
+        except ValueError:
+            self.goal8_substep_speed_max = 0.5
 
         print(
             f"[CONFIG-CORRECTION-GATE] enabled={int(self.correction_gate_enabled)} "
@@ -1654,6 +1684,35 @@ class WulframServer:
             history[-1] = entry
         else:
             history.append(entry)
+        self._update_sync_jitter_metric(ctx)
+
+    def _update_sync_jitter_metric(self, ctx: ClientContext) -> None:
+        """GOAL 8: track the server's own idle position oscillation amplitude.
+
+        The reactive correction gate's only divergence signal is the terrain-Z
+        clamp magnitude, which is BLIND to a hover-spring that overshoots ABOVE
+        terrain (the DO idle-Z bounce ran at `divergence_accum=0.000u` while Z swung
+        ~2u). Because the client runs deterministic prediction, the server never
+        receives the client's true pose; the honest server-measurable proxy for the
+        client<->server delta is the server's OWN state oscillation while the input
+        is idle — the client renders its smooth local spring while the server bounces.
+        We keep a short rolling window of recent Z (and XY) and expose peak-to-peak
+        jitter in `pos`/`players`/[STATUS] so sync is actually measurable. Telemetry
+        only — it does not feed the gate.
+        """
+        win = getattr(ctx, "_sync_jitter_window", None)
+        if win is None:
+            win = []
+            ctx._sync_jitter_window = win
+        px, py, pz = ctx.player_pos
+        win.append((px, py, pz))
+        if len(win) > 90:  # ~3s at 30Hz
+            del win[:-90]
+        zs = [p[2] for p in win]
+        ctx.sync_z_jitter = (max(zs) - min(zs)) if len(zs) > 1 else 0.0
+        xs = [p[0] for p in win]
+        ys = [p[1] for p in win]
+        ctx.sync_xy_jitter = max(max(xs) - min(xs), max(ys) - min(ys)) if len(zs) > 1 else 0.0
 
     def _select_authoritative_state_snapshot(
         self,
@@ -5673,11 +5732,21 @@ class WulframServer:
         if udp_addr == "0.0.0.0":
             # Use the local address the client actually connected to
             udp_addr = ctx.tcp_handler.sock.getsockname()[0]
+        # Advertised UDP endpoint overrides (default = no change). Lets the server
+        # sit behind a NAT / a latency proxy: the client is told to send UDP to the
+        # proxy's host:port instead of the server's own. Universal, no client fork.
+        adv_host = os.environ.get("WULFRAM_ADVERTISE_UDP_HOST", "").strip()
+        if adv_host:
+            udp_addr = adv_host
+        try:
+            adv_port = int(os.environ.get("WULFRAM_ADVERTISE_UDP_PORT", "") or self.port)
+        except ValueError:
+            adv_port = self.port
         print(
             f"[HANDSHAKE] Client {ctx.client_id}: mode={'og' if use_og_handshake else 'minimal'} "
-            f"UDP config {udp_addr}:{self.port}"
+            f"UDP config {udp_addr}:{adv_port}"
         )
-        ctx.tcp_handler.send(build_hello_udp_config(udp_addr, self.port))
+        ctx.tcp_handler.send(build_hello_udp_config(udp_addr, adv_port))
         ctx.session.udp_config_sent_time = time.monotonic()
 
         # Wait for UDP verification
@@ -7891,6 +7960,14 @@ class WulframServer:
                 "selected_age_s": 0.0,
             }
             return float(current_fwd), float(current_strafe), "current_slots_no_history"
+        # Snapshot the deque: the UDP receive thread appends ACTION_UPDATE movement
+        # samples to `movement_input_history` concurrently with this tick-thread
+        # iteration. GOAL 8's position sub-stepping calls this up to 3x per tick,
+        # widening that window — without a copy, a concurrent append raises
+        # "deque mutated during iteration" and crashes the client's tick (seen live
+        # on DO under real network jitter). A snapshot is also correct: selection
+        # must be consistent within one frame.
+        history = list(history)
 
         def entry_tick(entry) -> int | None:
             try:
@@ -8489,6 +8566,50 @@ class WulframServer:
         ctx.player_aim_pitch = 0.0
         ctx.player_aim_source = "input"
         ctx.player_aim_time = 0.0
+
+    def _update_player_position_stepped(self, ctx: ClientContext, move_dt: float,
+                                        heading_override: float = None):
+        """GOAL 8: integrate position/suspension in OG-sized inner substeps while the
+        tank is near-stationary, to stabilize the idle vertical hover spring.
+
+        The client's GameSim_substep_update (azurefishy-src Physics.c:1974) advances
+        BOTH the angular and the rigid-body position integration in inner substeps
+        (~40ms). The server's angular path (`step_client_substeps`) already inner-
+        substeps, but `_update_player_position` was called ONCE with the full outer
+        client-frame dt (~84ms on the OG WARP client). At that coarse dt the nonlinear
+        tank hover spring overshoots: a ~0.95u displacement (the OG spawn-height vs the
+        server spring-equilibrium mismatch) rings ~2u and takes seconds to settle —
+        the live DO idle-Z bounce (`z=4.09→2.08→3.11`, `divergence_accum=0.000u`).
+        Splitting into <=`goal8_substep_cap_s` chunks (default = server tick period)
+        reproduces the OG inner-substep behavior: the SAME displacement rings ~0.41u
+        and settles fast.
+
+        SCOPE: only substep when the tank is near-stationary (horizontal speed below
+        `goal8_substep_speed_max`). The idle Z bounce is a stationary/spawn problem; an
+        actively driving/coasting tank carries real horizontal speed where the legacy
+        single full-dt step already matches the client's prediction, and substepping
+        there would perturb the coast velocity-decay trajectory the client reconciles
+        against (a larger transient heading spike at turn→coast). Heading is held
+        across the substeps (it was already advanced by the angular path this frame),
+        so GOAL-7 angular parity is untouched; the py client (stepped at <=1/30 dt)
+        takes the single-step path unchanged, so the GOAL-6 drift baseline is intact.
+        """
+        if move_dt <= 1e-6:
+            return
+        cap = float(getattr(self, "goal8_substep_cap_s", 1.0 / 30.0) or (1.0 / 30.0))
+        if getattr(self, "goal8_legacy", False) or move_dt <= cap + 1e-6 or cap <= 0.0:
+            self._update_player_position(ctx, dt_override=move_dt, heading_override=heading_override)
+            return
+        vx, vy = ctx.player_vel[0], ctx.player_vel[1]
+        speed_max = float(getattr(self, "goal8_substep_speed_max", 0.5) or 0.0)
+        if speed_max > 0.0 and (vx * vx + vy * vy) > speed_max * speed_max:
+            # Moving: keep the legacy single-step horizontal/coast trajectory.
+            self._update_player_position(ctx, dt_override=move_dt, heading_override=heading_override)
+            return
+        n = int(math.ceil(move_dt / cap))
+        inner = move_dt / n
+        for _ in range(n):
+            self._update_player_position(ctx, dt_override=inner, heading_override=heading_override)
 
     def _update_player_position(self, ctx: ClientContext, dt_override: float = 0.0, heading_override: float = None):
         """
@@ -9360,6 +9481,21 @@ class WulframServer:
         )
         ctx.player_pose["pos"] = ctx.player_pos
         ctx.player_pose["vel"] = ctx.player_vel
+        # GOAL 8 (2026-06-04): per-step suspension/Z instrumentation. Default OFF.
+        # Surfaces the softbody-spring state that drives the idle Z limit-cycle so
+        # the bounce can be characterized empirically rather than guessed.
+        if getattr(self, "goal8_zdebug", False) and ctx.entity_type == EntityType.TANK:
+            tk = getattr(getattr(ctx, "session", None), "tick", 0) or 0
+            if tk % int(getattr(self, "goal8_zdebug_every", 15) or 15) == 0:
+                print(
+                    f"[ZDBG] c{ctx.client_id} t{tk} dt={dt*1000:.1f}ms "
+                    f"z={new_z:.4f} vz={new_vel_z:.4f} clamp={ground_clamp_dz:.4f} "
+                    f"susp_lift={float(suspension_lift):.3f} "
+                    f"susp_clr={('%.3f' % suspension_clearance) if suspension_clearance is not None else 'None'} "
+                    f"susp_tgt={('%.3f' % suspension_target_clearance) if suspension_target_clearance is not None else 'None'} "
+                    f"model={suspension_model} ovr={int(use_ground_override)} "
+                    f"rel={ground_override_release_reason or '-'} grnd={ground_level:.3f}"
+                )
         if getattr(ctx, "vehicle_physics", None) is not None:
             ctx.vehicle_physics.angular_velocity = ctx.angular_vel_yaw
         controller_now = time.monotonic()
@@ -22261,7 +22397,7 @@ class WulframServer:
                         if pre_dt > 1e-6:
                             physics.step_client_substeps(prev_torque, pre_dt, use_f32=use_f32)
                             self._sync_heading_physics_to_context(ctx, physics)
-                            self._update_player_position(ctx, dt_override=pre_dt, heading_override=old_heading)
+                            self._update_player_position_stepped(ctx, pre_dt, heading_override=old_heading)
                             move_heading = ctx.player_heading
                         if post_dt > 1e-6:
                             physics.step_client_substeps(torque, post_dt, use_f32=use_f32)
@@ -22278,7 +22414,7 @@ class WulframServer:
 
                     self._sync_heading_physics_to_context(ctx, physics)
                     if move_dt > 1e-6:
-                        self._update_player_position(ctx, dt_override=move_dt, heading_override=move_heading)
+                        self._update_player_position_stepped(ctx, move_dt, heading_override=move_heading)
                 if _phase_timing:
                     _phase_t_upp = time.perf_counter()
                 self._resolve_entity_entity_collisions(ctx)
@@ -22354,7 +22490,9 @@ class WulframServer:
                         f"input={input_status}(fwd={fwd_input:.2f},strafe={strafe_input:.2f}) "
                         f"stuck={stuck_duration:.0f}s "
                         f"corrections={int(getattr(ctx, 'correction_send_count', 0) or 0)} "
-                        f"divergence_accum={float(getattr(ctx, 'divergence_accum_pos', 0.0) or 0.0):.3f}u"
+                        f"divergence_accum={float(getattr(ctx, 'divergence_accum_pos', 0.0) or 0.0):.3f}u "
+                        f"z_jitter={float(getattr(ctx, 'sync_z_jitter', 0.0) or 0.0):.3f}u "
+                        f"xy_jitter={float(getattr(ctx, 'sync_xy_jitter', 0.0) or 0.0):.3f}u"
                     )
 
                 tick = self._get_network_tick(ctx)

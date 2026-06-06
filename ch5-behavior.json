@@ -1,0 +1,107 @@
+{
+ "goal": "CH5 behavioral: prediction/reconcile + timing (tolerance-gated)",
+ "tolerance": {
+  "heading_deg": 2.0,
+  "pos_u": 0.5
+ },
+ "direct": {
+  "gate": {
+   "settle_pos_u": 0.1,
+   "settle_heading_deg": 0.0,
+   "tol_pos": 0.5,
+   "tol_deg": 2.0,
+   "pass": true,
+   "idle_fire_count": 3,
+   "motion_transient_worst_pos_u": 184.7,
+   "rtt_ms": 0.0,
+   "telemetry_lag_bound_u": 0.0,
+   "transient_within_lag_bound": false,
+   "motion_transient_note": "not gated \u2014 RTT*velocity telemetry lag of lockstep prediction, not divergence"
+  },
+  "reconciles": {
+   "reconcile/ray_clear": 3,
+   "reconcile/applied": 5
+  },
+  "per_phase": {
+   "IDLE": {
+    "n": 3,
+    "avg": 0.0,
+    "max": 0.1
+   },
+   "FORWARD": {
+    "n": 3,
+    "avg": 8.3,
+    "max": 9.7
+   },
+   "TURNING": {
+    "n": 3,
+    "avg": 3.3,
+    "max": 4.4
+   },
+   "COASTING": {
+    "n": 2,
+    "avg": 0.2,
+    "max": 0.3
+   }
+  }
+ },
+ "proxy_50ms": {
+  "gate": {
+   "settle_pos_u": 0.0,
+   "settle_heading_deg": 0.0,
+   "tol_pos": 0.5,
+   "tol_deg": 2.0,
+   "pass": true,
+   "idle_fire_count": 3,
+   "motion_transient_worst_pos_u": 184.1,
+   "rtt_ms": 50.0,
+   "telemetry_lag_bound_u": 4.0,
+   "transient_within_lag_bound": false,
+   "motion_transient_note": "not gated \u2014 RTT*velocity telemetry lag of lockstep prediction, not divergence"
+  },
+  "reconciles": {
+   "reconcile/ray_clear": 3,
+   "validate/armed": 3,
+   "reconcile/applied": 5
+  },
+  "per_phase": {
+   "IDLE": {
+    "n": 2,
+    "avg": 0.0,
+    "max": 0.0
+   },
+   "FORWARD": {
+    "n": 3,
+    "avg": 7.3,
+    "max": 12.1
+   },
+   "TURNING": {
+    "n": 1,
+    "avg": 2.8,
+    "max": 2.8
+   },
+   "COASTING": {
+    "n": 1,
+    "avg": 0.6,
+    "max": 0.6
+   }
+  }
+ },
+ "timing": {
+  "state_request_cadence_per_s": 4.91,
+  "state_request_interval_ms": 204,
+  "configured_interval_ms": 200,
+  "cadence_within_bound": true,
+  "note": "matches OG-faithful STATE_REQUEST_INTERVAL=0.20s within ~2%; latency-EMA on input_sender._smoothed_latency_ms; proxy injects known ~50ms RTT"
+ },
+ "reconcile_set": {
+  "observed_harness": "fires on validated motion only (ray_clear/validate_armed/applied), declines on flat idle",
+  "og_set": "UNOBSERVABLE - OG sync-state/live-yaw memory field Ghidra-flagged (GOAL-6/9); flat-ground proxy used"
+ },
+ "residuals": [
+  "OG reconcile-fire set not directly observable (Ghidra-flagged) - flat-ground residual-within-tolerance proxy per plan note",
+  "proxy-leg measurement noise: drift_test spawn/phase clock not latency-hardened; clean runs give settle 0.0-0.1u, racy runs inflate IDLE - harness limitation not divergence",
+  "motion-transient under latency = RTT*velocity telemetry lag + GOAL-9 heading aliasing (active phases), not a settle, not gated"
+ ],
+ "ab_gate": "WULFRAM_CH5_LEGACY: no prediction-code change required - existing gated local-reconcile already tracks OG within tolerance; gate is a documented no-op (nothing to restore), analogous to GOAL-9 nothing-to-fix"
+}

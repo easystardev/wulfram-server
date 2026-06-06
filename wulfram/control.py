@@ -1994,6 +1994,10 @@ Examples:
                     "heading_deg": round(math.degrees(-ctx.player_heading), 1),
                     "aim_yaw_deg": round(math.degrees(ctx.player_aim_yaw), 1),
                     "aim_pitch_deg": round(math.degrees(ctx.player_aim_pitch), 1),
+                    # GOAL 8: server-side idle position oscillation (the client<->server
+                    # delta the correction gate is blind to).
+                    "sync_z_jitter": round(float(getattr(ctx, "sync_z_jitter", 0.0) or 0.0), 3),
+                    "sync_xy_jitter": round(float(getattr(ctx, "sync_xy_jitter", 0.0) or 0.0), 3),
                     "health_pct": round(ctx.player_health * 100),
                     "energy": round(float(getattr(ctx, "player_energy", 0.0) or 0.0), 3),
                     "energy_pct": round(float(self.server._get_energy_value(ctx)) * 100.0, 3)
@@ -2045,11 +2049,13 @@ Examples:
             )
             diagnosis = telemetry.get("diagnosis") or {}
             diagnosis_str = f" diag={diagnosis.get('status')}" if diagnosis.get("status") else ""
+            zj = float(c.get("sync_z_jitter", 0.0) or 0.0)
+            jitter_str = f" zjit={zj:.3f}u" if zj >= 0.001 else ""
             lines.append(
                 f"Client {c['client_id']} (entity {c['entity_id']}) [{c['phase']}]: "
                 f"pos=({x:.1f}, {y:.1f}, {z:.1f}) "
                 f"heading={c['heading_deg']}° aim={c['aim_yaw_deg']}°"
-                f"{vel_str}{hp_str}{input_str}{sync_str}{diagnosis_str}"
+                f"{vel_str}{hp_str}{input_str}{sync_str}{jitter_str}{diagnosis_str}"
             )
         return "\n".join(lines)
 
@@ -4198,6 +4204,13 @@ Examples:
                     f"corrections={int(getattr(ctx, 'correction_send_count', 0) or 0)} "
                     f"divergence_accum={float(getattr(ctx, 'divergence_accum_pos', 0.0) or 0.0):.3f}u "
                     f"state_requests={int(getattr(ctx, 'state_request_count', 0) or 0)}"
+                )
+                # GOAL 8: server-side sync jitter (idle position oscillation amplitude
+                # over a ~3s window) — the client<->server delta the correction gate is
+                # blind to (gate only sees terrain-Z clamp).
+                lines.append(
+                    f"sync_jitter: z={float(getattr(ctx, 'sync_z_jitter', 0.0) or 0.0):.3f}u "
+                    f"xy={float(getattr(ctx, 'sync_xy_jitter', 0.0) or 0.0):.3f}u"
                 )
                 return "\n".join(lines)
             except Exception as e:

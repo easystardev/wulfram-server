@@ -80,6 +80,7 @@ def fixture_cases() -> list:
                         for dt in DTS:
                             for n in STEP_COUNTS:
                                 cases.append({
+                                    "source": "grid",
                                     "mode": mode,
                                     "init_euler": [px, ry, hz],
                                     "init_ang_vel": av,
@@ -90,8 +91,63 @@ def fixture_cases() -> list:
     return cases
 
 
+# CH2: the OG corpus captured on the VM (server/ch2-og-corpus.kernel.ndjson via
+# WULFRAM_GOLDEN_CAPTURE). When present, the golden is ALSO built from the REAL
+# OG input cadence — each captured per-frame step_client_substeps call becomes a
+# 1-step case seeded with the OG's actual intermediate pose (pre_euler/ang_vel)
+# and its real (base_torque, WARP frame_dt). The synthetic grid above is kept as
+# the determinism backbone; these add authentic-cadence coverage.
+OG_CORPUS = Path(__file__).parent / "ch2-og-corpus.kernel.frozen.ndjson"
+OG_CAPTURE_CAP = 600  # cap captured cases for a bounded fixture
+
+
+def _unhex(h: str) -> float:
+    return struct.unpack(">d", bytes.fromhex(h))[0]
+
+
+def captured_cases() -> list:
+    """Build golden cases from the captured OG per-frame cadence (if available)."""
+    if not OG_CORPUS.exists():
+        return []
+    import json as _json
+    seen = set()
+    cases = []
+    with OG_CORPUS.open(encoding="ascii") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            r = _json.loads(line)
+            # Use only the per-frame substep calls; step_f32 rows are their
+            # inner substeps (would double-count the same cadence).
+            if r.get("mode") != "substeps":
+                continue
+            init_euler = [_unhex(x) for x in r["pre_euler"]]
+            init_ang_vel = _unhex(r["pre_ang_vel"])
+            torque = _unhex(r["torque"])
+            dt = _unhex(r["dt"])
+            key = (tuple(init_euler), init_ang_vel, torque, dt)
+            if key in seen:
+                continue
+            seen.add(key)
+            cases.append({
+                "source": "og-capture",
+                "mode": "substeps",
+                "init_euler": init_euler,
+                "init_ang_vel": init_ang_vel,
+                "torque": torque,
+                "dt": dt,
+                "steps": 1,
+            })
+            if len(cases) >= OG_CAPTURE_CAP:
+                break
+    return cases
+
+
 def main() -> int:
     cases = fixture_cases()
+    captured = captured_cases()
+    cases.extend(captured)
     records = []
     for c in cases:
         records.append({**c, "out": _run_case(c)})
@@ -100,10 +156,14 @@ def main() -> int:
         "damp_coeff": DAMP_COEFF,
         "encoding": "IEEE-754 double, big-endian hex (exact)",
         "case_count": len(records),
+        "grid_case_count": len(cases) - len(captured),
+        "og_capture_case_count": len(captured),
+        "og_corpus": OG_CORPUS.name if captured else None,
         "cases": records,
     }
     GOLDEN.write_text(json.dumps(payload, indent=1))
-    print(f"wrote {GOLDEN} ({len(records)} cases)")
+    print(f"wrote {GOLDEN} ({len(records)} cases: "
+          f"{len(cases) - len(captured)} grid + {len(captured)} og-capture)")
     return 0
 
 

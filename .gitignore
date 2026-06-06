@@ -7,3 +7,6 @@ server.pid
 *.log
 *.log.err
 repomix-output.xml
+
+# Volatile live golden-capture (regenerable; frozen snapshot is the committed oracle)
+ch2-og-corpus.kernel.ndjson

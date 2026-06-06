@@ -40,41 +40,22 @@ NOTE: Earlier docstrings cited raw Ghidra addresses (0x004f1150, ...) and line n
 Those have been repointed to the organized azurefishy-src source above.
 """
 
-import array as _array
 import math
-import struct
+
+# Single shared sim kernel (CH1): the rotation/attitude primitives live in
+# exactly one place — shared/wulfram2_protocol/sim_kernel/rotation.py. This
+# module is a thin adapter that imports them under the legacy private names the
+# rest of the server uses, so server and client can never silently diverge.
+from wulfram2_protocol.sim_kernel.rotation import (  # noqa: F401
+    F32_TWO_PI,
+    extract_euler_angles as _extract_euler_angles,
+    f32 as _f32,
+    matrix3_from_axis_angle as _matrix3_from_axis_angle,
+    matrix3_from_euler_xyz as _matrix3_from_euler_xyz,
+    normalize_angle_client as _normalize_angle_client,
+)
 
 TWO_PI = 2.0 * math.pi
-
-_f32_buf = _array.array('f', [0.0])
-
-
-def _f32(v: float) -> float:
-    """Round-trip a float through float32 to match client precision."""
-    _f32_buf[0] = v
-    return _f32_buf[0]
-
-
-# Float32 2*pi constant from decompile (exact value used in Math_normalize_angle_radians)
-F32_TWO_PI = _f32(6.2831855)
-
-
-def _normalize_angle_client(angle: float) -> float:
-    """Normalize angle to [0, 2*pi] matching client's Math_normalize_angle_radians.
-
-    From decompile (GUESS3_Math_normalize_angle_radians, System/Core/Math.c:2744):
-      - Safety clamp: |angle| > 20000 → 0.0
-      - Iterative add/subtract of 6.2831855f (float32 2*pi)
-      - All operations in float32
-    """
-    angle = _f32(angle)
-    if angle > 20000.0 or angle < -20000.0:
-        return 0.0
-    while angle < 0.0:
-        angle = _f32(angle + F32_TWO_PI)
-    while angle > F32_TWO_PI:
-        angle = _f32(angle - F32_TWO_PI)
-    return angle
 
 
 def _normalize_angle_0_2pi(angle: float) -> float:
@@ -83,132 +64,6 @@ def _normalize_angle_0_2pi(angle: float) -> float:
     if angle < 0.0:
         angle += TWO_PI
     return angle
-
-
-def _matrix3_from_euler_xyz(ex: float, ey: float, ez: float) -> list:
-    """Build 3x3 rotation matrix from euler XYZ angles.
-
-    Matches GUESS5_Matrix3_from_euler_xyz (System/Core/Math.c:606).
-    XYZ intrinsic rotation order: R = Rz * Ry * Rx.
-
-    Input euler angles: X=roll, Y=pitch, Z=heading.
-    Output: 9-element list (row-major doubles), matching client entity+0x58.
-
-    Trig computed as extended precision (Python float64 ≈ x87 float80),
-    intermediates as float64 (matching decompile's (float10)(double) casts),
-    results stored as double.
-    """
-    cx = math.cos(ex)
-    sx = math.sin(ex)
-    cy = math.cos(ey)
-    sy = math.sin(ey)
-    cz = math.cos(ez)
-    sz = math.sin(ez)
-
-    return [
-        cz * cy,                        # M[0]
-        cz * sy * sx - sz * cx,         # M[1]
-        sz * sx + cz * cx * sy,         # M[2]
-        sz * cy,                        # M[3]
-        sy * sx * sz + cz * cx,         # M[4]
-        sy * cx * sz - cz * sx,         # M[5]
-        -sy,                            # M[6]
-        cy * sx,                        # M[7]
-        cx * cy,                        # M[8]
-    ]
-
-
-def _matrix3_from_axis_angle(omega_x: float, omega_y: float, omega_z: float) -> list:
-    """Build 3x3 rotation matrix from axis-angle vector via Rodrigues formula.
-
-    Matches GUESS3_Matrix3_from_axis_angle (System/Core/Math.c:2774).
-    Input: axis-angle vector (3 float32 values). Angle = ||vector||, axis = vector/||vector||.
-    Output: 9-element list (float32 values), row-major.
-
-    All arithmetic in float32 except sqrt/cos/sin which use extended precision
-    (x87 FPU) then cast to float32.
-    """
-    # Compute angle = length of axis-angle vector
-    # Client uses x87 sqrt (extended precision), casts to float32
-    angle_sq = omega_x * omega_x + omega_y * omega_y + omega_z * omega_z
-    angle_f64 = math.sqrt(angle_sq)  # extended precision (Python float64 ≈ x87 float80)
-    angle = _f32(angle_f64)
-
-    # Identity threshold: angle < 1e-05 (from decompile)
-    if angle < 1e-05:
-        return [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
-
-    # Normalize axis
-    inv_len = _f32(1.0 / angle)
-    nx = _f32(omega_x * inv_len)
-    ny = _f32(omega_y * inv_len)
-    nz = _f32(omega_z * inv_len)
-
-    # cos/sin via x87 extended precision, cast to float32
-    # Client passes the angle (still on FPU stack from sqrt) to cos/sin
-    c = _f32(math.cos(angle_f64))
-    s = _f32(math.sin(angle_f64))
-    t = _f32(1.0 - c)  # 1 - cos(angle)
-
-    # Rodrigues formula: R = cos*I + (1-cos)*n*nT + sin*skew(n)
-    t_nx = _f32(nx * t)
-    t_ny = _f32(ny * t)
-    t_nz = _f32(nz * t)
-
-    return [
-        _f32(_f32(nx * t_nx) + c),         # R[0] = nx*nx*(1-cos) + cos
-        _f32(_f32(ny * t_nx) + _f32(nz * s)),  # R[1] = ny*nx*(1-cos) + nz*sin
-        _f32(_f32(t_nx * nz) - _f32(ny * s)),  # R[2] = nx*nz*(1-cos) - ny*sin
-        _f32(_f32(t_ny * nx) - _f32(nz * s)),  # R[3] = nx*ny*(1-cos) - nz*sin
-        _f32(_f32(ny * t_ny) + c),         # R[4] = ny*ny*(1-cos) + cos
-        _f32(_f32(t_ny * nz) + _f32(nx * s)),  # R[5] = nz*ny*(1-cos) + nx*sin
-        _f32(_f32(nx * t_nz) + _f32(ny * s)),  # R[6] = nx*nz*(1-cos) + ny*sin
-        _f32(_f32(ny * t_nz) - _f32(nx * s)),  # R[7] = ny*nz*(1-cos) - nx*sin
-        _f32(_f32(nz * t_nz) + c),         # R[8] = nz*nz*(1-cos) + cos
-    ]
-
-
-def _extract_euler_angles(m: list) -> tuple:
-    """Extract XYZ euler angles from 3x3 rotation matrix.
-
-    Matches GUESS2_Vec3_normalize_safe (System/Core/Math.c:2358) which is actually
-    euler extraction via atan2, despite its misleading name. The atan2 arguments
-    come from the rotation matrix elements on the FPU stack.
-
-    Standard XYZ euler extraction from row-major matrix:
-      euler_x (roll)  = atan2(M[7], M[8])           = atan2(R[2][1], R[2][2])
-      euler_y (pitch) = atan2(-M[6], sqrt(M[0]^2 + M[1]^2))  = atan2(-R[2][0], ...)
-      euler_z (heading) = atan2(M[3], M[0])          = atan2(R[1][0], R[0][0])
-
-    Gimbal lock: when sqrt(M[0]^2 + M[1]^2) <= 2^(-19), roll is set to 0.
-
-    Returns: (euler_x, euler_y, euler_z) as float32 values.
-    """
-    # Read matrix elements as float32 (matching client's (float) casts)
-    fm0 = _f32(m[0])
-    fm1 = _f32(m[1])
-    fm3 = _f32(m[3])
-    fm6 = _f32(m[6])
-    fm7 = _f32(m[7])
-    fm8 = _f32(m[8])
-
-    # Gimbal lock check: sqrt(M[0][0]^2 + M[1][0]^2)
-    # Client computes this on the FPU stack (extended precision)
-    gimbal = math.sqrt(fm0 * fm0 + fm1 * fm1)
-
-    if gimbal <= 1.9073486328125e-06:  # 2^(-19), from decompile
-        # Degenerate case: near gimbal lock
-        # pitch and yaw extracted, roll set to 0
-        euler_x = _f32(math.atan2(fm7, fm8))
-        euler_y = _f32(math.atan2(-fm6, gimbal))
-        euler_z = 0.0
-    else:
-        # Normal case: all 3 euler angles
-        euler_x = _f32(math.atan2(fm7, fm8))
-        euler_y = _f32(float(math.atan2(-fm6, gimbal)))  # extra double cast per decompile
-        euler_z = _f32(math.atan2(fm3, fm0))
-
-    return (euler_x, euler_y, euler_z)
 
 
 class VehiclePhysics:

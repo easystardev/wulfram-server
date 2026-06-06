@@ -1550,16 +1550,47 @@ FX_IMPACT_VEHICLE = 10
 FX_IMPACT_BUILDING = 11
 FX_IMPACT_TERRAIN = 12
 
-# Quantizer bit widths from decompile ValueQuantizer struct offsets:
-#   type:      g_network_quantizer_array[0x300][0x00] → entry 12, bits=16
-#   entity_id: g_network_quantizer_array[0x180][0x00] → entry 6, bits=16
-#   position:  g_network_quantizer_array[0x400] → entry 16 (pos_bank0), 16-bit values
+# Legacy DETACHED bit widths (WULFRAM_TRANSIENT_LEGACY=1): the pre-CH4 form that
+# hardcoded the widths in packets.py instead of sourcing them from the live
+# TRANSLATION/quantizer table. They currently EQUAL the table values, so the A/B
+# is byte-neutral today; the gate exists so a TRANSLATION-table width change is
+# followed by the live (table-sourced) path, not silently by these constants.
+#   type:      quantizer entry 12 (scalar12), bits=16
+#   entity_id: quantizer entry 6  (scalar6),  bits=16
+#   position:  quantizer entry 16 (pos_bank0), per-component value width=16
 _TRANSIENT_TYPE_BITS = 16
 _TRANSIENT_ENTITY_BITS = 16
 _TRANSIENT_POS_BITS = 16
 
+# Quantizer-table indices for the TRANSIENT_ARRAY fields (decompile-backed).
+_QIDX_TRANSIENT_TYPE = 12
+_QIDX_TRANSIENT_ENTITY = 6
+_QIDX_TRANSIENT_POS = 16
 
-def build_transient_array(events: list) -> bytes:
+
+def _transient_legacy_default() -> bool:
+    return os.environ.get("WULFRAM_TRANSIENT_LEGACY", "0") == "1"
+
+
+def _transient_field_params(legacy: bool):
+    """Resolve (type_bits, entity_bits, pos_bits, pos_max, pos_range) for TRANSIENT.
+
+    CH4 fidelity debt: the canonical path sources every width/range from the
+    shared quantizer table (the same table the server advertises in TRANSLATION),
+    so encode/decode follow the table rather than packets.py defaults. The legacy
+    gate restores the detached hardcoded widths for A/B.
+    """
+    if legacy:
+        return (_TRANSIENT_TYPE_BITS, _TRANSIENT_ENTITY_BITS, _TRANSIENT_POS_BITS,
+                VEC_POS_MAX, VEC_POS_RANGE)
+    from wulfram2_protocol.quantizers import get_quantizer
+    qt = get_quantizer(_QIDX_TRANSIENT_TYPE)
+    qe = get_quantizer(_QIDX_TRANSIENT_ENTITY)
+    qp = get_quantizer(_QIDX_TRANSIENT_POS)
+    return (qt.fixed_bits, qe.fixed_bits, qp.total_bits, qp.max_value, qp.range_value)
+
+
+def build_transient_array(events: list, *, legacy: bool = None) -> bytes:
     """Build TRANSIENT_ARRAY (0x0D) packet using decompile-backed quantized bitstream.
 
     Decompile: GUESS6_PacketHandler_TRANSIENT_ARRAY (0x0046CA60)
@@ -1572,20 +1603,23 @@ def build_transient_array(events: list) -> bytes:
     Wire format (quantized bitstream after opcode byte):
         8 bits: count
         per event:
-            16 bits: fx_type (quantizer index 12)
-            1 bit:   has_pos
-            if has_pos:
-                16 bits: pos_x  (quantized via VEC_POS_MAX/RANGE)
-                16 bits: pos_y
-                16 bits: pos_z
-            1 bit:   has_entity
-            if has_entity:
-                16 bits: entity_id (quantizer index 6)
+            <type_bits>: fx_type     (quantizer index 12)
+            1 bit:       has_pos
+            if has_pos:  3 × <pos_bits> quantized via the table's pos max/range
+            1 bit:       has_entity
+            if has_entity: <entity_bits>: entity_id (quantizer index 6)
+
+    Field widths are sourced from the shared quantizer table (CH4); set
+    WULFRAM_TRANSIENT_LEGACY=1 (or pass legacy=True) for the detached defaults.
     """
     from wulfram2_protocol.codec import BitWriter, quantize_float
 
     if not events:
         return b''
+
+    if legacy is None:
+        legacy = _transient_legacy_default()
+    type_bits, entity_bits, pos_bits, pos_max, pos_range = _transient_field_params(legacy)
 
     count = min(len(events), 255)
     bw = BitWriter()
@@ -1596,21 +1630,50 @@ def build_transient_array(events: list) -> bytes:
         pos = ev.get('pos')
         eid = ev.get('entity_id', 0)
 
-        bw.write_bits(_TRANSIENT_TYPE_BITS, fx_type & 0xFFFF)
+        bw.write_bits(type_bits, fx_type & ((1 << type_bits) - 1))
 
         if pos is not None:
             bw.write_bits(1, 1)  # has_pos = 1
             for v in pos:
-                raw = quantize_float(float(v), VEC_POS_MAX, VEC_POS_RANGE, _TRANSIENT_POS_BITS)
-                bw.write_bits(_TRANSIENT_POS_BITS, raw)
+                raw = quantize_float(float(v), pos_max, pos_range, pos_bits)
+                bw.write_bits(pos_bits, raw)
         else:
             bw.write_bits(1, 0)  # has_pos = 0
 
         if eid:
             bw.write_bits(1, 1)  # has_entity = 1
-            bw.write_bits(_TRANSIENT_ENTITY_BITS, eid & 0xFFFF)
+            bw.write_bits(entity_bits, eid & ((1 << entity_bits) - 1))
         else:
             bw.write_bits(1, 0)  # has_entity = 0
 
     # Opcode byte + bitstream payload
     return bytes([0x0D]) + bw.get_bytes()
+
+
+def decode_transient_array(packet: bytes, *, legacy: bool = None) -> list:
+    """Decode a TRANSIENT_ARRAY (0x0D) packet, sourcing field widths from the
+    same quantizer table the encoder used (CH4 round-trip). Returns the event
+    list: [{type, pos|None, entity_id}]. Inverse of build_transient_array."""
+    from wulfram2_protocol.codec import BitReader, dequantize_float
+
+    if not packet or packet[0] != 0x0D:
+        return []
+    if legacy is None:
+        legacy = _transient_legacy_default()
+    type_bits, entity_bits, pos_bits, pos_max, pos_range = _transient_field_params(legacy)
+
+    br = BitReader(packet[1:])
+    count = br.read_bits(8)
+    events = []
+    for _ in range(count):
+        fx_type = br.read_bits(type_bits)
+        ev = {"type": fx_type, "pos": None, "entity_id": 0}
+        if br.read_bits(1):
+            ev["pos"] = tuple(
+                dequantize_float(br.read_bits(pos_bits), pos_max, pos_range, pos_bits)
+                for _ in range(3)
+            )
+        if br.read_bits(1):
+            ev["entity_id"] = br.read_bits(entity_bits)
+        events.append(ev)
+    return events
