@@ -4177,10 +4177,18 @@ Examples:
                 yaw_deg = math.degrees(-ctx.player_heading)
                 speed = math.sqrt(vx*vx + vy*vy + vz*vz)
                 ang_vel = math.degrees(ctx.vehicle_physics.angular_velocity) if ctx.vehicle_physics else 0.0
+                # Read-only body attitude (CH2 slope/collision parity): the
+                # server-authoritative pitch/roll for this entity, so a live
+                # capture can compare it to the OG client's wulftap attitude at
+                # the same pos/terrain. Echoes player_pose only — no physics change.
+                _pose = getattr(ctx, "player_pose", {}) or {}
+                _roll_deg = math.degrees(float(_pose.get("roll", 0.0) or 0.0))
+                _pitch_deg = math.degrees(float(_pose.get("pitch", 0.0) or 0.0))
                 lines = [
                     f"pos=({px:.1f}, {py:.1f}, {pz:.1f})",
                     f"vel=({vx:.1f}, {vy:.1f}, {vz:.1f}) speed={speed:.1f}",
                     f"heading={yaw_deg:.2f}deg ang_vel={ang_vel:.2f}deg/s",
+                    f"body_roll={_roll_deg:.2f}deg body_pitch={_pitch_deg:.2f}deg",
                 ]
                 if ctx.weapon_system:
                     from .weapons import BehaviorSlot
