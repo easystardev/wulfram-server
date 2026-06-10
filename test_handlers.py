@@ -981,8 +981,11 @@ def test_remote_spawn_create_update_array_avoids_tcp():
 def test_login_bootstrap_mode_routes_og_client_by_login_flow():
     """A real OG client (game-service login, sub_type 0x01->0x03) must get the
     OG bootstrap even on loopback — otherwise it lacks the spectator PLAYER
-    identity and hangs at 'Processing Player Map'. The Python client (sub_type
-    0x00) stays on minimal."""
+    identity and hangs at 'Processing Player Map'. Since the loopback
+    client-type fork was retired (9ea5dbd, 2026-06-02: _is_loopback_client
+    always False; the Python client is an OG clone), hybrid mode resolves to
+    the OG bootstrap for EVERY client; only the explicit env override selects
+    minimal."""
     from wulfram.handlers import _get_login_bootstrap_mode
 
     old = os.environ.get("WULFRAM_LOGIN_BOOTSTRAP")
@@ -996,8 +999,8 @@ def test_login_bootstrap_mode_routes_og_client_by_login_flow():
 
         # OG client (game-service) on loopback -> og (the fix).
         assert _get_login_bootstrap_mode(_ctx(("127.0.0.1", 5), True)) == "og"
-        # Python client (no game-service) on loopback -> minimal (preserved).
-        assert _get_login_bootstrap_mode(_ctx(("127.0.0.1", 5), False)) == "minimal"
+        # Loopback fork retired: non-game-service loopback client also gets og.
+        assert _get_login_bootstrap_mode(_ctx(("127.0.0.1", 5), False)) == "og"
         # Remote client -> og regardless (preserved).
         assert _get_login_bootstrap_mode(_ctx(("10.10.10.2", 5), False)) == "og"
         # Explicit override still wins over the heuristic.
@@ -1267,7 +1270,13 @@ def test_build_update_array_remote_heartbeat_shape():
 
 
 def test_server_remote_heartbeat_helper_keeps_full_local_state():
-    """Promoted remote OG heartbeats should keep local-state and a complete transform."""
+    """Promoted remote OG heartbeats keep the FULL local-state HUD shape.
+
+    GOAL 7 (16a3bfb, 2026-06-04): steady-state heartbeats (no transform to
+    deliver) now carry ZERO entity records — the per-player mask=0 record made
+    the OG client zero its predicted angular velocity (~10x under-rotation).
+    The promoted full local-state (real weapon/ammo/turret bits) is preserved.
+    """
     server = WulframServer.__new__(WulframServer)
     server.update_local_state_mode = "wf"
     server.local_state_weapon_type = 0
@@ -1316,13 +1325,13 @@ def test_server_remote_heartbeat_helper_keeps_full_local_state():
     )
     assert tick == 0x12345678
     assert local_state is not None
-    assert local_state.weapon_id == 2
-    assert len(entities) == 1
-    assert entities[0].entity_id == 0x14EA
-    assert entities[0].position is not None
-    assert entities[0].velocity is not None
-    assert entities[0].rotation is not None
-    assert entities[0].angular_velocity is not None
+    # Promoted/full form uses the HUD weapon type (local_state_weapon_type=0),
+    # not the spawn-safe short-form weapon (spawn_tank_weapon_type=2).
+    assert local_state.weapon_id == 0
+    # Full form carries the live turret aim (short form zeroes it).
+    assert abs(local_state.primary_turret - 1.234) < 0.01, local_state
+    # GOAL 7: no transform requested -> no entity record (stomp-entity dropped).
+    assert len(entities) == 0, entities
     print("test_server_remote_heartbeat_helper_keeps_full_local_state: PASSED")
     return True
 
@@ -1781,7 +1790,13 @@ def test_remote_state_sync_reply_emits_view_update_with_fresh_remote_timestamp()
 
 
 def test_loopback_state_sync_reply_keeps_request_timestamp():
-    """Loopback/Python STATE_REQUEST replies keep request-id timestamps for latency correlation."""
+    """Loopback STATE_REQUEST replies take the SAME unified path as remote.
+
+    The loopback client-type fork was retired (9ea5dbd, 2026-06-02): a
+    127.0.0.1 client gets the same fresh remote-admission VIEW_UPDATE
+    timestamp as a remote OG client (UpdateArray_check_eligible rejects stale
+    interp_record+0x08 values), not the echoed request id.
+    """
     server = WulframServer.__new__(WulframServer)
     server.update_local_state_mode = "wf"
     server.update_entity_vitals = False
@@ -1842,7 +1857,8 @@ def test_loopback_state_sync_reply_keeps_request_timestamp():
         view_payload,
         behavior_config=parse_behavior(build_behavior_packet()),
     )
-    assert timestamp == 0x89ABCDEF
+    # Unified path: fresh remote-admission timestamp, not the request id.
+    assert timestamp == _remote_view_timestamp(0x12345678), hex(timestamp)
     assert view_tick == 0x12345678
     assert len(view_entities) == 1
     assert view_entities[0].entity_id == 0x14EA
@@ -1868,15 +1884,130 @@ def test_remote_state_request_queues_visible_correction_burst():
     assert remote.correction_burst_remaining == 6
     assert remote.correction_burst_interval_s == 0.10
 
+    # The loopback client-type fork is retired (2026-06-02): a 127.0.0.1
+    # client queues exactly like any other — flood safety is the rate cap,
+    # not a client-type branch.
     loopback = ClientContext(
         client_id=2,
         client_addr=("127.0.0.1", 50000),
         session=Session(),
         entity_id=0x14EB,
     )
-    assert server._queue_state_sync_correction_burst(loopback) is False
-    assert getattr(loopback, "correction_burst_remaining", 0) == 0
+    assert server._queue_state_sync_correction_burst(loopback) is True
+    assert loopback.correction_burst_remaining == 6
     print("test_remote_state_request_queues_visible_correction_burst: PASSED")
+    return True
+
+
+def test_state_request_burst_rate_cap():
+    """Auto-burst on STATE_REQUEST is capped to one queue per min_interval."""
+    server = WulframServer.__new__(WulframServer)
+    server.state_sync_correction_burst_count = 6
+    server.state_sync_correction_burst_interval = 0.10
+    server.state_request_burst_enabled = True
+    server.state_request_burst_min_interval = 1.75
+    server.active_input_correction_suppress_window = 0.35
+
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    assert server._maybe_queue_state_request_burst(ctx, now=100.0) is True
+    assert ctx.correction_burst_remaining == 6
+    assert ctx.last_state_request_burst_queue == 100.0
+
+    # Drain the burst, then spam requests inside the cap window: no re-queue.
+    ctx.correction_burst_remaining = 0
+    assert server._maybe_queue_state_request_burst(ctx, now=100.5) is False
+    assert server._maybe_queue_state_request_burst(ctx, now=101.7) is False
+    assert ctx.correction_burst_remaining == 0
+
+    # Past the cap window the next request queues again.
+    assert server._maybe_queue_state_request_burst(ctx, now=101.8) is True
+    assert ctx.correction_burst_remaining == 6
+    print("test_state_request_burst_rate_cap: PASSED")
+    return True
+
+
+def test_correction_burst_due_drains_under_gate():
+    """Queued bursts must drain in the GATED tick branch (2026-06-09 bug:
+    `correction now c1 10 0.1` emitted a single packet because the gated
+    branch never consulted correction_burst_remaining)."""
+    server = WulframServer.__new__(WulframServer)
+
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    ctx.correction_burst_remaining = 3
+    ctx.correction_burst_interval_s = 0.10
+    ctx.last_correction_send = 0.0
+
+    assert server._correction_burst_due(ctx, now=10.0, movement_suppressed=False) is True
+    # Movement pauses the drain (corrections land right after key release).
+    assert server._correction_burst_due(ctx, now=10.0, movement_suppressed=True) is False
+    # Burst spacing (~10Hz) is honored between packets...
+    ctx.last_correction_send = 10.0
+    assert server._correction_burst_due(ctx, now=10.05, movement_suppressed=False) is False
+    assert server._correction_burst_due(ctx, now=10.11, movement_suppressed=False) is True
+    # ...and an empty queue never fires.
+    ctx.correction_burst_remaining = 0
+    assert server._correction_burst_due(ctx, now=11.0, movement_suppressed=False) is False
+    print("test_correction_burst_due_drains_under_gate: PASSED")
+    return True
+
+
+def test_state_request_queues_burst_under_default_gate():
+    """End-to-end trigger: STATE_REQUEST under the default correction gate
+    queues the rate-capped settle burst (the 2026-06-09 correction-trigger
+    fix) in addition to the plain snapshot reply."""
+    snapshots = []
+    server = WulframServer.__new__(WulframServer)
+    server.correction_gate_enabled = True
+    server.state_request_burst_enabled = True
+    server.state_request_burst_min_interval = 1.75
+    server.state_sync_correction_burst_count = 6
+    server.state_sync_correction_burst_interval = 0.10
+    server.active_input_correction_suppress_window = 0.35
+    server.state_sync_reply_allow_all = True
+    server.state_sync_reply_hosts = set()
+    server._state_sync_blocked_clients = set()
+    server.remote_full_local_state_delay = 2.0
+    server.update_local_state_mode = "off"
+    server._send_state_sync_snapshot = lambda *a, **k: snapshots.append(k)
+
+    session = Session()
+    session.in_game = True
+    session.entity_id = 0x14EA
+    session.udp_addr = ("10.10.10.2", 50000)
+    session.last_spawn_time = time.monotonic() - 5.0
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=session,
+        entity_id=0x14EA,
+    )
+    ctx.last_decoded_input = {"fwd": 0.0, "strafe": 0.0}
+
+    payload = struct.pack(">BII", 0x0C, 0x00ABCDEF, 0)
+    server._handle_state_request(ctx, payload, ctx.client_addr)
+
+    assert len(snapshots) == 1, snapshots
+    assert snapshots[0].get("include_view_update") is False
+    assert ctx.correction_burst_remaining == 6
+    assert ctx.correction_burst_interval_s == 0.10
+    assert ctx.last_state_request_burst_queue > 0.0
+
+    # Second request inside the cap window: snapshot replies, burst does not re-queue.
+    ctx.correction_burst_remaining = 0
+    server._handle_state_request(ctx, payload, ctx.client_addr)
+    assert len(snapshots) == 2
+    assert ctx.correction_burst_remaining == 0
+    print("test_state_request_queues_burst_under_default_gate: PASSED")
     return True
 
 
@@ -2495,7 +2626,15 @@ def test_remote_state_sync_reuses_cached_sample_when_replay_window_misses():
 
 
 def test_remote_promoted_heartbeat_stays_short_form_safe():
-    """Ordinary promoted remote heartbeats should keep short local-state and full transform."""
+    """Promoted transform-bearing heartbeats stay on the short-form-safe local-state.
+
+    GOAL 7 (16a3bfb, 2026-06-04): an ORDINARY steady-state heartbeat (no
+    transform) now carries zero entity records (the mask=0 stomp-entity zeroed
+    the OG client's predicted angular velocity). A transform-bearing heartbeat
+    (correction shape) keeps the full pos+vel+rot entity record AND the
+    spawn-safe short-form local-state prefix (weapon=spawn_tank_weapon_type,
+    zeroed ammo/turret bits).
+    """
     server = WulframServer.__new__(WulframServer)
     server.update_local_state_mode = "wf"
     server.local_state_weapon_type = 0
@@ -2532,6 +2671,7 @@ def test_remote_promoted_heartbeat_stays_short_form_safe():
     ctx.player_pose = {"roll": 0.0, "pitch": 0.0}
     ctx.player_heading = 0.0
 
+    # Steady-state heartbeat (no transform): GOAL-7 zero-entity HUD form.
     payload = server._build_local_state_heartbeat(
         ctx,
         tick=0x12345678,
@@ -2539,6 +2679,26 @@ def test_remote_promoted_heartbeat_stays_short_form_safe():
         include_health=True,
         health=1.0,
         fuel=1.0,
+    )
+    tick, local_state, entities = decode_update_array(
+        payload,
+        behavior_config=parse_behavior(build_behavior_packet()),
+    )
+    assert tick == 0x12345678
+    assert local_state is not None
+    assert len(entities) == 0, entities
+
+    # Transform-bearing heartbeat (correction shape): full transform entity
+    # plus the short-form-safe local-state prefix.
+    payload = server._build_local_state_heartbeat(
+        ctx,
+        tick=0x12345678,
+        entity_id=0x14EA,
+        include_health=True,
+        health=1.0,
+        fuel=1.0,
+        pos=ctx.player_pos,
+        rot=(0.0, 0.0, 0.0),
     )
     tick, local_state, entities = decode_update_array(
         payload,
@@ -3288,7 +3448,13 @@ def test_caltrop_projectile_spawn_and_update_decode_promoted_wire_shape():
 
 
 def test_loopback_projectile_update_stays_entity_only():
-    """Loopback/Python projectile updates must remain entity-only."""
+    """Loopback projectile updates carry the same OG local-state prefix as remote.
+
+    The loopback client-type fork was retired (9ea5dbd, 2026-06-02) and the
+    viewer discriminator is _is_og_client (login bootstrap mode, og by
+    default), so a 127.0.0.1 viewer gets the short-form-safe local-state
+    prefix — the OG client reads garbage health from an entity-only packet.
+    """
     server = WulframServer.__new__(WulframServer)
     server.update_local_state_mode = "wf"
     server.local_state_weapon_type = 0
@@ -3301,6 +3467,9 @@ def test_loopback_projectile_update_stays_entity_only():
     server.local_state_turret_max = 6.3
     server.local_state_turret_range = 12.6
     server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
+    server.debug_health_value = 1.0
+    server.debug_health_pattern = False
+    server.player_energy_max = 100.0
 
     session = Session()
     session.translation_ack_received = True
@@ -3333,7 +3502,9 @@ def test_loopback_projectile_update_stays_entity_only():
 
     tick, local_state, entities = decode_update_array(payload)
     assert tick == 0x12345679
-    assert local_state is None
+    # Unified OG path: short-form-safe local-state prefix present.
+    assert local_state is not None
+    assert local_state.weapon_id == 2
     assert len(entities) == 1
     assert entities[0].entity_id == 21001
     print("test_loopback_projectile_update_stays_entity_only: PASSED")
@@ -4040,7 +4211,12 @@ def test_send_entity_create_uses_udp_only():
 
 
 def test_og_viewer_replication_gates_skip_remote_only():
-    """T3 isolation gates should suppress OG-viewer streams without blocking loopback clients."""
+    """T3 isolation gates apply uniformly — loopback is no longer exempt.
+
+    The loopback client-type fork was retired (9ea5dbd, 2026-06-02:
+    _is_loopback_client always False), so the og_viewer_* gates suppress the
+    streams for EVERY client, 127.0.0.1 included.
+    """
     server = WulframServer.__new__(WulframServer)
     server.og_viewer_roster_entry = False
     server.og_viewer_entity_create = False
@@ -4069,9 +4245,10 @@ def test_og_viewer_replication_gates_skip_remote_only():
     assert server._og_viewer_replication_enabled(remote_ctx, "roster") is False
     assert server._og_viewer_replication_enabled(remote_ctx, "entity_create") is False
     assert server._og_viewer_replication_enabled(remote_ctx, "remote_updates") is False
-    assert server._og_viewer_replication_enabled(loopback_ctx, "roster") is True
-    assert server._og_viewer_replication_enabled(loopback_ctx, "entity_create") is True
-    assert server._og_viewer_replication_enabled(loopback_ctx, "remote_updates") is True
+    # Unified path: loopback clients honor the same gates.
+    assert server._og_viewer_replication_enabled(loopback_ctx, "roster") is False
+    assert server._og_viewer_replication_enabled(loopback_ctx, "entity_create") is False
+    assert server._og_viewer_replication_enabled(loopback_ctx, "remote_updates") is False
 
     player_session = Session()
     player_session.player_id = 1338
@@ -4135,7 +4312,9 @@ def test_transient_fx_stays_off_for_remote_og_by_default():
     }])
 
     assert pkt and pkt[0] == 0x0D
-    assert sent == [(pkt, ("127.0.0.1", 50001))], sent
+    # Loopback fork retired (9ea5dbd, 2026-06-02): the remote_transient_fx
+    # gate applies to ALL clients, so nothing is delivered while it is off.
+    assert sent == [], sent
     print("test_transient_fx_stays_off_for_remote_og_by_default: PASSED")
     return True
 
@@ -4358,7 +4537,9 @@ def test_loopback_entity_create_decodes_roundtrip():
     )
     assert tick == 0x12345678
     assert local_state is not None
-    assert local_state.weapon_id == 0
+    # Loopback fork retired (9ea5dbd): an unpromoted viewer gets the
+    # spawn-safe short-form weapon (spawn_tank_weapon_type), like remote OG.
+    assert local_state.weapon_id == 2
     assert len(entities) == 1, entities
     assert entities[0].entity_id == 1338
     print("test_loopback_entity_create_decodes_roundtrip: PASSED")
@@ -4366,7 +4547,12 @@ def test_loopback_entity_create_decodes_roundtrip():
 
 
 def test_loopback_remote_player_update_decodes_roundtrip():
-    """Loopback remote updates must decode cleanly on the entity-only path."""
+    """Loopback remote updates decode cleanly on the unified OG viewer path.
+
+    Loopback fork retired (9ea5dbd, 2026-06-02): the viewer gets the same
+    short-form-safe local-state prefix as a remote OG client, not the old
+    entity-only shape.
+    """
     server = WulframServer.__new__(WulframServer)
     server.remote_update_mode = "pos_vel_rot"
     server.remote_yaw_negate = False
@@ -4431,7 +4617,9 @@ def test_loopback_remote_player_update_decodes_roundtrip():
         behavior_config=parse_behavior(build_behavior_packet()),
     )
     assert tick == 0x12345678
-    assert local_state is None
+    # Unified OG path: short-form-safe local-state prefix present.
+    assert local_state is not None
+    assert local_state.weapon_id == 2
     assert len(entities) == 1, entities
     assert entities[0].entity_id == 1338
     assert entities[0].velocity is not None
@@ -4442,7 +4630,13 @@ def test_loopback_remote_player_update_decodes_roundtrip():
 
 
 def test_loopback_heartbeat_decodes_roundtrip():
-    """Loopback heartbeats must decode cleanly with local-state + dummy entity block."""
+    """Loopback heartbeats decode cleanly on the unified spawn-safe form.
+
+    Loopback fork retired (9ea5dbd): an unpromoted client stays on the
+    10-byte spawn-safe short form (weapon=spawn_tank_weapon_type), and
+    GOAL 7 (16a3bfb) dropped the dummy/stomp entity record, so the
+    heartbeat carries zero entities.
+    """
     server = WulframServer.__new__(WulframServer)
     server.update_local_state_mode = "wf"
     server.local_state_weapon_type = 0
@@ -4484,9 +4678,8 @@ def test_loopback_heartbeat_decodes_roundtrip():
     )
     assert tick == 0x12345678
     assert local_state is not None
-    assert local_state.weapon_id == 0
-    assert len(entities) == 1, entities
-    assert entities[0].entity_id == 0xFFFFFFFE
+    assert local_state.weapon_id == 2
+    assert len(entities) == 0, entities
     print("test_loopback_heartbeat_decodes_roundtrip: PASSED")
     return True
 
@@ -4702,7 +4895,6 @@ def test_server_tank_motion_uses_fuel_mobility_factor():
     server.gravity = 0.0
     server.ground_level = 0.0
     server.world_bound = 100000.0
-    server.f32_physics = False
     server._resolve_entity_world_collision = (
         lambda ctx, px, py, pz, vx, vy, vz: (px, py, pz, vx, vy, vz)
     )
@@ -4747,7 +4939,6 @@ def test_server_tank_motion_reduces_mobility_when_low_fuel():
     server.gravity = 0.0
     server.ground_level = 0.0
     server.world_bound = 100000.0
-    server.f32_physics = False
     server._resolve_entity_world_collision = (
         lambda ctx, px, py, pz, vx, vy, vz: (px, py, pz, vx, vy, vz)
     )
@@ -4804,7 +4995,6 @@ def test_tank_ground_contact_damping_limits_low_hover_speed():
     server.gravity = 0.0
     server.ground_level = 0.0
     server.world_bound = 100000.0
-    server.f32_physics = False
     server.jump_jets_enabled = False
     server._resolve_entity_world_collision = (
         lambda ctx, px, py, pz, vx, vy, vz: (px, py, pz, vx, vy, vz)
@@ -4870,7 +5060,6 @@ def test_tank_high_hover_uses_linear_damping_for_w_motion():
     server.gravity = 0.0
     server.ground_level = 0.0
     server.world_bound = 100000.0
-    server.f32_physics = False
     server.jump_jets_enabled = False
     server._resolve_entity_world_collision = (
         lambda ctx, px, py, pz, vx, vy, vz: (px, py, pz, vx, vy, vz)
@@ -4966,7 +5155,11 @@ def test_remote_og_movement_input_delay_replays_prior_axis_sample():
     assert window[0]["fwd"] == 0.0 and window[0]["selected"] is True, window
     assert window[1]["fwd"] == 0.5188 and window[1]["future_of_target"] is True, window
 
+    # Loopback fork retired (9ea5dbd, 2026-06-02): the replay delay applies
+    # to loopback clients too — only injected control-port input bypasses it.
     ctx.client_addr = ("127.0.0.1", 50000)
+    assert abs(server._remote_og_movement_input_delay_for_ctx(ctx) - 0.20) < 1e-6
+    ctx.injected_input = (0.0, 0.0)
     assert server._remote_og_movement_input_delay_for_ctx(ctx) == 0.0
     print("test_remote_og_movement_input_delay_replays_prior_axis_sample: PASSED")
     return True
@@ -5307,7 +5500,6 @@ def test_server_jump_jets_apply_fixed_step_rising_edge():
     server.gravity = 0.0
     server.ground_level = 0.0
     server.world_bound = 100000.0
-    server.f32_physics = False
     server.jump_jets_enabled = True
     server.weapon_energy_enabled = True
     server.player_energy_max = 100.0
@@ -5365,7 +5557,6 @@ def test_server_jump_jets_have_visible_peak_under_default_gravity():
     server.gravity = -50.0
     server.ground_level = 0.0
     server.world_bound = 100000.0
-    server.f32_physics = False
     server.jump_jets_enabled = True
     server.weapon_energy_enabled = True
     server.player_energy_max = 100.0
@@ -5422,7 +5613,6 @@ def test_server_jump_jets_use_tank_body_up_direction():
     server.gravity = 0.0
     server.ground_level = 0.0
     server.world_bound = 100000.0
-    server.f32_physics = False
     server.jump_jets_enabled = True
     server.jump_jet_direction = "body"
     server.weapon_energy_enabled = True
@@ -5485,7 +5675,6 @@ def test_server_jump_jet_landing_guard_rejects_large_world_collision_projection(
     server.gravity = 0.0
     server.ground_level = 0.0
     server.world_bound = 100000.0
-    server.f32_physics = False
     server.jump_jets_enabled = True
     server.jump_jet_direction = "body"
     server.jump_jet_collision_guard = True
@@ -5550,7 +5739,6 @@ def test_server_tank_terrain_projection_guard_rejects_fast_straight_side_shove()
     server.gravity = 0.0
     server.ground_level = 0.0
     server.world_bound = 100000.0
-    server.f32_physics = False
     server.jump_jets_enabled = True
     server.jump_jet_direction = "body"
     server.tank_terrain_projection_guard = True
@@ -5622,6 +5810,8 @@ def test_server_jump_jets_queue_remote_og_correction_burst():
     assert abs(ctx.correction_burst_interval_s - 0.05) < 1e-6
     assert ctx.last_correction_send == 0.0
 
+    # Loopback fork retired (9ea5dbd, 2026-06-02): a 127.0.0.1 client queues
+    # the same correction burst as a remote OG client.
     loopback_ctx = ClientContext(
         client_id=2,
         client_addr=("127.0.0.1", 50001),
@@ -5635,8 +5825,8 @@ def test_server_jump_jets_queue_remote_og_correction_burst():
         new_vel_z=tank_jump.impulse,
     )
 
-    assert loopback_ctx.force_correction_once is False
-    assert loopback_ctx.correction_burst_remaining == 0
+    assert loopback_ctx.force_correction_once is True
+    assert loopback_ctx.correction_burst_remaining == 11
     print("test_server_jump_jets_queue_remote_og_correction_burst: PASSED")
     return True
 
@@ -5655,7 +5845,6 @@ def test_server_motion_clamps_to_move_adjust():
     server.gravity = 0.0
     server.ground_level = 0.0
     server.world_bound = 100000.0
-    server.f32_physics = False
     server._resolve_entity_world_collision = (
         lambda ctx, px, py, pz, vx, vy, vz: (px, py, pz, vx, vy, vz)
     )
@@ -5700,7 +5889,6 @@ def test_server_motion_reclamps_below_ground_after_collision_response():
     server.gravity = 0.0
     server.ground_level = 0.0
     server.world_bound = 100000.0
-    server.f32_physics = False
     server._resolve_entity_world_collision = (
         lambda ctx, px, py, pz, vx, vy, vz: (px, py, 1.0, vx, vy, -7.0)
     )
@@ -5748,7 +5936,6 @@ def test_server_motion_uses_physics_terrain_offset_for_vehicle_ground():
     server.gravity = 0.0
     server.ground_level = 0.0
     server.world_bound = 100000.0
-    server.f32_physics = False
     server._resolve_entity_world_collision = (
         lambda ctx, px, py, pz, vx, vy, vz: (px, py, pz, vx, vy, vz)
     )
@@ -5796,7 +5983,6 @@ def test_server_motion_releases_spawn_ground_override_on_terrain_departure():
     server.gravity = -50.0
     server.ground_level = 0.0
     server.world_bound = 100000.0
-    server.f32_physics = False
     server.ground_override_release_distance = 24.0
     server.ground_override_release_height = 4.0
     server._resolve_entity_world_collision = (
@@ -5849,7 +6035,6 @@ def test_server_motion_releases_ground_override_when_terrain_changes_under_tank(
     server.gravity = -50.0
     server.ground_level = 0.0
     server.world_bound = 100000.0
-    server.f32_physics = False
     server.ground_override_release_distance = 24.0
     server.ground_override_release_height = 4.0
     server.ground_override_release_terrain_distance = 4.0
@@ -6068,7 +6253,6 @@ def test_server_tank_drive_uses_body_matrix_when_body_pose_live():
         server.gravity = 0.0
         server.ground_level = 0.0
         server.world_bound = 100000.0
-        server.f32_physics = False
         server.jump_jets_enabled = False
         server._resolve_entity_world_collision = (
             lambda ctx, px, py, pz, vx, vy, vz: (px, py, pz, vx, vy, vz)
@@ -6165,7 +6349,6 @@ def test_contact_yaw_velocity_feeds_next_vehicle_physics_tick():
     server.gravity = 0.0
     server.ground_level = 0.0
     server.world_bound = 100000.0
-    server.f32_physics = False
     server.jump_jets_enabled = False
 
     def fake_contact(ctx, px, py, pz, vx, vy, vz):
@@ -6222,7 +6405,6 @@ def test_surface_attitude_uses_post_yaw_heading_after_drive_step():
     server.gravity = 0.0
     server.ground_level = 0.0
     server.world_bound = 100000.0
-    server.f32_physics = False
     server.jump_jets_enabled = False
     server._resolve_entity_world_collision = (
         lambda ctx, px, py, pz, vx, vy, vz: (px, py, pz, vx, vy, vz)
@@ -6300,6 +6482,9 @@ def test_tank_surface_attitude_uses_spring_normal_for_replication():
         (-5.0, 1.0),
         (-5.0, -1.0),
     )
+    # 7bca231 (CH2 attitude debug command) stashes this attribute into
+    # ctx.debug_attitude_target unconditionally; __init__ defaults it to "force".
+    server.tank_spring_attitude_model = "force"
 
     ctx = ClientContext(
         client_id=1,
@@ -6348,6 +6533,9 @@ def test_tank_surface_attitude_steps_toward_spring_normal():
     )
     server.tank_spring_attitude_stiffness = 40.0
     server.tank_spring_attitude_damping = 2.0
+    # 7bca231 (CH2 attitude debug command) stashes this attribute into
+    # ctx.debug_attitude_target unconditionally; __init__ defaults it to "force".
+    server.tank_spring_attitude_model = "force"
 
     ctx = ClientContext(
         client_id=1,
@@ -6555,7 +6743,6 @@ def test_tank_softbody_support_pulls_down_from_compact_equilibrium():
     server.gravity = -50.0
     server.ground_level = 0.0
     server.world_bound = 100000.0
-    server.f32_physics = False
     server._resolve_entity_world_collision = (
         lambda ctx, px, py, pz, vx, vy, vz: (px, py, pz, vx, vy, vz)
     )
@@ -16998,7 +17185,9 @@ def test_remote_combat_observer_stats_gate_skips_nonparticipant_og():
 
     assert observer_ctx.tcp_handler.sent == [], observer_ctx.tcp_handler.sent
     assert len(participant_ctx.tcp_handler.sent) == 1
-    assert len(loopback_ctx.tcp_handler.sent) == 1
+    # Loopback fork retired (9ea5dbd, 2026-06-02): a nonparticipant loopback
+    # observer is gated exactly like a remote OG observer.
+    assert loopback_ctx.tcp_handler.sent == [], loopback_ctx.tcp_handler.sent
     print("test_remote_combat_observer_stats_gate_skips_nonparticipant_og: PASSED")
     return True
 
@@ -18242,6 +18431,9 @@ def main():
         test_remote_state_sync_reply_emits_view_update_with_fresh_remote_timestamp,
         test_loopback_state_sync_reply_keeps_request_timestamp,
         test_remote_state_request_queues_visible_correction_burst,
+        test_state_request_burst_rate_cap,
+        test_correction_burst_due_drains_under_gate,
+        test_state_request_queues_burst_under_default_gate,
         test_remote_active_movement_suppresses_visible_correction_burst,
         test_state_request_active_movement_skips_view_update_correction,
         test_batched_state_request_sees_later_action_update_movement,

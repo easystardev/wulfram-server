@@ -1244,8 +1244,10 @@ class WulframServer:
         except ValueError:
             self.turn_deadzone = 0.05
         # (subtick/ticksync/client_frame_physics removed â€” dead scaffolding, never used in tick loop)
-        # float32 precision matching: quantize heading/ang_vel to float32 after each step
-        self.f32_physics = os.environ.get("WULFRAM_F32_PHYSICS", "1") == "1"
+        # (float32 precision matching is now unconditional: the angular pipeline uses
+        #  step_f32 and position uses the shared sim kernel's integrate_verlet — both
+        #  always quantize to float32, matching the OG client. The old WULFRAM_F32_PHYSICS
+        #  off-path was a non-faithful fallback and has been removed.)
         # (frame_locked mode removed â€” not part of original decompile architecture)
         try:
             self.turn_sign = float(os.environ.get("WULFRAM_TURN_SIGN", "-1.0"))
@@ -1530,6 +1532,23 @@ class WulframServer:
         self.correction_divergence_decay = min(1.0, max(0.0, self.correction_divergence_decay))
         # Debug counters for empirical flat-ground verification of the gate.
         self.correction_gate_debug = os.environ.get("WULFRAM_CORRECTION_GATE_DEBUG", "0").strip().lower() in ("1", "on", "true", "yes")
+        # ── Correction-trigger fix (2026-06-09) ─────────────────────────────
+        # The divergence accumulator above is fed ONLY by the terrain-Z clamp,
+        # so it is structurally blind to LATERAL divergence (zero on flat
+        # ground), and STATE_REQUEST carries no client position — the server
+        # cannot measure lateral drift from the wire. The OG client's own
+        # STATE_REQUEST cadence is the only divergence-shaped signal available,
+        # so when enabled (default) a STATE_REQUEST queues the standard ~10Hz
+        # settle burst even under the correction gate, capped to one burst per
+        # state_request_burst_min_interval so fire-spam STATE_REQUESTs cannot
+        # reproduce the GOAL-2 flood/freeze. Identical for every client.
+        self.state_request_burst_enabled = os.environ.get("WULFRAM_STATE_REQUEST_BURST", "1").strip().lower() not in ("0", "off", "false", "no")
+        try:
+            self.state_request_burst_min_interval = float(os.environ.get("WULFRAM_STATE_REQUEST_BURST_MIN_INTERVAL", "1.75"))
+        except ValueError:
+            self.state_request_burst_min_interval = 1.75
+        if self.state_request_burst_min_interval < 0.0:
+            self.state_request_burst_min_interval = 0.0
         # GOAL 8: per-step suspension/Z instrumentation (default OFF).
         self.goal8_zdebug = os.environ.get("WULFRAM_GOAL8_ZDEBUG", "0").strip().lower() in ("1", "on", "true", "yes")
         try:
@@ -1566,7 +1585,9 @@ class WulframServer:
             f"divergence_pos={self.correction_divergence_pos}u "
             f"divergence_heading={self.correction_divergence_heading_deg}deg "
             f"min_interval={self.correction_min_interval}s "
-            f"floor={self.correction_divergence_floor}u decay={self.correction_divergence_decay}"
+            f"floor={self.correction_divergence_floor}u decay={self.correction_divergence_decay} "
+            f"state_request_burst={int(self.state_request_burst_enabled)} "
+            f"burst_queue_min_interval={self.state_request_burst_min_interval}s"
         )
 
         print(
@@ -4239,6 +4260,10 @@ class WulframServer:
         ctx.last_state_sync_rot = None
         ctx.last_correction_send = 0.0
         ctx.force_correction_once = False
+        ctx.last_state_request_burst_queue = 0.0
+        # A burst queued against the pre-death pose must not drain against the
+        # respawn pose (same discontinuity argument as the accumulators below).
+        ctx.correction_burst_remaining = 0
         # Gated-rare correction divergence accumulators (GOAL 2). Reset on
         # spawn so the respawn pose discontinuity doesn't read as divergence.
         ctx.divergence_accum_pos = 0.0
@@ -4558,6 +4583,10 @@ class WulframServer:
         ctx.last_state_sync_rot = None
         ctx.last_correction_send = 0.0
         ctx.force_correction_once = False
+        ctx.last_state_request_burst_queue = 0.0
+        # A burst queued against the pre-death pose must not drain against the
+        # respawn pose (same discontinuity argument as the accumulators below).
+        ctx.correction_burst_remaining = 0
         # Gated-rare correction divergence accumulators (GOAL 2). Reset on
         # spawn so the respawn pose discontinuity doesn't read as divergence.
         ctx.divergence_accum_pos = 0.0
@@ -6206,14 +6235,18 @@ class WulframServer:
         if self._remote_movement_input_active(ctx, now=now):
             return
 
-        # GOAL 2: under the gated-rare correction model the STATE_REQUEST reply
-        # must NOT proactively emit a VIEW_UPDATE (camera-clamp) correction or
-        # queue a correction burst — on fire the OG client spams STATE_REQUEST,
-        # which previously flooded a zero-latency loopback client into a render
-        # stall. Reply with the plain UPDATE_ARRAY snapshot only (HUD/local-state,
-        # no camera clamp); any genuine divergence is handled by the tick-loop
-        # divergence gate under its hard rate cap. Legacy proactive replies remain
-        # available for A/B via WULFRAM_CORRECTION_GATE=0.
+        # GOAL 2 (amended 2026-06-09): under the gated-rare correction model the
+        # STATE_REQUEST reply must not flood — on fire the OG client spams
+        # STATE_REQUEST, which previously froze a zero-latency loopback client.
+        # But the tick-loop divergence gate is fed ONLY by the terrain-Z clamp
+        # (structurally zero on flat ground, blind to lateral drift) and
+        # STATE_REQUEST carries no client position, so with NO trigger lateral
+        # divergence under motion grew unbounded (60u+ observed live 2026-06-09).
+        # Middle ground: reply with the plain UPDATE_ARRAY snapshot, and queue
+        # the standard ~10Hz settle burst at most once per
+        # state_request_burst_min_interval — the queue-time rate cap defuses the
+        # flood while restoring a correction path for lateral drift. Legacy
+        # uncapped proactive replies remain available via WULFRAM_CORRECTION_GATE=0.
         if self.correction_gate_enabled:
             include_view_update = False
         else:
@@ -6226,6 +6259,8 @@ class WulframServer:
         )
         if include_view_update:
             self._queue_state_sync_correction_burst(ctx)
+        elif getattr(self, "state_request_burst_enabled", False):
+            self._maybe_queue_state_request_burst(ctx, now=now)
 
     def _queue_state_sync_correction_burst(self, ctx: ClientContext) -> bool:
         """Queue enough replay updates for OG's local correction to visibly settle."""
@@ -6243,6 +6278,51 @@ class WulframServer:
         ctx.correction_burst_remaining = max(current_remaining, count)
         ctx.correction_burst_interval_s = interval
         return True
+
+    def _maybe_queue_state_request_burst(
+        self, ctx: ClientContext, now: Optional[float] = None
+    ) -> bool:
+        """Correction-trigger fix (2026-06-09): queue the settle burst in reply
+        to STATE_REQUEST even under the correction gate, rate-capped per client.
+
+        The gate's divergence accumulator only sees server-side terrain-Z
+        clamping (lateral divergence on flat ground never trips it) and
+        STATE_REQUEST carries no position for the server to measure against,
+        so the client's own request cadence is the only divergence-shaped
+        signal on the wire. The queue-time rate cap (default 1.75s) is what
+        keeps the GOAL-2 fire-spam flood dead — flood safety lives HERE, not
+        at drain time. Identical for every client; no client-type fork."""
+        if now is None:
+            now = time.monotonic()
+        last = float(getattr(ctx, "last_state_request_burst_queue", 0.0) or 0.0)
+        min_interval = float(
+            getattr(self, "state_request_burst_min_interval", 1.75) or 0.0
+        )
+        if (now - last) < min_interval:
+            return False
+        if not self._queue_state_sync_correction_burst(ctx):
+            return False
+        ctx.last_state_request_burst_queue = now
+        return True
+
+    def _correction_burst_due(
+        self, ctx: ClientContext, now: float, movement_suppressed: bool
+    ) -> bool:
+        """A queued correction burst is due to emit its next packet.
+
+        Used by BOTH the gated and legacy tick branches (the gated branch
+        ignoring queued bursts was the 2026-06-09 'correction now only sends
+        one packet' bug): bursts drain at their own interval (~10Hz), pause
+        during active movement input, and deliberately bypass
+        correction_min_interval — flood safety lives at burst-QUEUE time
+        (_maybe_queue_state_request_burst), not at drain time."""
+        burst_remaining = int(getattr(ctx, "correction_burst_remaining", 0) or 0)
+        if burst_remaining <= 0:
+            return False
+        if movement_suppressed:
+            return False
+        burst_interval = float(getattr(ctx, "correction_burst_interval_s", 0.0) or 0.0)
+        return (now - ctx.last_correction_send) >= burst_interval
 
     def _send_state_sync_snapshot(
         self,
@@ -9162,29 +9242,16 @@ class WulframServer:
         pre_pos = ctx.player_pos
         pre_vel = (vel_x, vel_y, vel_z)
 
-        # Verlet integration: pos += vel * dt + 0.5 * acc * dtÂ²
-        # (semi-implicit Euler, from Vec3_integrate_motion, Game/Simulation/Physics.c:5124,
-        #  called by RigidBody_integrate_position. Bit-exact verified 2026-06-01.)
-        x, y, z = ctx.player_pos
-        half_dt2 = 0.5 * dt * dt
-        new_x = x + vel_x * dt + acc_x * half_dt2
-        new_y = y + vel_y * dt + acc_y * half_dt2
-        new_z = z + vel_z * dt + acc_z * half_dt2
-
-        # Velocity update: vel += acc * dt
-        new_vel_x = vel_x + acc_x * dt
-        new_vel_y = vel_y + acc_y * dt
-        new_vel_z = vel_z + acc_z * dt
-
-        # Float32 quantization: client stores pos/vel as float32
-        if self.f32_physics:
-            from .physics import _f32
-            new_x = _f32(new_x)
-            new_y = _f32(new_y)
-            new_z = _f32(new_z)
-            new_vel_x = _f32(new_vel_x)
-            new_vel_y = _f32(new_vel_y)
-            new_vel_z = _f32(new_vel_z)
+        # Verlet position step + float32 quantize, via the shared sim kernel
+        # (integrate_verlet): pos += vel*dt + 0.5*acc*dt²; vel += acc*dt; pos uses
+        # the OLD velocity. Semi-implicit Euler from Vec3_integrate_motion
+        # (Game/Simulation/Physics.c:5124, called by RigidBody_integrate_position;
+        # bit-exact verified 2026-06-01). Always f32 — the rounding point now lives
+        # in the kernel (client stores pos/vel as float32).
+        from .physics import _integrate_verlet
+        (new_x, new_y, new_z), (new_vel_x, new_vel_y, new_vel_z) = _integrate_verlet(
+            ctx.player_pos, (vel_x, vel_y, vel_z), (acc_x, acc_y, acc_z), dt
+        )
 
         # Clamp to world bounds
         if self.up_axis == "z":
@@ -22024,8 +22091,9 @@ class WulframServer:
     def _on_jump_jet_triggered(self, ctx: ClientContext, player_id: int, impulse: float, new_vel_z: float):
         """Callback when a jump jet is triggered."""
         print(f"[JUMP] Jump triggered for player {player_id}: impulse={impulse}, vel_up={new_vel_z:.1f}")
+        # Loopback fork retired (2026-06-02): the burst queues for every client.
         burst_count = int(getattr(self, "jump_jet_correction_burst_count", 0) or 0)
-        if burst_count > 0 and not handlers._is_loopback_client(ctx):
+        if burst_count > 0:
             # The original Tank controller has no local jumpjet impulse, so OG
             # clients need a short authoritative burst to make the custom
             # server-side hop visible instead of waiting for sparse organic
@@ -22277,7 +22345,6 @@ class WulframServer:
 
                 physics = ctx.vehicle_physics
                 ws = ctx.weapon_system
-                use_f32 = self.f32_physics
 
                 # Log input transitions (key press/release)
                 input_changed = abs(raw_input - prev_input) > 0.001
@@ -22401,12 +22468,12 @@ class WulframServer:
                         post_dt = step_dt - pre_dt
                         prev_torque = self._compute_turn_torque(ctx, prev_turn_input)
                         if pre_dt > 1e-6:
-                            physics.step_client_substeps(prev_torque, pre_dt, use_f32=use_f32)
+                            physics.step_client_substeps(prev_torque, pre_dt)
                             self._sync_heading_physics_to_context(ctx, physics)
                             self._update_player_position_stepped(ctx, pre_dt, heading_override=old_heading)
                             move_heading = ctx.player_heading
                         if post_dt > 1e-6:
-                            physics.step_client_substeps(torque, post_dt, use_f32=use_f32)
+                            physics.step_client_substeps(torque, post_dt)
                         move_dt = post_dt
                         ws.turn_input_change_time = 0.0
                         if self.debug_sync:
@@ -22416,7 +22483,7 @@ class WulframServer:
                                 f"pre_dt={pre_dt * 1000.0:.1f}ms post_dt={post_dt * 1000.0:.1f}ms"
                             )
                     else:
-                        physics.step_client_substeps(torque, step_dt, use_f32=use_f32)
+                        physics.step_client_substeps(torque, step_dt)
 
                     self._sync_heading_physics_to_context(ctx, physics)
                     if move_dt > 1e-6:
@@ -22531,14 +22598,19 @@ class WulframServer:
                 correction_reason = ""
                 force_due = bool(getattr(ctx, "force_correction_once", False))
                 if self.correction_gate_enabled:
-                    # OG-faithful GATED-RARE reactive correction (GOAL 2). No
-                    # proactive timer streams: emit a VIEW_UPDATE only when the
-                    # authoritative state has genuinely DIVERGED (accumulated
-                    # server-only, client-unpredictable displacement — terrain-Z
-                    # clamp / collision push — since the last correction) beyond a
+                    # OG-faithful GATED-RARE reactive correction (GOAL 2, amended
+                    # 2026-06-09). No proactive timer streams: a correction emits
+                    # only when (a) explicitly forced, (b) a queued reactive burst
+                    # is draining (operator `correction now`, jump-jet hop, or the
+                    # rate-capped STATE_REQUEST settle burst — see
+                    # _maybe_queue_state_request_burst; queue sites are all
+                    # event-driven and rate-capped), or (c) the authoritative
+                    # state has genuinely DIVERGED (accumulated server-only,
+                    # client-unpredictable displacement — terrain-Z clamp /
+                    # collision push — since the last correction) beyond a
                     # threshold, and never faster than the hard rate cap. The gate
                     # is IDENTICAL for every client: a zero-latency loopback client
-                    # is bounded by the same cap, with no _is_loopback_client fork.
+                    # is bounded by the same caps, with no _is_loopback_client fork.
                     accum_pos = float(getattr(ctx, "divergence_accum_pos", 0.0) or 0.0)
                     accum_heading_deg = math.degrees(
                         abs(float(getattr(ctx, "divergence_accum_heading", 0.0) or 0.0))
@@ -22549,17 +22621,20 @@ class WulframServer:
                         or accum_heading_deg >= self.correction_divergence_heading_deg
                     )
                     divergence_correction_due = diverged and rate_ok
+                    burst_due = self._correction_burst_due(
+                        ctx, now, active_movement_correction_suppressed
+                    )
                     if force_due:
                         correction_reason = "forced"
+                    elif burst_due:
+                        correction_reason = "burst"
                     elif divergence_correction_due:
                         correction_reason = "divergence"
-                    correction_due = force_due or divergence_correction_due
+                    correction_due = force_due or burst_due or divergence_correction_due
                 else:
                     # Legacy proactive streams — A/B only (WULFRAM_CORRECTION_GATE=0).
-                    burst_due = (
-                        burst_remaining > 0
-                        and not active_movement_correction_suppressed
-                        and (now - ctx.last_correction_send) >= burst_interval
+                    burst_due = self._correction_burst_due(
+                        ctx, now, active_movement_correction_suppressed
                     )
                     movement_interval = float(getattr(self, "movement_correction_interval", 0.0) or 0.0)
                     movement_window = float(getattr(self, "movement_correction_window", 0.0) or 0.0)
@@ -22875,8 +22950,13 @@ class WulframServer:
                         ctx.divergence_accum_pos = 0.0
                         ctx.divergence_accum_heading = 0.0
                         ctx.correction_send_count = int(getattr(ctx, "correction_send_count", 0) or 0) + 1
-                        if burst_remaining > 0:
-                            ctx.correction_burst_remaining = burst_remaining - 1
+                        # Decrement against the LIVE value, not the tick-entry
+                        # snapshot: the UDP thread may have re-queued a fresh
+                        # burst between snapshot and here, and a stale-snapshot
+                        # write-back would silently cancel it.
+                        live_burst_remaining = int(getattr(ctx, "correction_burst_remaining", 0) or 0)
+                        if live_burst_remaining > 0:
+                            ctx.correction_burst_remaining = live_burst_remaining - 1
                         if correction_reason == "movement":
                             ctx.movement_correction_count = int(
                                 getattr(ctx, "movement_correction_count", 0) or 0

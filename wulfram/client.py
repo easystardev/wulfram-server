@@ -200,6 +200,10 @@ class ClientContext:
     # at ~10 Hz is visibly applied and the new pose persists after the burst.
     correction_burst_remaining: int = 0
     correction_burst_interval_s: float = 0.0
+    # Correction-trigger fix (2026-06-09): last time a STATE_REQUEST queued a
+    # settle burst. Rate-caps the auto-burst so the OG client's fire-spam
+    # STATE_REQUEST cadence cannot reproduce the GOAL-2 correction flood.
+    last_state_request_burst_queue: float = 0.0
     # Solo-local-player keepalive — satisfies the OG client's organic
     # STATE_REQUEST trigger at Replication.c:1173-1177 which only fires for
     # `entity_count == 1 && final == local_player` packets. Without a steady
