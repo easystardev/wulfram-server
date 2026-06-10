@@ -54,13 +54,13 @@ def install() -> bool:
     _orig_substeps = VehiclePhysics.step_client_substeps
     _orig_step_f32 = VehiclePhysics.step_f32
 
-    def _wrapped_substeps(self, torque, frame_dt, use_f32=False):
+    def _wrapped_substeps(self, torque, frame_dt):
         pre_euler = list(self._euler)
         pre_av = self._angular_velocity
-        r = _orig_substeps(self, torque, frame_dt, use_f32)
+        r = _orig_substeps(self, torque, frame_dt)
         _emit({
             "k": "rot", "mode": "substeps",
-            "torque": _h(torque), "dt": _h(frame_dt), "use_f32": bool(use_f32),
+            "torque": _h(torque), "dt": _h(frame_dt), "use_f32": True,
             "pre_euler": [_h(x) for x in pre_euler], "pre_ang_vel": _h(pre_av),
             "post_euler": [_h(x) for x in self._euler],
             "post_ang_vel": _h(self._angular_velocity),

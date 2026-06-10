@@ -50,20 +50,13 @@ from wulfram2_protocol.sim_kernel import (  # noqa: F401  (backend gated by WULF
     F32_TWO_PI,
     extract_euler_angles as _extract_euler_angles,
     f32 as _f32,
+    integrate_verlet as _integrate_verlet,
     matrix3_from_axis_angle as _matrix3_from_axis_angle,
     matrix3_from_euler_xyz as _matrix3_from_euler_xyz,
     normalize_angle_client as _normalize_angle_client,
 )
 
 TWO_PI = 2.0 * math.pi
-
-
-def _normalize_angle_0_2pi(angle: float) -> float:
-    """Normalize angle to [0, 2*pi] — float64 version for step() backward compat."""
-    angle = angle % TWO_PI
-    if angle < 0.0:
-        angle += TWO_PI
-    return angle
 
 
 class VehiclePhysics:
@@ -110,22 +103,6 @@ class VehiclePhysics:
             self._matrix = _matrix3_from_euler_xyz(
                 self._euler[0], self._euler[1], self._euler[2]
             )
-
-    def step(self, torque: float, dt: float):
-        """Advance physics by dt seconds (float64 mode, backward compat).
-
-        Uses scalar heading integration — NOT the rotation matrix path.
-        Kept for non-f32 testing and backward compatibility.
-        """
-        h = self._euler[2]
-        ang_vel = self._angular_velocity
-
-        h += ang_vel * dt
-        ang_vel += (torque - ang_vel * self.damp_coeff) * dt
-
-        self._angular_velocity = ang_vel
-        self._euler[2] = _normalize_angle_0_2pi(h)
-        # Invalidate matrix dirty-check (don't update prev_euler)
 
     def step_f32(self, torque: float, dt: float):
         """Step with full rotation matrix pipeline matching client's x86 code.
@@ -218,7 +195,7 @@ class VehiclePhysics:
 
         self._angular_velocity = ang_vel
 
-    def step_client_substeps(self, torque: float, frame_dt: float, use_f32: bool = False):
+    def step_client_substeps(self, torque: float, frame_dt: float):
         """Step physics using the client's two-level substep algorithm.
 
         Outer: GUESS6_GameSim_substep_update (Game/Simulation/Physics.c:1974)
@@ -235,9 +212,8 @@ class VehiclePhysics:
         Args:
             torque: base torque for ONE application (turn_adjust * raw_input)
             frame_dt: the client's frame duration in seconds
-            use_f32: if True, use rotation matrix pipeline (matching client)
         """
-        step_fn = self.step_f32 if use_f32 else self.step
+        step_fn = self.step_f32
 
         # Convert to integer ms, matching client's integer arithmetic
         elapsed_ms = int(frame_dt * 1000.0)

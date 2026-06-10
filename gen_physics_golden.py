@@ -66,7 +66,7 @@ def _run_case(case: dict) -> dict:
         if mode == "step_f32":
             p.step_f32(torque, dt)
         else:
-            p.step_client_substeps(torque, dt, use_f32=True)
+            p.step_client_substeps(torque, dt)
     return _capture(p)
 
 
