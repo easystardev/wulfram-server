@@ -1514,6 +1514,19 @@ class WulframServer:
             self.correction_min_interval = 0.2
         if self.correction_min_interval < 0.0:
             self.correction_min_interval = 0.0
+        # Periodic correction (2026-06-17): opt-in steady-cadence correction that
+        # fires DURING movement (like the jumpjet force-correction), so divergence
+        # is nudged out continuously instead of accumulating into a big jumpjet-
+        # triggerable rubber-band. 0 = off (default). Unlike burst/divergence
+        # corrections it is NOT held back by the movement-suppress pause; each
+        # emit is a single authoritative snapshot, so a small interval keeps the
+        # per-correction nudge tiny (smooth) while bounding max drift.
+        try:
+            self.periodic_correction_interval = float(os.environ.get("WULFRAM_PERIODIC_CORRECTION_S", "0"))
+        except ValueError:
+            self.periodic_correction_interval = 0.0
+        if self.periodic_correction_interval < 0.0:
+            self.periodic_correction_interval = 0.0
         try:
             # Per-tick noise floor: server-only displacement below this is treated
             # as float/quantization noise and ignored (keeps flat ground at ~0).
@@ -22624,13 +22637,27 @@ class WulframServer:
                     burst_due = self._correction_burst_due(
                         ctx, now, active_movement_correction_suppressed
                     )
+                    # Periodic correction: fires on a steady cadence even DURING
+                    # movement (the divergence accumulator is blind to the OG's
+                    # lateral prediction gap, and burst/divergence are paused while
+                    # driving — so without this, drift only clears on a jumpjet
+                    # force-correction). Opt-in via WULFRAM_PERIODIC_CORRECTION_S.
+                    periodic_due = (
+                        self.periodic_correction_interval > 0.0
+                        and not handlers._is_loopback_client(ctx)
+                        and (now - ctx.last_correction_send) >= self.periodic_correction_interval
+                    )
                     if force_due:
                         correction_reason = "forced"
                     elif burst_due:
                         correction_reason = "burst"
                     elif divergence_correction_due:
                         correction_reason = "divergence"
-                    correction_due = force_due or burst_due or divergence_correction_due
+                    elif periodic_due:
+                        correction_reason = "periodic"
+                    correction_due = (
+                        force_due or burst_due or divergence_correction_due or periodic_due
+                    )
                 else:
                     # Legacy proactive streams — A/B only (WULFRAM_CORRECTION_GATE=0).
                     burst_due = self._correction_burst_due(
