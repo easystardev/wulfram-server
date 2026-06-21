@@ -47,3 +47,23 @@ class ConfigMixin:
             0.0,
             float(os.environ.get("WULFRAM_JUMP_JET_LANDING_CLEARANCE", "1.85")),
         )
+
+    def _init_tank_terrain_projection_guard_config(self):
+        self.tank_terrain_projection_guard = (
+            os.environ.get("WULFRAM_TANK_TERRAIN_PROJECTION_GUARD", "1")
+            .strip()
+            .lower()
+            not in ("0", "false", "off", "no")
+        )
+        self.tank_terrain_projection_guard_xy = max(
+            0.0,
+            float(os.environ.get("WULFRAM_TANK_TERRAIN_PROJECTION_GUARD_XY", "1.0")),
+        )
+        self.tank_terrain_projection_guard_zpop = max(
+            0.0,
+            float(os.environ.get("WULFRAM_TANK_TERRAIN_PROJECTION_GUARD_ZPOP", "2.0")),
+        )
+        self.tank_terrain_projection_guard_min_clearance = max(
+            0.0,
+            float(os.environ.get("WULFRAM_TANK_TERRAIN_PROJECTION_GUARD_MIN_CLEARANCE", "0.0")),
+        )

@@ -847,24 +847,7 @@ class WulframServer(ConfigMixin):
         # the canonical gameplay stream for vitals and entity replication.
         self.heartbeat_view_update = os.environ.get("WULFRAM_HEARTBEAT_VIEW_UPDATE", "0") == "1"
         self._init_jump_jet_config()
-        self.tank_terrain_projection_guard = (
-            os.environ.get("WULFRAM_TANK_TERRAIN_PROJECTION_GUARD", "1")
-            .strip()
-            .lower()
-            not in ("0", "false", "off", "no")
-        )
-        self.tank_terrain_projection_guard_xy = max(
-            0.0,
-            float(os.environ.get("WULFRAM_TANK_TERRAIN_PROJECTION_GUARD_XY", "1.0")),
-        )
-        self.tank_terrain_projection_guard_zpop = max(
-            0.0,
-            float(os.environ.get("WULFRAM_TANK_TERRAIN_PROJECTION_GUARD_ZPOP", "2.0")),
-        )
-        self.tank_terrain_projection_guard_min_clearance = max(
-            0.0,
-            float(os.environ.get("WULFRAM_TANK_TERRAIN_PROJECTION_GUARD_MIN_CLEARANCE", "0.0")),
-        )
+        self._init_tank_terrain_projection_guard_config()
 
         print(
             "[CONFIG] spawn_udp_tank="
