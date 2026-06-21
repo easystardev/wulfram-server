@@ -533,6 +533,8 @@ class ControlServer:
             return self._cmd_physics(args)
         elif cmd == 'correction' or cmd == 'corr':
             return self._cmd_correction(args)
+        elif cmd == 'periodic':
+            return self._cmd_periodic(args)
         elif cmd == 'subtick':
             if not self.server:
                 return "No server"
@@ -1122,6 +1124,28 @@ Examples:
             f"tick={tick} pos=({corr_pos[0]:.1f},{corr_pos[1]:.1f},{corr_pos[2]:.1f}) "
             f"yaw={math.degrees(corr_rot[2]):.1f}deg"
         )
+
+    def _cmd_periodic(self, args: list) -> str:
+        """Show or set the periodic-correction interval live (seconds; 0=off).
+
+          periodic            - show current interval
+          periodic <seconds>  - set interval (e.g. periodic 0.5; periodic 0 disables)
+        """
+        if not self.server:
+            return "No server"
+        cur = float(getattr(self.server, "periodic_correction_interval", 0.0) or 0.0)
+        cur_s = "OFF" if cur <= 0.0 else f"{cur:.3f}s"
+        if not args:
+            return f"periodic correction: {cur_s}"
+        try:
+            val = float(args[0])
+        except (ValueError, IndexError):
+            return "usage: periodic <seconds> (0=off)"
+        if val < 0.0:
+            val = 0.0
+        self.server.periodic_correction_interval = val
+        new_s = "OFF" if val <= 0.0 else f"{val:.3f}s"
+        return f"periodic correction set to {new_s} (was {cur_s})"
 
     def _cmd_correction(self, args: list) -> str:
         """Show or control the empirical local-correction loop."""
