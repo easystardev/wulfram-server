@@ -263,6 +263,17 @@ def build_add_to_roster(player_id: int, entity_id: int, name: str, team: int,
     return payload
 
 
+def build_remove_from_roster(player_id: int) -> bytes:
+    """Build REMOVE_FROM_ROSTER (0x1B).
+
+    The handler registered at Network.c:1524 reads a single u32 player_id (same
+    shape as the sibling DEATH_NOTICE/BEACON_DELETE u32 handlers), so the packet
+    is exactly opcode + u32 = 5 bytes (TCP-frame-safe). Sent on disconnect so the
+    OG P-scoreboard drops the departed player's row instead of leaving it stale.
+    """
+    return b'\x1B' + struct.pack(">I", player_id)
+
+
 def build_update_stats(player_id: int, entity_id: int, kills: int = 0,
                        deaths: int = 0, team_id: int = 0) -> bytes:
     """Build UPDATE_STATS packet (0x1C).

@@ -94,7 +94,7 @@ from .packets import (
     build_ping_reply,
     build_identified_udp, build_login_status, build_tank_packet,
     build_udp_tank_packet_wf, build_update_array_heartbeat,
-    build_chat_message, build_add_to_roster, build_update_stats, build_update_stats_team_first, build_player, build_player_info,
+    build_chat_message, build_add_to_roster, build_remove_from_roster, build_update_stats, build_update_stats_team_first, build_player, build_player_info,
     build_birth_notice, build_game_clock, build_reincarnate,
     build_update_array_create_tank, build_update_array_player_update,
     build_view_update_create_tank,
@@ -2678,6 +2678,11 @@ class WulframServer(ConfigMixin):
         """Return a snapshot list of in-game clients (thread-safe)."""
         return [c for c in self._snapshot_clients() if c.session and c.session.in_game]
 
+    def _snapshot_logged_in_clients(self):
+        """Snapshot of clients past login — roster presence is announced here,
+        NOT gated on spawn, so players see who is connected before anyone deploys."""
+        return [c for c in self._snapshot_clients() if c.session and c.session.login_complete]
+
     @staticmethod
     def _is_conn_reset(err) -> bool:
         """True when an error means the peer's TCP socket is definitively dead."""
@@ -2962,6 +2967,46 @@ class WulframServer(ConfigMixin):
         target_ctx.known_roster_ids.add(player_id)
         print(f"[MULTI] Sent roster {name} (id={player_id}) -> client {target_ctx.client_id}")
 
+    def _broadcast_roster_presence(self, ctx: ClientContext) -> None:
+        """Exchange roster entries between ctx and every other LOGGED-IN client.
+
+        Player presence is announced at login/team-select (not spawn), so each
+        client sees who is connected before anyone deploys. Idempotent:
+        _send_roster_entry short-circuits on known_roster_ids, so calling this
+        every game-loop turn is a no-op after the first exchange (until a team
+        change invalidates the cached entry).
+        """
+        if not ctx.session.login_complete:
+            return
+        for other in self._snapshot_logged_in_clients():
+            if other is ctx:
+                continue
+            self._send_roster_entry(ctx, other)
+            self._send_roster_entry(other, ctx)
+
+    def _invalidate_roster_for_player(self, player_ctx: ClientContext) -> None:
+        """Force every viewer to re-send player_ctx's roster entry on the next
+        presence broadcast (e.g. after a team change), since _send_roster_entry
+        is otherwise once-per-session via known_roster_ids."""
+        player_id = player_ctx.session.player_id or player_ctx.entity_id
+        for c in self._snapshot_clients():
+            c.known_roster_ids.discard(player_id)
+
+    def _broadcast_roster_removal(self, player_ctx: ClientContext) -> None:
+        """Tell every other client to drop player_ctx from the scoreboard
+        (REMOVE_FROM_ROSTER 0x1B) on disconnect, instead of leaving a stale row."""
+        player_id = player_ctx.session.player_id or player_ctx.entity_id
+        if not player_id:
+            return
+        payload = build_remove_from_roster(player_id)
+        for c in self._snapshot_clients():
+            if c is player_ctx:
+                continue
+            if not self._og_viewer_replication_enabled(c, "roster"):
+                continue
+            c.known_roster_ids.discard(player_id)
+            self._send_packet_to_client(c, payload, prefer_tcp=True, allow_udp_fallback=False)
+
     def _combat_observer_packets_allowed_for_client(
         self,
         ctx: ClientContext,
@@ -3151,7 +3196,14 @@ class WulframServer(ConfigMixin):
             entity_id = other.session.entity_id or other.entity_id
             if entity_id not in ctx.known_entity_ids:
                 continue
-            health_val = self._get_health_value(ctx)
+            # Entity vitals (health) for the REMOTE entity, not the viewer.
+            # The OG targeting collector (Targeting.c:3744) drops manned
+            # vehicles whose health (entity+0xD0) == 0.0, so a remote tank that
+            # only gets pos/rot/manned renders but can NEVER be targeted with T.
+            # Sending the health vitals delta-bit (mask bit 5, via speed_scale)
+            # sets entity+0xD0 = max_health * health on the client, making the
+            # remote player targetable. Dead players (health 0) stay untargetable.
+            health_val = self._get_health_value(other)
             include_local_state, local_state_kwargs = self._get_update_array_local_state_for_viewer(ctx)
             send_pos = self._to_client_pos(other.player_pos)
             payload = build_update_array_player_update(
@@ -3170,7 +3222,8 @@ class WulframServer(ConfigMixin):
                 include_spin=include_rot,
                 spin=(0.0, 0.0, other.angular_vel_yaw),
                 include_local_state=include_local_state,
-                include_entity_vitals=False,
+                include_entity_vitals=True,
+                speed_scale=health_val,
                 is_manned=True,
                 **local_state_kwargs,
             )
@@ -4375,6 +4428,10 @@ class WulframServer(ConfigMixin):
         net_id = net_id or (ctx.session.player_id or ctx.entity_id)
         ctx.session.player_id = net_id
         ctx.session.team_id = team_id
+        # Team is now known/changed -> force every viewer to re-send this player's
+        # roster entry with the correct team on the next presence broadcast
+        # (entries are otherwise cached once per session via known_roster_ids).
+        self._invalidate_roster_for_player(ctx)
         ctx.entity_type = unit_type
 
         # Reset position tracking to spawn location.
@@ -5587,6 +5644,13 @@ class WulframServer(ConfigMixin):
             if was_in_game:
                 self._broadcast_disconnected_player_delete(ctx, disconnected_entity_id)
 
+            # Drop the departed player's scoreboard row on every other client
+            # (REMOVE_FROM_ROSTER 0x1B). Roster presence is login-gated, not
+            # spawn-gated, so remove for any logged-in client, not just in-game.
+            # Runs before session.reset() while player_id is still valid.
+            if ctx.session.login_complete:
+                self._broadcast_roster_removal(ctx)
+
             # Remove UDP address mapping only if it still points to this context.
             if udp_addr and self.udp_addr_to_client.get(udp_addr) is ctx:
                 del self.udp_addr_to_client[udp_addr]
@@ -5770,6 +5834,10 @@ class WulframServer(ConfigMixin):
         last_activity = time.monotonic()
         while ctx.running and ctx.session.phase in [Phase.TEAM_SELECT, Phase.SPAWNING, Phase.IN_GAME]:
             inactivity_timeout = self._effective_inactivity_timeout(ctx)
+            # Announce/refresh roster presence so logged-in players see each
+            # other in the scoreboard BEFORE anyone spawns (idempotent — a no-op
+            # after the first exchange until a team change invalidates it).
+            self._broadcast_roster_presence(ctx)
             # Check for delayed spawn
             if ctx.session.delayed_spawn_team and ctx.session.delayed_spawn_time:
                 now = time.monotonic()
