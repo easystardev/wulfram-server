@@ -3,6 +3,7 @@ Transport layer: TCP/UDP socket handling, framing, logging.
 Handles packet I/O and trace recording for replay/debugging.
 """
 
+import os
 import socket
 import struct
 import time
@@ -124,6 +125,11 @@ class UDPHandler:
         self.sock = sock
         self.logger = logger
         self.client_addr: Optional[Tuple[str, int]] = None
+        # Per-send "[UDP SEND] <pkt> to <addr>" lines are a heartbeat-frequency
+        # firehose (~66KB/s with a few clients) that fills disk on a public
+        # server. Gate them behind an opt-in flag; default OFF in production.
+        # The structured PacketLogger (self.logger) is unaffected.
+        self.log_sends = os.environ.get("WULFRAM_DEBUG_UDP_SEND", "0") == "1"
 
     def bind(self, addr: Tuple[str, int]):
         """Bind to address."""
@@ -137,7 +143,7 @@ class UDPHandler:
         try:
             self.sock.sendto(data, addr)
 
-            if log and len(data) > 0:
+            if log and self.log_sends and len(data) > 0:
                 packet_type = data[0]
                 pkt_name = get_packet_name(packet_type)
                 print(f"[UDP SEND] {pkt_name} to {addr}")
