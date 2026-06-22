@@ -3293,6 +3293,7 @@ class WulframServer(ConfigMixin):
 
     def _udp_loop(self):
         """Handle incoming UDP packets, routing to correct client context."""
+        malformed_count = 0
         while self.running:
             data, addr = self.udp_handler.recv_from()
             if data is None:
@@ -3325,7 +3326,28 @@ class WulframServer(ConfigMixin):
             # STATE_REQUEST before the ACTION_UPDATE/ACTION_DUMP that makes W/A/D
             # active; pre-scan the whole datagram so correction suppression sees
             # that input before the first state-sync packet is handled.
-            packets = list(self._parse_udp_datagram(data, ctx))
+            try:
+                packets = list(self._parse_udp_datagram(data, ctx))
+            except (ConnectionResetError, ConnectionAbortedError,
+                    BrokenPipeError, OSError):
+                continue
+            except Exception as parse_err:
+                # RESILIENCE BOUNDARY (parse): _udp_loop is the SINGLE shared
+                # UDP thread serving every client. A malformed datagram must
+                # never crash the parser out of this loop, or UDP dies for ALL
+                # clients (a one-packet remote DoS on a public port). Garbage is
+                # EXPECTED on a public UDP socket (scans/probes), so log
+                # concisely and flood-capped (first few + every 1000th), with NO
+                # traceback — an unbounded traceback-per-packet is itself a
+                # log-flood DoS the a3 soak watches for.
+                malformed_count += 1
+                if malformed_count <= 5 or malformed_count % 1000 == 0:
+                    cid = ctx.client_id if ctx is not None else "?"
+                    print(
+                        f"[UDP] dropped malformed datagram #{malformed_count} "
+                        f"(client {cid}, len={len(data)}): {parse_err!r}"
+                    )
+                continue
             if ctx is not None:
                 ctx._datagram_active_movement_input = (
                     self._udp_packets_have_active_movement_input(ctx, packets)
@@ -5796,8 +5818,10 @@ class WulframServer(ConfigMixin):
                 try:
                     ctx.tcp_handler.sock.getpeername()
                     continue  # Socket still connected, just timeout
-                except:
-                    break  # Socket disconnected
+                except OSError:
+                    break  # Socket disconnected (getpeername raises OSError on a
+                    # closed/invalid socket). Narrowed from a bare `except:` so a
+                    # KeyboardInterrupt/SystemExit during shutdown isn't swallowed.
 
             if len(packet) < 1:
                 continue
