@@ -2985,11 +2985,22 @@ class WulframServer(ConfigMixin):
             self._send_roster_entry(other, ctx)
 
     def _invalidate_roster_for_player(self, player_ctx: ClientContext) -> None:
-        """Force every viewer to re-send player_ctx's roster entry on the next
-        presence broadcast (e.g. after a team change), since _send_roster_entry
-        is otherwise once-per-session via known_roster_ids."""
+        """Refresh player_ctx's roster row on every client after a (re)spawn /
+        team change. MUST remove-then-add, not just re-add: ADD_TO_ROSTER
+        CREATES a PlayerEntry on the OG client (it does not update an existing
+        one), so re-sending alone DUPLICATES the row on every respawn. Send
+        REMOVE_FROM_ROSTER (incl. to the player itself, whose own scoreboard
+        also holds the stale row) and clear known_roster_ids so the next
+        presence broadcast re-adds exactly one entry with the current team."""
         player_id = player_ctx.session.player_id or player_ctx.entity_id
+        if not player_id:
+            return
+        payload = build_remove_from_roster(player_id)
         for c in self._snapshot_clients():
+            if self._og_viewer_replication_enabled(c, "roster"):
+                self._send_packet_to_client(
+                    c, payload, prefer_tcp=True, allow_udp_fallback=False
+                )
             c.known_roster_ids.discard(player_id)
 
     def _broadcast_roster_removal(self, player_ctx: ClientContext) -> None:
