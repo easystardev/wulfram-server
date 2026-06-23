@@ -3255,7 +3255,7 @@ class WulframServer(ConfigMixin):
                 include_spin=include_rot,
                 spin=(0.0, 0.0, other.angular_vel_yaw),
                 include_local_state=include_local_state,
-                include_entity_vitals=self.remote_entity_vitals,
+                include_entity_vitals=getattr(self, "remote_entity_vitals", True),
                 speed_scale=health_val,
                 is_manned=True,
                 **local_state_kwargs,
