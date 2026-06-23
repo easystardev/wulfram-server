@@ -21597,6 +21597,11 @@ class WulframServer(ConfigMixin):
         sess.in_game = False
         if sess.phase == Phase.IN_GAME:
             sess.transition_to(Phase.TEAM_SELECT)
+        # NOTE: an unsolicited server-sent team-confirm here (REINCARNATE 0x11 +
+        # roster + UPDATE_STATS for the preserved team) BOUNCES the OG client to
+        # the title/login screen (tested 2026-06-23, WULFRAM_DEATH_REINCARNATE_ENTRY)
+        # -- the client only accepts that handshake when IT initiated the team
+        # click. So death->entry-map cannot be routed from the server this way.
         print(
             f"[COMBAT] c{target.client_id} -> death/deploy "
             f"(team={preserved_team} preserved, awaiting flag-click redeploy; no auto-spawn)"
