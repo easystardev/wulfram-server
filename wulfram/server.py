@@ -330,6 +330,10 @@ class WulframServer(ConfigMixin):
         # Remote update shape to avoid malformed packets destabilizing HUD state in multi-client.
         # Modes: pos, pos_rot, pos_vel_rot, heartbeat, off (default: pos_rot).
         self.remote_update_mode = os.environ.get("WULFRAM_REMOTE_UPDATE_MODE", "pos_vel_rot").strip().lower()
+        # Health vitals delta-bit on remote-player UPDATE_ARRAY (makes the remote
+        # tank targetable: entity+0xD0>0). Gated so we can A/B it against a
+        # suspected render-context freeze. Default ON.
+        self.remote_entity_vitals = os.environ.get("WULFRAM_REMOTE_ENTITY_VITALS", "1") == "1"
         # Throttle remote player updates: interval in seconds (0 = every tick).
         # 30Hz tick rate = every tick; lower values reduce packet flood.
         try:
@@ -3251,7 +3255,7 @@ class WulframServer(ConfigMixin):
                 include_spin=include_rot,
                 spin=(0.0, 0.0, other.angular_vel_yaw),
                 include_local_state=include_local_state,
-                include_entity_vitals=True,
+                include_entity_vitals=self.remote_entity_vitals,
                 speed_scale=health_val,
                 is_manned=True,
                 **local_state_kwargs,
