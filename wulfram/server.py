@@ -2981,27 +2981,45 @@ class WulframServer(ConfigMixin):
         for other in self._snapshot_logged_in_clients():
             if other is ctx:
                 continue
-            self._send_roster_entry(ctx, other)
-            self._send_roster_entry(other, ctx)
+            # Only roster a player once they HAVE a team, so ADD_TO_ROSTER
+            # carries the correct team from the start and the row never needs a
+            # later REMOVE (which would free the name string mid-render -> crash;
+            # see _invalidate_roster_for_player). Players still at team-select
+            # (team_id 0) appear as soon as they pick a team / spawn.
+            if other.session.team_id:
+                self._send_roster_entry(ctx, other)
+            if ctx.session.team_id:
+                self._send_roster_entry(other, ctx)
 
     def _invalidate_roster_for_player(self, player_ctx: ClientContext) -> None:
-        """Refresh player_ctx's roster row on every client after a (re)spawn /
-        team change. MUST remove-then-add, not just re-add: ADD_TO_ROSTER
-        CREATES a PlayerEntry on the OG client (it does not update an existing
-        one), so re-sending alone DUPLICATES the row on every respawn. Send
-        REMOVE_FROM_ROSTER (incl. to the player itself, whose own scoreboard
-        also holds the stale row) and clear known_roster_ids so the next
-        presence broadcast re-adds exactly one entry with the current team."""
+        """Update player_ctx's roster TEAM in place after a (re)spawn / team
+        change -- via UPDATE_STATS (0x1C), NEVER remove-then-add.
+
+        REMOVE_FROM_ROSTER makes the OG client FREE the player's name/clan
+        strings (PlayerEntry_remove, 0x475d40); the HUD then renders the freed
+        string -> use-after-free (observed live: APPCRASH 0xc0000005 in
+        HUD_render_text_dispatch right after a respawn, both clients down). And
+        re-adding duplicates the row (ADD_TO_ROSTER CREATES a PlayerEntry, it
+        does not update). UPDATE_STATS updates the EXISTING entry's team in
+        place (PlayerEntry_update_stats, 0x475ec0) with no free and no
+        duplicate. Sent only to clients that already hold the entry; others get
+        a correct-team ADD from the next presence broadcast."""
         player_id = player_ctx.session.player_id or player_ctx.entity_id
-        if not player_id:
+        team = player_ctx.session.team_id
+        if not player_id or not team:
             return
-        payload = build_remove_from_roster(player_id)
+        payload = build_update_stats(
+            player_id=player_id,
+            entity_id=player_id,
+            kills=player_ctx.kills,
+            deaths=player_ctx.deaths,
+            team_id=team,
+        )
         for c in self._snapshot_clients():
-            if self._og_viewer_replication_enabled(c, "roster"):
+            if player_id in c.known_roster_ids and self._og_viewer_replication_enabled(c, "roster"):
                 self._send_packet_to_client(
                     c, payload, prefer_tcp=True, allow_udp_fallback=False
                 )
-            c.known_roster_ids.discard(player_id)
 
     def _broadcast_roster_removal(self, player_ctx: ClientContext) -> None:
         """Tell every other client to drop player_ctx from the scoreboard
