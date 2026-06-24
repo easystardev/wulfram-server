@@ -2946,6 +2946,8 @@ class WulframServer(ConfigMixin):
             sender_mode/channel fields is a follow-up).
         """
         text = (text or "").strip()
+        if ctx is None or getattr(ctx, "session", None) is None:
+            return {"relayed": 0, "mode": mode, "skipped": "no_ctx"}
         if not text or mode == 1:  # empty or SERVER channel -> not a player relay
             return {"relayed": 0, "mode": mode}
         if len(text) > 240:
