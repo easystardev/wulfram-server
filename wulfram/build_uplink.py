@@ -540,6 +540,14 @@ def handle_comm_message_request(
 
     msg_type = int(decoded.get("message_type") or 0)
     if msg_type != 2:
+        # Normal player chat (ALL/TEAM/whisper). msg_type 2 is reserved here for the
+        # build-uplink/starship command channel (handled below); everything else is
+        # relayed to other players as COMM_MESSAGE (0x1F).
+        relay = server._relay_player_chat(
+            ctx, msg_type, int(decoded.get("flags_or_target") or 0), text
+        )
+        event["handled"] = True
+        event["chat_relay"] = relay
         return event
 
     command = server._parse_build_uplink_command(text)

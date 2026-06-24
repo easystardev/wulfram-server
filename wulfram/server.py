@@ -2932,6 +2932,51 @@ class WulframServer(ConfigMixin):
             addr=getattr(ctx, "client_addr", None),
         )
 
+    def _relay_player_chat(self, ctx: ClientContext, mode: int, target_id: int, text: str) -> dict:
+        """Relay a player chat message to the right recipients as COMM_MESSAGE (0x1F).
+
+        OG chat modes (View/Communications/ChatSystem.c): 4=ALL, 3=TEAM,
+        5=PLAYER(whisper), 1=SERVER. Two OG-client facts drive recipients:
+          - The client SUPPRESSES its own local echo for ALL/TEAM (it expects the
+            server to echo those back), so those recipient sets INCLUDE the sender.
+            PLAYER echoes locally, so a whisper goes only to the target.
+          - Chat_process_message only auto-resolves the sender NAME for type-5; for
+            ALL/TEAM the name field stays null. So we prefix "<name>: " into the
+            text (a functional MVP; fuller per-mode coloring via the 0x1F
+            sender_mode/channel fields is a follow-up).
+        """
+        text = (text or "").strip()
+        if not text or mode == 1:  # empty or SERVER channel -> not a player relay
+            return {"relayed": 0, "mode": mode}
+        if len(text) > 240:
+            text = text[:240]
+        sender_id = ctx.session.player_id or ctx.entity_id
+        sender_name = ctx.session.username or f"Player{ctx.client_id}"
+        sender_team = ctx.session.team_id
+
+        if mode == 5:  # whisper: target only (sender already echoed locally)
+            label = f"[whisper] {sender_name}: {text}"
+            recipients = [c for c in self._snapshot_clients()
+                          if (c.session.player_id or c.entity_id) == target_id and c is not ctx]
+        elif mode == 3:  # TEAM (incl sender)
+            label = f"[team] {sender_name}: {text}"
+            recipients = [c for c in self._snapshot_clients()
+                          if c.session.team_id and c.session.team_id == sender_team]
+        else:  # ALL (4) / default: broadcast incl sender
+            label = f"{sender_name}: {text}"
+            recipients = list(self._snapshot_clients())
+
+        pkt = build_chat_message(label, source_id=sender_id)
+        sent = 0
+        for c in recipients:
+            try:
+                self._send_packet_to_client(c, pkt, prefer_tcp=True, allow_udp_fallback=True)
+                sent += 1
+            except Exception:  # noqa: BLE001
+                pass
+        print(f"[CHAT] c{ctx.client_id} mode={mode} -> {sent} recipient(s): {label!r}")
+        return {"relayed": sent, "mode": mode}
+
     def _og_viewer_replication_enabled(self, target_ctx: ClientContext, stream: str) -> bool:
         """Return whether a replication stream is enabled for an OG/remote viewer."""
         if handlers._is_loopback_client(target_ctx):

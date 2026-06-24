@@ -1103,6 +1103,43 @@ def _make_spawned_chat_ctx(sent_packets: list, wonked_pos):
     return ctx
 
 
+def test_relay_player_chat_routes_by_mode():
+    """Player chat relays as COMM_MESSAGE (0x1F): ALL -> everyone incl sender,
+    TEAM -> same-team incl sender, whisper(5) -> target only; SERVER/empty -> none."""
+    def mkctx(cid, team, pid, name):
+        s = Session(phase=Phase.IN_GAME, in_game=True, team_id=team)
+        s.player_id = pid
+        s.username = name
+        return ClientContext(client_id=cid, client_addr=("127.0.0.1", 50000 + cid),
+                             session=s, entity_id=pid)
+    c1 = mkctx(1, 1, 0x1001, "Alice")  # sender, team 1
+    c2 = mkctx(2, 1, 0x1002, "Bob")    # team 1
+    c3 = mkctx(3, 2, 0x1003, "Carol")  # team 2
+
+    server = WulframServer.__new__(WulframServer)
+    server._snapshot_clients = lambda: [c1, c2, c3]
+    sends: list = []
+    server._send_packet_to_client = lambda c, pkt, **k: sends.append((c.client_id, pkt))
+
+    sends.clear(); server._relay_player_chat(c1, 4, 0, "hi all")
+    assert {s[0] for s in sends} == {1, 2, 3}, f"ALL should reach everyone: {sends}"
+    assert all(p[:1] == b"\x1F" for _, p in sends)
+    assert b"Alice: hi all" in sends[0][1]
+
+    sends.clear(); server._relay_player_chat(c1, 3, 0, "go left")
+    assert {s[0] for s in sends} == {1, 2}, f"TEAM should reach team 1 only: {sends}"
+    assert b"[team] Alice: go left" in sends[0][1]
+
+    sends.clear(); server._relay_player_chat(c1, 5, 0x1003, "secret")
+    assert {s[0] for s in sends} == {3}, f"whisper should reach target only: {sends}"
+    assert b"[whisper] Alice: secret" in sends[0][1]
+
+    sends.clear(); server._relay_player_chat(c1, 1, 0, "x")
+    assert sends == [], "SERVER channel must not relay"
+    sends.clear(); server._relay_player_chat(c1, 4, 0, "   ")
+    assert sends == [], "empty message must not relay"
+
+
 def test_player_chat_respawn_despawns_and_clears_cached_spawn():
     """/respawn from a player must despawn their tank, clear the cached spawn
     position so the next spawn uses the team map spawn point, and confirm via
@@ -1117,6 +1154,7 @@ def test_player_chat_respawn_despawns_and_clears_cached_spawn():
     server.spawn_height = 5.0
     server._get_network_tick = lambda ctx: 1234
     server._snapshot_in_game_clients = lambda: [active_ctx]
+    server._snapshot_clients = lambda: []  # normal chat now relays via 0x1F; no peers here
 
     control = ControlServer.__new__(ControlServer)
     control.server = server
