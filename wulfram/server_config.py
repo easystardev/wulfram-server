@@ -178,3 +178,126 @@ class ConfigMixin:
             )
             self.update_local_state_mode = "off"
             self.update_local_state = False
+
+    def _init_correction_config(self):
+        # ── OG-faithful GATED-RARE correction gate (GOAL 2, 2026-06-02) ──────
+        # The OG client corrects RARELY and reactively. The proactive streams
+        # above (spawn burst, movement-correction interval, STATE_REQUEST replies)
+        # each camera-clamp/zero-velocity on the OG client; on a zero-latency
+        # loopback client that flood freezes rendering. When this gate is enabled
+        # (default), those proactive timers no longer emit VIEW_UPDATE corrections.
+        # Instead a single correction fires only when the authoritative state has
+        # genuinely DIVERGED beyond a threshold (accumulated server-only,
+        # non-input-predictable displacement — terrain-Z clamp / collision push —
+        # since the last correction), and corrections are hard-rate-limited so a
+        # zero-latency client cannot be flooded even under rapid STATE_REQUEST/fire.
+        # The gate is IDENTICAL for every client; the loopback fix falls out of the
+        # rate cap, not a client-type branch.
+        self.correction_gate_enabled = os.environ.get("WULFRAM_CORRECTION_GATE", "1").strip().lower() not in ("0", "off", "false", "no")
+        try:
+            # Accumulated divergence (units) required to admit a correction.
+            self.correction_divergence_pos = float(os.environ.get("WULFRAM_CORRECTION_DIVERGENCE_POS", "1.5"))
+        except ValueError:
+            self.correction_divergence_pos = 1.5
+        if self.correction_divergence_pos <= 0.0:
+            self.correction_divergence_pos = 1.5
+        try:
+            # Accumulated heading divergence (degrees) required to admit a correction.
+            self.correction_divergence_heading_deg = float(os.environ.get("WULFRAM_CORRECTION_DIVERGENCE_HEADING", "12.0"))
+        except ValueError:
+            self.correction_divergence_heading_deg = 12.0
+        try:
+            # Hard floor between any two corrections to a client (rate cap, seconds).
+            self.correction_min_interval = float(os.environ.get("WULFRAM_CORRECTION_MIN_INTERVAL", "0.2"))
+        except ValueError:
+            self.correction_min_interval = 0.2
+        if self.correction_min_interval < 0.0:
+            self.correction_min_interval = 0.0
+        # Periodic correction (2026-06-17): opt-in steady-cadence correction that
+        # fires DURING movement (like the jumpjet force-correction), so divergence
+        # is nudged out continuously instead of accumulating into a big jumpjet-
+        # triggerable rubber-band. 0 = off (default). Unlike burst/divergence
+        # corrections it is NOT held back by the movement-suppress pause; each
+        # emit is a single authoritative snapshot, so a small interval keeps the
+        # per-correction nudge tiny (smooth) while bounding max drift.
+        try:
+            self.periodic_correction_interval = float(os.environ.get("WULFRAM_PERIODIC_CORRECTION_S", "0"))
+        except ValueError:
+            self.periodic_correction_interval = 0.0
+        if self.periodic_correction_interval < 0.0:
+            self.periodic_correction_interval = 0.0
+        try:
+            # Per-tick noise floor: server-only displacement below this is treated
+            # as float/quantization noise and ignored (keeps flat ground at ~0).
+            self.correction_divergence_floor = float(os.environ.get("WULFRAM_CORRECTION_DIVERGENCE_FLOOR", "0.02"))
+        except ValueError:
+            self.correction_divergence_floor = 0.02
+        if self.correction_divergence_floor < 0.0:
+            self.correction_divergence_floor = 0.0
+        try:
+            # Per-tick multiplicative decay of the divergence accumulator so
+            # transient/slow noise bleeds off and never reaches threshold; only
+            # genuine spikes or sustained divergence trip the gate.
+            self.correction_divergence_decay = float(os.environ.get("WULFRAM_CORRECTION_DIVERGENCE_DECAY", "0.98"))
+        except ValueError:
+            self.correction_divergence_decay = 0.98
+        self.correction_divergence_decay = min(1.0, max(0.0, self.correction_divergence_decay))
+        # Debug counters for empirical flat-ground verification of the gate.
+        self.correction_gate_debug = os.environ.get("WULFRAM_CORRECTION_GATE_DEBUG", "0").strip().lower() in ("1", "on", "true", "yes")
+        # ── Correction-trigger fix (2026-06-09) ─────────────────────────────
+        # The divergence accumulator above is fed ONLY by the terrain-Z clamp,
+        # so it is structurally blind to LATERAL divergence (zero on flat
+        # ground), and STATE_REQUEST carries no client position — the server
+        # cannot measure lateral drift from the wire. The OG client's own
+        # STATE_REQUEST cadence is the only divergence-shaped signal available,
+        # so when enabled (default) a STATE_REQUEST queues the standard ~10Hz
+        # settle burst even under the correction gate, capped to one burst per
+        # state_request_burst_min_interval so fire-spam STATE_REQUESTs cannot
+        # reproduce the GOAL-2 flood/freeze. Identical for every client.
+        self.state_request_burst_enabled = os.environ.get("WULFRAM_STATE_REQUEST_BURST", "1").strip().lower() not in ("0", "off", "false", "no")
+        try:
+            self.state_request_burst_min_interval = float(os.environ.get("WULFRAM_STATE_REQUEST_BURST_MIN_INTERVAL", "1.75"))
+        except ValueError:
+            self.state_request_burst_min_interval = 1.75
+        if self.state_request_burst_min_interval < 0.0:
+            self.state_request_burst_min_interval = 0.0
+        # GOAL 8: per-step suspension/Z instrumentation (default OFF).
+        self.goal8_zdebug = os.environ.get("WULFRAM_GOAL8_ZDEBUG", "0").strip().lower() in ("1", "on", "true", "yes")
+        try:
+            self.goal8_zdebug_every = int(os.environ.get("WULFRAM_GOAL8_ZDEBUG_EVERY", "15") or 15)
+        except ValueError:
+            self.goal8_zdebug_every = 15
+        # GOAL 8 (2026-06-04): sub-step the position/suspension integration to the OG
+        # inner-substep size so the vertical hover spring matches the client's
+        # GameSim_substep_update (Physics.c:1974, ~40ms inner) instead of overshooting
+        # when integrated at the coarse outer client-frame dt (~84ms on OG WARP). The
+        # coarse step makes the nonlinear hover spring ring ~2u on any displacement
+        # (e.g. the spawn-height vs equilibrium mismatch) — the live DO idle Z bounce.
+        # Legacy=1 restores the single full-dt step (A/B). Default = fixed.
+        self.goal8_legacy = os.environ.get("WULFRAM_GOAL8_LEGACY", "0").strip().lower() in ("1", "on", "true", "yes")
+        try:
+            # Inner sub-step cap (seconds). Default = server tick period; empirically
+            # a 0.95u spawn displacement rings ~0.46u at 33ms vs ~2.08u at 84ms.
+            self.goal8_substep_cap_s = float(os.environ.get("WULFRAM_GOAL8_SUBSTEP_CAP_MS", "")) / 1000.0
+        except ValueError:
+            self.goal8_substep_cap_s = 1.0 / max(1.0, self.tick_rate_hz)
+        if self.goal8_substep_cap_s <= 0.0:
+            self.goal8_substep_cap_s = 1.0 / max(1.0, self.tick_rate_hz)
+        try:
+            # Only substep the vertical-stabilizing path when the tank is near-
+            # stationary (horizontal speed below this). Active driving/coasting keeps
+            # the legacy single full-dt step so the coast trajectory the client
+            # reconciles against is unchanged. 0 disables the speed gate (always sub).
+            self.goal8_substep_speed_max = float(os.environ.get("WULFRAM_GOAL8_SUBSTEP_SPEED_MAX", "0.5"))
+        except ValueError:
+            self.goal8_substep_speed_max = 0.5
+
+        print(
+            f"[CONFIG-CORRECTION-GATE] enabled={int(self.correction_gate_enabled)} "
+            f"divergence_pos={self.correction_divergence_pos}u "
+            f"divergence_heading={self.correction_divergence_heading_deg}deg "
+            f"min_interval={self.correction_min_interval}s "
+            f"floor={self.correction_divergence_floor}u decay={self.correction_divergence_decay} "
+            f"state_request_burst={int(self.state_request_burst_enabled)} "
+            f"burst_queue_min_interval={self.state_request_burst_min_interval}s"
+        )
