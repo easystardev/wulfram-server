@@ -301,3 +301,123 @@ class ConfigMixin:
             f"state_request_burst={int(self.state_request_burst_enabled)} "
             f"burst_queue_min_interval={self.state_request_burst_min_interval}s"
         )
+
+    def _init_spawn_config(self):
+        spawn_height_env = os.environ.get("WULFRAM_SPAWN_HEIGHT")
+        try:
+            # Default to ground-height spawn to avoid immediate fall-damage overlays.
+            self.spawn_height = float(spawn_height_env) if spawn_height_env is not None else 5.0
+        except ValueError:
+            self.spawn_height = 5.0
+        try:
+            self.spawn_delay_seconds = float(os.environ.get("WULFRAM_SPAWN_DELAY", "6.0"))
+        except ValueError:
+            self.spawn_delay_seconds = 6.0
+        # Spawn is driven by the explicit map-flag click (REINCARNATE subtype 0x00 ->
+        # handlers.handle_spawn_at_point). Team-select no longer auto-spawns. Combat
+        # respawn still uses the delayed_spawn mechanism in the game loop.
+        self.team_switch_send_reincarnate = os.environ.get("WULFRAM_TEAM_SWITCH_REINCARNATE", "1") == "1"
+        self.team_switch_send_update_stats = (
+            os.environ.get("WULFRAM_TEAM_SWITCH_UPDATE_STATS", "1").strip().lower()
+            not in ("0", "false", "off", "no")
+        )
+        self.team_switch_update_stats_transport = os.environ.get(
+            "WULFRAM_TEAM_SWITCH_UPDATE_STATS_TRANSPORT",
+            "udp",
+        ).strip().lower()
+        if self.team_switch_update_stats_transport not in ("udp", "tcp", "auto"):
+            self.team_switch_update_stats_transport = "udp"
+        self.team_switch_update_stats_variant = os.environ.get(
+            "WULFRAM_TEAM_SWITCH_UPDATE_STATS_VARIANT",
+            "canonical",
+        ).strip().lower()
+        if self.team_switch_update_stats_variant not in ("canonical", "team_first"):
+            self.team_switch_update_stats_variant = "canonical"
+        self.team_switch_send_roster = (
+            os.environ.get("WULFRAM_TEAM_SWITCH_ROSTER", "0").strip().lower()
+            not in ("0", "false", "off", "no")
+        )
+        self.team_switch_send_entry_packets = (
+            os.environ.get("WULFRAM_TEAM_SWITCH_ENTRY_PACKETS", "1").strip().lower()
+            not in ("0", "false", "off", "no")
+        )
+        # Allow explicit spawn-point packets to recover clients stuck on entry-map
+        # after auto-spawn already marked the session IN_GAME.
+        self.spawn_allow_point_override = os.environ.get("WULFRAM_SPAWN_POINT_OVERRIDE", "1") == "1"
+        try:
+            self.spawn_point_override_min_interval = float(
+                os.environ.get("WULFRAM_SPAWN_POINT_OVERRIDE_MIN_INTERVAL", "0.0")
+            )
+        except ValueError:
+            self.spawn_point_override_min_interval = 0.0
+        try:
+            self.spawn_force_after = float(os.environ.get("WULFRAM_SPAWN_FORCE_AFTER", "12.0"))
+        except ValueError:
+            self.spawn_force_after = 12.0
+        try:
+            # Avoid false "crash" diagnosis when scripted input arrives slightly late.
+            self.inactivity_timeout = float(os.environ.get("WULFRAM_INACTIVITY_TIMEOUT", "120.0"))
+        except ValueError:
+            self.inactivity_timeout = 120.0
+        try:
+            self.remote_idle_timeout = float(os.environ.get("WULFRAM_REMOTE_IDLE_TIMEOUT", "900.0"))
+        except ValueError:
+            self.remote_idle_timeout = 900.0
+        # Keep spawns pinned to ground unless explicitly disabled.
+        self.spawn_sets_ground_level = os.environ.get("WULFRAM_SPAWN_SET_GROUND", "1") == "1"
+        try:
+            self.ground_override_release_distance = float(
+                os.environ.get("WULFRAM_GROUND_OVERRIDE_RELEASE_DISTANCE", "24.0")
+            )
+        except ValueError:
+            self.ground_override_release_distance = 24.0
+        try:
+            self.ground_override_release_height = float(
+                os.environ.get("WULFRAM_GROUND_OVERRIDE_RELEASE_HEIGHT", "4.0")
+            )
+        except ValueError:
+            self.ground_override_release_height = 4.0
+        try:
+            self.ground_override_release_terrain_distance = float(
+                os.environ.get("WULFRAM_GROUND_OVERRIDE_RELEASE_TERRAIN_DISTANCE", "4.0")
+            )
+        except ValueError:
+            self.ground_override_release_terrain_distance = 4.0
+        try:
+            self.ground_override_release_terrain_height = float(
+                os.environ.get("WULFRAM_GROUND_OVERRIDE_RELEASE_TERRAIN_HEIGHT", "0.75")
+            )
+        except ValueError:
+            self.ground_override_release_terrain_height = 0.75
+        # Spawn packet toggles (useful for crash isolation).
+        # Spawn sequence toggles (default to Wulf-Forge minimal behavior).
+        self.spawn_send_udp_tank = os.environ.get("WULFRAM_SPAWN_UDP_TANK", "1") == "1"
+        spawn_player_info_env = os.environ.get("WULFRAM_SPAWN_PLAYER_INFO")
+        self.spawn_send_player_info_explicit = spawn_player_info_env is not None
+        if self.spawn_send_player_info_explicit:
+            self.spawn_send_player_info = spawn_player_info_env == "1"
+        else:
+            # AzureFishy decompile shows PLAYER_INFO is the canonical local-player
+            # init path. Keep loopback/Python on the existing minimal path by
+            # default, but send PLAYER_INFO to remote OG clients unless explicitly
+            # disabled.
+            self.spawn_send_player_info = False
+        # Keep UPDATE_ARRAY pre-create opt-in until it preserves the OG
+        # local sync/camera bootstrap. Proven correction sessions can use the
+        # local sync state plus server_expected, even when the camera global is 0.
+        self.spawn_send_update_array = os.environ.get("WULFRAM_SPAWN_UPDATE_ARRAY", "0") == "1"
+        self.spawn_send_game_clock = os.environ.get("WULFRAM_SPAWN_GAME_CLOCK", "1") == "1"
+        self.spawn_send_comm_message = (
+            os.environ.get("WULFRAM_SPAWN_COMM_MESSAGE", "0").strip().lower()
+            not in ("0", "false", "off", "no")
+        )
+        # Wulf-forge does NOT send REINCARNATE(0x11) during spawn.
+        self.spawn_send_reincarnate = os.environ.get("WULFRAM_SPAWN_REINCARNATE", "0") == "1"
+        spawn_entry_transition = os.environ.get("WULFRAM_SPAWN_ENTRY_TRANSITION", "off").strip().lower()
+        if spawn_entry_transition not in ("0", "1", "false", "true", "off", "on", "auto", "auto-remote"):
+            spawn_entry_transition = "off"
+        self.spawn_entry_transition = spawn_entry_transition
+        self.spawn_send_birth_notice = os.environ.get("WULFRAM_SPAWN_BIRTH_NOTICE", "0") == "1"
+        self.spawn_send_player_packet = os.environ.get("WULFRAM_SPAWN_PLAYER_PACKET", "0") == "1"
+        self.spawn_player_spectator = os.environ.get("WULFRAM_SPAWN_PLAYER_SPECTATOR", "0") == "1"
+        self.player_info_properties_mode = os.environ.get("WULFRAM_PLAYER_INFO_PROPERTIES", "team").strip().lower()
