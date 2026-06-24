@@ -21597,6 +21597,16 @@ class WulframServer(ConfigMixin):
         sess.in_game = False
         if sess.phase == Phase.IN_GAME:
             sess.transition_to(Phase.TEAM_SELECT)
+        # NOTE: death leaves the OG client's g_player_team==0, which makes mode-3
+        # (TabMenu_initialize_team, Screens.c:1314) HIDE the ENTRY-MAP/deploy tab
+        # and force SWITCH-TEAM -- the player "loses their team" and must re-pick
+        # instead of seeing the deploy countdown. A trailing UPDATE_STATS for the
+        # preserved team (player_id = real id AND 0) does NOT re-set g_player_team
+        # post-death (tested 2026-06-24): the client doesn't apply UPDATE_STATS ->
+        # g_player_team off the in-game path (or the death DELETE-clear races it).
+        # The clear is a side effect of our DELETE_OBJECT clearing the local-player
+        # region; OG-faithful "keep team on death" likely needs a death signal that
+        # does NOT delete/clear the local-player entity. Left as a TODO.
         # NOTE: an unsolicited server-sent team-confirm here (REINCARNATE 0x11 +
         # roster + UPDATE_STATS for the preserved team) BOUNCES the OG client to
         # the title/login screen (tested 2026-06-23, WULFRAM_DEATH_REINCARNATE_ENTRY)
@@ -21630,6 +21640,13 @@ class WulframServer(ConfigMixin):
         target_entity_id = target.session.entity_id or target.entity_id
         tick_del = self._get_network_tick(target)
         del_pkt = build_delete_object(tick_del, [target_entity_id], with_effects=True)
+        # NOTE: the dying client receiving its OWN DELETE_OBJECT is what triggers the
+        # death/deploy screen (Entity_delete(local) -> mode 3), but that SAME code
+        # clears the local-player state incl g_player_team (-> SWITCH-TEAM not the
+        # deploy tab). Skipping the self-DELETE (tested 2026-06-24) keeps the team
+        # but leaves the player stuck IN-GAME with no death UI -- there is no
+        # death-without-delete path in the OG client. "Keep team on death" needs a
+        # client-side re-assert of g_player_team after the delete, not a server tweak.
         for client in self._snapshot_in_game_clients():
             if not self._combat_observer_packets_allowed_for_client(client, *participants):
                 continue
