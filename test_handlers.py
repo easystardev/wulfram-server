@@ -329,8 +329,10 @@ def test_spawn_at_point_honors_clicked_pad_when_default_configured():
 
 def test_spawn_at_point_honors_vehicle_selection():
     """handle_spawn_at_point threads the client's selected vehicle_type to
-    _spawn_wf_style for supported types (0=Tank,1=Scout,3=Bomber); 2/4 fall back
-    to Tank; the whole feature gates on vehicle_select_enabled."""
+    _spawn_wf_style for supported types (0=Tank, 1=Scout only); 2/3/4 fall back
+    to Tank; the whole feature gates on vehicle_select_enabled. Bomber (3) is a
+    fallback because it crashes the live OG client on spawn (see memory
+    vehicle-select-bomber-crashes-og)."""
     old = os.environ.get("WULFRAM_SPAWN_POS")
     try:
         os.environ["WULFRAM_SPAWN_POS"] = "4950,5100,5"
@@ -360,8 +362,8 @@ def test_spawn_at_point_honors_vehicle_selection():
 
         assert spawn(0) == 0, "Tank"
         assert spawn(1) == 1, "Scout honored"
-        assert spawn(3) == 3, "Bomber honored"
         assert spawn(2) == 0, "Assault -> Tank fallback"
+        assert spawn(3) == 0, "Bomber -> Tank fallback (crashes live OG client)"
         assert spawn(4) == 0, "Transport -> Tank fallback"
         server.vehicle_select_enabled = False
         assert spawn(1) == 0, "gated off -> Tank"

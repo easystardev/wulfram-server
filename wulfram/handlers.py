@@ -1252,14 +1252,19 @@ def handle_spawn_at_point(server: "WulframServer", ctx: "ClientContext", spawn_p
     # Honor the client's selected vehicle. REINCARNATE carries vehicle_type and the
     # spawn plumbing already threads unit_type to TankPacket / PLAYER_INFO /
     # UPDATE_ARRAY -- it just was never passed here, so every spawn was a Tank.
-    # Only types with a BEHAVIOR config + a client model are honored (0=Tank,
-    # 1=Scout/Medic, 3=Bomber); 2 (Assault) / 4 (Transport) have neither yet and
-    # fall back to Tank. NOTE: non-Tank server PHYSICS is still Tank-like (the
-    # suspension/flight paths gate on entity_type==TANK) -- a separate follow-up;
-    # this change unblocks the SELECTION (right model/config). Gated by
-    # WULFRAM_VEHICLE_SELECT (default on).
+    # Only types the OG client can actually instantiate are honored: 0=Tank,
+    # 1=Scout. 2 (Assault) / 3 (Bomber) / 4 (Transport) fall back to Tank.
+    # NOTE: Bomber (3) was tried live but CRASHES the OG client on spawn --
+    # APPCRASH 0xc0000005 at module offset 0x69eb5 (VA 0x469eb5), in the
+    # entity/model instantiation for vehicle 3; the spawn packets are byte-
+    # identical to Scout except the vehicle field, so it's purely the client
+    # choking on type 3 (no real Bomber model/data in this build). See memory
+    # vehicle-select-bomber-crashes-og. NOTE: non-Tank server PHYSICS is still
+    # Tank-like (suspension/flight gate on entity_type==TANK) -- a separate
+    # follow-up; this only unblocks the SELECTION. Gated by WULFRAM_VEHICLE_SELECT
+    # (default on).
     unit_type = 0
-    if getattr(server, "vehicle_select_enabled", True) and vehicle_type in (0, 1, 3):
+    if getattr(server, "vehicle_select_enabled", True) and vehicle_type in (0, 1):
         unit_type = vehicle_type
     elif vehicle_type not in (0,):
         print(f"[SPAWN] Client {ctx.client_id}: vehicle_type={vehicle_type} "
