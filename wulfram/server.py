@@ -337,6 +337,9 @@ class WulframServer(ConfigMixin):
         # Server-generated kill-feed chat notifications (the OG client has no built-in
         # kill feed; kill notices ride server chat). Default on; A/B off.
         self.kill_feed_enabled = os.environ.get("WULFRAM_KILL_FEED", "1") == "1"
+        # Honor the client's selected vehicle at spawn (Tank/Scout/Bomber). Default
+        # on; off forces every spawn to a Tank (legacy behaviour).
+        self.vehicle_select_enabled = os.environ.get("WULFRAM_VEHICLE_SELECT", "1") == "1"
         # Throttle remote player updates: interval in seconds (0 = every tick).
         # 30Hz tick rate = every tick; lower values reduce packet flood.
         try:

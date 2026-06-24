@@ -1249,7 +1249,22 @@ def handle_spawn_at_point(server: "WulframServer", ctx: "ClientContext", spawn_p
     else:
         pos = server._resolve_spawn_pos(team_id, explicit_pos=requested_pos)
 
-    server._spawn_wf_style(ctx, team_id=team_id, pos=pos)
+    # Honor the client's selected vehicle. REINCARNATE carries vehicle_type and the
+    # spawn plumbing already threads unit_type to TankPacket / PLAYER_INFO /
+    # UPDATE_ARRAY -- it just was never passed here, so every spawn was a Tank.
+    # Only types with a BEHAVIOR config + a client model are honored (0=Tank,
+    # 1=Scout/Medic, 3=Bomber); 2 (Assault) / 4 (Transport) have neither yet and
+    # fall back to Tank. NOTE: non-Tank server PHYSICS is still Tank-like (the
+    # suspension/flight paths gate on entity_type==TANK) -- a separate follow-up;
+    # this change unblocks the SELECTION (right model/config). Gated by
+    # WULFRAM_VEHICLE_SELECT (default on).
+    unit_type = 0
+    if getattr(server, "vehicle_select_enabled", True) and vehicle_type in (0, 1, 3):
+        unit_type = vehicle_type
+    elif vehicle_type not in (0,):
+        print(f"[SPAWN] Client {ctx.client_id}: vehicle_type={vehicle_type} "
+              f"not selectable yet, spawning Tank")
+    server._spawn_wf_style(ctx, team_id=team_id, pos=pos, unit_type=unit_type)
 
 
 def send_udp_ack(server: "WulframServer", ctx: Optional["ClientContext"], addr: tuple, packet_id: int, seq_num: int, subcmd: int = 1):

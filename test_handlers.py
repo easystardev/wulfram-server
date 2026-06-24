@@ -327,6 +327,53 @@ def test_spawn_at_point_honors_clicked_pad_when_default_configured():
             os.environ["WULFRAM_SPAWN_POS"] = old_spawn_pos
 
 
+def test_spawn_at_point_honors_vehicle_selection():
+    """handle_spawn_at_point threads the client's selected vehicle_type to
+    _spawn_wf_style for supported types (0=Tank,1=Scout,3=Bomber); 2/4 fall back
+    to Tank; the whole feature gates on vehicle_select_enabled."""
+    old = os.environ.get("WULFRAM_SPAWN_POS")
+    try:
+        os.environ["WULFRAM_SPAWN_POS"] = "4950,5100,5"
+        server = WulframServer.__new__(WulframServer)
+        server.map_name = "crossroads"
+        server.up_axis = "z"
+        server.spawn_height = 5.0
+        server.use_map_spawn_points = True
+        server.force_default_spawn_pos = True
+        server.default_flat_spawn_pos = (4950.0, 5100.0, 5.0)
+        server.spawn_allow_point_override = True
+        server.spawn_point_override_min_interval = 0.0
+        server.get_spawn_points = lambda: [
+            {"oid": 7001, "team": 2, "x": 6000.0, "y": 6000.0, "z": 90.0},
+        ]
+        server.vehicle_select_enabled = True
+        captured = {}
+        server._spawn_wf_style = lambda ctx, team_id, pos=None, unit_type=0, **kw: \
+            captured.update(unit_type=unit_type)
+
+        def spawn(veh):
+            captured.clear()
+            ctx = ClientContext(client_id=1, client_addr=("127.0.0.1", 50000),
+                                session=Session(), entity_id=0x14EA)
+            handle_spawn_at_point(server, ctx, 7001, veh, ("127.0.0.1", 50000))
+            return captured.get("unit_type")
+
+        assert spawn(0) == 0, "Tank"
+        assert spawn(1) == 1, "Scout honored"
+        assert spawn(3) == 3, "Bomber honored"
+        assert spawn(2) == 0, "Assault -> Tank fallback"
+        assert spawn(4) == 0, "Transport -> Tank fallback"
+        server.vehicle_select_enabled = False
+        assert spawn(1) == 0, "gated off -> Tank"
+        print("  test_spawn_at_point_honors_vehicle_selection: PASSED")
+        return True
+    finally:
+        if old is None:
+            os.environ.pop("WULFRAM_SPAWN_POS", None)
+        else:
+            os.environ["WULFRAM_SPAWN_POS"] = old
+
+
 def test_recent_control_pose_blocks_in_game_spawn_override():
     """Late spawn-point packets must not undo a control-plane setup pose."""
     old_block = os.environ.get("WULFRAM_CONTROL_POSE_BLOCK_SPAWN_OVERRIDE_S")
@@ -18467,6 +18514,7 @@ def main():
         test_input_sync_diagnosis_counts_unsolicited_correction_stream,
         test_spawn_override_wins_over_map_spawn_points,
         test_spawn_at_point_honors_clicked_pad_when_default_configured,
+        test_spawn_at_point_honors_vehicle_selection,
         test_recent_control_pose_blocks_in_game_spawn_override,
         test_recent_control_pose_blocks_delayed_auto_spawn,
         test_recent_control_pose_repairs_unstamped_large_jump,
