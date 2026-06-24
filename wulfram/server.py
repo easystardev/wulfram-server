@@ -334,6 +334,9 @@ class WulframServer(ConfigMixin):
         # tank targetable: entity+0xD0>0). Gated so we can A/B it against a
         # suspected render-context freeze. Default ON.
         self.remote_entity_vitals = os.environ.get("WULFRAM_REMOTE_ENTITY_VITALS", "1") == "1"
+        # Server-generated kill-feed chat notifications (the OG client has no built-in
+        # kill feed; kill notices ride server chat). Default on; A/B off.
+        self.kill_feed_enabled = os.environ.get("WULFRAM_KILL_FEED", "1") == "1"
         # Throttle remote player updates: interval in seconds (0 = every tick).
         # 30Hz tick rate = every tick; lower values reduce packet flood.
         try:
@@ -2978,6 +2981,24 @@ class WulframServer(ConfigMixin):
                 pass
         print(f"[CHAT] c{ctx.client_id} mode={mode} -> {sent} recipient(s): {label!r}")
         return {"relayed": sent, "mode": mode}
+
+    def _broadcast_kill_feed(self, message: str) -> int:
+        """Server-generated kill notification, sent as COMM_MESSAGE (0x1F, system
+        source_id=0) to all in-game clients. The OG client has no built-in kill
+        feed (DEATH_NOTICE 0x1D only drops the victim's cargo), so kill notices
+        ride server chat like the OG. Gated by WULFRAM_KILL_FEED (default on)."""
+        if not getattr(self, "kill_feed_enabled", True):
+            return 0
+        pkt = build_chat_message(message, source_id=0)
+        sent = 0
+        for client in self._snapshot_in_game_clients():
+            try:
+                self._send_packet_to_client(client, pkt, prefer_tcp=True, allow_udp_fallback=False)
+                sent += 1
+            except Exception:  # noqa: BLE001
+                pass
+        print(f"[KILL-FEED] {message!r} -> {sent} client(s)")
+        return sent
 
     def _og_viewer_replication_enabled(self, target_ctx: ClientContext, stream: str) -> bool:
         """Return whether a replication stream is enabled for an OG/remote viewer."""
@@ -7096,6 +7117,7 @@ class WulframServer(ConfigMixin):
         combat_participants = (attacker, target)
         self._broadcast_player_stats(attacker, participants=combat_participants)
         self._broadcast_player_stats(target, participants=combat_participants)
+        self._broadcast_kill_feed(f"{attacker_name} destroyed {target_name}")
 
         target_entity_id = target.session.entity_id or target.entity_id
         tick_del = self._get_network_tick(target)
@@ -21540,14 +21562,7 @@ class WulframServer(ConfigMixin):
             target.deaths += 1
             print(f"[COMBAT] {target_name} (c{target.client_id}) DESTROYED by {attacker_name} (c{attacker.client_id})"
                   f" [K:{attacker.kills} D:{target.deaths}]")
-            kill_msg = f"KILL! {attacker_name} destroyed {target_name}!"
-            kill_chat = build_chat_message(kill_msg, source_id=attacker.session.player_id or attacker.entity_id)
-            for client in self._snapshot_in_game_clients():
-                if client.tcp_handler and self._debug_comm_allowed_for_client(client):
-                    # Crash-safe (see HIT chat above): never let a dead socket
-                    # kill the projectile thread.
-                    self._send_packet_to_client(client, kill_chat, prefer_tcp=True,
-                                                allow_udp_fallback=False)
+            self._broadcast_kill_feed(f"{attacker_name} destroyed {target_name}")
 
             # Broadcast updated stats for attacker and target
             combat_participants = (attacker, target)
@@ -21682,6 +21697,9 @@ class WulframServer(ConfigMixin):
         if attacker is not None:
             attacker.kills += 1
             self._broadcast_player_stats(attacker, participants=participants)
+            a_name = attacker.session.username or f"Player{attacker.client_id}"
+            t_name = target.session.username or f"Player{target.client_id}"
+            self._broadcast_kill_feed(f"{a_name} destroyed {t_name}")
         self._broadcast_player_stats(target, participants=participants)
 
         target_entity_id = target.session.entity_id or target.entity_id
@@ -21958,19 +21976,7 @@ class WulframServer(ConfigMixin):
                 best_target.deaths += 1
                 self._broadcast_player_stats(best_target, participants=(best_target,))
                 print(f"[TURRET] {btype_name} oid={oid} KILLED {target_name}")
-                kill_msg = f"{target_name} was destroyed by a {btype_name}!"
-                from .packets import build_chat_message
-                kill_chat = build_chat_message(kill_msg, source_id=0)
-                for client in in_game:
-                    if (
-                        client.tcp_handler
-                        and self._combat_observer_packets_allowed_for_client(client, best_target)
-                        and self._debug_comm_allowed_for_client(client)
-                    ):
-                        try:
-                            client.tcp_handler.send(kill_chat)
-                        except Exception:
-                            pass  # client may have disconnected
+                self._broadcast_kill_feed(f"{target_name} was destroyed by a {btype_name}")
 
                 # Death sequence: DELETE with effects + respawn
                 target_eid = best_target.session.entity_id or best_target.entity_id

@@ -1138,6 +1138,35 @@ def test_relay_player_chat_routes_by_mode():
     assert sends == [], "SERVER channel must not relay"
     sends.clear(); server._relay_player_chat(c1, 4, 0, "   ")
     assert sends == [], "empty message must not relay"
+    print("  test_relay_player_chat_routes_by_mode: PASSED")
+    return True
+
+
+def test_kill_feed_broadcasts_to_all_in_game():
+    """Kill notices ride server chat (COMM_MESSAGE 0x1F, system source_id=0) to all
+    in-game clients; gated by kill_feed_enabled."""
+    def mkctx(cid):
+        s = Session(phase=Phase.IN_GAME, in_game=True, team_id=1)
+        s.player_id = 0x100 + cid
+        return ClientContext(client_id=cid, client_addr=("127.0.0.1", 50000 + cid),
+                             session=s, entity_id=0x100 + cid)
+    a, b = mkctx(1), mkctx(2)
+    server = WulframServer.__new__(WulframServer)
+    server.kill_feed_enabled = True
+    server._snapshot_in_game_clients = lambda: [a, b]
+    sends: list = []
+    server._send_packet_to_client = lambda c, pkt, **k: sends.append((c.client_id, pkt))
+
+    assert server._broadcast_kill_feed("Alice destroyed Bob") == 2
+    assert {s[0] for s in sends} == {1, 2}
+    assert all(p[:1] == b"\x1F" for _, p in sends)
+    assert b"Alice destroyed Bob" in sends[0][1]
+
+    server.kill_feed_enabled = False
+    sends.clear()
+    assert server._broadcast_kill_feed("x") == 0 and sends == []
+    print("  test_kill_feed_broadcasts_to_all_in_game: PASSED")
+    return True
 
 
 def test_player_chat_respawn_despawns_and_clears_cached_spawn():
@@ -18459,6 +18488,8 @@ def main():
         test_build_chat_message_comm_layout,
         test_player_chat_respawn_despawns_and_clears_cached_spawn,
         test_player_chat_respawn_via_tcp_comm_handler,
+        test_relay_player_chat_routes_by_mode,
+        test_kill_feed_broadcasts_to_all_in_game,
         test_build_update_array_remote_heartbeat_shape,
         test_server_remote_heartbeat_helper_keeps_full_local_state,
         test_server_remote_heartbeat_helper_pre_state_request_is_spawn_safe,
