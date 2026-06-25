@@ -2,11 +2,11 @@
 
 Python server emulator for Wulfram II / Wulfram 2.
 
-This repo contains the live server runtime, deterministic gameplay simulation, packet builders, and test scripts. Shared wire-format definitions and quantizer math live in the separate public repo `easystardev/wulfram2-protocol`.
+This repo contains the live server runtime, deterministic gameplay simulation, packet builders, and test scripts. Shared wire-format definitions and quantizer math live in the separate public repo `easystardev/wulfram2-core`.
 
 ## Related Repo
 
-- Shared protocol layer: `https://github.com/easystardev/wulfram2-protocol`
+- Shared protocol layer: `https://github.com/easystardev/wulfram2-core`
 
 ## Layout
 
@@ -27,7 +27,7 @@ Recommended standalone layout:
 ```text
 work/
   server/   <- this repo
-  shared/   <- https://github.com/easystardev/wulfram2-protocol
+  shared/   <- https://github.com/easystardev/wulfram2-core
 ```
 
 Example:
@@ -36,7 +36,7 @@ Example:
 mkdir C:\dev\wulfram-runtime
 cd C:\dev\wulfram-runtime
 git clone https://github.com/easystardev/wulfram-server.git server
-git clone https://github.com/easystardev/wulfram2-protocol.git shared
+git clone https://github.com/easystardev/wulfram2-core.git shared
 cd server
 ```
 
@@ -107,7 +107,7 @@ uv run python test_udp_parser.py
 ## Notes
 
 - Use `manage_server.py`, not direct ad-hoc background launches, for normal start/stop/restart flow.
-- The server repo intentionally stays focused on runtime/server code. Shared packet definitions, quantizers, and entity/vehicle enums are maintained in `wulfram2-protocol`.
+- The server repo intentionally stays focused on runtime/server code. Shared packet definitions, quantizers, and entity/vehicle enums are maintained in `wulfram2-core`.
 
 ## License
 
