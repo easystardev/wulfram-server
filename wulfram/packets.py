@@ -1019,18 +1019,8 @@ def build_update_array_create_tank(tick: int, entity_id: int, entity_type: int, 
                                     secondary_turret_bits: int = 0,
                                     secondary_turret_angle: float = 0.0,
                                     turret_max: float = 6.3,
-                                    turret_range: float = 12.6,
-                                    decoration_index: int = 0,
-                                    struct_field_138: int = 1) -> bytes:
-    """Build UPDATE_ARRAY that creates a tank entity with position inline.
-
-    When ``entity_type == 0x25`` (Decoration/structure), the OG client's spawn
-    parser reads 2 extra u32s right after team and before the static bit
-    (azurefishy-src Replication.c type-0x25 branch): ``decoration_index`` lands at
-    entity+0x134 (mesh via Entity_adjust_decoration_shape) and ``struct_field_138``
-    at entity+0x138 (the static-structure flag). Omitting them on a 0x25 entity
-    desyncs the bitstream, so they are written here only for that type.
-    """
+                                    turret_range: float = 12.6) -> bytes:
+    """Build UPDATE_ARRAY that creates a tank entity with position inline."""
     tick_bytes = struct.pack(">I", tick)
     bw = BitWriter()
 
@@ -1055,10 +1045,6 @@ def build_update_array_create_tank(tick: int, entity_id: int, entity_type: int, 
     config_val = behavior_type if behavior_type else team
     bw.write_bits(8, config_val & 0xFF)
     bw.write_bits(8, team & 0xFF)
-    if (entity_type & 0xFF) == 0x25:
-        # Type-0x25 structure: 2 u32s (decoration_index -> +0x134, flags -> +0x138)
-        bw.write_bits(32, decoration_index & 0xFFFFFFFF)
-        bw.write_bits(32, struct_field_138 & 0xFFFFFFFF)
     bw.write_bits(1, 1 if is_static else 0)
 
     bw.write_bits(4, 15)

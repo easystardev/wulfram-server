@@ -645,23 +645,6 @@ class ConfigMixin:
         # building's replicated rotation gets terrain pitch/roll so it lies on the
         # slope. Static MAP buildings are client-local-rendered and unaffected. 0 = off.
         self.building_terrain_conform = os.environ.get("WULFRAM_BUILDING_TERRAIN_CONFORM", "1") != "0"
-        # Decoration/structure replication EXPERIMENT (2026-06-26, default OFF). The
-        # decompile (azurefishy-src Replication.c:43-56 + Physics.c:44) shows the OG
-        # client makes structures IMMOVABLE purely by entity type 0x25 (one-sided
-        # collision), and gives them a mesh from a decoration index at entity+0x134
-        # (Entity_adjust_decoration_shape). So replicating a player-built building as
-        # wire entity_type 0x25 with the 2 structure u32s (decoration_index, flags)
-        # SHOULD make it static + correctly-meshed on the OG client -- the proper fix
-        # for "pads fly off when bumped" (vs movable default-physics network entities;
-        # see memory dynamic-buildings-cant-be-static-over-wire). Gated experiment:
-        # confirm immovable + render + no OG crash before promoting.
-        self.building_wire_decoration = os.environ.get("WULFRAM_BUILDING_WIRE_DECORATION", "0").strip().lower() in ("1", "on", "true", "yes")
-        try:
-            # Override the decoration_name_index (entity+0x134 -> decoration mesh list).
-            # -1 = use the building's own entity_type as the index (first guess).
-            self.building_decoration_index = int(os.environ.get("WULFRAM_BUILDING_DECORATION_INDEX", "-1"))
-        except ValueError:
-            self.building_decoration_index = -1
         self.projectiles_enabled = os.environ.get("WULFRAM_PROJECTILES_ENABLED", "1") == "1"
         self.remote_projectiles = os.environ.get("WULFRAM_REMOTE_PROJECTILES", "1") == "1"
         self.remote_combat_observer_packets = (

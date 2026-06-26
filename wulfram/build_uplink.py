@@ -242,21 +242,10 @@ def send_dynamic_entity_definition(
     local_state_kwargs.setdefault("health", server._get_health_value(target_ctx))
     local_state_kwargs.setdefault("fuel", server._get_energy_value(target_ctx))
     rot = _building_terrain_conform_rot(server, pos, heading)
-    # EXPERIMENT: replicate as wire-type 0x25 (Decoration/structure) so the OG client
-    # makes it immovable (one-sided collision) + meshes it from the decoration index.
-    # Default off; keeps the building's real type for the movable network entity.
-    wire_type = entity_type
-    extra_kwargs = {}
-    if getattr(server, "building_wire_decoration", False):
-        wire_type = 0x25
-        dec_idx = int(getattr(server, "building_decoration_index", -1))
-        if dec_idx < 0:
-            dec_idx = int(entity_type)
-        extra_kwargs = {"decoration_index": dec_idx, "struct_field_138": 1}
     payload = build_update_array_create_tank(
         tick=tick,
         entity_id=entity_id,
-        entity_type=wire_type,
+        entity_type=entity_type,
         team=team_id,
         pos=server._to_client_pos(pos),
         behavior_type=team_id,
@@ -266,7 +255,6 @@ def send_dynamic_entity_definition(
         is_static=is_static,
         rot=rot,
         **local_state_kwargs,
-        **extra_kwargs,
     )
     sent = server._send_packet_to_client(target_ctx, payload, prefer_tcp=False)
     if sent:
