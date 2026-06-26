@@ -15,6 +15,10 @@ from .client import ClientContext
 from .packets import build_update_array_player_update, build_view_update_player_update
 
 
+from .weapons import EntityType
+from .packets import build_update_array_multi, build_view_update_create_tank, build_view_update_multi
+
+
 class CorrectionMixin:
     def _handle_state_request(self, ctx: Optional[ClientContext], data: bytes, addr: tuple):
         """
@@ -562,3 +566,299 @@ class CorrectionMixin:
         if mode == "remote":
             return not is_loopback
         return True
+
+    def _fresh_remote_view_update_timestamp(self, ctx: ClientContext, tick: int) -> int:
+        """Return a remote OG VIEW_UPDATE timestamp that the client will clamp fresh.
+
+        The OG replay handler clamps future VIEW_UPDATE timestamps down to its
+        current tick before storing interp_record+0x08. Live wulftap shows stale
+        STATE_REQUEST ids are rejected by UpdateArray_check_eligible before
+        NetworkSync_receive_entity_update can store server_expected, so remote
+        OG replay wrappers must be current/future while snapshot selection can
+        still use the original request id.
+        """
+        base_tick = int(tick) & 0xFFFFFFFF
+        client_tick = int(getattr(ctx, "last_client_tick", 0) or 0) & 0xFFFFFFFF
+        if client_tick and self._tick_delta_signed(client_tick, base_tick) > 0:
+            base_tick = client_tick
+        ahead_ms = int(getattr(self, "remote_view_update_timestamp_ahead_ms", 1000) or 0)
+        if ahead_ms < 0:
+            ahead_ms = 0
+        return (base_tick + ahead_ms) & 0xFFFFFFFF
+
+    def _accumulate_correction_divergence(self, ctx: ClientContext, clamp_dz: float) -> None:
+        """Accumulate server-only (client-unpredictable) displacement for the
+        reactive correction gate (GOAL 2, 2026-06-02).
+
+        `clamp_dz` is the magnitude the terrain-Z safety clamp pushed the tank
+        this physics step — the canonical client/server divergence on this map
+        (server clamps Z to terrain; the OG client uses a spring-damper). The
+        accumulator decays every call so transient float/quantization noise
+        bleeds off and never reaches threshold; only a genuine spike (collision/
+        teleport-scale push) or sustained divergence (driving across rough
+        terrain) trips the gate. Flat open ground keeps this at ~0 because the
+        clamp rarely fires there and small dips stay under the noise floor.
+        """
+        if not getattr(self, "correction_gate_enabled", False):
+            return
+        accum = float(getattr(ctx, "divergence_accum_pos", 0.0) or 0.0) * self.correction_divergence_decay
+        dz = abs(float(clamp_dz or 0.0))
+        if dz > self.correction_divergence_floor:
+            accum += dz
+            if self.correction_gate_debug:
+                ctx._divergence_clamp_events = int(getattr(ctx, "_divergence_clamp_events", 0) or 0) + 1
+                ctx._divergence_clamp_max = max(
+                    float(getattr(ctx, "_divergence_clamp_max", 0.0) or 0.0), dz
+                )
+        ctx.divergence_accum_pos = accum
+
+    def _build_empirical_correction_payload(
+        self,
+        ctx: ClientContext,
+        *,
+        tick: int,
+        include_local_state: bool,
+        health: float,
+        fuel: float,
+        weapon_type: int,
+        ammo_bits: int,
+        ammo_mask: int,
+        pt_bits: int,
+        pt_angle: float,
+        st_bits: int,
+        st_angle: float,
+    ) -> tuple[bytes, str, tuple[float, float, float], tuple[float, float, float], bool, bool]:
+        """Build one of the older empirical local-correction packet shapes.
+
+        The rotation tuple MUST match what every other local-player packet
+        path emits (heartbeat, full UPDATE_ARRAY, VIEW_UPDATE loop,
+        TankPacket resend, vitals heartbeat, solo-local keepalive). Those
+        all use `_local_player_sync_rotation` which returns
+        `(roll, pitch, player_heading)` — the body-heading convention.
+        This function historically used `(roll, 0.0, player_yaw)` — the
+        camera-yaw sign-flipped convention — which diverged from every
+        other path and was flagged in the 2026-03-14 audit but missed.
+        Aligning to `_local_player_sync_rotation` does not on its own
+        restore the correction burst when the keepalive is running, but
+        it removes a confounding variable. See
+        docs/keepalive-breaks-correction-2026-04-18.md.
+        """
+        self._repair_recent_control_pose_jump(ctx, "correction_payload")
+        corr_pos = self._to_client_pos(ctx.player_pos)
+        corr_rot = self._local_player_sync_rotation(ctx)
+        cmode = self.correction_mode
+        inc_pos = cmode in ("full", "pos_only", "dual_entity", "view_update", "view_update_define")
+        inc_vel = cmode in ("full", "pos_only", "dual_entity", "view_update")
+        inc_rot = cmode in ("full", "rot_only", "dual_entity", "view_update", "view_update_define")
+        correction_timestamp = None
+        if cmode in ("view_update", "view_update_define"):
+            if handlers._is_loopback_client(ctx):
+                last_request_id = int(getattr(ctx, "last_state_request_id", 0) or 0)
+                last_request_time = float(getattr(ctx, "last_state_request_time", 0.0) or 0.0)
+                if last_request_id and last_request_time > 0.0 and (time.monotonic() - last_request_time) <= 1.5:
+                    correction_timestamp = last_request_id
+            else:
+                correction_timestamp = self._fresh_remote_view_update_timestamp(ctx, tick)
+
+        if not handlers._is_loopback_client(ctx):
+            # OG clients reject the promoted/full local-state form on targeted
+            # correction bursts. Keep this aligned with STATE_REQUEST replies:
+            # a short local-state prefix plus the transform-bearing entity.
+            include_local_state = True
+            weapon_type = self._get_spawn_tank_weapon_type(ctx)
+            ammo_bits = 0
+            ammo_mask = 0
+            pt_bits = 0
+            pt_angle = 0.0
+            st_bits = 0
+            st_angle = 0.0
+
+        common_kw = dict(
+            include_local_state=include_local_state,
+            weapon_id=weapon_type,
+            health=health,
+            fuel=fuel,
+            ammo_count_bits=ammo_bits,
+            ammo_count=ammo_mask,
+            primary_turret_bits=pt_bits,
+            primary_turret_angle=pt_angle,
+            secondary_turret_bits=st_bits,
+            secondary_turret_angle=st_angle,
+            turret_max=self.local_state_turret_max,
+            turret_range=self.local_state_turret_range,
+        )
+
+        if cmode == "view_update_define":
+            team_id = int(getattr(ctx.session, "team_id", 0) or 1)
+            entity_type = int(getattr(ctx, "entity_type", EntityType.TANK) or EntityType.TANK)
+            payload = build_view_update_create_tank(
+                tick=tick,
+                entity_id=ctx.session.entity_id,
+                entity_type=entity_type,
+                team=team_id,
+                pos=corr_pos,
+                behavior_type=team_id,
+                include_health=include_local_state,
+                include_entity_vitals=False,
+                health=health,
+                fuel=fuel,
+                is_manned=True,
+                weapon_id=weapon_type,
+                rot=corr_rot,
+                ammo_count_bits=ammo_bits,
+                ammo_count=ammo_mask,
+                primary_turret_bits=pt_bits,
+                primary_turret_angle=pt_angle,
+                secondary_turret_bits=st_bits,
+                secondary_turret_angle=st_angle,
+                turret_max=self.local_state_turret_max,
+                turret_range=self.local_state_turret_range,
+                timestamp=correction_timestamp,
+            )
+            label = "CORRECTION(view_update_define)"
+        elif cmode == "view_update":
+            payload = build_view_update_player_update(
+                tick=tick,
+                entity_id=ctx.session.entity_id,
+                pos=corr_pos,
+                vel=ctx.player_vel,
+                rot=corr_rot,
+                include_pos=inc_pos,
+                include_vel=inc_vel,
+                include_rot=inc_rot,
+                timestamp=correction_timestamp,
+                **common_kw,
+            )
+            label = "CORRECTION(view_update)"
+        elif cmode == "dual_entity":
+            ent_real = dict(
+                entity_id=ctx.session.entity_id,
+                is_manned=True,
+                pos=corr_pos,
+                vel=ctx.player_vel,
+                rot=corr_rot,
+                include_pos=inc_pos,
+                include_vel=inc_vel,
+                include_rot=inc_rot,
+            )
+            ent_dummy = dict(
+                entity_id=0xFFFFFFFE,
+                is_manned=True,
+                pos=(0.0, 0.0, 0.0),
+                vel=(0.0, 0.0, 0.0),
+                rot=(0.0, 0.0, 0.0),
+                include_pos=False,
+                include_vel=False,
+                include_rot=False,
+            )
+            payload = build_update_array_multi(
+                tick=tick,
+                entities=[ent_real, ent_dummy],
+                **common_kw,
+            )
+            label = "CORRECTION(dual_entity)"
+        else:
+            payload = build_update_array_player_update(
+                tick=tick,
+                entity_id=ctx.session.entity_id,
+                pos=corr_pos,
+                vel=ctx.player_vel,
+                rot=corr_rot,
+                include_pos=inc_pos,
+                include_vel=inc_vel,
+                include_rot=inc_rot,
+                **common_kw,
+            )
+            label = f"CORRECTION({cmode})"
+
+        return payload, label, corr_pos, corr_rot, inc_pos, inc_rot
+
+    def _maybe_send_view_update_loop(
+        self,
+        ctx: ClientContext,
+        *,
+        tick: int,
+        send_pos: tuple,
+        health_val: float,
+        fuel_val: float,
+        weapon_type: int,
+        ammo_bits: int,
+        ammo_mask: int,
+        pt_bits: int,
+        pt_angle: float,
+        st_bits: int,
+        st_angle: float,
+    ) -> None:
+        """Optionally send auxiliary VIEW_UPDATE correction/replay packets."""
+        if not self.view_update_loop or self.update_packet_type == "view":
+            return
+
+        now = time.monotonic()
+        if (now - ctx.last_view_update_send) < self.view_update_interval:
+            return
+        ctx.last_view_update_send = now
+
+        view_local_state = False
+        view_ammo_bits = 0
+        view_ammo_mask = 0
+        view_pt_bits = 0
+        view_st_bits = 0
+        view_pt_angle = 0.0
+        view_st_angle = 0.0
+
+        # Only include local-state in VIEW_UPDATE when explicitly enabled.
+        if self.view_update_local_stats:
+            view_mode = "wf" if self.update_local_state_mode == "wf" else "auto"
+            if self._should_send_local_state(ctx, pt_bits, st_bits, view_mode):
+                view_local_state = True
+                view_ammo_bits = ammo_bits
+                view_ammo_mask = ammo_mask
+                view_pt_bits = pt_bits
+                view_st_bits = st_bits
+                view_pt_angle = pt_angle
+                view_st_angle = st_angle
+
+        view_entities = [
+            {
+                "entity_id": ctx.session.entity_id,
+                "is_manned": True,
+                "pos": send_pos,
+                "vel": ctx.player_vel,
+                "rot": self._local_player_sync_rotation(ctx),
+                "include_pos": True,
+                "include_vel": True,
+                "include_rot": True,
+                "include_entity_vitals": self.view_update_entity_vitals,
+                "speed_scale": 1.0,
+                "fuel": fuel_val,
+            }
+        ]
+        view_payload = build_view_update_multi(
+            tick,
+            include_local_state=view_local_state,
+            weapon_id=weapon_type,
+            health=health_val,
+            fuel=fuel_val,
+            ammo_count_bits=view_ammo_bits,
+            ammo_count=view_ammo_mask,
+            primary_turret_bits=view_pt_bits,
+            primary_turret_angle=view_pt_angle,
+            secondary_turret_bits=view_st_bits,
+            secondary_turret_angle=view_st_angle,
+            turret_max=self.local_state_turret_max,
+            turret_range=self.local_state_turret_range,
+            entities=view_entities,
+        )
+        if view_local_state:
+            self._log_vitals(
+                ctx,
+                "VIEW_UPDATE",
+                include_vitals=True,
+                health=health_val,
+                energy=fuel_val,
+                weapon_id=weapon_type,
+                note=f"ammo_bits={view_ammo_bits} pt_bits={view_pt_bits} st_bits={view_st_bits}",
+            )
+        if self.udp_handler and ctx.session.udp_addr:
+            self.udp_handler.send_to(view_payload, ctx.session.udp_addr)
+        # Never send VIEW_UPDATE over TCP (can desync OG stream parser).

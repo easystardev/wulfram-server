@@ -837,25 +837,6 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
         ctx.last_sent_tick = tick & 0xFFFFFFFF
         return ctx.last_sent_tick
 
-    def _fresh_remote_view_update_timestamp(self, ctx: ClientContext, tick: int) -> int:
-        """Return a remote OG VIEW_UPDATE timestamp that the client will clamp fresh.
-
-        The OG replay handler clamps future VIEW_UPDATE timestamps down to its
-        current tick before storing interp_record+0x08. Live wulftap shows stale
-        STATE_REQUEST ids are rejected by UpdateArray_check_eligible before
-        NetworkSync_receive_entity_update can store server_expected, so remote
-        OG replay wrappers must be current/future while snapshot selection can
-        still use the original request id.
-        """
-        base_tick = int(tick) & 0xFFFFFFFF
-        client_tick = int(getattr(ctx, "last_client_tick", 0) or 0) & 0xFFFFFFFF
-        if client_tick and self._tick_delta_signed(client_tick, base_tick) > 0:
-            base_tick = client_tick
-        ahead_ms = int(getattr(self, "remote_view_update_timestamp_ahead_ms", 1000) or 0)
-        if ahead_ms < 0:
-            ahead_ms = 0
-        return (base_tick + ahead_ms) & 0xFFFFFFFF
-
     @staticmethod
     def _tick_delta_signed(newer: int, older: int) -> int:
         """Return the signed 32-bit tick delta `newer - older`."""
@@ -863,32 +844,6 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
         if delta & 0x80000000:
             delta -= 0x100000000
         return delta
-
-    def _accumulate_correction_divergence(self, ctx: ClientContext, clamp_dz: float) -> None:
-        """Accumulate server-only (client-unpredictable) displacement for the
-        reactive correction gate (GOAL 2, 2026-06-02).
-
-        `clamp_dz` is the magnitude the terrain-Z safety clamp pushed the tank
-        this physics step — the canonical client/server divergence on this map
-        (server clamps Z to terrain; the OG client uses a spring-damper). The
-        accumulator decays every call so transient float/quantization noise
-        bleeds off and never reaches threshold; only a genuine spike (collision/
-        teleport-scale push) or sustained divergence (driving across rough
-        terrain) trips the gate. Flat open ground keeps this at ~0 because the
-        clamp rarely fires there and small dips stay under the noise floor.
-        """
-        if not getattr(self, "correction_gate_enabled", False):
-            return
-        accum = float(getattr(ctx, "divergence_accum_pos", 0.0) or 0.0) * self.correction_divergence_decay
-        dz = abs(float(clamp_dz or 0.0))
-        if dz > self.correction_divergence_floor:
-            accum += dz
-            if self.correction_gate_debug:
-                ctx._divergence_clamp_events = int(getattr(ctx, "_divergence_clamp_events", 0) or 0) + 1
-                ctx._divergence_clamp_max = max(
-                    float(getattr(ctx, "_divergence_clamp_max", 0.0) or 0.0), dz
-                )
-        ctx.divergence_accum_pos = accum
 
     def _record_authoritative_state(self, ctx: ClientContext, *, tick: int) -> None:
         """Cache recent authoritative states for replay-aligned sync replies."""
@@ -991,167 +946,6 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
             return best_abs
         return None
 
-    def _build_empirical_correction_payload(
-        self,
-        ctx: ClientContext,
-        *,
-        tick: int,
-        include_local_state: bool,
-        health: float,
-        fuel: float,
-        weapon_type: int,
-        ammo_bits: int,
-        ammo_mask: int,
-        pt_bits: int,
-        pt_angle: float,
-        st_bits: int,
-        st_angle: float,
-    ) -> tuple[bytes, str, tuple[float, float, float], tuple[float, float, float], bool, bool]:
-        """Build one of the older empirical local-correction packet shapes.
-
-        The rotation tuple MUST match what every other local-player packet
-        path emits (heartbeat, full UPDATE_ARRAY, VIEW_UPDATE loop,
-        TankPacket resend, vitals heartbeat, solo-local keepalive). Those
-        all use `_local_player_sync_rotation` which returns
-        `(roll, pitch, player_heading)` — the body-heading convention.
-        This function historically used `(roll, 0.0, player_yaw)` — the
-        camera-yaw sign-flipped convention — which diverged from every
-        other path and was flagged in the 2026-03-14 audit but missed.
-        Aligning to `_local_player_sync_rotation` does not on its own
-        restore the correction burst when the keepalive is running, but
-        it removes a confounding variable. See
-        docs/keepalive-breaks-correction-2026-04-18.md.
-        """
-        self._repair_recent_control_pose_jump(ctx, "correction_payload")
-        corr_pos = self._to_client_pos(ctx.player_pos)
-        corr_rot = self._local_player_sync_rotation(ctx)
-        cmode = self.correction_mode
-        inc_pos = cmode in ("full", "pos_only", "dual_entity", "view_update", "view_update_define")
-        inc_vel = cmode in ("full", "pos_only", "dual_entity", "view_update")
-        inc_rot = cmode in ("full", "rot_only", "dual_entity", "view_update", "view_update_define")
-        correction_timestamp = None
-        if cmode in ("view_update", "view_update_define"):
-            if handlers._is_loopback_client(ctx):
-                last_request_id = int(getattr(ctx, "last_state_request_id", 0) or 0)
-                last_request_time = float(getattr(ctx, "last_state_request_time", 0.0) or 0.0)
-                if last_request_id and last_request_time > 0.0 and (time.monotonic() - last_request_time) <= 1.5:
-                    correction_timestamp = last_request_id
-            else:
-                correction_timestamp = self._fresh_remote_view_update_timestamp(ctx, tick)
-
-        if not handlers._is_loopback_client(ctx):
-            # OG clients reject the promoted/full local-state form on targeted
-            # correction bursts. Keep this aligned with STATE_REQUEST replies:
-            # a short local-state prefix plus the transform-bearing entity.
-            include_local_state = True
-            weapon_type = self._get_spawn_tank_weapon_type(ctx)
-            ammo_bits = 0
-            ammo_mask = 0
-            pt_bits = 0
-            pt_angle = 0.0
-            st_bits = 0
-            st_angle = 0.0
-
-        common_kw = dict(
-            include_local_state=include_local_state,
-            weapon_id=weapon_type,
-            health=health,
-            fuel=fuel,
-            ammo_count_bits=ammo_bits,
-            ammo_count=ammo_mask,
-            primary_turret_bits=pt_bits,
-            primary_turret_angle=pt_angle,
-            secondary_turret_bits=st_bits,
-            secondary_turret_angle=st_angle,
-            turret_max=self.local_state_turret_max,
-            turret_range=self.local_state_turret_range,
-        )
-
-        if cmode == "view_update_define":
-            team_id = int(getattr(ctx.session, "team_id", 0) or 1)
-            entity_type = int(getattr(ctx, "entity_type", EntityType.TANK) or EntityType.TANK)
-            payload = build_view_update_create_tank(
-                tick=tick,
-                entity_id=ctx.session.entity_id,
-                entity_type=entity_type,
-                team=team_id,
-                pos=corr_pos,
-                behavior_type=team_id,
-                include_health=include_local_state,
-                include_entity_vitals=False,
-                health=health,
-                fuel=fuel,
-                is_manned=True,
-                weapon_id=weapon_type,
-                rot=corr_rot,
-                ammo_count_bits=ammo_bits,
-                ammo_count=ammo_mask,
-                primary_turret_bits=pt_bits,
-                primary_turret_angle=pt_angle,
-                secondary_turret_bits=st_bits,
-                secondary_turret_angle=st_angle,
-                turret_max=self.local_state_turret_max,
-                turret_range=self.local_state_turret_range,
-                timestamp=correction_timestamp,
-            )
-            label = "CORRECTION(view_update_define)"
-        elif cmode == "view_update":
-            payload = build_view_update_player_update(
-                tick=tick,
-                entity_id=ctx.session.entity_id,
-                pos=corr_pos,
-                vel=ctx.player_vel,
-                rot=corr_rot,
-                include_pos=inc_pos,
-                include_vel=inc_vel,
-                include_rot=inc_rot,
-                timestamp=correction_timestamp,
-                **common_kw,
-            )
-            label = "CORRECTION(view_update)"
-        elif cmode == "dual_entity":
-            ent_real = dict(
-                entity_id=ctx.session.entity_id,
-                is_manned=True,
-                pos=corr_pos,
-                vel=ctx.player_vel,
-                rot=corr_rot,
-                include_pos=inc_pos,
-                include_vel=inc_vel,
-                include_rot=inc_rot,
-            )
-            ent_dummy = dict(
-                entity_id=0xFFFFFFFE,
-                is_manned=True,
-                pos=(0.0, 0.0, 0.0),
-                vel=(0.0, 0.0, 0.0),
-                rot=(0.0, 0.0, 0.0),
-                include_pos=False,
-                include_vel=False,
-                include_rot=False,
-            )
-            payload = build_update_array_multi(
-                tick=tick,
-                entities=[ent_real, ent_dummy],
-                **common_kw,
-            )
-            label = "CORRECTION(dual_entity)"
-        else:
-            payload = build_update_array_player_update(
-                tick=tick,
-                entity_id=ctx.session.entity_id,
-                pos=corr_pos,
-                vel=ctx.player_vel,
-                rot=corr_rot,
-                include_pos=inc_pos,
-                include_vel=inc_vel,
-                include_rot=inc_rot,
-                **common_kw,
-            )
-            label = f"CORRECTION({cmode})"
-
-        return payload, label, corr_pos, corr_rot, inc_pos, inc_rot
-
     def _local_player_sync_rotation(self, ctx: ClientContext) -> tuple[float, float, float]:
         """Return the body-space rotation tuple for local-player replication packets.
 
@@ -1187,96 +981,6 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
         if self.spawn_send_player_info_explicit:
             return self.spawn_send_player_info
         return not handlers._is_loopback_client(ctx)
-
-    def _maybe_send_view_update_loop(
-        self,
-        ctx: ClientContext,
-        *,
-        tick: int,
-        send_pos: tuple,
-        health_val: float,
-        fuel_val: float,
-        weapon_type: int,
-        ammo_bits: int,
-        ammo_mask: int,
-        pt_bits: int,
-        pt_angle: float,
-        st_bits: int,
-        st_angle: float,
-    ) -> None:
-        """Optionally send auxiliary VIEW_UPDATE correction/replay packets."""
-        if not self.view_update_loop or self.update_packet_type == "view":
-            return
-
-        now = time.monotonic()
-        if (now - ctx.last_view_update_send) < self.view_update_interval:
-            return
-        ctx.last_view_update_send = now
-
-        view_local_state = False
-        view_ammo_bits = 0
-        view_ammo_mask = 0
-        view_pt_bits = 0
-        view_st_bits = 0
-        view_pt_angle = 0.0
-        view_st_angle = 0.0
-
-        # Only include local-state in VIEW_UPDATE when explicitly enabled.
-        if self.view_update_local_stats:
-            view_mode = "wf" if self.update_local_state_mode == "wf" else "auto"
-            if self._should_send_local_state(ctx, pt_bits, st_bits, view_mode):
-                view_local_state = True
-                view_ammo_bits = ammo_bits
-                view_ammo_mask = ammo_mask
-                view_pt_bits = pt_bits
-                view_st_bits = st_bits
-                view_pt_angle = pt_angle
-                view_st_angle = st_angle
-
-        view_entities = [
-            {
-                "entity_id": ctx.session.entity_id,
-                "is_manned": True,
-                "pos": send_pos,
-                "vel": ctx.player_vel,
-                "rot": self._local_player_sync_rotation(ctx),
-                "include_pos": True,
-                "include_vel": True,
-                "include_rot": True,
-                "include_entity_vitals": self.view_update_entity_vitals,
-                "speed_scale": 1.0,
-                "fuel": fuel_val,
-            }
-        ]
-        view_payload = build_view_update_multi(
-            tick,
-            include_local_state=view_local_state,
-            weapon_id=weapon_type,
-            health=health_val,
-            fuel=fuel_val,
-            ammo_count_bits=view_ammo_bits,
-            ammo_count=view_ammo_mask,
-            primary_turret_bits=view_pt_bits,
-            primary_turret_angle=view_pt_angle,
-            secondary_turret_bits=view_st_bits,
-            secondary_turret_angle=view_st_angle,
-            turret_max=self.local_state_turret_max,
-            turret_range=self.local_state_turret_range,
-            entities=view_entities,
-        )
-        if view_local_state:
-            self._log_vitals(
-                ctx,
-                "VIEW_UPDATE",
-                include_vitals=True,
-                health=health_val,
-                energy=fuel_val,
-                weapon_id=weapon_type,
-                note=f"ammo_bits={view_ammo_bits} pt_bits={view_pt_bits} st_bits={view_st_bits}",
-            )
-        if self.udp_handler and ctx.session.udp_addr:
-            self.udp_handler.send_to(view_payload, ctx.session.udp_addr)
-        # Never send VIEW_UPDATE over TCP (can desync OG stream parser).
 
     def _to_client_pos(self, pos: tuple) -> tuple:
         """Apply configured world offset when sending positions to the client."""
@@ -1510,24 +1214,6 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
 
     def _remove_dynamic_building_record(self, oid: int) -> None:
         building_lifecycle.remove_dynamic_record(self, oid)
-
-    def _apply_building_damage_amount(
-        self,
-        oid: int,
-        damage: float,
-        *,
-        source: str,
-        remove_dynamic_on_destroy: bool = True,
-        delete_participants: tuple[ClientContext, ...] | None = None,
-    ) -> dict[str, Any]:
-        return building_lifecycle.apply_damage_amount(
-            self,
-            oid,
-            damage,
-            source=source,
-            remove_dynamic_on_destroy=remove_dynamic_on_destroy,
-            delete_participants=delete_participants,
-        )
 
     def _choose_dynamic_building_pos(self, ctx: ClientContext, slot: int) -> tuple[float, float, float]:
         return build_uplink.choose_dynamic_building_pos(self, ctx, slot)
@@ -3852,89 +3538,6 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
                 if self.debug_viewpoint:
                     print(f"[VIEWPOINT-ERR] Failed to decode (double): {e}")
 
-    def _log_fire_pose_context(self, ctx: ClientContext, client_tick: int, source: str) -> None:
-        """Trace pose choices used for projectile origin diagnostics."""
-        if not self.debug_projectiles:
-            return
-
-        def _fmt_vec(vec: Optional[tuple]) -> str:
-            if not vec:
-                return "None"
-            return ",".join(f"{float(v):.2f}" for v in vec)
-
-        now = time.monotonic()
-        last = ctx.last_sent_player_state or {}
-        last_pos = last.get("pos")
-        last_tick = last.get("tick")
-        last_dt = now - float(last.get("time", now))
-
-        hist = self._select_authoritative_state_snapshot(ctx, client_tick) if client_tick else None
-        hist_pos = hist.get("pos") if hist else None
-        hist_tick = hist.get("tick") if hist else None
-        hist_dt = now - float(hist.get("time", now)) if hist else 0.0
-
-        print(
-            f"[FIRE-POSE] src={source} client={ctx.client_id} "
-            f"client_tick={client_tick} server_tick={get_ticks()} "
-            f"session_tick={ctx.session.tick if ctx.session else 0} "
-            f"tick_offset={ctx.tick_offset} "
-            f"player_pos=({_fmt_vec(self._to_client_pos(ctx.player_pos))}) "
-            f"player_vel=({_fmt_vec(ctx.player_vel)}) "
-            f"last_sent_tick={last_tick} last_sent_dt={last_dt:.3f}s "
-            f"last_sent_pos=({_fmt_vec(last_pos)}) "
-            f"hist_tick={hist_tick} hist_dt={hist_dt:.3f}s "
-            f"hist_pos=({_fmt_vec(hist_pos)})"
-        )
-
-    def _select_weapon_fire_pose(
-        self,
-        ctx: ClientContext,
-        client_tick: int,
-    ) -> tuple[tuple, tuple, str, str]:
-        """Return the packet-aligned pose used to spawn a projectile.
-
-        Fire packets arrive after the client has already simulated the input
-        frame that produced them. Using the live server pose makes moving shots
-        spawn a few units ahead of the client's local muzzle. Reuse the same
-        replay/history mapping as STATE_REQUEST so projectile origin and local
-        correction agree on the input tick.
-        """
-        pose_source = "live"
-        fire_pos = ctx.player_pos
-        body_roll = float(ctx.player_pose.get("roll", 0.0) or 0.0)
-        body_pitch = float(ctx.player_pose.get("pitch", 0.0) or 0.0)
-        body_yaw = float(ctx.player_heading)
-
-        hist = self._select_authoritative_state_snapshot(ctx, client_tick) if client_tick else None
-        if hist is not None:
-            hist_pos = hist.get("pos")
-            hist_rot = hist.get("rot") or ()
-            if hist_pos is not None:
-                fire_pos = self._from_client_pos(hist_pos)
-                pose_source = "history"
-            if len(hist_rot) >= 1:
-                body_roll = float(hist_rot[0])
-            if len(hist_rot) >= 2:
-                body_pitch = float(hist_rot[1])
-            if len(hist_rot) >= 3:
-                body_yaw = float(hist_rot[2])
-
-        aim_pitch, aim_yaw, aim_src = self._get_aim_rotation(ctx)
-        aim_label = aim_src
-        if self.projectile_aim_source == "body":
-            aim_pitch = body_pitch if getattr(self, "projectile_body_pitch", False) else 0.0
-            aim_yaw = body_yaw
-            aim_label = "body_pitch" if getattr(self, "projectile_body_pitch", False) else "body"
-        elif self.projectile_aim_source == "viewpoint":
-            aim_pitch = ctx.player_aim_pitch
-            aim_yaw = ctx.player_aim_yaw
-            aim_label = "viewpoint"
-        elif self.projectile_aim_source == "auto" and aim_src != "viewpoint":
-            aim_pitch = body_pitch
-            aim_yaw = body_yaw
-
-        return fire_pos, (body_roll, aim_pitch, aim_yaw), aim_label, pose_source
-
     def _handle_action_dump(self, ctx: Optional[ClientContext], data: bytes, addr: tuple):
         """
         Handle ACTION_DUMP packet (0x09).
@@ -4093,54 +3696,6 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
                     f"len={len(data)} data={ctx.last_action_update_decode_fail_hex}"
                 )
 
-    def _handle_weapon_demand(self, ctx: Optional[ClientContext], data: bytes, addr: tuple):
-        """
-        Handle WEAPON_DEMAND packet (0x2E) - weapon selection/action.
-        Format: [opcode:1] [mode:1] [slot:4] [param:4]
-        Mode values:
-          1 = Cycle weapon forward
-          2 = Cycle weapon backward
-          3 = Buy/request ammo
-          4 = Sell/drop ammo
-        """
-        if ctx is None or len(data) < 2:
-            return
-
-        # Parse the packet
-        mode = data[1] if len(data) > 1 else 0
-        slot = struct.unpack(">I", data[2:6])[0] if len(data) >= 6 else 0
-        param = struct.unpack(">i", data[6:10])[0] if len(data) >= 10 else 0
-
-        print(f"[WEAPON] WEAPON_DEMAND mode={mode} slot={slot} param={param}")
-
-        # Handle weapon cycling
-        cycle_slots = sorted(TANK_WEAPON_SLOTS)
-        current = ctx.weapon_system.current_weapon
-        if current in cycle_slots:
-            current_idx = cycle_slots.index(current)
-        else:
-            current_idx = 0
-
-        if mode == 1:  # Cycle forward
-            ctx.weapon_system.current_weapon = cycle_slots[(current_idx + 1) % len(cycle_slots)]
-            print(f"[WEAPON] Cycled forward to weapon slot {ctx.weapon_system.current_weapon}")
-        elif mode == 2:  # Cycle backward
-            ctx.weapon_system.current_weapon = cycle_slots[(current_idx - 1) % len(cycle_slots)]
-            print(f"[WEAPON] Cycled backward to weapon slot {ctx.weapon_system.current_weapon}")
-        elif slot != ctx.weapon_system.current_weapon:
-            # Direct weapon selection via slot parameter
-            if slot in TANK_WEAPON_SLOTS:
-                ctx.weapon_system.current_weapon = slot
-                print(f"[WEAPON] Selected weapon slot {slot}")
-            else:
-                print(f"[WEAPON] Ignoring invalid weapon slot request: {slot}")
-
-        # Python-client-only debug feedback; not part of OG gameplay traffic.
-        if ctx.tcp_handler and self._debug_comm_allowed_for_client(ctx):
-            weapon = WEAPON_NAMES.get(ctx.weapon_system.current_weapon, f"Weapon {ctx.weapon_system.current_weapon}")
-            msg = build_chat_message(f"[{weapon}]", source_id=ctx.session.player_id or ctx.entity_id)
-            ctx.tcp_handler.send(msg)
-
     def _handle_input_feedback(self, ctx: Optional[ClientContext], data: bytes, addr: tuple):
         """
         Handle INPUT_FEEDBACK packet (0x40).
@@ -4159,62 +3714,6 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
                 extra = data[5:]
                 if extra and extra != b'\x00' * len(extra):
                     print(f"[INPUT] Extra data: {extra.hex()}")
-
-    def _record_client_weapon_fire(
-        self,
-        ctx: ClientContext,
-        packet_type: str,
-        client_tick: int,
-        projectiles,
-        energy_spent: float,
-    ) -> None:
-        """Record client-input-triggered projectile fire for live T3 gates."""
-        if ctx is None or ctx.weapon_system is None:
-            return
-        projectiles = list(projectiles or [])
-        if not projectiles:
-            return
-
-        now = time.monotonic()
-        ws = ctx.weapon_system
-        active_slots = {
-            str(idx): float(value)
-            for idx, value in enumerate(ws.behavior_slots)
-            if abs(float(value)) > 0.001
-        }
-        direct_slots = {
-            str(idx): float(ws.behavior_slots[idx])
-            for idx in OG_DIRECT_TRIGGER_WEAPON_SLOTS
-            if idx < len(ws.behavior_slots) and abs(float(ws.behavior_slots[idx])) > 0.001
-        }
-
-        ctx.weapon_fire_count = int(getattr(ctx, "weapon_fire_count", 0) or 0) + len(projectiles)
-        ctx.last_weapon_fire_time = now
-        ctx.last_weapon_fire_source = packet_type
-        ctx.last_weapon_fire_client_tick = int(client_tick or 0)
-        ctx.last_weapon_fire_projectile_ids = [int(getattr(proj, "entity_id", 0) or 0) for proj in projectiles]
-        ctx.last_weapon_fire_projectile_types = [
-            getattr(getattr(proj, "entity_type", None), "name", str(getattr(proj, "entity_type", "")))
-            for proj in projectiles
-        ]
-        ctx.last_weapon_fire_energy_spent = float(energy_spent or 0.0)
-        ctx.last_weapon_fire_input = {
-            "active_slots": active_slots,
-            "direct_slots": direct_slots,
-            "fire": float(ws.behavior_slots[BehaviorSlot.FIRE]),
-            "thrust": float(tank_softbody_control_slot_value(ws.behavior_slots)),
-            "jumpjet": float(ws.behavior_slots[BehaviorSlot.JUMPJET]),
-        }
-
-    @staticmethod
-    def _select_team_model_name(model_names, team_id: int) -> Optional[str]:
-        if not model_names:
-            return None
-        if len(model_names) == 1:
-            return model_names[0]
-        if team_id == 1:
-            return model_names[1]
-        return model_names[0]
 
     def _udp_ping_reply_allowed_for_client(self, ctx: ClientContext) -> bool:
         if self.udp_ping_reply_allow_all:
@@ -4348,46 +3847,6 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
             ctx.player_energy = min(max_energy, ctx.player_energy + FUEL_RATE)
         if near_energy and ctx.player_energy < max_energy:
             ctx.player_energy = min(max_energy, ctx.player_energy + ENERGY_RATE)
-
-    def _process_jump_jets(self, ctx: ClientContext, addr: tuple):
-        """
-        Process jump jet input.
-        Called after decoding ACTION_DUMP or ACTION_UPDATE.
-        """
-        # Jump jets are now applied in _update_player_position() so the server
-        # and Python prediction use the same fixed-step rising-edge model.
-        # Keep this packet-arrival hook as a no-op compatibility shim.
-        return
-
-    def _on_jump_jet_triggered(self, ctx: ClientContext, player_id: int, impulse: float, new_vel_z: float):
-        """Callback when a jump jet is triggered."""
-        print(f"[JUMP] Jump triggered for player {player_id}: impulse={impulse}, vel_up={new_vel_z:.1f}")
-        # Loopback fork retired (2026-06-02): the burst queues for every client.
-        burst_count = int(getattr(self, "jump_jet_correction_burst_count", 0) or 0)
-        if burst_count > 0:
-            # The original Tank controller has no local jumpjet impulse, so OG
-            # clients need a short authoritative burst to make the custom
-            # server-side hop visible instead of waiting for sparse organic
-            # STATE_REQUEST replies.
-            ctx.force_correction_once = True
-            ctx.correction_burst_remaining = max(
-                int(getattr(ctx, "correction_burst_remaining", 0) or 0),
-                burst_count - 1,
-            )
-            ctx.correction_burst_interval_s = float(
-                getattr(self, "jump_jet_correction_burst_interval", 0.05) or 0.05
-            )
-            ctx.last_correction_send = 0.0
-            print(
-                f"[JUMP] Queued correction burst x{burst_count} "
-                f"@ {ctx.correction_burst_interval_s:.2f}s for client {ctx.client_id}"
-            )
-
-        # Send visual/audio feedback via chat — debug clients only.
-        # OG client crashes on unexpected COMM_MESSAGE during spawn.
-        if ctx.tcp_handler and self._debug_comm_allowed_for_client(ctx):
-            msg = build_chat_message("*WHOOSH*", source_id=player_id)
-            ctx.tcp_handler.send(msg)
 
     def _send_jump_velocity_update(self, ctx: ClientContext, addr: tuple):
         """Send velocity update to client after jump."""

@@ -46,6 +46,9 @@ from wulfram2_protocol.entities import (
 )
 
 
+from .packets import build_chat_message
+
+
 class TickMixin:
     @staticmethod
     def _piecewise_interpolate(samples: list, t: float) -> float:
@@ -12858,3 +12861,53 @@ class TickMixin:
         EntityType.PIERCER: ("rocket_1", "rocket_2"),
         EntityType.THUMPER: ("p_rocket_1", "p_rocket_2"),
     }
+
+    @staticmethod
+    def _select_team_model_name(model_names, team_id: int) -> Optional[str]:
+        if not model_names:
+            return None
+        if len(model_names) == 1:
+            return model_names[0]
+        if team_id == 1:
+            return model_names[1]
+        return model_names[0]
+
+    def _process_jump_jets(self, ctx: ClientContext, addr: tuple):
+        """
+        Process jump jet input.
+        Called after decoding ACTION_DUMP or ACTION_UPDATE.
+        """
+        # Jump jets are now applied in _update_player_position() so the server
+        # and Python prediction use the same fixed-step rising-edge model.
+        # Keep this packet-arrival hook as a no-op compatibility shim.
+        return
+
+    def _on_jump_jet_triggered(self, ctx: ClientContext, player_id: int, impulse: float, new_vel_z: float):
+        """Callback when a jump jet is triggered."""
+        print(f"[JUMP] Jump triggered for player {player_id}: impulse={impulse}, vel_up={new_vel_z:.1f}")
+        # Loopback fork retired (2026-06-02): the burst queues for every client.
+        burst_count = int(getattr(self, "jump_jet_correction_burst_count", 0) or 0)
+        if burst_count > 0:
+            # The original Tank controller has no local jumpjet impulse, so OG
+            # clients need a short authoritative burst to make the custom
+            # server-side hop visible instead of waiting for sparse organic
+            # STATE_REQUEST replies.
+            ctx.force_correction_once = True
+            ctx.correction_burst_remaining = max(
+                int(getattr(ctx, "correction_burst_remaining", 0) or 0),
+                burst_count - 1,
+            )
+            ctx.correction_burst_interval_s = float(
+                getattr(self, "jump_jet_correction_burst_interval", 0.05) or 0.05
+            )
+            ctx.last_correction_send = 0.0
+            print(
+                f"[JUMP] Queued correction burst x{burst_count} "
+                f"@ {ctx.correction_burst_interval_s:.2f}s for client {ctx.client_id}"
+            )
+
+        # Send visual/audio feedback via chat — debug clients only.
+        # OG client crashes on unexpected COMM_MESSAGE during spawn.
+        if ctx.tcp_handler and self._debug_comm_allowed_for_client(ctx):
+            msg = build_chat_message("*WHOOSH*", source_id=player_id)
+            ctx.tcp_handler.send(msg)
