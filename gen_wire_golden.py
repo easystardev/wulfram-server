@@ -33,7 +33,7 @@ from wulfram.packets import (  # noqa: E402
     FX_PULSE_FIRE, FX_IMPACT_VEHICLE, FX_CHAIN_GUN_FIRE,
 )
 
-GOLDEN = Path(__file__).parent / "wire_parity_golden.json"
+GOLDEN = Path(__file__).parent / "testdata" / "wire_parity_golden.json"
 POSE_CORPUS = Path(__file__).parent / "ch2-og-corpus.pose.ndjson"
 
 # Deterministic base tick (client-tick regime: ticks are explicit inputs).

@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "shared"))
 
 from wulfram.physics import VehiclePhysics  # noqa: E402
 
-GOLDEN = Path(__file__).parent / "physics_parity_golden.json"
+GOLDEN = Path(__file__).parent / "testdata" / "physics_parity_golden.json"
 
 
 def _hex(v: float) -> str:

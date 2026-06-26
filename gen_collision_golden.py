@@ -14,7 +14,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "shared"))
 
-GOLDEN = Path(__file__).parent / "collision_parity_golden.json"
+GOLDEN = Path(__file__).parent / "testdata" / "collision_parity_golden.json"
 
 
 def build():

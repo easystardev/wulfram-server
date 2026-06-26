@@ -25,7 +25,7 @@ from wulfram.packets import (  # noqa: E402
     decode_transient_array,
 )
 
-GOLDEN = Path(__file__).parent / "wire_parity_golden.json"
+GOLDEN = Path(__file__).parent / "testdata" / "wire_parity_golden.json"
 POSE_CORPUS = Path(__file__).parent / "ch2-og-corpus.pose.ndjson"
 BASE_TICK = 711_000
 TICK_STEP = 84
