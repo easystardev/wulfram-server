@@ -556,6 +556,8 @@ class ControlServer:
             return self._cmd_dynbuild(args)
         elif cmd == 'carry' or cmd == 'drop':
             return self._cmd_carry(([] if cmd == 'carry' else ['drop']) + args)
+        elif cmd == 'econ':
+            return self._cmd_econ(args)
         elif cmd == 'building_events' or cmd == 'bevents':
             return self._cmd_building_events(args)
         elif cmd == 'building_damage' or cmd == 'bdmg':
@@ -2088,6 +2090,38 @@ Examples:
                 f"{vel_str}{hp_str}{input_str}{sync_str}{jitter_str}{diagnosis_str}"
             )
         return "\n".join(lines)
+
+    def _cmd_econ(self, args: list) -> str:
+        """Dump construction-economy state as JSON: per-player carry, supply ships,
+        and under-construction buildings (with remaining time). Phase-1 harness."""
+        import json
+        import time as _time
+        if not self.server:
+            return "Error: No server reference"
+        out = {"players": [], "ships": [], "under_construction": []}
+        try:
+            with self.server.clients_lock:
+                for c in self.server.clients.values():
+                    if getattr(c, "session", None) and c.session.in_game:
+                        out["players"].append({
+                            "client_id": getattr(c, "client_id", None),
+                            "cargo_type": int(getattr(c, "cargo_type", 0) or 0),
+                            "cargo_count": int(getattr(c, "cargo_count", 0) or 0),
+                            "has_uplink": bool(getattr(c, "has_uplink", False)),
+                            "pos": [round(float(v), 1) for v in (c.player_pos or (0, 0, 0))],
+                        })
+            for team, ship in (self.server._uplink_ships or {}).items():
+                out["ships"].append({
+                    "team": team, "oid": ship.get("oid"),
+                    "pos": [round(float(v), 1) for v in ship.get("pos", (0, 0, 0))],
+                    "cargo": ship.get("cargo"),
+                })
+            now = _time.monotonic()
+            for oid, done in (getattr(self.server, "_building_construction", {}) or {}).items():
+                out["under_construction"].append({"oid": oid, "remaining_s": round(done - now, 1)})
+        except Exception as e:  # noqa: BLE001
+            return f"econ error: {e}"
+        return json.dumps(out)
 
     def _cmd_carry(self, args: list) -> str:
         """Set the active player's cargo carry state + broadcast CARRYING_INFO.
