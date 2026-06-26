@@ -1284,6 +1284,14 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
     def _broadcast_uplink_ship_info(self, ship: dict[str, Any]) -> int:
         return build_uplink.broadcast_uplink_ship_info(self, ship)
 
+    def _broadcast_carrying_info(self, ctx: ClientContext) -> int:
+        return build_uplink.broadcast_carrying_info(self, ctx)
+
+    def _set_player_carry(self, ctx: ClientContext, *, cargo_type: int, cargo_count: int, has_uplink: bool) -> dict:
+        return build_uplink.set_player_carry(
+            self, ctx, cargo_type=cargo_type, cargo_count=cargo_count, has_uplink=has_uplink
+        )
+
     def _send_existing_build_uplink_entities(self, ctx: ClientContext) -> int:
         return build_uplink.send_existing_build_uplink_entities(self, ctx)
 

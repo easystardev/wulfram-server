@@ -18558,6 +18558,56 @@ def test_lead_extrapolated_correction_pose():
     return True
 
 
+def test_carrying_info_carry_state():
+    """Cargo carry state + CARRYING_INFO broadcast (construction Phase 1).
+
+    `set_player_carry` updates the ctx cargo fields and broadcasts CARRYING_INFO
+    (0x29: u32 player_oid, u8 cargo_type, u8 has_uplink, u8 cargo_count) only when
+    the state actually changes. `build_carrying_info` encodes the wire format.
+    """
+    from wulfram import build_uplink
+    from wulfram.packets import build_carrying_info
+
+    # wire format
+    pkt = build_carrying_info(0x1337, cargo_type=27, has_uplink=True, cargo_count=2)
+    assert pkt == b"\x29" + struct.pack(">I", 0x1337) + struct.pack("BBB", 27, 1, 2), pkt.hex()
+
+    sent = []
+    ctx = SimpleNamespace(
+        cargo_type=0, cargo_count=0, has_uplink=False, entity_id=1339,
+        session=SimpleNamespace(player_id=0x1337, in_game=True))
+
+    class StubServer:
+        def _snapshot_in_game_clients(self):
+            return [ctx]
+
+        def _send_packet_to_client(self, target, payload, prefer_tcp=False):
+            sent.append(payload)
+            return True
+
+        def _broadcast_carrying_info(self, c):
+            return build_uplink.broadcast_carrying_info(self, c)
+
+    srv = StubServer()
+
+    r = build_uplink.set_player_carry(srv, ctx, cargo_type=27, cargo_count=2, has_uplink=True)
+    assert ctx.cargo_type == 27 and ctx.cargo_count == 2 and ctx.has_uplink is True, vars(ctx)
+    assert r["changed"] is True and r["recipients"] == 1, r
+    assert sent and sent[-1] == build_carrying_info(0x1337, cargo_type=27, has_uplink=True, cargo_count=2)
+
+    # unchanged -> no re-broadcast
+    sent.clear()
+    r2 = build_uplink.set_player_carry(srv, ctx, cargo_type=27, cargo_count=2, has_uplink=True)
+    assert r2["changed"] is False and r2["recipients"] == 0 and not sent, (r2, sent)
+
+    # drop
+    r3 = build_uplink.set_player_carry(srv, ctx, cargo_type=0, cargo_count=0, has_uplink=False)
+    assert ctx.cargo_type == 0 and ctx.has_uplink is False and r3["changed"] is True, (vars(ctx), r3)
+
+    print("test_carrying_info_carry_state: PASSED")
+    return True
+
+
 def main():
     print("=" * 60)
     print("Handler Tests")
@@ -18570,6 +18620,7 @@ def main():
         test_decode_lp_string_truncated,
         test_handlers_import,
         test_lead_extrapolated_correction_pose,
+        test_carrying_info_carry_state,
         test_behavior_spawn_enabled_defaults_on_for_entry_map_spawn,
         test_input_sync_diagnosis_distinguishes_idle_snapback_from_correction_failure,
         test_input_sync_diagnosis_reports_movement_without_targeted_corrections,

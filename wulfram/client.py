@@ -79,6 +79,13 @@ class ClientContext:
     player_energy: float = 100.0
     player_health: float = 1.0  # Normalized 0.0-1.0, used for HUD health display
 
+    # Cargo carry state (construction economy). Mirrors the OG PlayerEntry cargo
+    # fields the CARRYING_INFO (0x29) handler updates (+0x44 cargo_type, +0x48
+    # has_uplink, +0x4c cargo_count). cargo_type 0 = carrying nothing.
+    cargo_type: int = 0
+    cargo_count: int = 0
+    has_uplink: bool = False
+
     # Direct-impulse physics for heading (matches client's damped torque system)
     vehicle_physics: Optional[VehiclePhysics] = None
 

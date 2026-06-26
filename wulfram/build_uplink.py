@@ -458,6 +458,52 @@ def broadcast_uplink_ship_info(server: object, ship: dict[str, Any]) -> int:
     return sent
 
 
+def broadcast_carrying_info(server: object, ctx: object) -> int:
+    """Broadcast a player's CARRYING_INFO (0x29) to all in-game clients.
+
+    OG's PacketHandler_CARRYING_INFO updates the PlayerEntry cargo fields for the
+    named player, which drives the carried-cargo HUD. Sent to everyone so other
+    players see who is hauling cargo / the uplink.
+    """
+    if ctx is None or getattr(ctx, "session", None) is None:
+        return 0
+    player_oid = ctx.session.player_id or ctx.entity_id
+    payload = build_carrying_info(
+        int(player_oid),
+        cargo_type=int(getattr(ctx, "cargo_type", 0) or 0),
+        has_uplink=bool(getattr(ctx, "has_uplink", False)),
+        cargo_count=int(getattr(ctx, "cargo_count", 0) or 0),
+    )
+    sent = 0
+    for target in server._snapshot_in_game_clients():
+        if server._send_packet_to_client(target, payload, prefer_tcp=True):
+            sent += 1
+    return sent
+
+
+def set_player_carry(server: object, ctx: object, *, cargo_type: int, cargo_count: int, has_uplink: bool) -> dict[str, Any]:
+    """Set a player's cargo carry state; broadcast CARRYING_INFO when it changes."""
+    cargo_type = int(cargo_type) & 0xFF
+    cargo_count = max(0, int(cargo_count)) & 0xFF
+    has_uplink = bool(has_uplink)
+    changed = (
+        ctx.cargo_type != cargo_type
+        or ctx.cargo_count != cargo_count
+        or ctx.has_uplink != has_uplink
+    )
+    ctx.cargo_type = cargo_type
+    ctx.cargo_count = cargo_count
+    ctx.has_uplink = has_uplink
+    sent = server._broadcast_carrying_info(ctx) if changed else 0
+    return {
+        "cargo_type": cargo_type,
+        "cargo_count": cargo_count,
+        "has_uplink": has_uplink,
+        "changed": changed,
+        "recipients": sent,
+    }
+
+
 def send_existing_build_uplink_entities(server: object, ctx: object) -> int:
     sent = 0
     for team_id, ship in sorted(server._uplink_ships.items(), key=lambda item: int(item[0])):

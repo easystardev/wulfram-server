@@ -554,6 +554,8 @@ class ControlServer:
             return self._cmd_buildings(args)
         elif cmd == 'dynbuild':
             return self._cmd_dynbuild(args)
+        elif cmd == 'carry' or cmd == 'drop':
+            return self._cmd_carry(([] if cmd == 'carry' else ['drop']) + args)
         elif cmd == 'building_events' or cmd == 'bevents':
             return self._cmd_building_events(args)
         elif cmd == 'building_damage' or cmd == 'bdmg':
@@ -2086,6 +2088,53 @@ Examples:
                 f"{vel_str}{hp_str}{input_str}{sync_str}{jitter_str}{diagnosis_str}"
             )
         return "\n".join(lines)
+
+    def _cmd_carry(self, args: list) -> str:
+        """Set the active player's cargo carry state + broadcast CARRYING_INFO.
+
+        Usage: carry <type|drop|uplink> [count] [cN]   (or: drop [cN])
+          carry <repair|fuel|energy|...|N> [count]  - carry a cargo box (count=1)
+          drop                                       - drop all cargo
+          carry uplink                               - toggle carrying the uplink device
+        Construction-economy test tool (Phase 1).
+        """
+        from .build_uplink import entity_type_from_name
+        if not self.server:
+            return "Error: No server reference"
+        target_client_id = None
+        filtered = []
+        for a in args:
+            if a.startswith('c') and a[1:].isdigit():
+                target_client_id = int(a[1:])
+            else:
+                filtered.append(a)
+        ctx = None
+        with self.server.clients_lock:
+            for c in self.server.clients.values():
+                if target_client_id is not None and getattr(c, "client_id", None) != target_client_id:
+                    continue
+                if getattr(c, "session", None) and c.session.in_game:
+                    ctx = c
+                    break
+        if ctx is None:
+            return "Error: no in-game client"
+        if not filtered or filtered[0].lower() == "drop":
+            return f"drop: {self.server._set_player_carry(ctx, cargo_type=0, cargo_count=0, has_uplink=False)}"
+        if filtered[0].lower() == "uplink":
+            return f"carry uplink: {self.server._set_player_carry(ctx, cargo_type=ctx.cargo_type, cargo_count=ctx.cargo_count, has_uplink=not ctx.has_uplink)}"
+        etype = entity_type_from_name(filtered[0])
+        if etype is None:
+            try:
+                etype = int(filtered[0])
+            except ValueError:
+                return f"Unknown cargo type: {filtered[0]!r}"
+        count = 1
+        if len(filtered) > 1:
+            try:
+                count = int(filtered[1])
+            except ValueError:
+                pass
+        return f"carry {filtered[0]}: {self.server._set_player_carry(ctx, cargo_type=int(etype), cargo_count=count, has_uplink=ctx.has_uplink)}"
 
     def _cmd_dynbuild(self, args: list) -> str:
         """Build a dynamic (player-built) building via the real uplink path.
