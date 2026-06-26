@@ -666,6 +666,12 @@ class ConfigMixin:
             self.construction_timeout = max(0.0, float(os.environ.get("WULFRAM_CONSTRUCTION_TIMEOUT_S", "0")))
         except ValueError:
             self.construction_timeout = 0.0
+        # Deconstruction timer: a deconstruct takes this many seconds (building stays,
+        # no service, then is removed + cargo refunded). 0 = instant (default).
+        try:
+            self.deconstruction_timeout = max(0.0, float(os.environ.get("WULFRAM_DECONSTRUCTION_TIMEOUT_S", "0")))
+        except ValueError:
+            self.deconstruction_timeout = 0.0
         self.projectiles_enabled = os.environ.get("WULFRAM_PROJECTILES_ENABLED", "1") == "1"
         self.remote_projectiles = os.environ.get("WULFRAM_REMOTE_PROJECTILES", "1") == "1"
         self.remote_combat_observer_packets = (

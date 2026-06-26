@@ -154,6 +154,10 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
         self._uplink_ships: dict[int, dict[str, Any]] = {}
         # oid -> monotonic completion time for structures still under construction.
         self._building_construction: dict[int, float] = {}
+        # oid -> {done, client_id, entity_type, team_id, slot} for structures being
+        # deconstructed (timer); removed + cargo-refunded on completion.
+        self._building_deconstruction: dict[int, dict[str, Any]] = {}
+        self._last_deconstruction_check: float = 0.0
         self._static_world_raycast_root: Optional[_StaticWorldRayNode] = None
         self._building_collision = BuildingCollisionAssets()
         if self._building_collision.load_default():
@@ -1288,6 +1292,16 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
 
     def _broadcast_carrying_info(self, ctx: ClientContext) -> int:
         return build_uplink.broadcast_carrying_info(self, ctx)
+
+    def _update_deconstruction(self) -> None:
+        """Complete due deconstructions (remove + refund). Guarded to run ~once per
+        tick even though it's invoked from the per-client building update."""
+        now = time.monotonic()
+        if now - float(getattr(self, "_last_deconstruction_check", 0.0) or 0.0) < 0.1:
+            return
+        self._last_deconstruction_check = now
+        if getattr(self, "_building_deconstruction", None):
+            build_uplink.update_deconstruction(self)
 
     def _building_under_construction(self, oid: int) -> bool:
         """True while a just-built structure is still constructing (lazy-completes).
@@ -2685,8 +2699,8 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
             # Skip enemy buildings
             if b.team_id != team:
                 continue
-            # Structures under construction don't provide service until complete
-            if self._building_under_construction(oid):
+            # Structures under construction or being deconstructed give no service
+            if self._building_under_construction(oid) or oid in (getattr(self, "_building_deconstruction", None) or {}):
                 continue
 
             dx = px - b.x
@@ -2713,6 +2727,7 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
             ctx.player_energy = min(max_energy, ctx.player_energy + ENERGY_RATE)
 
         self._try_cargo_pickup(ctx)
+        self._update_deconstruction()
 
     def _try_cargo_pickup(self, ctx: ClientContext) -> bool:
         """Pick up a cargo box when near the team supply ship and not carrying.

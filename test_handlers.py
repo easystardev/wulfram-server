@@ -18729,6 +18729,74 @@ def test_deconstruct_refund():
     return True
 
 
+def test_deconstruction_timer():
+    """Deconstruct with a timeout marks the building 'deconstructing' (kept, no
+    service), then update_deconstruction removes + refunds it when due (Phase 2)."""
+    import threading
+    import time as _t
+    from wulfram import build_uplink
+
+    refunds = []
+
+    class Srv:
+        build_require_cargo = True
+        deconstruction_timeout = 100.0
+
+        def __init__(self):
+            self._dynamic_building_ids = {30000}
+            self._building_entities = {30000: SimpleNamespace(entity_type=27, team_id=2)}
+            self._dynamic_building_sources = {30000: {}}
+            self._uplink_ships = {}
+            self._building_deconstruction = {}
+            self.clients = {}
+            self.clients_lock = threading.Lock()
+
+        def _building_lifecycle_base_event(self, oid, action):
+            return {"oid": oid}
+
+        def _broadcast_building_delete(self, oid, prefer_tcp=False):
+            return 1
+
+        def _remove_dynamic_building_record(self, oid):
+            self._building_entities.pop(oid, None)
+            self._dynamic_building_ids.discard(oid)
+
+        def _remember_building_lifecycle_event(self, ev):
+            return ev
+
+        def _broadcast_uplink_ship_info(self, ship):
+            return 0
+
+        def _set_player_carry(self, ctx, *, cargo_type, cargo_count, has_uplink):
+            ctx.cargo_type = cargo_type
+            ctx.cargo_count = cargo_count
+            ctx.has_uplink = has_uplink
+            refunds.append(cargo_type)
+
+    srv = Srv()
+    ctx = SimpleNamespace(cargo_type=0, cargo_count=0, has_uplink=False, client_id=7,
+                          session=SimpleNamespace(team_id=2))
+    srv.clients = {7: ctx}
+
+    # initiate -> deconstructing; building kept, not yet removed/refunded
+    r = build_uplink.delete_dynamic_building_from_uplink(srv, ctx, {})
+    assert r["deconstructing"] is True and r["ok"] is True, r
+    assert 30000 in srv._building_entities and 30000 in srv._building_deconstruction
+    assert not refunds and ctx.cargo_type == 0
+
+    # not due -> no completion
+    assert build_uplink.update_deconstruction(srv) == 0
+    assert 30000 in srv._building_entities, "removed too early"
+
+    # force due -> completes: removed + refunded
+    srv._building_deconstruction[30000]["done"] = _t.monotonic() - 1.0
+    assert build_uplink.update_deconstruction(srv) == 1
+    assert 30000 not in srv._building_entities and 30000 not in srv._building_deconstruction
+    assert ctx.cargo_type == 27 and refunds == [27], (vars(ctx), refunds)
+    print("test_deconstruction_timer: PASSED")
+    return True
+
+
 def main():
     print("=" * 60)
     print("Handler Tests")
@@ -18746,6 +18814,7 @@ def main():
         test_build_require_cargo_gate,
         test_construction_timer_lazy_complete,
         test_deconstruct_refund,
+        test_deconstruction_timer,
         test_behavior_spawn_enabled_defaults_on_for_entry_map_spawn,
         test_input_sync_diagnosis_distinguishes_idle_snapback_from_correction_failure,
         test_input_sync_diagnosis_reports_movement_without_targeted_corrections,

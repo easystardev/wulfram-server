@@ -408,6 +408,23 @@ def delete_dynamic_building_from_uplink(server: object, ctx: object, command: di
     oid = candidates[-1]
     decon_building = server._building_entities.get(oid)
     decon_type = int(decon_building.entity_type) if decon_building else -1
+    # Deconstruction timer: with a timeout, mark the building "deconstructing" (it
+    # stays, no service) and complete removal + refund later via update_deconstruction.
+    timeout = float(getattr(server, "deconstruction_timeout", 0.0) or 0.0)
+    if timeout > 0.0:
+        if oid in server._building_deconstruction:
+            return {"ok": True, "oid": oid, "deconstructing": True, "already": True}
+        server._building_deconstruction[oid] = {
+            "done": time.monotonic() + timeout,
+            "client_id": getattr(ctx, "client_id", None),
+            "entity_type": decon_type, "team_id": team_id, "slot": slot,
+        }
+        return {"ok": True, "oid": oid, "deconstructing": True, "remaining_s": round(timeout, 1)}
+    return _complete_deconstruction(server, oid, ctx, decon_type, team_id, slot)
+
+
+def _complete_deconstruction(server, oid, refund_ctx, decon_type, team_id, slot):
+    """Remove a deconstructed building + (economy on, hands free) refund it as cargo."""
     lifecycle = server._building_lifecycle_base_event(oid, "delete")
     ship = server._uplink_ships.get(team_id)
     if ship is not None and slot is not None:
@@ -422,17 +439,40 @@ def delete_dynamic_building_from_uplink(server: object, ctx: object, command: di
         server._broadcast_uplink_ship_info(ship)
     sent = server._broadcast_building_delete(oid, prefer_tcp=False)
     server._remove_dynamic_building_record(oid)
-    # Refund: deconstructing returns the structure as a carried cargo box (economy
-    # on, hands free) -- the inverse of the build cost. Hands full -> cargo is lost.
     refunded = False
-    if getattr(server, "build_require_cargo", False) and decon_type >= 0:
-        if int(getattr(ctx, "cargo_type", 0) or 0) == 0 and not getattr(ctx, "has_uplink", False):
-            server._set_player_carry(ctx, cargo_type=decon_type, cargo_count=1, has_uplink=False)
+    if refund_ctx is not None and getattr(server, "build_require_cargo", False) and int(decon_type) >= 0:
+        if int(getattr(refund_ctx, "cargo_type", 0) or 0) == 0 and not getattr(refund_ctx, "has_uplink", False):
+            server._set_player_carry(refund_ctx, cargo_type=int(decon_type), cargo_count=1, has_uplink=False)
             refunded = True
     lifecycle.update({"ok": sent > 0, "source": "uplink_delete", "delete_sent": sent,
                       "removed": True, "refunded": refunded})
     server._remember_building_lifecycle_event(lifecycle)
     return {"ok": sent > 0, "oid": oid, "replication_targets": sent, "refunded": refunded}
+
+
+def update_deconstruction(server) -> int:
+    """Complete due deconstructions (remove + refund). Called per-tick (guarded)."""
+    pending = getattr(server, "_building_deconstruction", None)
+    if not pending:
+        return 0
+    now = time.monotonic()
+    due = [oid for oid, info in pending.items() if now >= float(info.get("done", 0.0))]
+    for oid in due:
+        info = pending.pop(oid, None)
+        if info is None:
+            continue
+        refund_ctx = None
+        cid = info.get("client_id")
+        if cid is not None:
+            with server.clients_lock:
+                for c in server.clients.values():
+                    if getattr(c, "client_id", None) == cid:
+                        refund_ctx = c
+                        break
+        _complete_deconstruction(server, oid, refund_ctx, info.get("entity_type", -1),
+                                 info.get("team_id", 1), info.get("slot"))
+        print(f"[DECONSTRUCT] building oid={oid} removed")
+    return len(due)
 
 
 def get_or_create_uplink_ship(server: object, ctx: object, team_id: int) -> dict[str, Any]:
