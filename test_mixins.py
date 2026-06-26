@@ -21,6 +21,7 @@ EXPECTED_MIXINS = [
     ("server_remote", "RemoteSyncMixin"),
     ("server_corrections", "CorrectionMixin"),
     ("server_tick", "TickMixin"),
+    ("server_net", "NetMixin"),
 ]
 
 # A representative method moved into each mixin -- must still resolve on the
@@ -34,6 +35,7 @@ SAMPLE_METHODS = [
     "_send_remote_player_updates",        # RemoteSyncMixin
     "_send_state_sync_snapshot",          # CorrectionMixin
     "_resolve_entity_world_collision",    # TickMixin
+    "_handle_client",                     # NetMixin
 ]
 
 
