@@ -406,6 +406,8 @@ def delete_dynamic_building_from_uplink(server: object, ctx: object, command: di
     if not candidates:
         return {"ok": False, "error": "no matching dynamic building"}
     oid = candidates[-1]
+    decon_building = server._building_entities.get(oid)
+    decon_type = int(decon_building.entity_type) if decon_building else -1
     lifecycle = server._building_lifecycle_base_event(oid, "delete")
     ship = server._uplink_ships.get(team_id)
     if ship is not None and slot is not None:
@@ -420,9 +422,17 @@ def delete_dynamic_building_from_uplink(server: object, ctx: object, command: di
         server._broadcast_uplink_ship_info(ship)
     sent = server._broadcast_building_delete(oid, prefer_tcp=False)
     server._remove_dynamic_building_record(oid)
-    lifecycle.update({"ok": sent > 0, "source": "uplink_delete", "delete_sent": sent, "removed": True})
+    # Refund: deconstructing returns the structure as a carried cargo box (economy
+    # on, hands free) -- the inverse of the build cost. Hands full -> cargo is lost.
+    refunded = False
+    if getattr(server, "build_require_cargo", False) and decon_type >= 0:
+        if int(getattr(ctx, "cargo_type", 0) or 0) == 0 and not getattr(ctx, "has_uplink", False):
+            server._set_player_carry(ctx, cargo_type=decon_type, cargo_count=1, has_uplink=False)
+            refunded = True
+    lifecycle.update({"ok": sent > 0, "source": "uplink_delete", "delete_sent": sent,
+                      "removed": True, "refunded": refunded})
     server._remember_building_lifecycle_event(lifecycle)
-    return {"ok": sent > 0, "oid": oid, "replication_targets": sent}
+    return {"ok": sent > 0, "oid": oid, "replication_targets": sent, "refunded": refunded}
 
 
 def get_or_create_uplink_ship(server: object, ctx: object, team_id: int) -> dict[str, Any]:

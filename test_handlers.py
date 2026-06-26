@@ -18675,6 +18675,60 @@ def test_construction_timer_lazy_complete():
     return True
 
 
+def test_deconstruct_refund():
+    """Deconstruct removes a player-built structure and refunds it as carried
+    cargo when the economy is on and the player's hands are free (Phase 2)."""
+    from wulfram import build_uplink
+
+    class Srv:
+        build_require_cargo = True
+
+        def __init__(self):
+            self._dynamic_building_ids = {30000}
+            self._building_entities = {30000: SimpleNamespace(entity_type=27, team_id=2)}
+            self._dynamic_building_sources = {30000: {}}
+            self._uplink_ships = {}
+
+        def _building_lifecycle_base_event(self, oid, action):
+            return {"oid": oid, "action": action}
+
+        def _broadcast_building_delete(self, oid, prefer_tcp=False):
+            return 1
+
+        def _remove_dynamic_building_record(self, oid):
+            self._building_entities.pop(oid, None)
+            self._dynamic_building_ids.discard(oid)
+
+        def _remember_building_lifecycle_event(self, ev):
+            return ev
+
+        def _broadcast_uplink_ship_info(self, ship):
+            return 0
+
+        def _set_player_carry(self, ctx, *, cargo_type, cargo_count, has_uplink):
+            ctx.cargo_type = cargo_type
+            ctx.cargo_count = cargo_count
+            ctx.has_uplink = has_uplink
+            return {}
+
+    srv = Srv()
+    ctx = SimpleNamespace(cargo_type=0, cargo_count=0, has_uplink=False, client_id=1,
+                          session=SimpleNamespace(team_id=2))
+    r = build_uplink.delete_dynamic_building_from_uplink(srv, ctx, {})
+    assert r["ok"] is True and r["refunded"] is True, r
+    assert ctx.cargo_type == 27 and ctx.cargo_count == 1, vars(ctx)
+    assert 30000 not in srv._building_entities, srv._building_entities
+
+    # hands full -> no refund (cargo lost), building still removed
+    srv2 = Srv()
+    ctx2 = SimpleNamespace(cargo_type=27, cargo_count=1, has_uplink=False, client_id=1,
+                           session=SimpleNamespace(team_id=2))
+    r2 = build_uplink.delete_dynamic_building_from_uplink(srv2, ctx2, {})
+    assert r2["ok"] is True and r2["refunded"] is False, r2
+    print("test_deconstruct_refund: PASSED")
+    return True
+
+
 def main():
     print("=" * 60)
     print("Handler Tests")
@@ -18691,6 +18745,7 @@ def main():
         test_cargo_pickup_proximity,
         test_build_require_cargo_gate,
         test_construction_timer_lazy_complete,
+        test_deconstruct_refund,
         test_behavior_spawn_enabled_defaults_on_for_entry_map_spawn,
         test_input_sync_diagnosis_distinguishes_idle_snapback_from_correction_failure,
         test_input_sync_diagnosis_reports_movement_without_targeted_corrections,

@@ -558,6 +558,8 @@ class ControlServer:
             return self._cmd_carry(([] if cmd == 'carry' else ['drop']) + args)
         elif cmd == 'econ':
             return self._cmd_econ(args)
+        elif cmd == 'decon':
+            return self._cmd_decon(args)
         elif cmd == 'building_events' or cmd == 'bevents':
             return self._cmd_building_events(args)
         elif cmd == 'building_damage' or cmd == 'bdmg':
@@ -2090,6 +2092,44 @@ Examples:
                 f"{vel_str}{hp_str}{input_str}{sync_str}{jitter_str}{diagnosis_str}"
             )
         return "\n".join(lines)
+
+    def _cmd_decon(self, args: list) -> str:
+        """Deconstruct the active player's latest matching dynamic building.
+
+        Usage: decon [type] [cN]   (type optional: repair|fuel|...|N to filter)
+        Removes a player-built structure; with the economy on and hands free,
+        refunds it as carried cargo. Phase-2 test tool.
+        """
+        from .build_uplink import entity_type_from_name
+        if not self.server:
+            return "Error: No server reference"
+        target_client_id = None
+        filtered = []
+        for a in args:
+            if a.startswith('c') and a[1:].isdigit():
+                target_client_id = int(a[1:])
+            else:
+                filtered.append(a)
+        ctx = None
+        with self.server.clients_lock:
+            for c in self.server.clients.values():
+                if target_client_id is not None and getattr(c, "client_id", None) != target_client_id:
+                    continue
+                if getattr(c, "session", None) and c.session.in_game:
+                    ctx = c
+                    break
+        if ctx is None:
+            return "Error: no in-game client"
+        command = {}
+        if filtered:
+            etype = entity_type_from_name(filtered[0])
+            if etype is None:
+                try:
+                    etype = int(filtered[0])
+                except ValueError:
+                    return f"Unknown building type: {filtered[0]!r}"
+            command["entity_type"] = int(etype)
+        return f"decon: {self.server._delete_dynamic_building_from_uplink(ctx, command)}"
 
     def _cmd_econ(self, args: list) -> str:
         """Dump construction-economy state as JSON: per-player carry, supply ships,
