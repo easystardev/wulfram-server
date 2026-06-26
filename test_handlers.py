@@ -18503,6 +18503,61 @@ def test_uplink_mvp_bootstrap_sends_minimal_status_packets():
     return True
 
 
+def test_lead_extrapolated_correction_pose():
+    """Prediction-lead correction extrapolation (WULFRAM_CORRECTION_LEAD_TICKS).
+
+    Characterization (tools/wulftap_turn_capture.py) showed the OG client predicts
+    ~1 server tick AHEAD of the server's confirmed pose, with the turn RATE
+    lockstep. `_lead_extrapolated_correction_pose` aims corrections at that
+    predicted pose so they stop snapping the client backward. lead=0 must be a
+    byte-identical no-op vs the old `_to_client_pos(player_pos)` /
+    `_local_player_sync_rotation`; lead>0 advances pos by `player_vel`*dt and yaw
+    by `angular_vel_yaw`*dt (the very rates the integrator advances pos/heading
+    with); at rest both rates are 0 so it is a no-op.
+    """
+    from wulfram.server import WulframServer
+
+    def make_self(lead):
+        return SimpleNamespace(
+            correction_lead_ticks=lead,
+            tick_rate_hz=30.0,
+            # mimic _to_client_pos (pos_offset=5) and _local_player_sync_rotation
+            _to_client_pos=lambda p: (p[0], p[1], p[2] + 5.0),
+            _local_player_sync_rotation=lambda c: (
+                c.player_pose["roll"], c.player_pose["pitch"], c.player_heading),
+        )
+
+    pose = {"roll": 0.1, "pitch": -0.2}
+    moving = SimpleNamespace(
+        player_pos=(100.0, 200.0, 3.0), player_vel=(6.0, -3.0, 0.3),
+        angular_vel_yaw=0.9, player_heading=1.5, player_pose=pose)
+
+    # lead=0 -> identity with the legacy path
+    pos0, rot0 = WulframServer._lead_extrapolated_correction_pose(make_self(0.0), moving)
+    assert pos0 == (100.0, 200.0, 8.0), pos0
+    assert rot0 == (0.1, -0.2, 1.5), rot0
+
+    # lead=1 tick (1/30 s)
+    dt = 1.0 / 30.0
+    pos1, rot1 = WulframServer._lead_extrapolated_correction_pose(make_self(1.0), moving)
+    assert abs(pos1[0] - (100.0 + 6.0 * dt)) < 1e-9, pos1
+    assert abs(pos1[1] - (200.0 - 3.0 * dt)) < 1e-9, pos1
+    assert abs(pos1[2] - (3.0 + 0.3 * dt + 5.0)) < 1e-9, pos1
+    assert rot1[0] == 0.1 and rot1[1] == -0.2, rot1
+    assert abs(rot1[2] - (1.5 + 0.9 * dt)) < 1e-9, rot1
+
+    # at rest -> no-op even with lead>0
+    rest = SimpleNamespace(
+        player_pos=(10.0, 20.0, 3.0), player_vel=(0.0, 0.0, 0.0),
+        angular_vel_yaw=0.0, player_heading=2.0, player_pose=pose)
+    posr, rotr = WulframServer._lead_extrapolated_correction_pose(make_self(1.0), rest)
+    assert posr == (10.0, 20.0, 8.0), posr
+    assert rotr == (0.1, -0.2, 2.0), rotr
+
+    print("test_lead_extrapolated_correction_pose: PASSED")
+    return True
+
+
 def main():
     print("=" * 60)
     print("Handler Tests")
@@ -18514,6 +18569,7 @@ def main():
         test_decode_lp_string_empty,
         test_decode_lp_string_truncated,
         test_handlers_import,
+        test_lead_extrapolated_correction_pose,
         test_behavior_spawn_enabled_defaults_on_for_entry_map_spawn,
         test_input_sync_diagnosis_distinguishes_idle_snapback_from_correction_failure,
         test_input_sync_diagnosis_reports_movement_without_targeted_corrections,

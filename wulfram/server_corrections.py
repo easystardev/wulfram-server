@@ -209,13 +209,11 @@ class CorrectionMixin:
         )
         if snapshot is None:
             snapshot_source = "live"
-            send_pos = self._to_client_pos(ctx.player_pos)
+            # Same prediction-lead extrapolation as the cadence/burst correction
+            # path (_build_empirical_correction_payload) so STATE_REQUEST replies
+            # target the client's predicted pose, not the 1-tick-stale current one.
+            send_pos, update_rot = self._lead_extrapolated_correction_pose(ctx)
             sync_vel = ctx.player_vel
-            update_rot = (
-                ctx.player_pose.get("roll", 0.0),
-                ctx.player_pose.get("pitch", 0.0),
-                ctx.player_heading,
-            )
         else:
             snapshot_source = "history"
             send_pos = snapshot["pos"]
@@ -612,6 +610,31 @@ class CorrectionMixin:
                 )
         ctx.divergence_accum_pos = accum
 
+    def _lead_extrapolated_correction_pose(self, ctx: ClientContext):
+        """Correction-target pose, optionally extrapolated forward by the client's
+        prediction lead (WULFRAM_CORRECTION_LEAD_TICKS; see _init_correction_config).
+
+        Returns ``(client_pos, rot)`` in exactly the conventions the no-lead path
+        used — `_to_client_pos(player_pos)` and `_local_player_sync_rotation` —
+        so lead=0 is byte-identical to the previous behaviour. When lead>0 the
+        position is advanced by `player_vel` and the body heading by
+        `angular_vel_yaw` (the same rates the integrator uses to advance pos and
+        `player_heading`), so the snap lands where the client already predicted.
+        At rest both rates are 0, making the correction a no-op.
+        """
+        rot = self._local_player_sync_rotation(ctx)
+        lead = float(getattr(self, "correction_lead_ticks", 0.0) or 0.0)
+        if lead <= 0.0:
+            return self._to_client_pos(ctx.player_pos), rot
+        dt_lead = lead / max(1.0, float(getattr(self, "tick_rate_hz", 30.0)))
+        px, py, pz = ctx.player_pos
+        vx, vy, vz = getattr(ctx, "player_vel", (0.0, 0.0, 0.0))
+        ext_pos = (px + vx * dt_lead, py + vy * dt_lead, pz + vz * dt_lead)
+        ang = float(getattr(ctx, "angular_vel_yaw", 0.0) or 0.0)
+        roll, pitch, yaw = rot
+        ext_rot = (roll, pitch, yaw + ang * dt_lead)
+        return self._to_client_pos(ext_pos), ext_rot
+
     def _build_empirical_correction_payload(
         self,
         ctx: ClientContext,
@@ -644,8 +667,7 @@ class CorrectionMixin:
         docs/keepalive-breaks-correction-2026-04-18.md.
         """
         self._repair_recent_control_pose_jump(ctx, "correction_payload")
-        corr_pos = self._to_client_pos(ctx.player_pos)
-        corr_rot = self._local_player_sync_rotation(ctx)
+        corr_pos, corr_rot = self._lead_extrapolated_correction_pose(ctx)
         cmode = self.correction_mode
         inc_pos = cmode in ("full", "pos_only", "dual_entity", "view_update", "view_update_define")
         inc_vel = cmode in ("full", "pos_only", "dual_entity", "view_update")

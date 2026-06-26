@@ -229,6 +229,26 @@ class ConfigMixin:
             self.periodic_correction_interval = 0.0
         if self.periodic_correction_interval < 0.0:
             self.periodic_correction_interval = 0.0
+        # Prediction-lead extrapolation (2026-06-26). Characterized via
+        # tools/wulftap_turn_capture.py + analyze_turn_capture.py: the OG client
+        # runs deterministic prediction ~1 server tick AHEAD of the server's
+        # confirmed authoritative pose. The yaw/position gap through a turn holds
+        # a CONSTANT ~0.5-1.0 tick of motion (mean 0.73, std 0.24) — it does NOT
+        # grow with turn angle, so the turn RATE is lockstep and the residual is
+        # a pure phase lead, not a sim divergence. An open-loop correction that
+        # snaps the client to the *current* authoritative pose therefore yanks it
+        # ~1 tick BACKWARD on every cadence = the visible jerk. Extrapolating the
+        # correction TARGET forward by this many ticks — using the very
+        # velocity/angular-velocity the integrator advances pos/heading with —
+        # lands the snap where the client already predicted: a near no-op when
+        # prediction is correct (and exactly a no-op at rest, since vel=angvel=0),
+        # while genuine divergence still snaps. 0 = legacy (target current pose).
+        try:
+            self.correction_lead_ticks = float(os.environ.get("WULFRAM_CORRECTION_LEAD_TICKS", "1.0"))
+        except ValueError:
+            self.correction_lead_ticks = 1.0
+        if self.correction_lead_ticks < 0.0:
+            self.correction_lead_ticks = 0.0
         try:
             # Per-tick noise floor: server-only displacement below this is treated
             # as float/quantization noise and ignored (keeps flat ground at ~0).
@@ -300,6 +320,7 @@ class ConfigMixin:
             f"divergence_pos={self.correction_divergence_pos}u "
             f"divergence_heading={self.correction_divergence_heading_deg}deg "
             f"min_interval={self.correction_min_interval}s "
+            f"lead_ticks={self.correction_lead_ticks} "
             f"floor={self.correction_divergence_floor}u decay={self.correction_divergence_decay} "
             f"state_request_burst={int(self.state_request_burst_enabled)} "
             f"burst_queue_min_interval={self.state_request_burst_min_interval}s"
