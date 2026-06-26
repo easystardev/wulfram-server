@@ -6,6 +6,7 @@ replication layer (the local-state heartbeat builders).
 from __future__ import annotations
 
 import os
+import time
 from typing import Optional
 
 from . import handlers
@@ -15,6 +16,7 @@ from .packets import (
     build_add_to_roster,
     build_remove_from_roster,
     build_update_stats,
+    build_update_array_create_tank,
 )
 from wulfram2_protocol.entities import (
     LOCAL_STATE_PRIMARY_TURRET_WEAPON_TYPES,
@@ -560,3 +562,147 @@ class ReplicationMixin:
                 continue
             c.known_roster_ids.discard(player_id)
             self._send_packet_to_client(c, payload, prefer_tcp=True, allow_udp_fallback=False)
+
+    def _broadcast_player_stats(
+        self,
+        player_ctx: ClientContext,
+        *,
+        participants: tuple[ClientContext, ...] = (),
+    ) -> None:
+        """Send UPDATE_STATS for player_ctx to all connected clients."""
+        player_id = player_ctx.session.player_id or player_ctx.entity_id
+        entity_id = player_ctx.entity_id
+        team = player_ctx.session.team_id or 1
+        pkt = build_update_stats(
+            player_id=player_id,
+            entity_id=entity_id,
+            kills=player_ctx.kills,
+            deaths=player_ctx.deaths,
+            team_id=team,
+        )
+        for client in self._snapshot_in_game_clients():
+            if not self._combat_observer_packets_allowed_for_client(client, *participants):
+                continue
+            self._send_packet_to_client(
+                client,
+                pkt,
+                prefer_tcp=True,
+                allow_udp_fallback=False,
+            )
+
+    def _send_entity_create(self, target_ctx: ClientContext, player_ctx: ClientContext, *, is_retry: bool = False) -> None:
+        """Announce player_ctx's entity to target_ctx via UPDATE_ARRAY DEFINITION.
+
+        Remote entities are created via UPDATE_ARRAY's fallback path:
+          1. OIDTable_lookup(entity_id) â†’ NOT FOUND
+          2. Entity_create_from_network() creates entity + sets team/config
+          3. Entity_apply_network_transform: entity+0xAC=0 â†’ copies position â†’
+             Entity_toggle_static_state() â†’ Entity_set_transform() â†’ visible!
+
+        The client's Replication.c has a global tick guard
+        (g_tick_count < g_next_periodic_send_tick) that may block
+        Entity_apply_network_transform for newly connected clients.
+        To work around this, we resend entity creation packets for a
+        retry period after the first attempt, so that one eventually
+        arrives when the guard is open.
+        """
+        if not self._og_viewer_replication_enabled(target_ctx, "entity_create"):
+            return
+        if not target_ctx.session.translation_ack_received:
+            return
+        entity_id = player_ctx.session.entity_id or player_ctx.entity_id
+
+        # Track entity creation timing for retry logic.
+        if not hasattr(target_ctx, '_entity_create_times'):
+            target_ctx._entity_create_times = {}  # entity_id â†’ (first_send_time, last_send_time)
+
+        now = time.monotonic()
+        # Fast retries for the first N seconds, then slow periodic re-announce.
+        # The client's tick guard (g_tick_count < g_next_periodic_send_tick) can
+        # block Entity_apply_network_transform indefinitely.  DEFINITION packets
+        # bypass the guard via Entity_create_from_network (entity+0xAC=0 path),
+        # so periodic re-announce keeps entities visible even after the guard
+        # activates.
+        fast_window = float(os.environ.get("WULFRAM_ENTITY_CREATE_RETRY_SECS", "10"))
+        fast_interval = float(os.environ.get("WULFRAM_ENTITY_CREATE_RETRY_INTERVAL", "0.5"))
+        slow_interval = float(os.environ.get("WULFRAM_ENTITY_REANNOUNCE_INTERVAL", "5.0"))
+
+        if entity_id in target_ctx.known_entity_ids:
+            # Already sent at least once.  Check if we should retry.
+            times = target_ctx._entity_create_times.get(entity_id)
+            if times is None:
+                return  # No tracking info â€” legacy, don't retry.
+            first_send, last_send = times
+            in_fast_window = (now - first_send) <= fast_window
+            if not in_fast_window:
+                return  # Past fast window â€” entity is created, UPDATE packets handle sync.
+                # NOTE: Slow re-announce was REMOVED because build_update_array_create_tank
+                # sends hardcoded rotation=(0,0,0) and no velocity, causing the remote entity
+                # to visually snap to heading=0 every re-announce interval (glitching).
+            if (now - last_send) < fast_interval:
+                return  # Too soon since last retry.
+            is_retry = True
+
+        pos = self._to_client_pos(player_ctx.player_pos)
+        team = player_ctx.session.team_id or 1
+        tick = self._get_network_tick(target_ctx)
+        rot = self._player_body_rotation(
+            player_ctx,
+            negate_yaw=self.remote_yaw_negate,
+            yaw_offset=self.remote_yaw_offset,
+        )
+
+        include_local_state, ls = self._get_update_array_local_state_for_viewer(target_ctx)
+        create_pkt = build_update_array_create_tank(
+            tick=tick,
+            entity_id=entity_id,
+            entity_type=player_ctx.entity_type,
+            team=team,
+            pos=pos,
+            is_manned=True,
+            rot=rot,
+            include_health=include_local_state,
+            **ls,
+        )
+        label = "RETRY" if is_retry else "CREATE"
+        print(f"[MULTI] UPDATE_ARRAY DEFINITION {label} id={entity_id} "
+              f"type={player_ctx.entity_type} team={team} pos={pos} "
+              f"tick={tick} -> client {target_ctx.client_id}")
+        if not is_retry:
+            print(f"[MULTI-HEX] {create_pkt.hex().upper()}")
+        # OG clients are sensitive to UPDATE_ARRAY over TCP. Remote entity
+        # creation already has UDP retries, so keep this path UDP-only.
+        if not self._send_packet_to_client(target_ctx, create_pkt, prefer_tcp=False):
+            return
+
+        if entity_id not in target_ctx.known_entity_ids:
+            target_ctx.known_entity_ids.add(entity_id)
+            target_ctx._entity_create_times[entity_id] = (now, now)
+            print(f"[MULTI] Sent entity create OK -> client {target_ctx.client_id}")
+        else:
+            first_send = target_ctx._entity_create_times[entity_id][0]
+            target_ctx._entity_create_times[entity_id] = (first_send, now)
+            elapsed = now - first_send
+            phase = "RETRY" if elapsed <= fast_window else "REANNOUNCE"
+            if phase == "RETRY" or int(elapsed) % 30 == 0:  # Log retries always, re-announces every 30s
+                print(f"[MULTI] Sent entity create {phase} -> client {target_ctx.client_id} ({elapsed:.1f}s since first)")
+
+    def _ensure_multiplayer_visibility(self, ctx: ClientContext) -> None:
+        """Ensure ctx sees other players and vice versa once translation is ready."""
+        if not ctx.session.translation_ack_received:
+            return
+        self._ensure_uplink_mvp_state(ctx)
+        others = [c for c in self._snapshot_in_game_clients() if c is not ctx]
+        if ctx.session.tick % 300 == 0 and others:
+            print(f"[MULTI-DBG] client={ctx.client_id} trans_ack={ctx.session.translation_ack_received} "
+                  f"others={[(o.client_id, o.session.entity_id or o.entity_id, o.session.translation_ack_received) for o in others]} "
+                  f"known={ctx.known_entity_ids}")
+        for other in others:
+            # Always try to exchange roster entries (idempotent).
+            self._send_roster_entry(ctx, other)
+            if other.session.translation_ack_received:
+                self._send_roster_entry(other, ctx)
+            # Entity creation requires target translation ack.
+            self._send_entity_create(ctx, other)
+            if other.session.translation_ack_received:
+                self._send_entity_create(other, ctx)
