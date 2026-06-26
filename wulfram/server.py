@@ -152,6 +152,8 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
         self._build_uplink_command_events: list[dict[str, Any]] = []
         self._building_lifecycle_events: list[dict[str, Any]] = []
         self._uplink_ships: dict[int, dict[str, Any]] = {}
+        # oid -> monotonic completion time for structures still under construction.
+        self._building_construction: dict[int, float] = {}
         self._static_world_raycast_root: Optional[_StaticWorldRayNode] = None
         self._building_collision = BuildingCollisionAssets()
         if self._building_collision.load_default():
@@ -1286,6 +1288,25 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
 
     def _broadcast_carrying_info(self, ctx: ClientContext) -> int:
         return build_uplink.broadcast_carrying_info(self, ctx)
+
+    def _building_under_construction(self, oid: int) -> bool:
+        """True while a just-built structure is still constructing (lazy-completes).
+
+        Completion is time-based and resolved on access — when the timer elapses the
+        oid is dropped from the under-construction set and the building becomes
+        functional (service-providing). No separate per-tick loop needed.
+        """
+        construction = getattr(self, "_building_construction", None)
+        if not construction:
+            return False
+        done = construction.get(int(oid))
+        if done is None:
+            return False
+        if time.monotonic() >= done:
+            del construction[int(oid)]
+            print(f"[CONSTRUCTION] building oid={oid} complete")
+            return False
+        return True
 
     def _set_player_carry(self, ctx: ClientContext, *, cargo_type: int, cargo_count: int, has_uplink: bool) -> dict:
         return build_uplink.set_player_carry(
@@ -2663,6 +2684,9 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
                 continue
             # Skip enemy buildings
             if b.team_id != team:
+                continue
+            # Structures under construction don't provide service until complete
+            if self._building_under_construction(oid):
                 continue
 
             dx = px - b.x

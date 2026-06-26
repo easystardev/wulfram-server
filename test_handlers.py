@@ -18655,6 +18655,26 @@ def test_build_require_cargo_gate():
     return True
 
 
+def test_construction_timer_lazy_complete():
+    """_building_under_construction is True until the timer elapses, then completes."""
+    from wulfram.server import WulframServer
+    import time as _time
+
+    srv = SimpleNamespace(_building_construction={})
+    # untracked -> not under construction
+    assert WulframServer._building_under_construction(srv, 999) is False
+    # future completion -> under construction (stays tracked)
+    srv._building_construction[30001] = _time.monotonic() + 100.0
+    assert WulframServer._building_under_construction(srv, 30001) is True
+    assert 30001 in srv._building_construction
+    # elapsed completion -> completes + drops from the set
+    srv._building_construction[30002] = _time.monotonic() - 1.0
+    assert WulframServer._building_under_construction(srv, 30002) is False
+    assert 30002 not in srv._building_construction
+    print("test_construction_timer_lazy_complete: PASSED")
+    return True
+
+
 def main():
     print("=" * 60)
     print("Handler Tests")
@@ -18670,6 +18690,7 @@ def main():
         test_carrying_info_carry_state,
         test_cargo_pickup_proximity,
         test_build_require_cargo_gate,
+        test_construction_timer_lazy_complete,
         test_behavior_spawn_enabled_defaults_on_for_entry_map_spawn,
         test_input_sync_diagnosis_distinguishes_idle_snapback_from_correction_failure,
         test_input_sync_diagnosis_reports_movement_without_targeted_corrections,

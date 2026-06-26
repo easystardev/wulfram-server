@@ -660,6 +660,12 @@ class ConfigMixin:
         except (ValueError, TypeError):
             self.default_cargo_type = int(EntityType.REPAIR_BUILDING)
         self.build_require_cargo = os.environ.get("WULFRAM_BUILD_REQUIRE_CARGO", "0").strip().lower() in ("1", "on", "true", "yes")
+        # Construction timer: a just-built structure is "under construction" for this
+        # many seconds (provides no service until complete). 0 = instant (default).
+        try:
+            self.construction_timeout = max(0.0, float(os.environ.get("WULFRAM_CONSTRUCTION_TIMEOUT_S", "0")))
+        except ValueError:
+            self.construction_timeout = 0.0
         self.projectiles_enabled = os.environ.get("WULFRAM_PROJECTILES_ENABLED", "1") == "1"
         self.remote_projectiles = os.environ.get("WULFRAM_REMOTE_PROJECTILES", "1") == "1"
         self.remote_combat_observer_packets = (

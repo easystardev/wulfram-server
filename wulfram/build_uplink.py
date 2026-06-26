@@ -359,6 +359,12 @@ def create_dynamic_building_from_uplink(server: object, ctx: object, command: di
             has_uplink=bool(getattr(ctx, "has_uplink", False)),
         )
         consumed_cargo = True
+    # Construction timer: structure is "under construction" (no service) until the
+    # timeout elapses. Created/visible immediately; functionality gates on it.
+    timeout = float(getattr(server, "construction_timeout", 0.0) or 0.0)
+    under_construction = timeout > 0.0 and sent > 0
+    if under_construction:
+        server._building_construction[oid] = time.monotonic() + timeout
     event = {
         "ok": sent > 0,
         "oid": oid,
