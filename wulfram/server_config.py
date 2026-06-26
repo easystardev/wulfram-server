@@ -645,6 +645,21 @@ class ConfigMixin:
         # building's replicated rotation gets terrain pitch/roll so it lies on the
         # slope. Static MAP buildings are client-local-rendered and unaffected. 0 = off.
         self.building_terrain_conform = os.environ.get("WULFRAM_BUILDING_TERRAIN_CONFORM", "1") != "0"
+        # Cargo economy (construction Phase 1). Pickup: when a player drives within
+        # cargo_pickup_range of the team supply ship and isn't carrying, they pick up
+        # a cargo box (default_cargo_type). build_require_cargo gates whether a build
+        # consumes carried cargo (default off so dynbuild/testing builds freely; on =
+        # real economy where you build what you carry).
+        try:
+            self.cargo_pickup_range = float(os.environ.get("WULFRAM_CARGO_PICKUP_RANGE", "30.0"))
+        except ValueError:
+            self.cargo_pickup_range = 30.0
+        from .weapons import EntityType
+        try:
+            self.default_cargo_type = int(os.environ.get("WULFRAM_DEFAULT_CARGO_TYPE", str(int(EntityType.REPAIR_BUILDING))))
+        except (ValueError, TypeError):
+            self.default_cargo_type = int(EntityType.REPAIR_BUILDING)
+        self.build_require_cargo = os.environ.get("WULFRAM_BUILD_REQUIRE_CARGO", "0").strip().lower() in ("1", "on", "true", "yes")
         self.projectiles_enabled = os.environ.get("WULFRAM_PROJECTILES_ENABLED", "1") == "1"
         self.remote_projectiles = os.environ.get("WULFRAM_REMOTE_PROJECTILES", "1") == "1"
         self.remote_combat_observer_packets = (

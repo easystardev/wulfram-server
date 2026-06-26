@@ -305,6 +305,15 @@ def create_dynamic_building_from_uplink(server: object, ctx: object, command: di
     entity_type = int(command["entity_type"])
     team_id = int(ctx.session.team_id or 1)
     slot = int(command.get("slot", 0) or 0)
+    # Cargo economy: when build_require_cargo is on, a build consumes a carried
+    # cargo box and builds WHAT YOU CARRY (the carried cargo_type overrides the
+    # requested type). Default off so dynbuild/testing builds freely.
+    if getattr(server, "build_require_cargo", False):
+        carried = int(getattr(ctx, "cargo_type", 0) or 0)
+        if carried == 0:
+            return {"ok": False, "oid": None, "error": "no_cargo",
+                    "detail": "not carrying cargo to build (drive to the supply ship)"}
+        entity_type = carried
     oid = server._allocate_dynamic_building_oid()
     x, y, z = server._choose_dynamic_building_pos(ctx, slot)
     heading = float(getattr(ctx, "player_heading", 0.0) or 0.0)
@@ -339,6 +348,17 @@ def create_dynamic_building_from_uplink(server: object, ctx: object, command: di
         heading=heading,
         is_static=True,
     )
+    # Consume one carried cargo box on a successful build (economy on).
+    consumed_cargo = False
+    if getattr(server, "build_require_cargo", False) and sent > 0:
+        new_count = max(0, int(getattr(ctx, "cargo_count", 0) or 0) - 1)
+        server._set_player_carry(
+            ctx,
+            cargo_type=int(ctx.cargo_type) if new_count > 0 else 0,
+            cargo_count=new_count,
+            has_uplink=bool(getattr(ctx, "has_uplink", False)),
+        )
+        consumed_cargo = True
     event = {
         "ok": sent > 0,
         "oid": oid,
@@ -348,6 +368,7 @@ def create_dynamic_building_from_uplink(server: object, ctx: object, command: di
         "pos": [round(float(v), 5) for v in building.pos],
         "health": max_hp,
         "replication_targets": sent,
+        "consumed_cargo": consumed_cargo,
     }
     print(
         f"[BUILD-UPLINK] created oid={oid} type={event['entity_type_name']} "

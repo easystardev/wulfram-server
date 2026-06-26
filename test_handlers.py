@@ -18608,6 +18608,53 @@ def test_carrying_info_carry_state():
     return True
 
 
+def test_cargo_pickup_proximity():
+    """_try_cargo_pickup grabs a cargo box near the team ship, only empty-handed."""
+    from wulfram.server import WulframServer
+
+    carries = []
+
+    def set_carry(ctx, *, cargo_type, cargo_count, has_uplink):
+        ctx.cargo_type = cargo_type
+        ctx.cargo_count = cargo_count
+        ctx.has_uplink = has_uplink
+        carries.append((cargo_type, cargo_count))
+        return {}
+
+    srv = SimpleNamespace(
+        _uplink_ships={2: {"oid": 29002, "pos": (5000.0, 5000.0, 5.0)}},
+        cargo_pickup_range=30.0, default_cargo_type=27, _set_player_carry=set_carry)
+    ctx = SimpleNamespace(
+        cargo_type=0, cargo_count=0, has_uplink=False, client_id=1,
+        player_pos=(5100.0, 5000.0, 5.0), session=SimpleNamespace(team_id=2, in_game=True))
+
+    # far from ship -> no pickup
+    assert WulframServer._try_cargo_pickup(srv, ctx) is False and not carries, carries
+    # near ship + empty-handed -> pickup
+    ctx.player_pos = (5010.0, 5000.0, 5.0)
+    assert WulframServer._try_cargo_pickup(srv, ctx) is True
+    assert ctx.cargo_type == 27 and ctx.cargo_count == 1, vars(ctx)
+    # already carrying -> no re-pickup
+    carries.clear()
+    assert WulframServer._try_cargo_pickup(srv, ctx) is False and not carries, carries
+    print("test_cargo_pickup_proximity: PASSED")
+    return True
+
+
+def test_build_require_cargo_gate():
+    """build_require_cargo: a build with no carried cargo is rejected, no build."""
+    from wulfram import build_uplink
+
+    ctx = SimpleNamespace(
+        cargo_type=0, cargo_count=0, has_uplink=False, client_id=1, entity_id=1339,
+        session=SimpleNamespace(team_id=2, entity_id=1339))
+    srv = SimpleNamespace(build_require_cargo=True)
+    r = build_uplink.create_dynamic_building_from_uplink(srv, ctx, {"entity_type": 27, "slot": 0})
+    assert r["ok"] is False and r["error"] == "no_cargo", r
+    print("test_build_require_cargo_gate: PASSED")
+    return True
+
+
 def main():
     print("=" * 60)
     print("Handler Tests")
@@ -18621,6 +18668,8 @@ def main():
         test_handlers_import,
         test_lead_extrapolated_correction_pose,
         test_carrying_info_carry_state,
+        test_cargo_pickup_proximity,
+        test_build_require_cargo_gate,
         test_behavior_spawn_enabled_defaults_on_for_entry_map_spawn,
         test_input_sync_diagnosis_distinguishes_idle_snapback_from_correction_failure,
         test_input_sync_diagnosis_reports_movement_without_targeted_corrections,

@@ -2688,6 +2688,38 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
         if near_energy and ctx.player_energy < max_energy:
             ctx.player_energy = min(max_energy, ctx.player_energy + ENERGY_RATE)
 
+        self._try_cargo_pickup(ctx)
+
+    def _try_cargo_pickup(self, ctx: ClientContext) -> bool:
+        """Pick up a cargo box when near the team supply ship and not carrying.
+
+        Construction-economy pickup: drive within `cargo_pickup_range` of the team
+        supply ship while empty-handed and you grab a cargo box (default_cargo_type),
+        which broadcasts CARRYING_INFO. Build consumes it (see build_require_cargo).
+        """
+        if int(getattr(ctx, "cargo_type", 0) or 0) != 0 or getattr(ctx, "has_uplink", False):
+            return False  # hands full
+        session = getattr(ctx, "session", None)
+        if session is None or not getattr(session, "in_game", False):
+            return False
+        ship = self._uplink_ships.get(int(getattr(session, "team_id", 0) or 0))
+        if ship is None:
+            return False
+        try:
+            sx, sy = float(ship["pos"][0]), float(ship["pos"][1])
+            px, py = float(ctx.player_pos[0]), float(ctx.player_pos[1])
+        except (TypeError, KeyError, IndexError):
+            return False
+        rng = float(getattr(self, "cargo_pickup_range", 30.0))
+        if (px - sx) ** 2 + (py - sy) ** 2 > rng * rng:
+            return False
+        cargo_type = int(getattr(self, "default_cargo_type", 0) or 0)
+        if cargo_type == 0:
+            return False
+        self._set_player_carry(ctx, cargo_type=cargo_type, cargo_count=1, has_uplink=False)
+        print(f"[CARGO] Client {ctx.client_id} picked up cargo type={cargo_type} from supply ship {ship.get('oid')}")
+        return True
+
     def _send_jump_velocity_update(self, ctx: ClientContext, addr: tuple):
         """Send velocity update to client after jump."""
         from .packets import get_ticks
