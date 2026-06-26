@@ -639,6 +639,12 @@ class ConfigMixin:
         # (entity +0x30/+0x34/+0x38), but the playable slice keeps the previous
         # yaw-only body source unless this live OG gate flag is enabled.
         self.projectile_body_pitch = self._projectile_body_pitch_enabled_from_env()
+        # Terrain-conform replicated (player-built) buildings: a flat pad placed at
+        # its center terrain-Z cuts through any slope (uphill half sinks, downhill
+        # half floats) = the "pad floats into terrain" report. When on, the dynamic
+        # building's replicated rotation gets terrain pitch/roll so it lies on the
+        # slope. Static MAP buildings are client-local-rendered and unaffected. 0 = off.
+        self.building_terrain_conform = os.environ.get("WULFRAM_BUILDING_TERRAIN_CONFORM", "1") != "0"
         self.projectiles_enabled = os.environ.get("WULFRAM_PROJECTILES_ENABLED", "1") == "1"
         self.remote_projectiles = os.environ.get("WULFRAM_REMOTE_PROJECTILES", "1") == "1"
         self.remote_combat_observer_packets = (

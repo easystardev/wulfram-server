@@ -197,6 +197,32 @@ def choose_dynamic_building_pos(server: object, ctx: object, slot: int) -> tuple
     return (x, y, z)
 
 
+def _building_terrain_conform_rot(server: object, pos, heading: float):
+    """Rotation tuple (roll, pitch, yaw) for a replicated building.
+
+    Default is flat (roll=pitch=0, yaw=heading). When
+    `building_terrain_conform` is on, pitch follows the terrain slope along the
+    building's facing and roll follows the slope across it, so a pad lies ON a
+    slope instead of cutting through it (the "floats into terrain" report).
+    Sign of roll is verified live against the OG client; flip via the negation
+    here if it tilts the wrong way.
+    """
+    yaw = float(heading)
+    if not getattr(server, "building_terrain_conform", False):
+        return (0.0, 0.0, yaw)
+    terrain = getattr(server, "terrain", None)
+    if terrain is None:
+        return (0.0, 0.0, yaw)
+    try:
+        x, y = float(pos[0]), float(pos[1])
+        pitch = terrain.get_pitch_at_heading(x, y, yaw)
+        # Roll = slope across the facing (to the building's right = yaw - 90deg).
+        roll = -terrain.get_pitch_at_heading(x, y, yaw - math.pi / 2.0)
+    except Exception:  # noqa: BLE001 - terrain probe must never break replication
+        return (0.0, 0.0, yaw)
+    return (roll, pitch, yaw)
+
+
 def send_dynamic_entity_definition(
     server: object,
     target_ctx: object,
@@ -215,6 +241,7 @@ def send_dynamic_entity_definition(
     local_state_kwargs = dict(ls)
     local_state_kwargs.setdefault("health", server._get_health_value(target_ctx))
     local_state_kwargs.setdefault("fuel", server._get_energy_value(target_ctx))
+    rot = _building_terrain_conform_rot(server, pos, heading)
     payload = build_update_array_create_tank(
         tick=tick,
         entity_id=entity_id,
@@ -226,7 +253,7 @@ def send_dynamic_entity_definition(
         include_entity_vitals=False,
         is_manned=False,
         is_static=is_static,
-        rot=(0.0, 0.0, float(heading)),
+        rot=rot,
         **local_state_kwargs,
     )
     sent = server._send_packet_to_client(target_ctx, payload, prefer_tcp=False)

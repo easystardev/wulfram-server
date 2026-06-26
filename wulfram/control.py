@@ -552,6 +552,8 @@ class ControlServer:
             return self._cmd_projectiles(args)
         elif cmd == 'buildings' or cmd == 'bld':
             return self._cmd_buildings(args)
+        elif cmd == 'dynbuild':
+            return self._cmd_dynbuild(args)
         elif cmd == 'building_events' or cmd == 'bevents':
             return self._cmd_building_events(args)
         elif cmd == 'building_damage' or cmd == 'bdmg':
@@ -2084,6 +2086,42 @@ Examples:
                 f"{vel_str}{hp_str}{input_str}{sync_str}{jitter_str}{diagnosis_str}"
             )
         return "\n".join(lines)
+
+    def _cmd_dynbuild(self, args: list) -> str:
+        """Build a dynamic (player-built) building via the real uplink path.
+
+        Usage: dynbuild <repair|fuel|energy|powercell|gun> [cN]
+        Places it in front of the active player (drive/respawn onto a slope first
+        to exercise terrain-conform). Test tool for the building-conform fix.
+        """
+        from .build_uplink import entity_type_from_name
+        if not self.server:
+            return "Error: No server reference"
+        target_client_id = None
+        filtered = []
+        for a in args:
+            if a.startswith('c') and a[1:].isdigit():
+                target_client_id = int(a[1:])
+            else:
+                filtered.append(a)
+        if not filtered:
+            return "Usage: dynbuild <repair|fuel|energy|powercell|gun> [cN]"
+        etype = entity_type_from_name(filtered[0])
+        if etype is None:
+            return f"Unknown building type: {filtered[0]!r}"
+        ctx = None
+        with self.server.clients_lock:
+            for c in self.server.clients.values():
+                if target_client_id is not None and getattr(c, "client_id", None) != target_client_id:
+                    continue
+                if getattr(c, "session", None) and c.session.in_game:
+                    ctx = c
+                    break
+        if ctx is None:
+            return "Error: no in-game client to build for"
+        command = {"entity_type": int(etype), "slot": 0}
+        result = self.server._create_dynamic_building_from_uplink(ctx, command)
+        return f"dynbuild {filtered[0]}: {result}"
 
     def _cmd_buildings(self, args: list) -> str:
         """Dump static building, supply-pad, and turret state for slice smokes.
