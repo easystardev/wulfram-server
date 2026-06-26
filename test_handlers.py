@@ -3867,7 +3867,11 @@ def test_udp_team_switch_can_reassert_roster_without_entry_packets():
     session = Session()
     session.username = "RosterProbe"
     session.player_id = 0x0539
-    session.roster_sent = True
+    # roster_sent must be False to exercise the roster-send path: _send_team_switch_roster
+    # now guards against re-sending when roster_sent is already True (the duplicate
+    # "copy of yourself as spectator" row fix), so a True value here would correctly
+    # send nothing. (Test updated 2026-06-26 — was orphaned with a stale True.)
+    session.roster_sent = False
     session.world_stats_sent = True
     ctx = ClientContext(
         client_id=4,
@@ -18818,6 +18822,17 @@ def main():
         test_dynamic_building_projectile_damage_destroys_and_records_delete,
         test_uplink_mvp_bootstrap_sends_minimal_status_packets,
         test_buildings_json_exposes_playable_slice_observability,
+        # Previously-orphaned tests (defined but never registered -> silently not
+        # run); registered 2026-06-26 during the post-decomposition test audit.
+        test_projectile_world_hit_mesh_broadphase_uses_bounding_sphere,
+        test_remote_spawn_create_update_array_avoids_tcp,
+        test_remote_state_sync_reply_remaps_client_tick_to_server_history,
+        test_remote_state_sync_reuses_cached_sample_when_replay_window_misses,
+        test_udp_team_switch_can_reassert_roster_without_entry_packets,
+        test_udp_team_switch_can_send_update_stats_over_tcp,
+        test_udp_team_switch_can_suppress_duplicate_entry_packets,
+        test_udp_team_switch_can_use_team_first_update_stats_variant,
+        test_udp_team_switch_sends_update_stats_before_reincarnate,
     ]
 
     passed = 0
