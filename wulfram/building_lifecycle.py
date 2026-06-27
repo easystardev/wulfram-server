@@ -84,6 +84,16 @@ def remove_dynamic_record(server: object, oid: int) -> None:
     server._building_max_health.pop(oid, None)
     server._dynamic_building_ids.discard(oid)
     server._dynamic_building_sources.pop(oid, None)
+    # Unify the lifecycle: ANY removal path (deconstruct-complete, combat-destroy,
+    # disconnect) must clear the construction/deconstruction timer dicts, else a
+    # building destroyed mid-(de)construction leaves a dangling timer -- which for
+    # deconstruction would later double-refund + re-delete via update_deconstruction.
+    construction = getattr(server, "_building_construction", None)
+    if construction is not None:
+        construction.pop(oid, None)
+    deconstruction = getattr(server, "_building_deconstruction", None)
+    if deconstruction is not None:
+        deconstruction.pop(oid, None)
     server._rebuild_static_world_raycast_index()
 
 

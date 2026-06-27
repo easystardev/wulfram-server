@@ -18797,6 +18797,39 @@ def test_deconstruction_timer():
     return True
 
 
+def test_removal_clears_timer_dicts():
+    """Any building removal clears the construction + deconstruction timer dicts, so
+    a building destroyed mid-(de)construction can't dangle / double-refund (Phase 2)."""
+    from wulfram import building_lifecycle
+
+    class Srv:
+        def __init__(self):
+            self._building_entities = {30000: SimpleNamespace(team_id=2)}
+            self._building_health = {30000: 0.0}
+            self._building_max_health = {30000: 2000.0}
+            self._dynamic_building_ids = {30000}
+            self._dynamic_building_sources = {30000: {}}
+            self._uplink_ships = {}
+            self._building_construction = {30000: 123.0}
+            self._building_deconstruction = {30000: {"done": 123.0, "entity_type": 27}}
+            self.rebuilt = 0
+
+        def _broadcast_uplink_ship_info(self, ship):
+            return 0
+
+        def _rebuild_static_world_raycast_index(self):
+            self.rebuilt += 1
+
+    srv = Srv()
+    building_lifecycle.remove_dynamic_record(srv, 30000)
+    assert 30000 not in srv._building_entities
+    assert 30000 not in srv._building_construction, "construction timer dangled"
+    assert 30000 not in srv._building_deconstruction, "deconstruction timer dangled"
+    assert srv.rebuilt == 1
+    print("test_removal_clears_timer_dicts: PASSED")
+    return True
+
+
 def main():
     print("=" * 60)
     print("Handler Tests")
@@ -18815,6 +18848,7 @@ def main():
         test_construction_timer_lazy_complete,
         test_deconstruct_refund,
         test_deconstruction_timer,
+        test_removal_clears_timer_dicts,
         test_behavior_spawn_enabled_defaults_on_for_entry_map_spawn,
         test_input_sync_diagnosis_distinguishes_idle_snapback_from_correction_failure,
         test_input_sync_diagnosis_reports_movement_without_targeted_corrections,
