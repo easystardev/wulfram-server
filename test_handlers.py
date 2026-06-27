@@ -18830,6 +18830,58 @@ def test_removal_clears_timer_dicts():
     return True
 
 
+def test_cargo_drop_and_crate_pickup():
+    """A destroyed building drops a CARGO_BOX crate; a player drives over it
+    empty-handed and picks it up (crate removed). (Phase 2 cargo-drop-on-destroy)"""
+    from wulfram.server import WulframServer
+
+    sent = []
+    deleted = []
+
+    class Srv:
+        cargo_pickup_range = 30.0
+        default_cargo_type = 0  # no ship cargo -> isolate crate pickup
+
+        def __init__(self):
+            self._dropped_cargo = {}
+            self._dropped_cargo_next_oid = 40000
+            self._uplink_ships = {}
+
+        def _broadcast_dynamic_entity_definition(self, **kw):
+            sent.append(kw)
+            return 1
+
+        def _broadcast_building_delete(self, oid, prefer_tcp=False):
+            deleted.append(oid)
+            return 1
+
+        def _set_player_carry(self, ctx, *, cargo_type, cargo_count, has_uplink):
+            ctx.cargo_type = cargo_type
+            ctx.cargo_count = cargo_count
+            ctx.has_uplink = has_uplink
+
+    srv = Srv()
+
+    # destroyed building drops a crate at (5000,5000) of type 27
+    oid = WulframServer._drop_cargo_crate(srv, (5000.0, 5000.0, 5.0), 27, 2)
+    assert oid == 40000 and oid in srv._dropped_cargo, srv._dropped_cargo
+    assert srv._dropped_cargo[oid]["cargo_type"] == 27
+    assert sent and sent[-1]["entity_type"] == 19, sent  # CARGO_BOX
+
+    ctx = SimpleNamespace(cargo_type=0, cargo_count=0, has_uplink=False, client_id=1,
+                          player_pos=(5100.0, 5000.0, 5.0),
+                          session=SimpleNamespace(team_id=2, in_game=True))
+    # far -> no pickup
+    assert WulframServer._try_cargo_pickup(srv, ctx) is False and oid in srv._dropped_cargo
+    # near crate + empty-handed -> pickup; crate removed + delete broadcast
+    ctx.player_pos = (5010.0, 5000.0, 5.0)
+    assert WulframServer._try_cargo_pickup(srv, ctx) is True
+    assert ctx.cargo_type == 27, vars(ctx)
+    assert oid not in srv._dropped_cargo and oid in deleted, (srv._dropped_cargo, deleted)
+    print("test_cargo_drop_and_crate_pickup: PASSED")
+    return True
+
+
 def main():
     print("=" * 60)
     print("Handler Tests")
@@ -18849,6 +18901,7 @@ def main():
         test_deconstruct_refund,
         test_deconstruction_timer,
         test_removal_clears_timer_dicts,
+        test_cargo_drop_and_crate_pickup,
         test_behavior_spawn_enabled_defaults_on_for_entry_map_spawn,
         test_input_sync_diagnosis_distinguishes_idle_snapback_from_correction_failure,
         test_input_sync_diagnosis_reports_movement_without_targeted_corrections,

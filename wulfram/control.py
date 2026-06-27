@@ -2138,7 +2138,7 @@ Examples:
         import time as _time
         if not self.server:
             return "Error: No server reference"
-        out = {"players": [], "ships": [], "under_construction": []}
+        out = {"players": [], "ships": [], "under_construction": [], "dropped_cargo": []}
         try:
             with self.server.clients_lock:
                 for c in self.server.clients.values():
@@ -2159,6 +2159,10 @@ Examples:
             now = _time.monotonic()
             for oid, done in (getattr(self.server, "_building_construction", {}) or {}).items():
                 out["under_construction"].append({"oid": oid, "remaining_s": round(done - now, 1)})
+            for oid, crate in (getattr(self.server, "_dropped_cargo", {}) or {}).items():
+                out["dropped_cargo"].append({
+                    "oid": oid, "cargo_type": crate.get("cargo_type"),
+                    "pos": [round(float(v), 1) for v in crate.get("pos", (0, 0, 0))]})
         except Exception as e:  # noqa: BLE001
             return f"econ error: {e}"
         return json.dumps(out)

@@ -158,6 +158,10 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
         # deconstructed (timer); removed + cargo-refunded on completion.
         self._building_deconstruction: dict[int, dict[str, Any]] = {}
         self._last_deconstruction_check: float = 0.0
+        # oid -> {pos, cargo_type, team_id} for cargo crates dropped by destroyed
+        # buildings (pickup-able like supply-ship cargo). Crate oids from 40000+.
+        self._dropped_cargo: dict[int, dict[str, Any]] = {}
+        self._dropped_cargo_next_oid: int = 40000
         self._static_world_raycast_root: Optional[_StaticWorldRayNode] = None
         self._building_collision = BuildingCollisionAssets()
         if self._building_collision.load_default():
@@ -2741,16 +2745,36 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
         session = getattr(ctx, "session", None)
         if session is None or not getattr(session, "in_game", False):
             return False
+        try:
+            px, py = float(ctx.player_pos[0]), float(ctx.player_pos[1])
+        except (TypeError, KeyError, IndexError):
+            return False
+        rng = float(getattr(self, "cargo_pickup_range", 30.0))
+        rng_sq = rng * rng
+        # Dropped-crate pickup (cargo from destroyed buildings) -- takes precedence.
+        for oid, crate in list((getattr(self, "_dropped_cargo", None) or {}).items()):
+            try:
+                cx, cy = float(crate["pos"][0]), float(crate["pos"][1])
+            except (TypeError, KeyError, IndexError):
+                continue
+            if (px - cx) ** 2 + (py - cy) ** 2 <= rng_sq:
+                ctype = int(crate.get("cargo_type", 0) or 0)
+                if ctype == 0:
+                    continue
+                self._set_player_carry(ctx, cargo_type=ctype, cargo_count=1, has_uplink=False)
+                self._broadcast_building_delete(int(oid), prefer_tcp=False)
+                self._dropped_cargo.pop(oid, None)
+                print(f"[CARGO] Client {ctx.client_id} picked up dropped crate oid={oid} type={ctype}")
+                return True
+        # Supply-ship pickup.
         ship = self._uplink_ships.get(int(getattr(session, "team_id", 0) or 0))
         if ship is None:
             return False
         try:
             sx, sy = float(ship["pos"][0]), float(ship["pos"][1])
-            px, py = float(ctx.player_pos[0]), float(ctx.player_pos[1])
         except (TypeError, KeyError, IndexError):
             return False
-        rng = float(getattr(self, "cargo_pickup_range", 30.0))
-        if (px - sx) ** 2 + (py - sy) ** 2 > rng * rng:
+        if (px - sx) ** 2 + (py - sy) ** 2 > rng_sq:
             return False
         cargo_type = int(getattr(self, "default_cargo_type", 0) or 0)
         if cargo_type == 0:
@@ -2758,6 +2782,25 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
         self._set_player_carry(ctx, cargo_type=cargo_type, cargo_count=1, has_uplink=False)
         print(f"[CARGO] Client {ctx.client_id} picked up cargo type={cargo_type} from supply ship {ship.get('oid')}")
         return True
+
+    def _drop_cargo_crate(self, pos, cargo_type: int, team_id: int) -> int:
+        """Drop a pickup-able cargo crate (CARGO_BOX) at pos -- e.g. from a destroyed
+        building. Returns the crate oid (0 if not dropped)."""
+        ctype = int(cargo_type or 0)
+        if ctype <= 0 or pos is None:
+            return 0
+        oid = int(self._dropped_cargo_next_oid)
+        self._dropped_cargo_next_oid = oid + 1
+        cpos = tuple(float(v) for v in pos)
+        self._dropped_cargo[oid] = {"pos": cpos, "cargo_type": ctype, "team_id": int(team_id or 0)}
+        try:
+            self._broadcast_dynamic_entity_definition(
+                entity_id=oid, entity_type=int(EntityType.CARGO_BOX), team_id=int(team_id or 0),
+                pos=cpos, heading=0.0, is_static=True)
+        except Exception:  # noqa: BLE001 - drop tracking must never break the destroy path
+            pass
+        print(f"[CARGO] dropped crate oid={oid} type={ctype} at ({cpos[0]:.0f},{cpos[1]:.0f})")
+        return oid
 
     def _send_jump_velocity_update(self, ctx: ClientContext, addr: tuple):
         """Send velocity update to client after jump."""

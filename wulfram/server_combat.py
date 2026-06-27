@@ -523,6 +523,13 @@ class CombatMixin:
         }
         damage = _PROJECTILE_BUILDING_DAMAGE.get(proj.entity_type, 50.0)
         attacker_name = attacker.session.username or f"Player{attacker.client_id}"
+        # Capture building state before apply_damage_amount may remove it -- a
+        # destroyed player-built structure drops a pickup-able cargo crate.
+        _destroyed = self._building_entities.get(int(building_oid))
+        _drop_pos = (_destroyed.x, _destroyed.y, _destroyed.z) if _destroyed else None
+        _drop_type = int(_destroyed.entity_type) if _destroyed else -1
+        _drop_team = int(_destroyed.team_id) if _destroyed else 0
+        _was_dynamic = int(building_oid) in self._dynamic_building_ids
         event = self._apply_building_damage_amount(
             int(building_oid),
             damage,
@@ -546,6 +553,10 @@ class CombatMixin:
         # Building destroyed
         if new_hp <= 0:
             print(f"[BUILDING] {btype_name} oid={building_oid} DESTROYED by {attacker_name}")
+            # A destroyed player-built structure drops a pickup-able cargo crate
+            # (economy on) -- vs deconstruct, which refunds to the owner.
+            if _was_dynamic and getattr(self, "build_require_cargo", False) and _drop_pos is not None:
+                self._drop_cargo_crate(_drop_pos, _drop_type, _drop_team)
             # Track building kill
             attacker.kills += 1
             self._broadcast_player_stats(attacker, participants=(attacker,))
