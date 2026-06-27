@@ -2152,12 +2152,21 @@ def test_remote_active_movement_suppresses_visible_correction_burst():
     assert server._queue_state_sync_correction_burst(remote) is True
     assert remote.correction_burst_remaining == 6
 
+    # FREEZE FIX (2026-06-27): a HELD movement axis means actively driving even when
+    # the last ACTION packet is stale -- the OG client only sends ACTION_UPDATE on input
+    # CHANGE, so holding forward yields no fresh packets. The old packet-recency window
+    # reported "not moving" here and let the velocity-zeroing burst fire mid-drive =
+    # the persistent freeze. Held fwd now suppresses the burst regardless of recency.
     remote.correction_burst_remaining = 0
     remote.last_decoded_input = {"fwd": 0.61, "strafe": 0.0}
     remote.last_action_packet_time = now - 1.0
-    assert server._remote_movement_input_active(remote, now=now) is False
-    assert server._queue_state_sync_correction_burst(remote) is True
-    assert remote.correction_burst_remaining == 6
+    assert server._remote_movement_input_active(remote, now=now) is True
+    assert server._queue_state_sync_correction_burst(remote) is False
+    assert remote.correction_burst_remaining == 0
+
+    # Held TURN (no fwd/strafe) is also active driving and must suppress corrections.
+    remote.last_decoded_input = {"fwd": 0.0, "strafe": 0.0, "turn": -0.64}
+    assert server._remote_movement_input_active(remote, now=now) is True
     print("test_remote_active_movement_suppresses_visible_correction_burst: PASSED")
     return True
 

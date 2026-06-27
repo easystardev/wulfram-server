@@ -103,27 +103,30 @@ class RemoteSyncMixin:
         return True
 
     def _remote_movement_input_active(self, ctx: ClientContext, *, now: Optional[float] = None) -> bool:
-        """Return true while a remote OG client is actively driving."""
+        """Return true while a remote OG client is actively driving.
+
+        FREEZE FIX (2026-06-27): this gates ALL velocity-zeroing corrections (periodic,
+        burst, divergence) -- they ride VIEW_UPDATE, which the OG client applies as snap
+        pose + ZERO VELOCITY, so firing them mid-drive freezes movement. The OG client
+        sends ACTION_UPDATE only on input CHANGE: while a movement key is HELD there are
+        no new packets, so the old 0.35s packet-recency window lapsed and reported "not
+        moving" -> corrections fired -> persistent freeze (movement only, chat/respawn
+        still work). The server keeps applying the held input every tick and
+        last_decoded_input reflects the held axes (cleared by the release packet), so we
+        key off the HELD state, not packet recency. `_datagram_active_movement_input`
+        stays as an instant-on hint.
+        """
         if handlers._is_loopback_client(ctx):
             return False
         if bool(getattr(ctx, "_datagram_active_movement_input", False)):
             return True
-        window = float(
-            getattr(self, "active_input_correction_suppress_window", 0.35) or 0.0
-        )
-        if window <= 0.0:
-            return False
-        last_action = float(getattr(ctx, "last_action_packet_time", 0.0) or 0.0)
-        if last_action <= 0.0:
-            return False
-        if now is None:
-            now = time.monotonic()
-        if (now - last_action) > window:
-            return False
         decoded = getattr(ctx, "last_decoded_input", None) or {}
         try:
             fwd = float(decoded.get("fwd", 0.0) or 0.0)
             strafe = float(decoded.get("strafe", 0.0) or 0.0)
+            turn = float(decoded.get("turn", 0.0) or 0.0)
         except (TypeError, ValueError):
             return False
-        return abs(fwd) > 0.05 or abs(strafe) > 0.05
+        # Held movement axes (forward/strafe/turn) => actively driving, regardless of
+        # how long ago the (change-triggered) packet arrived.
+        return abs(fwd) > 0.05 or abs(strafe) > 0.05 or abs(turn) > 0.05
