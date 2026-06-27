@@ -19036,6 +19036,81 @@ def test_cargo_deploy_and_drop_request():
     return True
 
 
+def test_match_flow_clock_and_round_end():
+    """Match flow (Phase 3 slice 4): GAME_CLOCK uses the inverted active flag (running
+    -> 0), the round timer counts down, and round end announces a winner (most team
+    kills) + RESET_GAME + a fresh round (phase bump, timer reset)."""
+    import time as _t
+    from wulfram import match_flow
+    from wulfram.packets import build_game_clock
+
+    # Wire format: running clock sends active_flag=0 (byte 5), paused sends 1.
+    assert build_game_clock(running=True, round_time_ms=1000)[5] == 0x00, "running flag must be 0"
+    assert build_game_clock(running=False, round_time_ms=0)[5] == 0x01, "paused flag must be 1"
+
+    class Client:
+        def __init__(self, team, kills):
+            self.session = SimpleNamespace(team_id=team)
+            self.kills = kills
+
+    class Srv:
+        match_flow_enabled = True
+        match_round_duration_s = 600.0
+        match_clock_interval_s = 5.0
+
+        def __init__(self, clients):
+            self._clients = clients
+            self.sent = []
+
+        def _snapshot_in_game_clients(self):
+            return list(self._clients)
+
+        def _send_packet_to_client(self, client, pkt, *, prefer_tcp=True, allow_udp_fallback=False):
+            self.sent.append(pkt[0])
+            return True
+
+    # Winner = team with the most kills (Blue=2 with 5 > Red=1 with 3).
+    srv = Srv([Client(1, 3), Client(2, 5)])
+    match_flow.init_match_state(srv)
+    assert "Blue wins" in match_flow.winner_message(srv), match_flow.winner_message(srv)
+
+    # Round timer counts down from the duration.
+    assert match_flow.remaining_ms(srv) > 599_000
+
+    # Force expiry -> end_round announces (0x1f chat) + RESET_GAME (0x3f) + new GAME_CLOCK (0x2f),
+    # bumps the phase, and resets the timer.
+    srv._match_round_start = _t.monotonic() - 10_000.0  # already expired
+    assert match_flow.remaining_ms(srv) == 0
+    phase_before = srv._match_phase
+    match_flow.update_match_flow(srv)
+    assert 0x3F in srv.sent, "RESET_GAME not broadcast on round end"
+    assert 0x2F in srv.sent, "new GAME_CLOCK not broadcast on round end"
+    assert 0x1F in srv.sent, "winner chat not broadcast on round end"
+    assert srv._match_phase == phase_before + 1, "phase did not advance"
+    assert match_flow.remaining_ms(srv) > 599_000, "round timer did not reset"
+
+    # Ties / no kills -> draw.
+    srv2 = Srv([Client(1, 2), Client(2, 2)])
+    match_flow.init_match_state(srv2)
+    assert "draw" in match_flow.winner_message(srv2).lower(), match_flow.winner_message(srv2)
+
+    # Gated off -> no-op.
+    srv3 = Srv([Client(1, 1)]); srv3.match_flow_enabled = False
+    match_flow.init_match_state(srv3)
+    srv3._match_round_start = _t.monotonic() - 10_000.0
+    match_flow.update_match_flow(srv3)
+    assert not srv3.sent, "match flow must be a no-op when disabled"
+
+    # Empty server -> idle (don't burn rounds with no players).
+    srv4 = Srv([]); match_flow.init_match_state(srv4)
+    srv4._match_round_start = _t.monotonic() - 10_000.0
+    match_flow.update_match_flow(srv4)
+    assert not srv4.sent, "empty server must not run the round"
+
+    print("test_match_flow_clock_and_round_end: PASSED")
+    return True
+
+
 def main():
     print("=" * 60)
     print("Handler Tests")
@@ -19377,6 +19452,7 @@ def main():
         test_udp_team_switch_can_use_team_first_update_stats_variant,
         test_udp_team_switch_sends_update_stats_before_reincarnate,
         test_cargo_deploy_and_drop_request,
+        test_match_flow_clock_and_round_end,
     ]
 
     passed = 0

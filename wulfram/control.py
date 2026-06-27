@@ -564,6 +564,10 @@ class ControlServer:
             return self._cmd_slots(args)
         elif cmd == 'dropcargo':
             return self._cmd_dropcargo(args)
+        elif cmd == 'clock':
+            return self._cmd_clock(args)
+        elif cmd == 'endround':
+            return self._cmd_endround(args)
         elif cmd == 'building_events' or cmd == 'bevents':
             return self._cmd_building_events(args)
         elif cmd == 'building_damage' or cmd == 'bdmg':
@@ -2149,6 +2153,34 @@ Examples:
         contained = building_type_id_for_cargo(ctype)
         return (f"dropcargo: oid={oid} type={ctype} contained_id={contained} "
                 f"at ({pos[0]:.0f},{pos[1]:.0f})")
+
+    def _cmd_clock(self, args: list) -> str:
+        """Show match-flow state and force a GAME_CLOCK re-broadcast. Phase 3 slice 4."""
+        import json
+        from . import match_flow
+        if not self.server:
+            return "Error: No server reference"
+        rem_ms = match_flow.remaining_ms(self.server)
+        sent = match_flow.broadcast_game_clock(self.server, running=True)
+        return json.dumps({
+            "match_flow_enabled": bool(getattr(self.server, "match_flow_enabled", False)),
+            "round_duration_s": float(getattr(self.server, "match_round_duration_s", 0.0)),
+            "remaining_s": round(rem_ms / 1000.0, 1),
+            "phase": int(getattr(self.server, "_match_phase", 1) or 1),
+            "team_scores": match_flow._team_scores(self.server),
+            "clock_broadcast_to": sent,
+        })
+
+    def _cmd_endround(self, args: list) -> str:
+        """Force the current round to end now (announce + RESET_GAME + new round).
+        Test harness for match flow. Phase 3 slice 4."""
+        from . import match_flow
+        if not self.server:
+            return "Error: No server reference"
+        if not getattr(self.server, "match_flow_enabled", False):
+            return "match flow disabled (set WULFRAM_MATCH_FLOW=1)"
+        msg = match_flow.end_round(self.server)
+        return f"endround: {msg}"
 
     def _first_in_game_client(self, args: list):
         """Resolve the active (or cN-selected) in-game client."""
@@ -3964,8 +3996,15 @@ Examples:
             entity_oid=entity_id, vehicle_type=vehicle_type, pos=(x, y, z)
         ))
 
-        # 6) GAME_CLOCK + spawn success + birth notice
-        self.tcp_handler.send(build_game_clock())
+        # 6) GAME_CLOCK + spawn success + birth notice. With match flow on, seed the
+        # client's HUD timer with the actual round time remaining (the per-tick
+        # broadcast keeps it synced thereafter); otherwise a plain running clock.
+        if self.server is not None and getattr(self.server, "match_flow_enabled", False):
+            from . import match_flow
+            self.tcp_handler.send(build_game_clock(
+                running=True, round_time_ms=match_flow.remaining_ms(self.server)))
+        else:
+            self.tcp_handler.send(build_game_clock())
         self.tcp_handler.send(build_reincarnate(0x11, "Spawn success"))
         self.tcp_handler.send(build_birth_notice(entity_id))
 

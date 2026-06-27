@@ -105,7 +105,7 @@ from .packets import (
     FX_IMPACT_BUILDING, FX_IMPACT_TERRAIN,
     get_behavior_tank_spring_local_offsets,
 )
-from . import handlers, build_uplink, building_lifecycle, config as server_config
+from . import handlers, build_uplink, building_lifecycle, match_flow, config as server_config
 from .pktlog import PacketLog
 
 class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, CombatMixin, RemoteSyncMixin, CorrectionMixin, TickMixin, NetMixin):
@@ -2738,6 +2738,12 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
 
         self._try_cargo_pickup(ctx)
         self._update_deconstruction()
+        self._update_match_flow()
+
+    def _update_match_flow(self) -> None:
+        """Per-tick match clock + round end/reset (self-throttled). No-op unless
+        match_flow_enabled. See wulfram/match_flow.py."""
+        match_flow.update_match_flow(self)
 
     def _try_cargo_pickup(self, ctx: ClientContext) -> bool:
         """Pick up a cargo box when near the team supply ship and not carrying.

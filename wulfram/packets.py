@@ -337,15 +337,31 @@ def build_delete_object(tick: int, entity_ids: list, with_effects: bool = False)
     return b'\x15' + payload
 
 
-def build_game_clock(time_ms: int = 0, running: bool = True, round_time_ms: int = 30000) -> bytes:
-    """Build GAME_CLOCK packet (0x2F)."""
-    ticks = int(time.time() * 1000) & 0xFFFFFFFF
+def build_game_clock(time_ms: int = 0, running: bool = True, round_time_ms: int = 30000,
+                     phase: int = 1, server_time_ms: Optional[int] = None) -> bytes:
+    """Build GAME_CLOCK packet (0x2F).
+
+    Decompile-exact (Handlers.c:1121 PacketHandler_GAME_CLOCK):
+      u32 server_time, u8 active_flag, u32 phase_state, u32 countdown_duration(ms).
+    CRITICAL: the active flag is INVERTED -- the client sets
+    `g_game_clock_active = (active_flag == 0)`, so a RUNNING clock sends active_flag=0
+    and a paused one sends 1. `countdown_duration` is what the client counts down from
+    locally (Countdown_start); re-send periodically with the remaining time to re-sync.
+    """
+    if server_time_ms is None:
+        server_time_ms = int(time.time() * 1000) & 0xFFFFFFFF
     payload = b'\x2F'
-    payload += struct.pack(">I", ticks)
-    payload += b'\x01' if running else b'\x00'
-    payload += struct.pack(">I", 1)
-    payload += struct.pack(">I", round_time_ms)
+    payload += struct.pack(">I", server_time_ms & 0xFFFFFFFF)
+    payload += b'\x00' if running else b'\x01'   # INVERTED: 0 = active/running
+    payload += struct.pack(">I", phase & 0xFFFFFFFF)
+    payload += struct.pack(">I", round_time_ms & 0xFFFFFFFF)
     return payload
+
+
+def build_reset_game() -> bytes:
+    """Build RESET_GAME packet (0x3F). Empty payload; the client clears its warp/map
+    grid state (Handlers.c:1364 -> MapGrid_clear_all) for a new round."""
+    return b'\x3F'
 
 
 def build_motd(message: str = "Welcome to Wulfram!") -> bytes:

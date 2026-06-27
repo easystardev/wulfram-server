@@ -679,6 +679,19 @@ class ConfigMixin:
             self.cargo_drop_repickup_cooldown_s = float(os.environ.get("WULFRAM_CARGO_DROP_COOLDOWN_S", "5.0"))
         except ValueError:
             self.cargo_drop_repickup_cooldown_s = 5.0
+        # Match flow (Phase 3 slice 4): a running GAME_CLOCK (0x2f) round timer that the
+        # OG client counts down on its HUD; on expiry the server announces the result
+        # (most team kills wins), sends RESET_GAME (0x3f), and starts a fresh round.
+        # Default round is long (10 min) so it won't reset during short test sessions.
+        self.match_flow_enabled = os.environ.get("WULFRAM_MATCH_FLOW", "1").strip().lower() in ("1", "on", "true", "yes")
+        try:
+            self.match_round_duration_s = max(5.0, float(os.environ.get("WULFRAM_ROUND_TIME_S", "600.0")))
+        except ValueError:
+            self.match_round_duration_s = 600.0
+        try:
+            self.match_clock_interval_s = max(1.0, float(os.environ.get("WULFRAM_MATCH_CLOCK_INTERVAL_S", "5.0")))
+        except ValueError:
+            self.match_clock_interval_s = 5.0
         # Supply-ship cargo as a finite, replenishing resource (the OG cargo_times
         # mechanism; DOCKING 0x38 has no OG client handler). The ship holds up to
         # ship_cargo_capacity boxes; each pickup depletes one; one box restocks every
