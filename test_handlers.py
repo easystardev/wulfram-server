@@ -18933,6 +18933,109 @@ def test_supply_ship_cargo_replenish():
     return True
 
 
+def test_cargo_deploy_and_drop_request():
+    """DROP_REQUEST (0x2b) handler: mode 1 deploys the carried cargo as a building at
+    the player's position + consumes a box; mode 0 drops a pickup-able crate (with a
+    re-pickup cooldown) + consumes a box. Captured wire format: mode is a u32 (0=drop,
+    1=deploy); the packet carries no type/pos so the server uses carried type + player
+    pos. Phase 3 slice 2."""
+    import time as _t
+    from wulfram import build_uplink
+
+    class Srv:
+        construction_timeout = 0.0
+        deploy_distance = 12.0
+        cargo_drop_repickup_cooldown_s = 5.0
+
+        def __init__(self):
+            self._building_entities = {}
+            self._building_health = {}
+            self._building_max_health = {}
+            self._dynamic_building_ids = set()
+            self._dynamic_building_sources = {}
+            self._building_construction = {}
+            self._dropped_cargo = {}
+            self._next_oid = 30000
+            self.broadcasts = []
+
+        def _allocate_dynamic_building_oid(self):
+            oid = self._next_oid
+            self._next_oid += 1
+            return oid
+
+        def _building_max_health_for_type(self, et):
+            return 2000.0
+
+        def _terrain_ground_z_at(self, x, y):
+            return 5.0
+
+        def _rebuild_static_world_raycast_index(self):
+            return None
+
+        def _broadcast_dynamic_entity_definition(self, *, entity_id, entity_type, team_id,
+                                                 pos, heading, is_static, cargo_contained_type=None):
+            self.broadcasts.append((entity_id, entity_type, tuple(round(v) for v in pos)))
+            return 1
+
+        def _building_lifecycle_base_event(self, oid, action):
+            return {"oid": oid, "action": action}
+
+        def _remember_building_lifecycle_event(self, ev):
+            return ev
+
+        def _set_player_carry(self, ctx, *, cargo_type, cargo_count, has_uplink):
+            ctx.cargo_type = cargo_type
+            ctx.cargo_count = cargo_count
+            ctx.has_uplink = has_uplink
+            return {"changed": True}
+
+        def _drop_cargo_crate(self, pos, cargo_type, team_id):
+            oid = self._allocate_dynamic_building_oid()
+            self._dropped_cargo[oid] = {"pos": tuple(pos), "cargo_type": cargo_type,
+                                        "team_id": team_id}
+            return oid
+
+    def mk_ctx():
+        return SimpleNamespace(
+            client_id=1, entity_id=0x14EA, cargo_type=25, cargo_count=1, has_uplink=False,
+            player_heading=0.0, player_pos=(4950.0, 5100.0, 5.0),
+            session=SimpleNamespace(team_id=2, entity_id=0x14EA),
+        )
+
+    # --- mode 1: deploy builds the carried type in front of the player + consumes cargo
+    srv = Srv()
+    ctx = mk_ctx()
+    r = build_uplink.handle_drop_request(srv, ctx, 1)
+    assert r["ok"] is True, r
+    oid = r["oid"]
+    assert oid in srv._building_entities, "deploy did not create a building"
+    b = srv._building_entities[oid]
+    assert int(b.entity_type) == 25, b.entity_type           # Power Cell (carried)
+    assert round(b.x) == 4962 and round(b.y) == 5100, (b.x, b.y)  # 12u in front (heading 0 -> +x)
+    assert ctx.cargo_type == 0 and ctx.cargo_count == 0, "deploy must consume the carried box"
+    assert srv.broadcasts and srv.broadcasts[-1][1] == 25, srv.broadcasts
+
+    # not carrying -> deploy is a no-op
+    ctx2 = mk_ctx(); ctx2.cargo_type = 0; ctx2.cargo_count = 0
+    r2 = build_uplink.handle_drop_request(srv, ctx2, 1)
+    assert r2["ok"] is False and r2.get("error") == "not_carrying", r2
+
+    # --- mode 0: drop spawns a crate + consumes cargo + sets a re-pickup cooldown
+    srv3 = Srv()
+    ctx3 = mk_ctx()
+    r3 = build_uplink.handle_drop_request(srv3, ctx3, 0)
+    assert r3["ok"] is True, r3
+    crate_oid = r3["oid"]
+    assert crate_oid in srv3._dropped_cargo, "drop did not spawn a crate"
+    crate = srv3._dropped_cargo[crate_oid]
+    assert crate["cargo_type"] == 25, crate
+    assert crate.get("pickup_after", 0.0) > _t.monotonic(), "drop must set a re-pickup cooldown"
+    assert ctx3.cargo_type == 0 and ctx3.cargo_count == 0, "drop must consume the carried box"
+
+    print("test_cargo_deploy_and_drop_request: PASSED")
+    return True
+
+
 def main():
     print("=" * 60)
     print("Handler Tests")
@@ -19273,6 +19376,7 @@ def main():
         test_udp_team_switch_can_suppress_duplicate_entry_packets,
         test_udp_team_switch_can_use_team_first_update_stats_variant,
         test_udp_team_switch_sends_update_stats_before_reincarnate,
+        test_cargo_deploy_and_drop_request,
     ]
 
     passed = 0

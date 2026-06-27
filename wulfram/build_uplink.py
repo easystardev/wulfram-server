@@ -408,6 +408,116 @@ def create_dynamic_building_from_uplink(server: object, ctx: object, command: di
     return event
 
 
+def _deploy_pos_in_front(server: object, ctx: object) -> tuple[float, float, float]:
+    """Ground position a short distance in front of the player -- where a deployed
+    building / dropped crate lands (offset so it doesn't overlap the tank)."""
+    heading = float(getattr(ctx, "player_heading", 0.0) or 0.0)
+    px, py, pz = (float(v) for v in (getattr(ctx, "player_pos", None) or (0.0, 0.0, 0.0)))
+    dist = float(getattr(server, "deploy_distance", 12.0))
+    x = px + math.cos(heading) * dist
+    y = py + math.sin(heading) * dist
+    ground_z = server._terrain_ground_z_at(x, y)
+    z = float(ground_z) if (ground_z is not None and math.isfinite(float(ground_z))) else pz
+    return (x, y, z)
+
+
+def _consume_one_carried(server: object, ctx: object) -> None:
+    """Remove one carried cargo box and re-broadcast CARRYING_INFO (clears the HUD
+    carry indicator when the last box is used)."""
+    new_count = max(0, int(getattr(ctx, "cargo_count", 0) or 0) - 1)
+    server._set_player_carry(
+        ctx,
+        cargo_type=int(getattr(ctx, "cargo_type", 0) or 0) if new_count > 0 else 0,
+        cargo_count=new_count,
+        has_uplink=bool(getattr(ctx, "has_uplink", False)),
+    )
+
+
+def deploy_carried_cargo(server: object, ctx: object) -> dict[str, Any]:
+    """Deploy the player's carried cargo as a building -- DROP_REQUEST (0x2b) mode=1,
+    the OG `deploy_cargo` (`.`) command.
+
+    The wire packet carries neither type nor position: the server builds the *carried*
+    cargo type at the player's position. The OG client only emits a deploy request after
+    its own power gate passes (Power Cell deploys anywhere; other types need a Power Cell
+    in range -- not server-replicated until Phase-3 slice 3), so the server trusts the
+    request and builds. Consumes one carried box.
+    """
+    carried = int(getattr(ctx, "cargo_type", 0) or 0)
+    if carried <= 0:
+        return {"ok": False, "error": "not_carrying"}
+    team_id = int(ctx.session.team_id or 1)
+    heading = float(getattr(ctx, "player_heading", 0.0) or 0.0)
+    x, y, z = _deploy_pos_in_front(server, ctx)
+    oid = server._allocate_dynamic_building_oid()
+    building = BuildingEntity(x=x, y=y, z=z, entity_type=carried, team_id=team_id, heading=heading)
+    max_hp = server._building_max_health_for_type(carried)
+    server._building_entities[oid] = building
+    server._building_health[oid] = max_hp
+    server._building_max_health[oid] = max_hp
+    server._dynamic_building_ids.add(oid)
+    server._dynamic_building_sources[oid] = {
+        "client_id": ctx.client_id,
+        "player_entity_id": ctx.session.entity_id or ctx.entity_id,
+        "created_at": time.time(),
+        "source": "deploy_cargo",
+    }
+    server._rebuild_static_world_raycast_index()
+    sent = server._broadcast_dynamic_entity_definition(
+        entity_id=oid, entity_type=carried, team_id=team_id,
+        pos=building.pos, heading=heading, is_static=True,
+    )
+    if sent > 0:
+        _consume_one_carried(server, ctx)
+        timeout = float(getattr(server, "construction_timeout", 0.0) or 0.0)
+        if timeout > 0.0:
+            server._building_construction[oid] = time.monotonic() + timeout
+        lifecycle = server._building_lifecycle_base_event(oid, "create")
+        lifecycle.update({"ok": True, "source": "deploy_cargo", "replication_targets": sent})
+        server._remember_building_lifecycle_event(lifecycle)
+    try:
+        type_name = EntityType(carried).name
+    except ValueError:
+        type_name = str(carried)
+    print(f"[DEPLOY] client {ctx.client_id} deployed type={carried}({type_name}) "
+          f"oid={oid} at ({x:.0f},{y:.0f}) targets={sent}")
+    return {"ok": sent > 0, "oid": oid, "entity_type": carried, "pos": [x, y, z]}
+
+
+def drop_carried_cargo(server: object, ctx: object) -> dict[str, Any]:
+    """Drop the player's carried cargo as a pickup-able crate -- DROP_REQUEST (0x2b)
+    mode=0, the OG `drop_cargo` (`,`) command.
+
+    Spawns a CARGO_BOX crate at the player's position and consumes the carried box. A
+    short re-pickup cooldown keeps the proximity pickup from instantly re-grabbing the
+    crate the player just set down.
+    """
+    carried = int(getattr(ctx, "cargo_type", 0) or 0)
+    if carried <= 0:
+        return {"ok": False, "error": "not_carrying"}
+    team_id = int(ctx.session.team_id or 1)
+    x, y, z = _deploy_pos_in_front(server, ctx)
+    oid = server._drop_cargo_crate((x, y, z), carried, team_id)
+    if oid:
+        cooldown = float(getattr(server, "cargo_drop_repickup_cooldown_s", 5.0) or 0.0)
+        crate = server._dropped_cargo.get(oid)
+        if crate is not None and cooldown > 0.0:
+            crate["pickup_after"] = time.monotonic() + cooldown
+        _consume_one_carried(server, ctx)
+    print(f"[DROP] client {ctx.client_id} dropped type={carried} oid={oid} at ({x:.0f},{y:.0f})")
+    return {"ok": bool(oid), "oid": oid, "entity_type": carried, "pos": [x, y, z]}
+
+
+def handle_drop_request(server: object, ctx: object, mode: int) -> dict[str, Any]:
+    """Dispatch a DROP_REQUEST (0x2b): mode 0 = drop_cargo, mode 1 = deploy_cargo.
+    Both the `,` and `.` OG cargo commands ride this single opcode."""
+    if ctx is None:
+        return {"ok": False, "error": "no_ctx"}
+    if int(mode) == 1:
+        return deploy_carried_cargo(server, ctx)
+    return drop_carried_cargo(server, ctx)
+
+
 def delete_dynamic_building_from_uplink(server: object, ctx: object, command: dict[str, Any]) -> dict[str, Any]:
     entity_type = int(command.get("entity_type", -1) or -1)
     team_id = int(ctx.session.team_id or 1)

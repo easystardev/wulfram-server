@@ -666,6 +666,19 @@ class ConfigMixin:
         # gated OFF while that field was missing (desync -> PROTOCOL ERROR); default ON
         # now that the format is written. Set WULFRAM_CARGO_BOX_ENTITY=0 to suppress.
         self.cargo_box_entity_enabled = os.environ.get("WULFRAM_CARGO_BOX_ENTITY", "1").strip().lower() in ("1", "on", "true", "yes")
+        # Cargo deploy/drop (DROP_REQUEST 0x2b): the OG `.` (deploy) and `,` (drop) keys
+        # both send 0x2b with a u32 mode (1=deploy, 0=drop). Deploy builds the carried
+        # type at the player's position; drop sets it down as a pickup-able crate. The
+        # client gates deploy on its own power check, so the server trusts the request.
+        self.cargo_deploy_enabled = os.environ.get("WULFRAM_CARGO_DEPLOY", "1").strip().lower() in ("1", "on", "true", "yes")
+        try:
+            self.deploy_distance = float(os.environ.get("WULFRAM_DEPLOY_DISTANCE", "12.0"))
+        except ValueError:
+            self.deploy_distance = 12.0
+        try:
+            self.cargo_drop_repickup_cooldown_s = float(os.environ.get("WULFRAM_CARGO_DROP_COOLDOWN_S", "5.0"))
+        except ValueError:
+            self.cargo_drop_repickup_cooldown_s = 5.0
         # Supply-ship cargo as a finite, replenishing resource (the OG cargo_times
         # mechanism; DOCKING 0x38 has no OG client handler). The ship holds up to
         # ship_cargo_capacity boxes; each pickup depletes one; one box restocks every

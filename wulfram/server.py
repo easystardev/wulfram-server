@@ -2763,6 +2763,11 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
                 cx, cy = float(crate["pos"][0]), float(crate["pos"][1])
             except (TypeError, KeyError, IndexError):
                 continue
+            # Just-dropped crates have a re-pickup cooldown so the player who set one
+            # down (and is standing on it) doesn't instantly re-grab it.
+            pickup_after = float(crate.get("pickup_after", 0.0) or 0.0)
+            if pickup_after and time.monotonic() < pickup_after:
+                continue
             if (px - cx) ** 2 + (py - cy) ** 2 <= rng_sq:
                 ctype = int(crate.get("cargo_type", 0) or 0)
                 if ctype == 0:
@@ -2795,6 +2800,11 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
         print(f"[CARGO] Client {ctx.client_id} picked up cargo type={cargo_type} from supply ship "
               f"{ship.get('oid')} ({available - 1} left)")
         return True
+
+    def _handle_drop_request(self, ctx: ClientContext, mode: int) -> dict:
+        """DROP_REQUEST (0x2b) handler: mode 1 = deploy carried cargo as a building,
+        mode 0 = drop it as a pickup-able crate. Both at the player's position."""
+        return build_uplink.handle_drop_request(self, ctx, mode)
 
     def _drop_cargo_crate(self, pos, cargo_type: int, team_id: int) -> int:
         """Drop a pickup-able cargo crate (CARGO_BOX) at pos -- e.g. from a destroyed

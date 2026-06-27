@@ -512,12 +512,23 @@ class NetMixin:
                     print(f"[UDP] BEACON_MODIFY seq={seq_num} from {addr}")
 
         elif pkt_type == 0x2B:
-            # DROP_REQUEST (reliable stream): acknowledge.
+            # DROP_REQUEST (reliable stream): drop_cargo (`,`) AND deploy_cargo (`.`)
+            # both ride this single opcode (the only cargo-action opcode -- Debug.c:309).
+            # Wire format (captured live 2026-06-27): opcode(0x2b) + seq(u16) +
+            # len(u16=0x0009) + mode(u32), mode 0 = drop, 1 = deploy. No position/type:
+            # the server applies it using the player's authoritative pos + carried type.
             if len(data) >= 3:
                 seq_num = struct.unpack(">H", data[1:3])[0]
                 self._send_udp_ack(ctx, addr, 0x2B, seq_num)
+                mode = struct.unpack(">I", data[5:9])[0] if len(data) >= 9 else 0
                 if self.debug_udp_raw:
-                    print(f"[UDP] DROP_REQUEST seq={seq_num} from {addr}")
+                    print(f"[UDP] DROP_REQUEST seq={seq_num} mode={mode} "
+                          f"len={len(data)} data={data.hex()} from {addr}")
+                if getattr(self, "cargo_deploy_enabled", True) and ctx is not None:
+                    try:
+                        self._handle_drop_request(ctx, mode)
+                    except Exception as exc:  # noqa: BLE001 - never break the UDP loop
+                        print(f"[DROP_REQUEST] handler error: {exc}")
 
         elif pkt_type == 0x09:
             # ACTION_DUMP - full behavior slot dump (includes fire state)
