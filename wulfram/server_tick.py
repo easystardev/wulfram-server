@@ -49,6 +49,39 @@ from wulfram2_protocol.entities import (
 from .packets import build_chat_message
 
 
+# --- Numeric-validation helpers hoisted verbatim from the nested closures of
+# _resolve_entity_world_collision (server_tick.py decomposition). They are PURE (no
+# self/method-local capture), so lifting them to module scope is behavior-identical:
+# the method's existing unqualified call sites resolve to these by Python scoping with
+# zero call-site edits. (sane_position_triplet stays nested -- it needs self.world_bound.)
+def finite_values(values) -> bool:
+    try:
+        return all(math.isfinite(float(value)) for value in values)
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def finite_triplet(value):
+    if value is None:
+        return None
+    try:
+        if len(value) < 3:
+            return None
+        result = (float(value[0]), float(value[1]), float(value[2]))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return result if finite_values(result) else None
+
+
+def sane_velocity_triplet(value):
+    result = finite_triplet(value)
+    if result is None:
+        return None
+    if any(abs(component) > 10000.0 for component in result):
+        return None
+    return result
+
+
 class TickMixin:
     @staticmethod
     def _piecewise_interpolate(samples: list, t: float) -> float:
@@ -819,37 +852,14 @@ class TickMixin:
         if dt is None:
             dt = getattr(ctx, "_world_collision_step_dt", None)
 
-        def finite_values(values) -> bool:
-            try:
-                return all(math.isfinite(float(value)) for value in values)
-            except (TypeError, ValueError, OverflowError):
-                return False
-
-        def finite_triplet(value):
-            if value is None:
-                return None
-            try:
-                if len(value) < 3:
-                    return None
-                result = (float(value[0]), float(value[1]), float(value[2]))
-            except (TypeError, ValueError, OverflowError):
-                return None
-            return result if finite_values(result) else None
-
+        # finite_values / finite_triplet / sane_velocity_triplet hoisted to module
+        # scope (top of file); only sane_position_triplet stays nested (needs world_bound).
         def sane_position_triplet(value):
             result = finite_triplet(value)
             if result is None:
                 return None
             pos_limit = max(float(getattr(self, "world_bound", 8192.0) or 8192.0) * 4.0, 32768.0)
             if any(abs(component) > pos_limit for component in result):
-                return None
-            return result
-
-        def sane_velocity_triplet(value):
-            result = finite_triplet(value)
-            if result is None:
-                return None
-            if any(abs(component) > 10000.0 for component in result):
                 return None
             return result
 
