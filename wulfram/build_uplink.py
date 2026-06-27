@@ -157,6 +157,24 @@ def entity_type_from_name(name: str) -> Optional[int]:
     return int(value) if value is not None else None
 
 
+def building_type_id_for_cargo(entity_type: int) -> int:
+    """Map a value to the CARGO_BOX contained building-type ID (0-11) the OG client
+    stores at entity+0xDC.
+
+    Buildings are EntityType 25-36 (ENERGY_BUILDING..BUILDING); the deploy registry
+    indexes them as 0-11 (Registry.c EntityType_to_info_index is the inverse:
+    id -> info index 25-36). So a building entity type folds down by -25. A value
+    already in 0-11 is passed through; anything else defaults to 0 (Power Cell, the
+    only type deployable without an existing power source).
+    """
+    et = int(entity_type)
+    if 25 <= et <= 36:
+        return et - 25
+    if 0 <= et <= 11:
+        return et
+    return 0
+
+
 def building_max_health_for_type(entity_type: int) -> float:
     max_health = {
         EntityType.GUN_TURRET: 1200.0,
@@ -233,6 +251,7 @@ def send_dynamic_entity_definition(
     pos: tuple[float, float, float],
     heading: float = 0.0,
     is_static: bool = True,
+    cargo_contained_type: Optional[int] = None,
 ) -> bool:
     if not target_ctx.session or not target_ctx.session.translation_ack_received:
         return False
@@ -254,6 +273,7 @@ def send_dynamic_entity_definition(
         is_manned=False,
         is_static=is_static,
         rot=rot,
+        cargo_contained_type=cargo_contained_type,
         **local_state_kwargs,
     )
     sent = server._send_packet_to_client(target_ctx, payload, prefer_tcp=False)
@@ -285,6 +305,7 @@ def broadcast_dynamic_entity_definition(
     pos: tuple[float, float, float],
     heading: float = 0.0,
     is_static: bool = True,
+    cargo_contained_type: Optional[int] = None,
 ) -> int:
     sent = 0
     for target in server._snapshot_in_game_clients():
@@ -296,6 +317,7 @@ def broadcast_dynamic_entity_definition(
             pos=pos,
             heading=heading,
             is_static=is_static,
+            cargo_contained_type=cargo_contained_type,
         ):
             sent += 1
     return sent

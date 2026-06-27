@@ -25,8 +25,10 @@ from wulfram.packets import (
     build_carrying_info,
     build_uplink_info,
     build_supply_ship_info,
+    build_update_array_create_tank,
+    _compress_position,
 )
-from wulfram.codec import frame_packet
+from wulfram.codec import frame_packet, BitReader
 
 
 def test_hello_udp_config():
@@ -374,6 +376,59 @@ def test_supply_ship_info():
     return match
 
 
+def test_cargo_box_create_definition():
+    """CARGO_BOX (type 0x13) create must splice the type-specific DEFINITION field
+    (16-bit contained building type, network quantizer entry 4) BETWEEN team and the
+    static bit, per the OG parser (Replication.c:1002 -> entity+0xDC). Omitting it
+    desyncs the bitstream and the OG client drops with PROTOCOL ERROR "got ILLEGAL".
+
+    This mirrors the OG read sequence and asserts the position vector still decodes,
+    proving no downstream desync -- the lenient headless decoder did NOT catch this.
+    """
+    entity_id = 0x0000ABCD
+    team = 1
+    contained = 0  # Power Cell
+    pos = (1234.0, 5678.0, 42.0)
+    # include_health=False -> local-state prefix is exactly 1 bit (deterministic decode).
+    pkt = build_update_array_create_tank(
+        tick=7, entity_id=entity_id, entity_type=0x13, team=team, pos=pos,
+        include_health=False, is_manned=False, is_static=True,
+        cargo_contained_type=contained,
+    )
+
+    # Skip opcode (1 byte) + tick (4 bytes); bit-decode the rest mirroring the OG parser.
+    br = BitReader(pkt[5:])
+    ok = True
+    ok &= br.read_bits(1) == 0            # local-state flag (no stats)
+    ok &= br.read_bits(8) == 1            # entity count
+    ok &= br.read_bits(32) == entity_id   # OID
+    br.read_bits(1)                       # is_manned
+    br.read_bits(10)                      # presence flags
+    br.read_bits(16)                      # quantizer index field
+    etype = br.read_bits(8)
+    ok &= etype == 0x13                   # entity type
+    br.read_bits(8)                       # config/parent
+    ok &= br.read_bits(8) == team         # team
+    ok &= br.read_bits(16) == contained   # *** the type-0x13 DEFINITION field ***
+    br.read_bits(1)                       # static bit
+    ok &= br.read_bits(4) == 15           # position bank selector
+    for coord in pos:                     # alignment proof: position survives intact
+        _, q = _compress_position(coord)
+        ok &= br.read_bits(16) == q
+
+    # A non-0x13 create of otherwise-identical shape must be exactly 16 bits (2 bytes)
+    # shorter -- the field is present ONLY for 0x13.
+    pkt_plain = build_update_array_create_tank(
+        tick=7, entity_id=entity_id, entity_type=0x19, team=team, pos=pos,
+        include_health=False, is_manned=False, is_static=True,
+    )
+    ok &= (len(pkt) - len(pkt_plain)) == 2
+
+    print(f"CARGO_BOX create DEFINITION field: contained={contained} "
+          f"len_delta={len(pkt) - len(pkt_plain)}B  Match: {bool(ok)}")
+    return bool(ok)
+
+
 def test_world_stats():
     """Test WORLD_STATS packet."""
     payload = build_world_stats()
@@ -415,6 +470,7 @@ def main():
         test_carrying_info,
         test_uplink_info,
         test_supply_ship_info,
+        test_cargo_box_create_definition,
         test_world_stats,
     ]
 

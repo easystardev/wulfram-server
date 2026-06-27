@@ -660,10 +660,12 @@ class ConfigMixin:
         except (ValueError, TypeError):
             self.default_cargo_type = int(EntityType.REPAIR_BUILDING)
         self.build_require_cargo = os.environ.get("WULFRAM_BUILD_REQUIRE_CARGO", "0").strip().lower() in ("1", "on", "true", "yes")
-        # Broadcasting a CARGO_BOX (type 0x13) entity currently CRASHES the OG client
-        # (missing the type-0x13 DEFINITION field -> bitstream desync -> PROTOCOL ERROR).
-        # Off until build_update_array_create_tank writes that field (Phase 3).
-        self.cargo_box_entity_enabled = os.environ.get("WULFRAM_CARGO_BOX_ENTITY", "0").strip().lower() in ("1", "on", "true", "yes")
+        # Broadcasting a CARGO_BOX (type 0x13) entity: build_update_array_create_tank now
+        # writes the type-0x13 DEFINITION field (network quantizer entry 4 -> entity+0xDC
+        # contained building type), so the bitstream stays aligned on the OG client. Was
+        # gated OFF while that field was missing (desync -> PROTOCOL ERROR); default ON
+        # now that the format is written. Set WULFRAM_CARGO_BOX_ENTITY=0 to suppress.
+        self.cargo_box_entity_enabled = os.environ.get("WULFRAM_CARGO_BOX_ENTITY", "1").strip().lower() in ("1", "on", "true", "yes")
         # Supply-ship cargo as a finite, replenishing resource (the OG cargo_times
         # mechanism; DOCKING 0x38 has no OG client handler). The ship holds up to
         # ship_cargo_capacity boxes; each pickup depletes one; one box restocks every

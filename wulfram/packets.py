@@ -1019,7 +1019,8 @@ def build_update_array_create_tank(tick: int, entity_id: int, entity_type: int, 
                                     secondary_turret_bits: int = 0,
                                     secondary_turret_angle: float = 0.0,
                                     turret_max: float = 6.3,
-                                    turret_range: float = 12.6) -> bytes:
+                                    turret_range: float = 12.6,
+                                    cargo_contained_type: Optional[int] = None) -> bytes:
     """Build UPDATE_ARRAY that creates a tank entity with position inline."""
     tick_bytes = struct.pack(">I", tick)
     bw = BitWriter()
@@ -1045,6 +1046,16 @@ def build_update_array_create_tank(tick: int, entity_id: int, entity_type: int, 
     config_val = behavior_type if behavior_type else team
     bw.write_bits(8, config_val & 0xFF)
     bw.write_bits(8, team & 0xFF)
+    # CARGO_BOX (type 0x13) splices a type-specific DEFINITION field BEFORE the
+    # static bit: the OG create parser (Replication.c:1002) reads one quantized
+    # value via network quantizer entry 4 (16 bits) and stores it at entity+0xDC =
+    # the *contained building type* (0-11; the targeting code at Targeting.c:1609
+    # range-checks 0 <= +0xDC < 12). Omitting it desyncs the bitstream and the OG
+    # client drops with PROTOCOL ERROR "got ILLEGAL". 0 = Power Cell.
+    if (entity_type & 0xFF) == 0x13:
+        contained = 0 if cargo_contained_type is None else int(cargo_contained_type)
+        contained = max(0, min(11, contained))
+        bw.write_bits(16, contained & 0xFFFF)
     bw.write_bits(1, 1 if is_static else 0)
 
     bw.write_bits(4, 15)
@@ -1083,6 +1094,7 @@ def build_view_update_create_tank(tick: int, entity_id: int, entity_type: int, t
                                   secondary_turret_angle: float = 0.0,
                                   turret_max: float = 6.3,
                                   turret_range: float = 12.6,
+                                  cargo_contained_type: Optional[int] = None,
                                   timestamp: Optional[int] = None) -> bytes:
     """Build VIEW_UPDATE carrying the same definition-bearing tank shape.
 
@@ -1117,6 +1129,7 @@ def build_view_update_create_tank(tick: int, entity_id: int, entity_type: int, t
         secondary_turret_angle=secondary_turret_angle,
         turret_max=turret_max,
         turret_range=turret_range,
+        cargo_contained_type=cargo_contained_type,
     )
     return b'\x0F' + struct.pack(">I", timestamp) + update[1:]
 

@@ -1236,6 +1236,7 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
         pos: tuple[float, float, float],
         heading: float = 0.0,
         is_static: bool = True,
+        cargo_contained_type: int | None = None,
     ) -> bool:
         return build_uplink.send_dynamic_entity_definition(
             self,
@@ -1246,6 +1247,7 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
             pos=pos,
             heading=heading,
             is_static=is_static,
+            cargo_contained_type=cargo_contained_type,
         )
 
     def _broadcast_dynamic_entity_definition(
@@ -1257,6 +1259,7 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
         pos: tuple[float, float, float],
         heading: float = 0.0,
         is_static: bool = True,
+        cargo_contained_type: int | None = None,
     ) -> int:
         return build_uplink.broadcast_dynamic_entity_definition(
             self,
@@ -1266,6 +1269,7 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
             pos=pos,
             heading=heading,
             is_static=is_static,
+            cargo_contained_type=cargo_contained_type,
         )
 
     def _create_dynamic_building_from_uplink(
@@ -2802,19 +2806,22 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
         self._dropped_cargo_next_oid = oid + 1
         cpos = tuple(float(v) for v in pos)
         self._dropped_cargo[oid] = {"pos": cpos, "cargo_type": ctype, "team_id": int(team_id or 0)}
-        # Broadcasting a CARGO_BOX (type 0x13) entity via the generic create path
-        # CRASHES the OG client (PROTOCOL ERROR "got ILLEGAL"): the spawn parser reads
-        # a type-0x13-specific DEFINITION field (quantizer[4]) we don't write, so the
-        # bitstream desyncs. Gated OFF until build_update_array_create_tank writes the
-        # 0x13 field (Phase 3). The crate is still tracked + pickup-able server-side.
-        if getattr(self, "cargo_box_entity_enabled", False):
+        # Broadcast the pickup-able CARGO_BOX (type 0x13). The OG create parser reads a
+        # type-0x13-specific DEFINITION field (network quantizer entry 4, 16 bits) that
+        # stores the *contained building type* at entity+0xDC; build_update_array_create_tank
+        # now writes it, so the bitstream stays aligned (omitting it desynced -> OG dropped
+        # with PROTOCOL ERROR "got ILLEGAL"). `ctype` is the destroyed building's EntityType
+        # (25-36); fold it to the deploy registry's 0-11 id for the wire field.
+        contained = build_uplink.building_type_id_for_cargo(ctype)
+        if getattr(self, "cargo_box_entity_enabled", True):
             try:
                 self._broadcast_dynamic_entity_definition(
                     entity_id=oid, entity_type=int(EntityType.CARGO_BOX), team_id=int(team_id or 0),
-                    pos=cpos, heading=0.0, is_static=True)
+                    pos=cpos, heading=0.0, is_static=True, cargo_contained_type=contained)
             except Exception:  # noqa: BLE001 - drop tracking must never break the destroy path
                 pass
-        print(f"[CARGO] dropped crate oid={oid} type={ctype} at ({cpos[0]:.0f},{cpos[1]:.0f})")
+        print(f"[CARGO] dropped crate oid={oid} type={ctype} contained={contained} "
+              f"at ({cpos[0]:.0f},{cpos[1]:.0f})")
         return oid
 
     def _send_jump_velocity_update(self, ctx: ClientContext, addr: tuple):
