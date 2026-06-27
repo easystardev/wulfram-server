@@ -660,6 +660,18 @@ class ConfigMixin:
         except (ValueError, TypeError):
             self.default_cargo_type = int(EntityType.REPAIR_BUILDING)
         self.build_require_cargo = os.environ.get("WULFRAM_BUILD_REQUIRE_CARGO", "0").strip().lower() in ("1", "on", "true", "yes")
+        # Supply-ship cargo as a finite, replenishing resource (the OG cargo_times
+        # mechanism; DOCKING 0x38 has no OG client handler). The ship holds up to
+        # ship_cargo_capacity boxes; each pickup depletes one; one box restocks every
+        # ship_replenish_s seconds. So cargo isn't infinite.
+        try:
+            self.ship_cargo_capacity = max(1, int(os.environ.get("WULFRAM_SHIP_CARGO_CAPACITY", "3")))
+        except ValueError:
+            self.ship_cargo_capacity = 3
+        try:
+            self.ship_replenish_s = max(0.0, float(os.environ.get("WULFRAM_SHIP_REPLENISH_S", "12")))
+        except ValueError:
+            self.ship_replenish_s = 12.0
         # Construction timer: a just-built structure is "under construction" for this
         # many seconds (provides no service until complete). 0 = instant (default).
         try:

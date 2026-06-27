@@ -1298,14 +1298,16 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
         return build_uplink.broadcast_carrying_info(self, ctx)
 
     def _update_deconstruction(self) -> None:
-        """Complete due deconstructions (remove + refund). Guarded to run ~once per
-        tick even though it's invoked from the per-client building update."""
+        """Per-tick economy update: complete due deconstructions (remove + refund) and
+        replenish supply-ship cargo. Guarded to run ~once per tick even though it's
+        invoked from the per-client building update."""
         now = time.monotonic()
         if now - float(getattr(self, "_last_deconstruction_check", 0.0) or 0.0) < 0.1:
             return
         self._last_deconstruction_check = now
         if getattr(self, "_building_deconstruction", None):
             build_uplink.update_deconstruction(self)
+        build_uplink.replenish_ships(self)
 
     def _building_under_construction(self, oid: int) -> bool:
         """True while a just-built structure is still constructing (lazy-completes).
@@ -2776,11 +2778,18 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
             return False
         if (px - sx) ** 2 + (py - sy) ** 2 > rng_sq:
             return False
+        available = int(ship.get("cargo_available", 0) or 0)
+        if available <= 0:
+            return False  # ship out of cargo (replenishing)
         cargo_type = int(getattr(self, "default_cargo_type", 0) or 0)
         if cargo_type == 0:
             return False
         self._set_player_carry(ctx, cargo_type=cargo_type, cargo_count=1, has_uplink=False)
-        print(f"[CARGO] Client {ctx.client_id} picked up cargo type={cargo_type} from supply ship {ship.get('oid')}")
+        build_uplink.ship_set_cargo_available(self, ship, available - 1)
+        if float(ship.get("next_replenish", 0.0) or 0.0) <= 0.0:
+            ship["next_replenish"] = time.monotonic() + float(getattr(self, "ship_replenish_s", 0.0) or 0.0)
+        print(f"[CARGO] Client {ctx.client_id} picked up cargo type={cargo_type} from supply ship "
+              f"{ship.get('oid')} ({available - 1} left)")
         return True
 
     def _drop_cargo_crate(self, pos, cargo_type: int, team_id: int) -> int:

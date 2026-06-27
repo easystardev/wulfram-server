@@ -18622,8 +18622,11 @@ def test_cargo_pickup_proximity():
         return {}
 
     srv = SimpleNamespace(
-        _uplink_ships={2: {"oid": 29002, "pos": (5000.0, 5000.0, 5.0)}},
-        cargo_pickup_range=30.0, default_cargo_type=27, _set_player_carry=set_carry)
+        _uplink_ships={2: {"oid": 29002, "pos": (5000.0, 5000.0, 5.0),
+                           "cargo_available": 3, "next_replenish": 0.0, "cargo": [27, 27, 27, 40]}},
+        cargo_pickup_range=30.0, default_cargo_type=27, ship_cargo_capacity=3,
+        ship_replenish_s=0.0, _set_player_carry=set_carry,
+        _broadcast_uplink_ship_info=lambda ship: None)
     ctx = SimpleNamespace(
         cargo_type=0, cargo_count=0, has_uplink=False, client_id=1,
         player_pos=(5100.0, 5000.0, 5.0), session=SimpleNamespace(team_id=2, in_game=True))
@@ -18882,6 +18885,53 @@ def test_cargo_drop_and_crate_pickup():
     return True
 
 
+def test_supply_ship_cargo_replenish():
+    """Supply-ship cargo is finite + replenishes: ship_set_cargo_available reflects
+    the count into the cargo array; replenish_ships restocks one box per interval up
+    to capacity. (Phase 2 supply-ship resource)"""
+    import time as _t
+    from wulfram import build_uplink
+
+    class Srv:
+        ship_cargo_capacity = 3
+        ship_replenish_s = 10.0
+        default_cargo_type = 27
+
+        def __init__(self):
+            self._uplink_ships = {2: {"cargo_available": 3, "next_replenish": 0.0,
+                                      "cargo": [27, 27, 27, 40]}}
+            self.broadcasts = 0
+
+        def _broadcast_uplink_ship_info(self, ship):
+            self.broadcasts += 1
+
+    srv = Srv()
+    ship = srv._uplink_ships[2]
+
+    # set available -> reflects into the 4-slot array
+    build_uplink.ship_set_cargo_available(srv, ship, 1)
+    assert ship["cargo_available"] == 1 and ship["cargo"] == [27, 40, 40, 40], ship["cargo"]
+
+    # first replenish (next_replenish=0) arms the timer, no restock
+    ship["next_replenish"] = 0.0
+    assert build_uplink.replenish_ships(srv) == 0
+    assert ship["cargo_available"] == 1 and ship["next_replenish"] > 0
+
+    # not due -> no restock
+    ship["next_replenish"] = _t.monotonic() + 100.0
+    assert build_uplink.replenish_ships(srv) == 0
+
+    # due -> restock one
+    ship["next_replenish"] = _t.monotonic() - 1.0
+    assert build_uplink.replenish_ships(srv) == 1 and ship["cargo_available"] == 2
+
+    # at capacity -> no restock
+    build_uplink.ship_set_cargo_available(srv, ship, 3)
+    assert build_uplink.replenish_ships(srv) == 0
+    print("test_supply_ship_cargo_replenish: PASSED")
+    return True
+
+
 def main():
     print("=" * 60)
     print("Handler Tests")
@@ -18902,6 +18952,7 @@ def main():
         test_deconstruction_timer,
         test_removal_clears_timer_dicts,
         test_cargo_drop_and_crate_pickup,
+        test_supply_ship_cargo_replenish,
         test_behavior_spawn_enabled_defaults_on_for_entry_map_spawn,
         test_input_sync_diagnosis_distinguishes_idle_snapback_from_correction_failure,
         test_input_sync_diagnosis_reports_movement_without_targeted_corrections,

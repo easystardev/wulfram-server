@@ -496,17 +496,23 @@ def get_or_create_uplink_ship(server: object, ctx: object, team_id: int) -> dict
         base_oid = int(os.environ.get("WULFRAM_UPLINK_SHIP_BASE_OID", "29000"), 0)
     except ValueError:
         base_oid = 29000
+    capacity = int(getattr(server, "ship_cargo_capacity", 3) or 3)
+    cargo_type = int(getattr(server, "default_cargo_type", 0) or 0)
     ship = {
         "oid": base_oid + int(team_id),
         "team_id": team_id,
         "name": f"Team {team_id} Supply Ship",
         "pos": (x, y, z),
-        "heading": 0.0,
-        "cargo": [40, 40, 40, 40],
+        # cargo_available boxes available for pickup; reflected into the 4-slot
+        # cargo array (filled slots = the default cargo type, rest empty=40).
+        "cargo_available": capacity,
+        "next_replenish": 0.0,
+        "cargo": [cargo_type if i < capacity and cargo_type > 0 else 40 for i in range(4)],
         "cargo_times": [0, 0, 0, 0],
         "build_mode": 3,
         "shield_pct": 100,
         "status_template": 0,
+        "heading": 0.0,
     }
     server._uplink_ships[team_id] = ship
     return ship
@@ -533,6 +539,40 @@ def broadcast_uplink_ship_info(server: object, ship: dict[str, Any]) -> int:
         if server._send_uplink_ship_info(target, ship):
             sent += 1
     return sent
+
+
+def ship_set_cargo_available(server: object, ship: dict[str, Any], available: int) -> None:
+    """Set a supply ship's available-cargo count, reflect it into the 4-slot cargo
+    array (filled = default cargo type, rest empty=40), and broadcast SUPPLY_SHIP_INFO."""
+    capacity = int(getattr(server, "ship_cargo_capacity", 3) or 3)
+    available = max(0, min(capacity, int(available)))
+    ship["cargo_available"] = available
+    cargo_type = int(getattr(server, "default_cargo_type", 0) or 0)
+    ship["cargo"] = [cargo_type if i < available and cargo_type > 0 else 40 for i in range(4)]
+    server._broadcast_uplink_ship_info(ship)
+
+
+def replenish_ships(server: object) -> int:
+    """Per-tick: restock each supply ship one cargo box every ship_replenish_s."""
+    interval = float(getattr(server, "ship_replenish_s", 0.0) or 0.0)
+    if interval <= 0.0:
+        return 0
+    capacity = int(getattr(server, "ship_cargo_capacity", 3) or 3)
+    now = time.monotonic()
+    restocked = 0
+    for ship in (getattr(server, "_uplink_ships", None) or {}).values():
+        avail = int(ship.get("cargo_available", capacity))
+        if avail >= capacity:
+            continue
+        nxt = float(ship.get("next_replenish", 0.0) or 0.0)
+        if nxt <= 0.0:
+            ship["next_replenish"] = now + interval
+            continue
+        if now >= nxt:
+            ship_set_cargo_available(server, ship, avail + 1)
+            ship["next_replenish"] = (now + interval) if (avail + 1) < capacity else 0.0
+            restocked += 1
+    return restocked
 
 
 def broadcast_carrying_info(server: object, ctx: object) -> int:
