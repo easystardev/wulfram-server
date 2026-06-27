@@ -2112,16 +2112,19 @@ Examples:
                            "slots": [round(float(v), 3) for v in slots]})
 
     def _cmd_dropcargo(self, args: list) -> str:
-        """Spawn a CARGO_BOX crate ~20u in front of the active player (drive-over
-        pickup test). Usage: dropcargo [building_type]. Phase 3 harness.
+        """Spawn a CARGO_BOX crate in front of the active player (drive-over pickup
+        test). Usage: dropcargo [building_type] [distance]. Phase 3 harness.
 
         Default is a Power Cell box (EntityType.ENERGY_BUILDING) -- the one type that
-        deploys without an existing power source, so it's the natural first test."""
+        deploys without an existing power source, so it's the natural first test.
+        Distance defaults to 20u; pass a value > cargo_pickup_range (~30u) to keep the
+        crate from being auto-picked-up so it persists for render/target inspection."""
         import math as _m
         if not self.server:
             return "Error: No server reference"
         from .weapons import EntityType
         ctype = int(EntityType.ENERGY_BUILDING)
+        distance = 20.0
         if args:
             try:
                 ctype = int(args[0])
@@ -2130,12 +2133,17 @@ Examples:
                 et = entity_type_from_name(args[0])
                 if et is not None:
                     ctype = int(et)
+        if len(args) > 1:
+            try:
+                distance = float(args[1])
+            except ValueError:
+                pass
         ctx = self._first_in_game_client(args)
         if ctx is None:
             return "Error: no in-game client"
         heading = float(getattr(ctx, "player_heading", 0.0) or 0.0)
         px, py, pz = (float(v) for v in (ctx.player_pos or (0, 0, 0)))
-        pos = (px + _m.cos(heading) * 20.0, py + _m.sin(heading) * 20.0, pz)
+        pos = (px + _m.cos(heading) * distance, py + _m.sin(heading) * distance, pz)
         oid = self.server._drop_cargo_crate(pos, ctype, int(getattr(ctx.session, "team_id", 0) or 0))
         from .build_uplink import building_type_id_for_cargo
         contained = building_type_id_for_cargo(ctype)
