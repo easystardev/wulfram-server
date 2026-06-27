@@ -19045,6 +19045,53 @@ def test_cargo_deploy_and_drop_request():
     return True
 
 
+def test_death_auto_respawn_schedules_delayed_spawn():
+    """death=respawn (user-requested): on death, _enter_death_deploy_state schedules a
+    delayed auto-spawn on the PRESERVED team (mirroring the respawn command) instead of
+    the manual flag-click flow -- when death_auto_respawn is on. Off -> manual flow
+    (timer cleared, phase TEAM_SELECT)."""
+    import time as _t
+
+    class Srv:
+        death_auto_respawn = True
+        death_respawn_delay_s = 7.0
+
+        def _pick_spawn_point(self, team_id):
+            return {"oid": 5002, "x": 5050.0, "y": 5050.0, "z": 5.0, "team": team_id}
+
+    def mk_ctx():
+        ctx = ClientContext(client_id=1, client_addr=("10.10.10.2", 50000),
+                            session=Session(), entity_id=0x14EA)
+        ctx.session.team_id = 2
+        ctx.session.in_game = True
+        ctx.session.phase = Phase.IN_GAME
+        return ctx
+
+    # ON: schedules delayed auto-spawn on the preserved team
+    srv = Srv()
+    ctx = mk_ctx()
+    t0 = _t.monotonic()
+    team = WulframServer._enter_death_deploy_state(srv, ctx)
+    assert team == 2, team
+    assert ctx.session.delayed_spawn_team == 2, ctx.session.delayed_spawn_team
+    assert ctx.session.delayed_spawn_time >= t0 + 6.5, ctx.session.delayed_spawn_time
+    assert ctx.pending_respawn_pos == (5050.0, 5050.0, 5.0), getattr(ctx, "pending_respawn_pos", None)
+    assert ctx.session.in_game is False
+    # does NOT force TEAM_SELECT (matches _do_respawn so _auto_join_team fires)
+    assert ctx.session.phase == Phase.IN_GAME, ctx.session.phase
+
+    # OFF: manual flag-click flow (timer cleared, TEAM_SELECT)
+    srv2 = Srv(); srv2.death_auto_respawn = False
+    srv2.roster_sent = False
+    ctx2 = mk_ctx()
+    WulframServer._enter_death_deploy_state(srv2, ctx2)
+    assert ctx2.session.delayed_spawn_team == 0, ctx2.session.delayed_spawn_team
+    assert ctx2.session.phase == Phase.TEAM_SELECT, ctx2.session.phase
+
+    print("test_death_auto_respawn_schedules_delayed_spawn: PASSED")
+    return True
+
+
 def test_match_flow_clock_and_round_end():
     """Match flow (Phase 3 slice 4): GAME_CLOCK uses the inverted active flag (running
     -> 0), the round timer counts down, and round end announces a winner (most team
@@ -19462,6 +19509,7 @@ def main():
         test_udp_team_switch_sends_update_stats_before_reincarnate,
         test_cargo_deploy_and_drop_request,
         test_match_flow_clock_and_round_end,
+        test_death_auto_respawn_schedules_delayed_spawn,
     ]
 
     passed = 0

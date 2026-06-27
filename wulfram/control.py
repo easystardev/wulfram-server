@@ -568,6 +568,10 @@ class ControlServer:
             return self._cmd_clock(args)
         elif cmd == 'endround':
             return self._cmd_endround(args)
+        elif cmd == 'deathdelay':
+            return self._cmd_deathdelay(args)
+        elif cmd == 'constructtime':
+            return self._cmd_constructtime(args)
         elif cmd == 'building_events' or cmd == 'bevents':
             return self._cmd_building_events(args)
         elif cmd == 'building_damage' or cmd == 'bdmg':
@@ -2170,6 +2174,34 @@ Examples:
             "team_scores": match_flow._team_scores(self.server),
             "clock_broadcast_to": sent,
         })
+
+    def _cmd_deathdelay(self, args: list) -> str:
+        """Show/set the death->respawn auto-spawn delay (seconds). Usage: deathdelay [s].
+        With death=respawn on, this is how long the death/deploy screen shows before the
+        server auto-spawns you back on your team."""
+        if not self.server:
+            return "Error: No server reference"
+        if args:
+            try:
+                val = max(0.0, float(args[0]))
+            except ValueError:
+                return f"deathdelay: invalid value '{args[0]}'"
+            self.server.death_respawn_delay_s = val
+        return (f"death_auto_respawn={bool(getattr(self.server, 'death_auto_respawn', False))} "
+                f"death_respawn_delay_s={float(getattr(self.server, 'death_respawn_delay_s', 0.0)):.1f}")
+
+    def _cmd_constructtime(self, args: list) -> str:
+        """Show/set the building construction timeout (seconds). Usage: constructtime [s].
+        A just-built structure provides no service until this elapses."""
+        if not self.server:
+            return "Error: No server reference"
+        if args:
+            try:
+                val = max(0.0, float(args[0]))
+            except ValueError:
+                return f"constructtime: invalid value '{args[0]}'"
+            self.server.construction_timeout = val
+        return f"construction_timeout={float(getattr(self.server, 'construction_timeout', 0.0)):.1f}s"
 
     def _cmd_endround(self, args: list) -> str:
         """Force the current round to end now (announce + RESET_GAME + new round).

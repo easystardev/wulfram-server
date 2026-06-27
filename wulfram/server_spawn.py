@@ -138,6 +138,26 @@ class SpawnMixin:
         # redeploy must land on the SAME team. handle_spawn_at_point reads the clicked
         # flag's team and falls back to this preserved value.
         preserved_team = sess.team_id
+        # Death = respawn (user-requested 2026-06-27): mirror the `respawn` command
+        # (_do_respawn) -- schedule a server-side delayed auto-spawn on the preserved
+        # team instead of the manual flag-click flow. The OG client shows the
+        # death/deploy screen during the countdown (same as `respawn`). Does NOT force
+        # phase=TEAM_SELECT / reset roster_sent (matching _do_respawn), so the delayed
+        # spawn fires through _auto_join_team. Delay is live-tunable (`deathdelay`).
+        if getattr(self, "death_auto_respawn", False):
+            delay = float(getattr(self, "death_respawn_delay_s", 5.0) or 0.0)
+            spawn = self._pick_spawn_point(preserved_team)
+            if spawn:
+                target.pending_respawn_pos = (spawn["x"], spawn["y"], spawn["z"])
+            sess.delayed_spawn_team = preserved_team
+            sess.delayed_spawn_time = time.monotonic() + delay
+            sess.pending_spawn_team_id = 0
+            sess.in_game = False
+            print(
+                f"[COMBAT] c{target.client_id} -> death; auto-respawn "
+                f"(team={preserved_team} preserved) in {delay:.0f}s [death=respawn]"
+            )
+            return preserved_team
         # Belt-and-suspenders: make sure no stale auto-spawn timer can fire. THIS is the
         # line that used to schedule the instant respawn; we explicitly clear it instead.
         sess.delayed_spawn_team = 0

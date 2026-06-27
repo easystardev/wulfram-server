@@ -727,6 +727,16 @@ class ConfigMixin:
             self.deconstruction_timeout = max(0.0, float(os.environ.get("WULFRAM_DECONSTRUCTION_TIMEOUT_S", "0")))
         except ValueError:
             self.deconstruction_timeout = 0.0
+        # Death respawn flow: on death, mirror the `respawn` command -- schedule a
+        # server-side delayed auto-spawn on the preserved team (the OG client shows the
+        # death/deploy screen with a countdown during the wait) instead of the
+        # manual-flag-click death/deploy state. Default ON (user-requested). The delay
+        # is live-adjustable via the `deathdelay` control command.
+        self.death_auto_respawn = os.environ.get("WULFRAM_DEATH_AUTO_RESPAWN", "1").strip().lower() in ("1", "on", "true", "yes")
+        try:
+            self.death_respawn_delay_s = max(0.0, float(os.environ.get("WULFRAM_DEATH_RESPAWN_DELAY_S", "5")))
+        except ValueError:
+            self.death_respawn_delay_s = 5.0
         self.projectiles_enabled = os.environ.get("WULFRAM_PROJECTILES_ENABLED", "1") == "1"
         self.remote_projectiles = os.environ.get("WULFRAM_REMOTE_PROJECTILES", "1") == "1"
         self.remote_combat_observer_packets = (
