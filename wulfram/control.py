@@ -560,6 +560,10 @@ class ControlServer:
             return self._cmd_econ(args)
         elif cmd == 'decon':
             return self._cmd_decon(args)
+        elif cmd == 'slots':
+            return self._cmd_slots(args)
+        elif cmd == 'dropcargo':
+            return self._cmd_dropcargo(args)
         elif cmd == 'building_events' or cmd == 'bevents':
             return self._cmd_building_events(args)
         elif cmd == 'building_damage' or cmd == 'bdmg':
@@ -2092,6 +2096,58 @@ Examples:
                 f"{vel_str}{hp_str}{input_str}{sync_str}{jitter_str}{diagnosis_str}"
             )
         return "\n".join(lines)
+
+    def _cmd_slots(self, args: list) -> str:
+        """Dump the active in-game client's decoded behavior slots (0-21) as JSON.
+        Input-observation harness for Phase 3 (finding the deploy slot)."""
+        import json
+        if not self.server:
+            return "Error: No server reference"
+        ctx = self._first_in_game_client(args)
+        if ctx is None:
+            return "Error: no in-game client"
+        ws = getattr(ctx, "weapon_system", None)
+        slots = list(getattr(ws, "behavior_slots", []) or []) if ws is not None else []
+        return json.dumps({"client_id": getattr(ctx, "client_id", None),
+                           "slots": [round(float(v), 3) for v in slots]})
+
+    def _cmd_dropcargo(self, args: list) -> str:
+        """Spawn a CARGO_BOX crate ~20u in front of the active player (drive-over
+        pickup test). Usage: dropcargo [building_type]. Phase 3 harness."""
+        import math as _m
+        if not self.server:
+            return "Error: No server reference"
+        ctype = 27
+        if args:
+            try:
+                ctype = int(args[0])
+            except ValueError:
+                from .build_uplink import entity_type_from_name
+                et = entity_type_from_name(args[0])
+                if et is not None:
+                    ctype = int(et)
+        ctx = self._first_in_game_client(args)
+        if ctx is None:
+            return "Error: no in-game client"
+        heading = float(getattr(ctx, "player_heading", 0.0) or 0.0)
+        px, py, pz = (float(v) for v in (ctx.player_pos or (0, 0, 0)))
+        pos = (px + _m.cos(heading) * 20.0, py + _m.sin(heading) * 20.0, pz)
+        oid = self.server._drop_cargo_crate(pos, ctype, int(getattr(ctx.session, "team_id", 0) or 0))
+        return f"dropcargo: oid={oid} type={ctype} at ({pos[0]:.0f},{pos[1]:.0f})"
+
+    def _first_in_game_client(self, args: list):
+        """Resolve the active (or cN-selected) in-game client."""
+        target_client_id = None
+        for a in args:
+            if isinstance(a, str) and a.startswith('c') and a[1:].isdigit():
+                target_client_id = int(a[1:])
+        with self.server.clients_lock:
+            for c in self.server.clients.values():
+                if target_client_id is not None and getattr(c, "client_id", None) != target_client_id:
+                    continue
+                if getattr(c, "session", None) and c.session.in_game:
+                    return c
+        return None
 
     def _cmd_decon(self, args: list) -> str:
         """Deconstruct the active player's latest matching dynamic building.

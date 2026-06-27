@@ -2802,12 +2802,18 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
         self._dropped_cargo_next_oid = oid + 1
         cpos = tuple(float(v) for v in pos)
         self._dropped_cargo[oid] = {"pos": cpos, "cargo_type": ctype, "team_id": int(team_id or 0)}
-        try:
-            self._broadcast_dynamic_entity_definition(
-                entity_id=oid, entity_type=int(EntityType.CARGO_BOX), team_id=int(team_id or 0),
-                pos=cpos, heading=0.0, is_static=True)
-        except Exception:  # noqa: BLE001 - drop tracking must never break the destroy path
-            pass
+        # Broadcasting a CARGO_BOX (type 0x13) entity via the generic create path
+        # CRASHES the OG client (PROTOCOL ERROR "got ILLEGAL"): the spawn parser reads
+        # a type-0x13-specific DEFINITION field (quantizer[4]) we don't write, so the
+        # bitstream desyncs. Gated OFF until build_update_array_create_tank writes the
+        # 0x13 field (Phase 3). The crate is still tracked + pickup-able server-side.
+        if getattr(self, "cargo_box_entity_enabled", False):
+            try:
+                self._broadcast_dynamic_entity_definition(
+                    entity_id=oid, entity_type=int(EntityType.CARGO_BOX), team_id=int(team_id or 0),
+                    pos=cpos, heading=0.0, is_static=True)
+            except Exception:  # noqa: BLE001 - drop tracking must never break the destroy path
+                pass
         print(f"[CARGO] dropped crate oid={oid} type={ctype} at ({cpos[0]:.0f},{cpos[1]:.0f})")
         return oid
 

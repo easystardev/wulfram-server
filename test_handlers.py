@@ -18844,6 +18844,7 @@ def test_cargo_drop_and_crate_pickup():
     class Srv:
         cargo_pickup_range = 30.0
         default_cargo_type = 0  # no ship cargo -> isolate crate pickup
+        cargo_box_entity_enabled = True  # exercise the (gated) entity broadcast path
 
         def __init__(self):
             self._dropped_cargo = {}
