@@ -229,6 +229,17 @@ class ConfigMixin:
             self.periodic_correction_interval = 0.0
         if self.periodic_correction_interval < 0.0:
             self.periodic_correction_interval = 0.0
+        # FREEZE FIX (2026-06-27): periodic corrections ride VIEW_UPDATE, which the OG
+        # client applies as apply_lag_compensation = snap pose + ZERO VELOCITY. Firing
+        # that every ~0.5s while the player drives zeros their momentum each tick -> the
+        # tank can't move (a remote/real-latency freeze; masked before because wulftap
+        # validates position, not movement feel). Default: suppress periodic during
+        # active movement input (drift clears the moment the player stops, no freeze).
+        # Set WULFRAM_PERIODIC_CORRECTION_DURING_MOVEMENT=1 to restore the old
+        # fire-during-movement behavior (A/B only; it freezes real OG clients).
+        self.periodic_correction_during_movement = os.environ.get(
+            "WULFRAM_PERIODIC_CORRECTION_DURING_MOVEMENT", "0"
+        ).strip().lower() in ("1", "on", "true", "yes")
         # Prediction-lead extrapolation (2026-06-26). Characterized via
         # tools/wulftap_turn_capture.py + analyze_turn_capture.py: the OG client
         # runs deterministic prediction ~1 server tick AHEAD of the server's

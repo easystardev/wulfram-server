@@ -3346,14 +3346,22 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
                     burst_due = self._correction_burst_due(
                         ctx, now, active_movement_correction_suppressed
                     )
-                    # Periodic correction: fires on a steady cadence even DURING
-                    # movement (the divergence accumulator is blind to the OG's
-                    # lateral prediction gap, and burst/divergence are paused while
-                    # driving — so without this, drift only clears on a jumpjet
-                    # force-correction). Opt-in via WULFRAM_PERIODIC_CORRECTION_S.
+                    # Periodic correction: steady-cadence drift clear. It rides
+                    # VIEW_UPDATE, which the OG client applies as snap-pose + ZERO
+                    # VELOCITY (apply_lag_compensation). Firing it WHILE the player
+                    # drives zeros their momentum every ~0.5s -> a real-latency movement
+                    # FREEZE (2026-06-27). So by default it is SUPPRESSED during active
+                    # movement input (same gate burst/divergence already respect); the
+                    # accumulated drift then clears the instant the player stops, with no
+                    # freeze. WULFRAM_PERIODIC_CORRECTION_DURING_MOVEMENT=1 restores the
+                    # old fire-during-movement behavior (A/B only; freezes OG clients).
                     periodic_due = (
                         self.periodic_correction_interval > 0.0
                         and not handlers._is_loopback_client(ctx)
+                        and (
+                            self.periodic_correction_during_movement
+                            or not active_movement_correction_suppressed
+                        )
                         and (now - ctx.last_correction_send) >= self.periodic_correction_interval
                     )
                     if force_due:
