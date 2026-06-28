@@ -839,6 +839,15 @@ class WeaponSystem:
         entity_id = self.next_entity_id
         self.next_entity_id += 1
 
+        # NaN GUARD (2026-06-28): a terrain physics edge case can poison the player's
+        # pose/angular velocity to NaN, which propagates here into the projectile pos/vel.
+        # A projectile packet full of NaN explodes the OG client's physics/render -> FREEZE.
+        # Never emit a non-finite projectile (the player's own physics is sanitized
+        # separately so they recover without a respawn).
+        if not all(math.isfinite(v) for v in (spawn_x, spawn_y, spawn_z, vel_x, vel_y, vel_z)):
+            print(f"[WEAPON] BLOCKED non-finite pulse shell (pos=({spawn_x},{spawn_y},{spawn_z}) "
+                  f"vel=({vel_x},{vel_y},{vel_z})) -- physics NaN; skipping shot")
+            return None
         proj = Projectile(
             entity_id=entity_id,
             entity_type=EntityType.PULSE_SHELL,
@@ -966,6 +975,12 @@ class WeaponSystem:
         entity_id = self.next_entity_id
         self.next_entity_id += 1
 
+        # NaN GUARD (2026-06-28): never emit a non-finite projectile (a NaN from a terrain
+        # physics edge case freezes the OG client when the packet arrives). See _fire_pulse_cannon.
+        if not all(math.isfinite(v) for v in (spawn_x, spawn_y, spawn_z, vel_x, vel_y, vel_z)):
+            print(f"[WEAPON] BLOCKED non-finite projectile (pos=({spawn_x},{spawn_y},{spawn_z}) "
+                  f"vel=({vel_x},{vel_y},{vel_z})) -- physics NaN; skipping shot")
+            return None
         proj = Projectile(
             entity_id=entity_id,
             entity_type=entity_type,

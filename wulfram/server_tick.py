@@ -552,6 +552,17 @@ class TickMixin:
         erase the previous spring-derived body matrix before the next
         `Spring_update_world_state` sample.
         """
+        # NaN GUARD (2026-06-28): a terrain physics edge case can poison the physics
+        # object's heading/angular velocity to NaN. That NaN spreads to the pose, the
+        # correction stream, and the projectile fire -- a NaN projectile packet freezes
+        # the OG client, and the player rubberbands/sticks. Reset the physics object's
+        # state so the NaN can't persist and the player recovers WITHOUT a respawn.
+        if not math.isfinite(physics.angular_velocity):
+            physics.angular_velocity = 0.0
+        if not math.isfinite(physics.heading):
+            physics.heading = float(getattr(ctx, "player_heading", 0.0) or 0.0)
+            print(f"[PHYSICS] c{getattr(ctx, 'client_id', '?')} non-finite heading reset "
+                  f"(terrain NaN edge case) -> {physics.heading:.1f}")
         ctx.player_heading = physics.heading
         ctx.angular_vel_yaw = physics.angular_velocity
         ctx.player_yaw = -ctx.player_heading
