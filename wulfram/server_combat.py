@@ -1428,6 +1428,8 @@ class CombatMixin:
         body_pitch = float(ctx.player_pose.get("pitch", 0.0) or 0.0)
         body_yaw = float(ctx.player_heading)
 
+        live_body_yaw = body_yaw
+        ctx._last_auth_snapshot_stale = False
         hist = self._select_authoritative_state_snapshot(ctx, client_tick) if client_tick else None
         if hist is not None:
             hist_pos = hist.get("pos")
@@ -1440,7 +1442,27 @@ class CombatMixin:
             if len(hist_rot) >= 2:
                 body_pitch = float(hist_rot[1])
             if len(hist_rot) >= 3:
-                body_yaw = float(hist_rot[2])
+                hist_yaw = float(hist_rot[2])
+                # STALE-YAW GUARD: the snapshot selector returns an UNBOUNDED-stale pose
+                # (pre-turn) for a remote fire whose tick missed the 250ms replay window
+                # (its `return best_abs` fallback). Spawning the shell at that stale yaw is
+                # the "pulse fires the wrong way" bug (~109deg off, measured 2026-06-28).
+                # When the snapshot came from that stale fallback AND its yaw deviates
+                # implausibly from the live body yaw, use the live yaw (lockstep with the
+                # client) for direction. A FRESH history yaw is kept even if the player
+                # turned (that is the correct fire-tick aim).
+                stale_fallback = bool(getattr(ctx, "_last_auth_snapshot_stale", False))
+                yaw_dev = abs((math.degrees(hist_yaw - live_body_yaw) + 180.0) % 360.0 - 180.0)
+                if (getattr(self, "fire_pose_stale_yaw_guard", True)
+                        and stale_fallback
+                        and yaw_dev > float(getattr(self, "fire_pose_stale_yaw_deg", 30.0))):
+                    print(
+                        f"[FIRE-POSE] stale history yaw rejected: hist={math.degrees(hist_yaw):.1f} "
+                        f"live={math.degrees(live_body_yaw):.1f} dev={yaw_dev:.1f}deg -> using live yaw"
+                    )
+                    pose_source = "history+liveyaw"
+                else:
+                    body_yaw = hist_yaw
 
         aim_pitch, aim_yaw, aim_src = self._get_aim_rotation(ctx)
         aim_label = aim_src

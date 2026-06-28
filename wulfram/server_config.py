@@ -650,6 +650,24 @@ class ConfigMixin:
         # (entity +0x30/+0x34/+0x38), but the playable slice keeps the previous
         # yaw-only body source unless this live OG gate flag is enabled.
         self.projectile_body_pitch = self._projectile_body_pitch_enabled_from_env()
+        # FIRE-POSE STALE-YAW GUARD (2026-06-28): the muzzle pose comes from the replay
+        # history snapshot nearest the fire packet's client_tick. That selector has an
+        # UNBOUNDED stale fallback for remote clients (server.py _select_authoritative_
+        # state_snapshot: `return best_abs` with no max delta), so a fire whose tick does
+        # not map within the 250ms replay window grabs the nearest available snapshot --
+        # which during/after a turn is a PRE-TURN pose. Result: the pulse shell spawns at a
+        # stale heading (measured ~109deg off the live body) = the "shell fires the wrong
+        # way" report. Position staleness is a few units; YAW staleness is catastrophic.
+        # When the history yaw deviates from the live body yaw by more than the threshold
+        # (the stale-fallback signature -- at rest they are identical), use the live body
+        # yaw for the projectile DIRECTION (muzzle position still uses history). Live server
+        # yaw is in lockstep with the client (<2deg verified 2026-06-28), so it is the
+        # correct proxy for where the firer is aiming. 0 = off (legacy unbounded history).
+        self.fire_pose_stale_yaw_guard = os.environ.get("WULFRAM_FIRE_POSE_STALE_YAW_GUARD", "1") != "0"
+        try:
+            self.fire_pose_stale_yaw_deg = float(os.environ.get("WULFRAM_FIRE_POSE_STALE_YAW_DEG", "30.0"))
+        except (TypeError, ValueError):
+            self.fire_pose_stale_yaw_deg = 30.0
         # Terrain-conform replicated (player-built) buildings: a flat pad placed at
         # its center terrain-Z cuts through any slope (uphill half sinks, downhill
         # half floats) = the "pad floats into terrain" report. When on, the dynamic

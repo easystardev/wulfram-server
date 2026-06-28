@@ -813,6 +813,62 @@ def test_projectile_body_source_can_opt_into_body_pitch():
     return True
 
 
+def test_projectile_fire_pose_rejects_stale_fallback_yaw():
+    """A fire whose tick misses the replay window must NOT spawn at the stale
+    history yaw (the 'pulse fires the wrong way' bug). The selector's unbounded
+    best_abs fallback returns a pre-turn pose; the stale-yaw guard keeps the live
+    body yaw for direction while still using the history muzzle position."""
+    server = WulframServer.__new__(WulframServer)
+    server.up_axis = "z"
+    server.pos_offset = 0.0
+    server.projectile_aim_source = "body"
+    server.projectile_body_pitch = False
+    server.use_client_ticks = False
+    server.viewpoint_timeout = 0.5
+    server.aim_hold_time = 0.5
+    server.fire_pose_stale_yaw_guard = True
+    server.fire_pose_stale_yaw_deg = 30.0
+
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("73.185.157.225", 50000),  # non-loopback (real remote)
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    ctx.player_pos = (50.0, 60.0, 7.0)
+    ctx.player_heading = 2.0  # live body yaw (where the firer is actually pointing)
+    ctx.player_pose["roll"] = 0.4
+    ctx.player_pose["pitch"] = 0.2
+    ctx.player_aim_source = "init"
+    ctx.player_aim_time = 0.0
+    # History snapshot at tick 1000 with a PRE-TURN yaw (1.25 rad ~ 72deg, ~43deg off
+    # the live 2.0). The fire requests tick 9000 -> 8000ms past the snapshot, far outside
+    # the 250ms replay window, so the selector returns this via its stale best_abs fallback.
+    ctx.authoritative_state_history.append({
+        "tick": 1000,
+        "time": time.monotonic(),
+        "pos": (10.0, 20.0, 3.0),
+        "vel": (1.0, 0.0, 0.0),
+        "rot": (0.1, 0.2, 1.25),
+    })
+
+    pos, rot, aim_src, pose_src = server._select_weapon_fire_pose(ctx, 9000)
+
+    assert pos == (10.0, 20.0, 3.0), pos          # muzzle position still from history
+    assert rot == (0.1, 0.0, 2.0), rot            # DIRECTION uses live yaw (2.0), not 1.25
+    assert pose_src == "history+liveyaw", pose_src
+    assert getattr(ctx, "_last_auth_snapshot_stale", None) is True
+
+    # Guard OFF restores the legacy behavior (stale history yaw used) -- documents the gate.
+    server.fire_pose_stale_yaw_guard = False
+    _, rot_legacy, _, pose_legacy = server._select_weapon_fire_pose(ctx, 9000)
+    assert rot_legacy == (0.1, 0.0, 1.25), rot_legacy
+    assert pose_legacy == "history", pose_legacy
+
+    print("test_projectile_fire_pose_rejects_stale_fallback_yaw: PASSED")
+    return True
+
+
 def test_projectile_body_pitch_defaults_on_with_env_optout():
     """Pulse/body projectile pitch should be canonical by default, with explicit opt-out."""
     old_env = os.environ.get("WULFRAM_PROJECTILE_BODY_PITCH")
@@ -19207,6 +19263,7 @@ def main():
         test_pulse_shell_default_spawn_uses_recovered_muzzle_offset,
         test_projectile_fire_pose_uses_replay_history_when_available,
         test_projectile_body_source_can_opt_into_body_pitch,
+        test_projectile_fire_pose_rejects_stale_fallback_yaw,
         test_projectile_body_pitch_defaults_on_with_env_optout,
         test_remote_spawn_points_use_udp_not_tcp,
         test_login_bootstrap_mode_routes_og_client_by_login_flow,

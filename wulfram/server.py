@@ -945,15 +945,21 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
                     best_abs_delta = abs_delta
 
         max_replay_delta = 250
+        # Record whether the chosen snapshot fell within the tight replay window or came
+        # from the unbounded stale fallback below. Fire-pose selection uses this to avoid
+        # spawning a projectile at a stale (pre-turn) yaw -- see _select_weapon_fire_pose.
         if best_prior is not None and best_prior_delta is not None and best_prior_delta <= max_replay_delta:
+            ctx._last_auth_snapshot_stale = False
             return best_prior
         if best_abs is not None and best_abs_delta is not None and best_abs_delta <= max_replay_delta:
+            ctx._last_auth_snapshot_stale = False
             return best_abs
         if best_abs is not None and not handlers._is_loopback_client(ctx):
             # OG prediction is more likely to reject a reply that pairs an old
             # replay timestamp with the live/current pose than a coherent cached
             # authoritative sample. Keep remote replies on history even when the
             # request arrived outside our tight replay window.
+            ctx._last_auth_snapshot_stale = True
             return best_abs
         return None
 
