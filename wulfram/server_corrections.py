@@ -672,6 +672,14 @@ class CorrectionMixin:
         inc_pos = cmode in ("full", "pos_only", "dual_entity", "view_update", "view_update_define")
         inc_vel = cmode in ("full", "pos_only", "dual_entity", "view_update")
         inc_rot = cmode in ("full", "rot_only", "dual_entity", "view_update", "view_update_define")
+        # ROT-ONLY guard: drop pos/vel so a VIEW_UPDATE carries rotation only. Sending BOTH
+        # pos+rot makes the OG client sleep the local player (Entity_reset_physics) -> NaN
+        # freeze when corrected mid-motion. rot-only avoids reset_physics (zero-velocity branch).
+        # cmode stays view_update so the replay timestamp + build_view_update_player_update path
+        # are preserved -- still a real correction, just heading-only. See server.__init__.
+        if getattr(self, "correction_rot_only", False) and inc_rot:
+            inc_pos = False
+            inc_vel = False
         correction_timestamp = None
         if cmode in ("view_update", "view_update_define"):
             if handlers._is_loopback_client(ctx):

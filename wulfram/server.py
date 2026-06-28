@@ -799,6 +799,16 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
         self.correction_mode = os.environ.get("WULFRAM_CORRECTION_MODE", "view_update").strip().lower()
         if self.correction_mode not in ("full", "rot_only", "pos_only", "dual_entity", "view_update", "view_update_define"):
             self.correction_mode = "view_update"
+        # ROT-ONLY VIEW_UPDATE (2026-06-28): a VIEW_UPDATE carrying BOTH pos AND rot makes the
+        # OG client's apply_lag_compensation call Entity_reset_physics -> SLEEP (relocates the
+        # local player to the ghost list). Sleeping the actively-driven local player mid-motion
+        # corrupts its local prediction to NaN -> hard freeze (Replication.c:877 / Physics.c:5821).
+        # rot-only (no pos) takes the OTHER branch (zero velocity, no sleep) = a recoverable hitch.
+        # When on, force the view_update correction to rotation-only (heading resync, no position)
+        # so during-movement corrections stop freezing the client. Position stays client-predicted.
+        self.correction_rot_only = os.environ.get("WULFRAM_CORRECTION_ROT_ONLY", "0").strip().lower() in (
+            "1", "true", "on", "yes"
+        )
 
         self._init_correction_config()
 
