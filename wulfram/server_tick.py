@@ -587,6 +587,18 @@ class TickMixin:
         if ctx.injected_turn is not None:
             return self.turn_sign * ctx.injected_turn
 
+        # STALE-INPUT GUARD: a frozen/disconnected client stops sending ACTION packets
+        # (no key-release), so holding its last TURNING slot integrates a phantom turn
+        # every tick -> the server heading spins ~100deg/s and poisons correction yaw.
+        # Treat input as released once no ACTION packet has arrived for longer than the
+        # configured timeout (> the ~0.9s ACTION_DUMP interval, so a normal held turn that
+        # only refreshes on the periodic dump is never falsely zeroed). See server_config.
+        timeout = float(getattr(self, "input_stale_timeout_s", 0.0) or 0.0)
+        if timeout > 0.0:
+            last_action = float(getattr(ctx, "last_action_packet_time", 0.0) or 0.0)
+            if last_action > 0.0 and (time.monotonic() - last_action) > timeout:
+                return 0.0
+
         turn_val = ctx.weapon_system.behavior_slots[BehaviorSlot.TURNING]
         return self._normalize_turn_input_value(ctx, turn_val)
 

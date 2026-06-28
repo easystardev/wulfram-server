@@ -869,6 +869,52 @@ def test_projectile_fire_pose_rejects_stale_fallback_yaw():
     return True
 
 
+def test_stale_input_timeout_zeros_held_turn():
+    """A frozen/disconnected client stops sending ACTION packets but the server holds its
+    last TURNING slot and integrates it as yaw torque every tick -> a phantom ~100deg/s
+    spin that poisons the lead-extrapolated correction yaw and locks in a freeze. The
+    stale-input timeout releases (zeros) the held turn once no ACTION packet has arrived for
+    longer than the window -- which must exceed the ~0.9s ACTION_DUMP interval so a normal
+    held turn (refreshed only by the periodic dump) is never falsely zeroed."""
+    from wulfram2_protocol.entities import BehaviorSlot
+    server = WulframServer.__new__(WulframServer)
+    server.turn_sign = -1.0
+    server.turn_deadzone = 0.05
+    server.input_stale_timeout_s = 1.5
+
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("127.0.0.1", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    ctx.injected_turn = None
+    slots = [0.0] * 22
+    slots[int(BehaviorSlot.TURNING)] = 0.5
+    ctx.weapon_system = SimpleNamespace(behavior_slots=slots, control_max=1000.0)
+
+    now = time.monotonic()
+    # FRESH input -> held turn applied (turn_sign=-1 => -0.5).
+    ctx.last_action_packet_time = now
+    assert abs(server._get_raw_turn_input(ctx) - (-0.5)) < 1e-9, server._get_raw_turn_input(ctx)
+
+    # Normal held-turn dump gap (0.9s, within window) -> still applied, no false zero.
+    ctx.last_action_packet_time = now - 0.9
+    assert abs(server._get_raw_turn_input(ctx) - (-0.5)) < 1e-9, server._get_raw_turn_input(ctx)
+
+    # STALE (no ACTION packet for 3s > 1.5s timeout) -> released (0.0): no phantom spin.
+    ctx.last_action_packet_time = now - 3.0
+    assert server._get_raw_turn_input(ctx) == 0.0, server._get_raw_turn_input(ctx)
+
+    # Timeout OFF (legacy) -> stale input held indefinitely.
+    server.input_stale_timeout_s = 0.0
+    ctx.last_action_packet_time = now - 30.0
+    assert abs(server._get_raw_turn_input(ctx) - (-0.5)) < 1e-9, server._get_raw_turn_input(ctx)
+
+    print("test_stale_input_timeout_zeros_held_turn: PASSED")
+    return True
+
+
 def test_projectile_body_pitch_defaults_on_with_env_optout():
     """Pulse/body projectile pitch should be canonical by default, with explicit opt-out."""
     old_env = os.environ.get("WULFRAM_PROJECTILE_BODY_PITCH")
@@ -19264,6 +19310,7 @@ def main():
         test_projectile_fire_pose_uses_replay_history_when_available,
         test_projectile_body_source_can_opt_into_body_pitch,
         test_projectile_fire_pose_rejects_stale_fallback_yaw,
+        test_stale_input_timeout_zeros_held_turn,
         test_projectile_body_pitch_defaults_on_with_env_optout,
         test_remote_spawn_points_use_udp_not_tcp,
         test_login_bootstrap_mode_routes_og_client_by_login_flow,

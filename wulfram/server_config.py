@@ -260,6 +260,22 @@ class ConfigMixin:
             self.correction_lead_ticks = 1.0
         if self.correction_lead_ticks < 0.0:
             self.correction_lead_ticks = 0.0
+        # STALE-INPUT TIMEOUT (2026-06-28): the server holds the last decoded TURNING slot
+        # and integrates it as yaw torque EVERY tick (_get_raw_turn_input). A frozen or
+        # disconnected client stops sending ACTION packets and never sends the key-release,
+        # so the held turn is applied forever -> the server heading SPINS (~100deg/s observed
+        # on a frozen client). That phantom spin poisons the lead-extrapolated correction yaw
+        # (snaps the client to a new random heading every emit) and locks in a movement freeze.
+        # When no ACTION packet (dump or update) has arrived for this long, treat input as
+        # released (zero turn). MUST exceed the ~0.9s ACTION_DUMP restate interval so a normal
+        # HELD turn (which only refreshes on the periodic dump) is never falsely zeroed.
+        # 0 = off (legacy: hold stale input indefinitely).
+        try:
+            self.input_stale_timeout_s = float(os.environ.get("WULFRAM_INPUT_STALE_TIMEOUT_S", "1.5"))
+        except (TypeError, ValueError):
+            self.input_stale_timeout_s = 1.5
+        if self.input_stale_timeout_s < 0.0:
+            self.input_stale_timeout_s = 0.0
         try:
             # Per-tick noise floor: server-only displacement below this is treated
             # as float/quantization noise and ignored (keeps flat ground at ~0).
