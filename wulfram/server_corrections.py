@@ -680,15 +680,16 @@ class CorrectionMixin:
         if getattr(self, "correction_rot_only", False) and inc_rot:
             inc_pos = False
             inc_vel = False
-        correction_timestamp = None
-        if cmode in ("view_update", "view_update_define"):
-            if handlers._is_loopback_client(ctx):
-                last_request_id = int(getattr(ctx, "last_state_request_id", 0) or 0)
-                last_request_time = float(getattr(ctx, "last_state_request_time", 0.0) or 0.0)
-                if last_request_id and last_request_time > 0.0 and (time.monotonic() - last_request_time) <= 1.5:
-                    correction_timestamp = last_request_id
-            else:
-                correction_timestamp = self._fresh_remote_view_update_timestamp(ctx, tick)
+        def _fresh_ts():
+            if cmode in ("view_update", "view_update_define"):
+                if handlers._is_loopback_client(ctx):
+                    last_request_id = int(getattr(ctx, "last_state_request_id", 0) or 0)
+                    last_request_time = float(getattr(ctx, "last_state_request_time", 0.0) or 0.0)
+                    if last_request_id and last_request_time > 0.0 and (time.monotonic() - last_request_time) <= 1.5:
+                        return last_request_id
+                    return None
+                return self._fresh_remote_view_update_timestamp(ctx, tick)
+            return None
 
         if not handlers._is_loopback_client(ctx):
             # OG clients reject the promoted/full local-state form on targeted
@@ -718,89 +719,90 @@ class CorrectionMixin:
             turret_range=self.local_state_turret_range,
         )
 
-        if cmode == "view_update_define":
-            team_id = int(getattr(ctx.session, "team_id", 0) or 1)
-            entity_type = int(getattr(ctx, "entity_type", EntityType.TANK) or EntityType.TANK)
-            payload = build_view_update_create_tank(
-                tick=tick,
-                entity_id=ctx.session.entity_id,
-                entity_type=entity_type,
-                team=team_id,
-                pos=corr_pos,
-                behavior_type=team_id,
-                include_health=include_local_state,
-                include_entity_vitals=False,
-                health=health,
-                fuel=fuel,
-                is_manned=True,
-                weapon_id=weapon_type,
-                rot=corr_rot,
-                ammo_count_bits=ammo_bits,
-                ammo_count=ammo_mask,
-                primary_turret_bits=pt_bits,
-                primary_turret_angle=pt_angle,
-                secondary_turret_bits=st_bits,
-                secondary_turret_angle=st_angle,
-                turret_max=self.local_state_turret_max,
-                turret_range=self.local_state_turret_range,
-                timestamp=correction_timestamp,
-            )
-            label = "CORRECTION(view_update_define)"
-        elif cmode == "view_update":
-            payload = build_view_update_player_update(
-                tick=tick,
-                entity_id=ctx.session.entity_id,
-                pos=corr_pos,
-                vel=ctx.player_vel,
-                rot=corr_rot,
-                include_pos=inc_pos,
-                include_vel=inc_vel,
-                include_rot=inc_rot,
-                timestamp=correction_timestamp,
-                **common_kw,
-            )
-            label = "CORRECTION(view_update)"
-        elif cmode == "dual_entity":
-            ent_real = dict(
-                entity_id=ctx.session.entity_id,
-                is_manned=True,
-                pos=corr_pos,
-                vel=ctx.player_vel,
-                rot=corr_rot,
-                include_pos=inc_pos,
-                include_vel=inc_vel,
-                include_rot=inc_rot,
-            )
-            ent_dummy = dict(
-                entity_id=0xFFFFFFFE,
-                is_manned=True,
-                pos=(0.0, 0.0, 0.0),
-                vel=(0.0, 0.0, 0.0),
-                rot=(0.0, 0.0, 0.0),
-                include_pos=False,
-                include_vel=False,
-                include_rot=False,
-            )
-            payload = build_update_array_multi(
-                tick=tick,
-                entities=[ent_real, ent_dummy],
-                **common_kw,
-            )
-            label = "CORRECTION(dual_entity)"
-        else:
+        def _build_one(ip: bool, iv: bool, ir: bool, ts):
+            if cmode == "view_update_define":
+                team_id = int(getattr(ctx.session, "team_id", 0) or 1)
+                entity_type = int(getattr(ctx, "entity_type", EntityType.TANK) or EntityType.TANK)
+                payload = build_view_update_create_tank(
+                    tick=tick,
+                    entity_id=ctx.session.entity_id,
+                    entity_type=entity_type,
+                    team=team_id,
+                    pos=corr_pos,
+                    behavior_type=team_id,
+                    include_health=include_local_state,
+                    include_entity_vitals=False,
+                    health=health,
+                    fuel=fuel,
+                    is_manned=True,
+                    weapon_id=weapon_type,
+                    rot=corr_rot,
+                    ammo_count_bits=ammo_bits,
+                    ammo_count=ammo_mask,
+                    primary_turret_bits=pt_bits,
+                    primary_turret_angle=pt_angle,
+                    secondary_turret_bits=st_bits,
+                    secondary_turret_angle=st_angle,
+                    turret_max=self.local_state_turret_max,
+                    turret_range=self.local_state_turret_range,
+                    timestamp=ts,
+                )
+                return payload, "CORRECTION(view_update_define)"
+            if cmode == "view_update":
+                payload = build_view_update_player_update(
+                    tick=tick,
+                    entity_id=ctx.session.entity_id,
+                    pos=corr_pos,
+                    vel=ctx.player_vel,
+                    rot=corr_rot,
+                    include_pos=ip,
+                    include_vel=iv,
+                    include_rot=ir,
+                    timestamp=ts,
+                    **common_kw,
+                )
+                return payload, "CORRECTION(view_update)"
+            if cmode == "dual_entity":
+                ent_real = dict(
+                    entity_id=ctx.session.entity_id,
+                    is_manned=True,
+                    pos=corr_pos,
+                    vel=ctx.player_vel,
+                    rot=corr_rot,
+                    include_pos=ip,
+                    include_vel=iv,
+                    include_rot=ir,
+                )
+                ent_dummy = dict(
+                    entity_id=0xFFFFFFFE,
+                    is_manned=True,
+                    pos=(0.0, 0.0, 0.0),
+                    vel=(0.0, 0.0, 0.0),
+                    rot=(0.0, 0.0, 0.0),
+                    include_pos=False,
+                    include_vel=False,
+                    include_rot=False,
+                )
+                payload = build_update_array_multi(
+                    tick=tick,
+                    entities=[ent_real, ent_dummy],
+                    **common_kw,
+                )
+                return payload, "CORRECTION(dual_entity)"
             payload = build_update_array_player_update(
                 tick=tick,
                 entity_id=ctx.session.entity_id,
                 pos=corr_pos,
                 vel=ctx.player_vel,
                 rot=corr_rot,
-                include_pos=inc_pos,
-                include_vel=inc_vel,
-                include_rot=inc_rot,
+                include_pos=ip,
+                include_vel=iv,
+                include_rot=ir,
                 **common_kw,
             )
-            label = f"CORRECTION({cmode})"
+            return payload, f"CORRECTION({cmode})"
 
+        payload, label = _build_one(inc_pos, inc_vel, inc_rot, _fresh_ts())
         return payload, label, corr_pos, corr_rot, inc_pos, inc_rot
 
     def _maybe_send_view_update_loop(

@@ -2431,6 +2431,68 @@ def test_remote_empirical_view_update_correction_uses_fresh_remote_timestamp():
     return True
 
 
+def test_correction_rot_only_drops_position():
+    """ROT-ONLY correction: a pos+rot correction is dropped to rotation-only so the OG
+    client never gets pos+rot in one packet (the Entity_reset_physics -> unclamped-acos
+    slerp NaN trigger; decompile 2026-06-30). Position stays client-predicted. A pos-bearing
+    VIEW_UPDATE is force-clamped to also carry rot (packets.py:854), so rot-only is the only
+    crash-safe form. Verifies the decoded packet has rotation but NO position."""
+    server = WulframServer.__new__(WulframServer)
+    server.correction_mode = "view_update"
+    server.correction_rot_only = True
+    server.local_state_turret_max = 6.3
+    server.local_state_turret_range = 12.6
+    server.spawn_tank_weapon_type = 2
+    server._get_health_value = lambda ctx: 1.0
+    server._get_energy_value = lambda ctx: 1.0
+    server._to_client_pos = lambda pos: pos
+
+    session = Session()
+    session.translation_ack_received = True
+    session.in_game = True
+    session.entity_id = 0x14EA
+    session.udp_addr = ("10.10.10.2", 50000)
+    ctx = ClientContext(
+        client_id=1, client_addr=("10.10.10.2", 50000), session=session, entity_id=0x14EA,
+    )
+    ctx.player_pos = (4950.0, 5100.0, 5.0)
+    ctx.player_vel = (1.0, 2.0, 3.0)
+    ctx.player_pose = {"roll": 0.125, "pitch": -0.25}
+    ctx.player_heading = 0.5
+    ctx.last_state_request_id = 0x00ABCDEF
+    ctx.last_state_request_time = time.monotonic()
+
+    payload, label, corr_pos, corr_rot, inc_pos, inc_rot = server._build_empirical_correction_payload(
+        ctx, tick=0x00123456, include_local_state=True, health=1.0, fuel=1.0, weapon_type=0,
+        ammo_bits=6, ammo_mask=0x3F, pt_bits=16, pt_angle=1.0, st_bits=16, st_angle=-1.0,
+    )
+    assert inc_pos is False, "rot-only must drop position"
+    assert inc_rot is True
+    bcfg = parse_behavior(build_behavior_packet())
+    _, _, _, ents = decode_view_update(payload, behavior_config=bcfg)
+    assert len(ents) == 1
+    assert ents[0].rotation is not None
+    assert ents[0].position is None, "rot-only correction must NOT carry position"
+    assert all(abs(a - b) < 0.01 for a, b in zip(ents[0].rotation, corr_rot))
+    print("test_correction_rot_only_drops_position: PASSED")
+    return True
+
+
+def test_is_conn_reset_matches_bad_file_descriptor():
+    """A dead-fd send error (EBADF / WSAENOTSOCK) must count as a reset so the client is
+    reaped and its entity can't linger as a ghost replicated to new clients as a remote
+    entity that crashes them (ghost-entity bug, 2026-06-30)."""
+    f = WulframServer._is_conn_reset
+    assert f(OSError(9, "Bad file descriptor")) is True
+    assert f(OSError(10038, "not a socket")) is True
+    assert f(Exception("[Errno 9] Bad file descriptor")) is True
+    assert f(Exception("[WinError 10038] An operation was attempted on something that is not a socket")) is True
+    assert f(ConnectionResetError()) is True
+    assert f(Exception("something unrelated")) is False
+    print("test_is_conn_reset_matches_bad_file_descriptor: PASSED")
+    return True
+
+
 def test_view_update_create_tank_decodes_definition_shape():
     """Definition-bearing VIEW_UPDATE should roundtrip with bit 0 plus pos/rot."""
     payload = build_view_update_create_tank(
@@ -19291,6 +19353,8 @@ def main():
         test_cargo_drop_and_crate_pickup,
         test_supply_ship_cargo_replenish,
         test_behavior_spawn_enabled_defaults_on_for_entry_map_spawn,
+        test_correction_rot_only_drops_position,
+        test_is_conn_reset_matches_bad_file_descriptor,
         test_input_sync_diagnosis_distinguishes_idle_snapback_from_correction_failure,
         test_input_sync_diagnosis_reports_movement_without_targeted_corrections,
         test_input_sync_diagnosis_counts_unsolicited_correction_stream,

@@ -806,7 +806,20 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
         # rot-only (no pos) takes the OTHER branch (zero velocity, no sleep) = a recoverable hitch.
         # When on, force the view_update correction to rotation-only (heading resync, no position)
         # so during-movement corrections stop freezing the client. Position stays client-predicted.
-        self.correction_rot_only = os.environ.get("WULFRAM_CORRECTION_ROT_ONLY", "0").strip().lower() in (
+        # ROT-ONLY default ON (2026-06-30, decompile-grounded). A local-player correction
+        # carrying BOTH pos+rot routes the OG client through Entity_reset_physics -> the
+        # attitude-interpolation slerp (Interpolation.c:191 -> Quat_slerp Math.c:2455), whose
+        # acos(dot) is UNCLAMPED: when the client is well-synced the rotation delta is
+        # sub-epsilon, dot rounds just above 1.0, acos = NaN -> crash. This fires ~1-in-2 on
+        # a real-GPU/variable-fps client (tiny per-frame deltas) and never on WARP ~12fps
+        # (coarse deltas stay clear of dot>1) -- the exact host-vs-VM discrepancy we chased.
+        # A manned-tank VIEW_UPDATE that carries POSITION is force-clamped to also carry
+        # rotation (packets.py:854, else the client _exit(0)s), so pos-only is impossible;
+        # the only crash-safe correction is ROT-ONLY, which takes the benign branch (zero
+        # velocities, direct euler write, NO reset_physics/slerp). Position stays
+        # client-predicted -- physics parity keeps it synced on open ground. Set =0 to A/B
+        # the old (crashing) pos+rot form.
+        self.correction_rot_only = os.environ.get("WULFRAM_CORRECTION_ROT_ONLY", "1").strip().lower() in (
             "1", "true", "on", "yes"
         )
 
@@ -1123,12 +1136,22 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
 
     @staticmethod
     def _is_conn_reset(err) -> bool:
-        """True when an error means the peer's TCP socket is definitively dead."""
+        """True when an error means the peer's TCP socket is definitively dead.
+
+        Includes EBADF / WSAENOTSOCK ("Bad file descriptor" / errno 9 / 10038 /
+        "not a socket"): a client whose fd went bad (socket closed underneath a
+        pending send) must be reaped too, else it lingers as a ZOMBIE -- endless
+        TCP-send-failed spam AND its tank stays in the world, replicated to every
+        new client as a remote entity that crashes them (ghost-entity bug,
+        2026-06-30). Not reaping bad-fd was the gap that left ghosts on DO."""
         if isinstance(err, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)):
             return True
+        if isinstance(err, OSError) and err.errno in (9, 10038, 10053, 10054):
+            return True
         s = str(err)
-        return ("10054" in s or "10053" in s or "forcibly closed" in s
-                or "aborted by the software" in s or "Broken pipe" in s)
+        return ("10054" in s or "10053" in s or "10038" in s or "forcibly closed" in s
+                or "aborted by the software" in s or "Broken pipe" in s
+                or "Bad file descriptor" in s or "not a socket" in s)
 
     def _reap_dead_client(self, ctx: ClientContext, reason: str = "") -> None:
         """Mark a client whose TCP socket is dead for teardown.
@@ -3806,6 +3829,17 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
                         except Exception as tcp_err:
                             print(f"[TICK] Client {ctx.client_id}: TCP failed ({tcp_err}), switching to UDP-only")
                             tcp_failed = True
+                            # A dead socket (conn-reset/bad-fd) on a client that has ALSO
+                            # stopped sending input is a crashed client, not a legit
+                            # TCP-closed-but-UDP-alive one -- reap it so it stops getting
+                            # ticked every frame (the [SEND] Error spam that starves the tick
+                            # loop and cascades connect-crashes under rapid reconnect). A live
+                            # UDP-only client keeps sending ACTION packets, so last_action
+                            # stays fresh and it is NOT reaped. (2026-06-30 zombie fix.)
+                            if self._is_conn_reset(tcp_err):
+                                last_action = float(getattr(ctx, "last_action_packet_time", 0.0) or 0.0)
+                                if last_action <= 0.0 or (now - last_action) > 3.0:
+                                    self._reap_dead_client(ctx, reason="heartbeat_tcp_dead_no_input")
 
                     # Always send via UDP as well for reliability
                     if self.send_updates_udp and self.udp_handler and ctx.session.udp_addr:
