@@ -13,6 +13,7 @@ from . import handlers
 from .client import ClientContext
 from .physics import _matrix3_from_euler_xyz
 from .session import Phase
+from .weapons import EntityType
 from .packets import (
     build_delete_object,
     build_add_to_roster,
@@ -461,13 +462,32 @@ class SpawnMixin:
         # distinct map-flag spawns are unaffected.
         spawn_pos = self._separate_from_live_tanks(ctx, spawn_pos)
 
-        # Terrain-safe height (upward-only): never let a spawn sit below the map
-        # surface, which causes continuous collision damage on arrival.
+        # Spawn a suspension tank at its SETTLED REST Z (physics ground + spring base offset)
+        # with zero vertical velocity -- NOT terrain+terrain_height_offset(5.0). The old +5
+        # map-ground drop made the tank fall and BOUNCE on spawn; during that bounce the OG
+        # client's per-wheel suspension rays miss terrain and Spring_calc_edge_angle
+        # (Physics.c:2214) divides by a zeroed contact-edge length -> NaN -> crash (~1-in-2 on a
+        # real-GPU client during the settle, never on WARP). Spawning at rest = no bounce = no
+        # wheel-ray miss = no NaN. (2026-07-01, decompile-grounded.) Non-tanks / disabled keep
+        # the upward-only terrain-safe raise (never spawn below the surface = arrival damage).
         if self.up_axis == "z":
-            ground_z = self._terrain_ground_z_at(spawn_pos[0], spawn_pos[1])
-            if ground_z is not None and spawn_pos[2] < ground_z:
-                print(f"[SPAWN] Raising spawn Z {spawn_pos[2]:.1f} -> {ground_z:.1f} (terrain-safe)")
-                spawn_pos = (spawn_pos[0], spawn_pos[1], ground_z)
+            settled_z = None
+            if (getattr(self, "spawn_settle_tank_z", True)
+                    and getattr(ctx, "entity_type", None) == EntityType.TANK
+                    and getattr(self, "tank_suspension_enabled", False)):
+                phys_ground = self._terrain_physics_ground_z_at(spawn_pos[0], spawn_pos[1])
+                if phys_ground is not None:
+                    settled_z = phys_ground + float(getattr(self, "spawn_settle_ride_height", 3.35))
+            if settled_z is not None:
+                if abs(spawn_pos[2] - settled_z) > 0.05:
+                    print(f"[SPAWN] Settling tank spawn Z {spawn_pos[2]:.1f} -> {settled_z:.1f} "
+                          f"(suspension rest, no bounce)")
+                spawn_pos = (spawn_pos[0], spawn_pos[1], settled_z)
+            else:
+                ground_z = self._terrain_ground_z_at(spawn_pos[0], spawn_pos[1])
+                if ground_z is not None and spawn_pos[2] < ground_z:
+                    print(f"[SPAWN] Raising spawn Z {spawn_pos[2]:.1f} -> {ground_z:.1f} (terrain-safe)")
+                    spawn_pos = (spawn_pos[0], spawn_pos[1], ground_z)
 
         ctx.player_pos = spawn_pos
         ctx.player_pose["pos"] = spawn_pos

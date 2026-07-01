@@ -210,6 +210,50 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
             )
         except ValueError:
             self.tank_spring_base_offset = 2.0
+        # SPAWN AT SUSPENSION REST (2026-07-01, decompile-grounded). The old spawn raised Z to
+        # terrain+terrain_height_offset(5.0) -- ~5 units above the physics ground -- so the tank
+        # dropped and BOUNCED on spawn. During that bounce the OG client's per-wheel suspension
+        # rays miss terrain, Spring_calc_edge_angle (Physics.c:2214) divides by a zeroed contact
+        # edge length -> NaN -> crash (~1-in-2 on a real-GPU/60fps client during the settle,
+        # never on WARP ~12fps which sleeps first). Spawn the tank at its settled rest Z
+        # (physics ground + spring base offset) with zero vertical velocity = no bounce = no
+        # wheel-ray miss. Set =0 to A/B the old bouncing spawn.
+        # NOTE (2026-07-01): spawn-at-rest was TESTED against a deterministic 6/6 post-spawn
+        # crash repro and did NOT reduce it -- the client's suspension spring oscillates
+        # persistently (z_jitter ~0.05, never sleeps), so it samples the unguarded
+        # Spring_calc_edge_angle asin/divide (Physics.c:2214) every frame regardless of spawn Z
+        # or the heartbeat-sleep companion. The crash is frame-rate-sampled (host 60fps crashes,
+        # VM 12fps doesn't); the real lever is the client render/frame-pacing path, not spawn.
+        # Kept OFF by default (env preserved for A/B once a frame-pacing fix exists).
+        self.spawn_settle_tank_z = os.environ.get(
+            "WULFRAM_SPAWN_SETTLE_TANK_Z", "0"
+        ).strip().lower() not in ("0", "false", "off", "no")
+        # Suspension ride height above the physics ground at REST (the equilibrium the tank's
+        # springs settle to). Empirically ~3.3 on the flat DO map (idle in-game z stabilises at
+        # ~3.3-3.4); spring_base_offset (2.0) is a spring-model constant, NOT the settled ride
+        # height, so calibrate this to the observed rest. Spawn Z = physics_ground + this.
+        try:
+            self.spawn_settle_ride_height = float(
+                os.environ.get("WULFRAM_SPAWN_SETTLE_RIDE_HEIGHT", "3.35")
+            )
+        except ValueError:
+            self.spawn_settle_ride_height = 3.35
+        # SPAWN SETTLE HEARTBEAT SUPPRESS (2026-07-01, decompile-grounded companion to
+        # spawn-at-rest). The mask=0 UDP heartbeat calls RigidBody_wake on the local tank every
+        # ~100ms (Replication.c:1124), so a just-spawned tank NEVER sleeps and keeps running its
+        # suspension spring -- which samples the unguarded Spring_calc_edge_angle divide/asin
+        # (Physics.c:2214) and NaN-crashes the OG client ~1-in-2 on a real-GPU client (never on
+        # WARP, which sleeps first). Suppress the local-player heartbeat/correction for this
+        # window after spawn so the at-rest tank sleeps (RigidBody_should_sleep) and the spring
+        # stops. TCP ping-loop keeps the connection alive meanwhile. 0 = disable.
+        # OFF by default: paired with spawn-at-rest above; did not reduce the 6/6 repro (the
+        # tank never sleeps because its spring oscillates). Env preserved for future A/B.
+        try:
+            self.spawn_settle_heartbeat_suppress_s = float(
+                os.environ.get("WULFRAM_SPAWN_SETTLE_HEARTBEAT_SUPPRESS_S", "0")
+            )
+        except ValueError:
+            self.spawn_settle_heartbeat_suppress_s = 0.0
         self.tank_drive_terrain_aligned = (
             os.environ.get("WULFRAM_TANK_DRIVE_TERRAIN_ALIGNED", "0") == "1"
         )
@@ -3816,6 +3860,18 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
                         st_bits=st_bits,
                         st_angle=st_angle,
                     )
+
+                # SPAWN SETTLE: suppress the local-player heartbeat/correction for a brief
+                # window after spawn so the at-rest tank SLEEPS (RigidBody_should_sleep) instead
+                # of being re-woken every ~100ms (Replication.c:1124). A running suspension
+                # spring on a just-spawned tank samples Spring_calc_edge_angle's unguarded
+                # divide/asin (Physics.c:2214) and NaN-crashes the OG client ~1-in-2 on a
+                # real-GPU client. Spawn-at-rest removes the bounce; sleeping stops the spring
+                # from running at all during the vulnerable window. (2026-07-01.)
+                if getattr(self, "spawn_settle_heartbeat_suppress_s", 0.0) > 0.0:
+                    _since_spawn = now - float(getattr(ctx.session, "last_spawn_time", 0.0) or 0.0)
+                    if 0.0 <= _since_spawn < self.spawn_settle_heartbeat_suppress_s:
+                        send_payload = False
 
                 if self.send_player_updates and send_payload and payload is not None:
                     # Determine transport for logging
