@@ -1253,6 +1253,14 @@ class CombatMixin:
             for target in self._snapshot_in_game_clients():
                 if not target.session.udp_addr or not target.session.translation_ack_received:
                     continue
+                # SKIP-FIRER (2026-06-29): optionally do NOT send the firer its OWN projectile.
+                # If the OG client predicts its own shell locally (along its exact mouse-aim),
+                # injecting the server's shell (fired along the lagging body) is what makes the
+                # shell miss the crosshair -- and the self-projectile spawned behind+through the
+                # tank is a fire-freeze suspect. Skipping the firer lets the client's own
+                # prediction stand = pixel-exact crosshair. (Others still get the server shell.)
+                if self.projectile_skip_firer and target is ctx:
+                    continue
                 if not self._projectile_packets_allowed_for_client(target):
                     continue
                 tick = self._get_network_tick(target)
@@ -1477,6 +1485,16 @@ class CombatMixin:
         elif self.projectile_aim_source == "auto" and aim_src != "viewpoint":
             aim_pitch = body_pitch
             aim_yaw = body_yaw
+
+        # FIRE-POSE LEAD: extrapolate the fire yaw forward by angular_vel_yaw * lead_dt so the
+        # shell leads toward the client's mouse-aim (which the body lags, compoundingly, during a
+        # sustained turn). 0 = off. Only the projectile DIRECTION is led, not the muzzle position.
+        fire_lead = float(getattr(self, "fire_pose_lead_ticks", 0.0) or 0.0)
+        if fire_lead > 0.0:
+            angvel = float(getattr(ctx, "angular_vel_yaw", 0.0) or 0.0)
+            if math.isfinite(angvel):
+                dt_lead = fire_lead / max(1.0, float(getattr(self, "tick_rate_hz", 30.0)))
+                aim_yaw = aim_yaw + angvel * dt_lead
 
         return fire_pos, (body_roll, aim_pitch, aim_yaw), aim_label, pose_source
 

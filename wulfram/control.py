@@ -535,6 +535,10 @@ class ControlServer:
             return self._cmd_correction(args)
         elif cmd == 'periodic':
             return self._cmd_periodic(args)
+        elif cmd == 'firelead':
+            return self._cmd_firelead(args)
+        elif cmd == 'skipfirer':
+            return self._cmd_skipfirer(args)
         elif cmd == 'subtick':
             if not self.server:
                 return "No server"
@@ -1144,6 +1148,47 @@ Examples:
             f"tick={tick} pos=({corr_pos[0]:.1f},{corr_pos[1]:.1f},{corr_pos[2]:.1f}) "
             f"yaw={math.degrees(corr_rot[2]):.1f}deg"
         )
+
+    def _cmd_skipfirer(self, args: list) -> str:
+        """Show or toggle whether the firer is sent its OWN projectile (crosshair test).
+
+          skipfirer        - show current
+          skipfirer 1      - do NOT send the firer its shell (rely on its local prediction)
+          skipfirer 0      - send the firer its shell (current default)
+        """
+        if not self.server:
+            return "No server"
+        cur = bool(getattr(self.server, "projectile_skip_firer", False))
+        if not args:
+            return f"projectile skip-firer: {'ON' if cur else 'OFF'}"
+        val = str(args[0]).strip().lower() in ("1", "true", "on", "yes")
+        self.server.projectile_skip_firer = val
+        return f"projectile skip-firer set to {'ON' if val else 'OFF'} (was {'ON' if cur else 'OFF'})"
+
+    def _cmd_firelead(self, args: list) -> str:
+        """Show or set the projectile fire-pose lead (ticks) live, for crosshair tuning.
+
+          firelead            - show current lead
+          firelead <ticks>    - set lead (e.g. firelead 3; 0=off = fire along raw body)
+
+        The shell yaw is extrapolated forward by angular_vel_yaw * (ticks/tick_rate) so shells
+        lead toward the mouse-aim the body lags. Tune live while firing during a turn.
+        """
+        if not self.server:
+            return "No server"
+        cur = float(getattr(self.server, "fire_pose_lead_ticks", 0.0) or 0.0)
+        cur_s = "OFF" if cur <= 0.0 else f"{cur:.2f} ticks"
+        if not args:
+            return f"fire-pose lead: {cur_s}"
+        try:
+            val = float(args[0])
+        except (ValueError, IndexError):
+            return "usage: firelead <ticks> (0=off)"
+        if val < 0.0:
+            val = 0.0
+        self.server.fire_pose_lead_ticks = val
+        new_s = "OFF" if val <= 0.0 else f"{val:.2f} ticks"
+        return f"fire-pose lead set to {new_s} (was {cur_s})"
 
     def _cmd_periodic(self, args: list) -> str:
         """Show or set the periodic-correction interval live (seconds; 0=off).

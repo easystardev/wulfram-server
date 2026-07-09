@@ -637,6 +637,21 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
         # Default ON - entity entries with mask=0 (no rotation) cause client to zero angular velocity.
         self.heartbeat_include_rot = os.environ.get("WULFRAM_HEARTBEAT_ROT", "1") == "1"
         self.heartbeat_include_pos = os.environ.get("WULFRAM_HEARTBEAT_POS", "0") == "1"
+        # HEARTBEAT ON DUMMY ENTITY (2026-07-01, decompile-grounded; likely the real
+        # server-vs-original difference). Our per-tick mask=0 health heartbeat was sent on the
+        # REAL local entity. In the OG client a network update on a non-null entity calls
+        # RigidBody_wake (Replication.c:1124), so this WOKE the local tank every ~100ms -> it
+        # NEVER slept -> its suspension spring ran every frame -> sampled the unguarded
+        # Spring_calc_edge_angle asin/divide NaN (Physics.c:2214) and crashed the OG client
+        # ~1-in-2 at high fps (never on WARP, which sleeps first). The old code comment even
+        # called this a "dummy-entity packet" -- but it sent the real entity. Send it on the
+        # NULL/dummy entity (0xFFFFFFFE) instead: is_null_entity -> NO wake, the tank sleeps
+        # after settling, the spring stops. HUD health rides the local_state PREFIX (not the
+        # entity vitals), so health still updates. Only applies to a mask=0 heartbeat (no
+        # pos/rot bits). Set =0 to A/B the old (waking) real-entity heartbeat.
+        self.heartbeat_dummy_entity = os.environ.get(
+            "WULFRAM_HEARTBEAT_DUMMY_ENTITY", "0"
+        ).strip().lower() not in ("0", "false", "off", "no")
         # DEBUG_SYNC: send authoritative physics state to client after each step
         # for measuring client-server divergence (opcode 0x60, 49 bytes, ~12Hz).
         # This is a custom debug packet and must never leak to OG clients unless
@@ -3812,10 +3827,18 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
                         hb_pos = None
                         if self.heartbeat_include_pos:
                             hb_pos = self._to_client_pos(ctx.player_pos)
+                        # Send a mask=0 (health-only) heartbeat on the NULL/dummy entity so it
+                        # does NOT wake the local tank (see heartbeat_dummy_entity note). Only
+                        # when there is no pos/rot bit -- a transform-bearing heartbeat must use
+                        # the real entity.
+                        hb_entity_id = ctx.session.entity_id
+                        if (getattr(self, "heartbeat_dummy_entity", False)
+                                and hb_rot is None and hb_pos is None):
+                            hb_entity_id = 0xFFFFFFFE
                         payload = self._build_local_state_heartbeat(
                             ctx,
                             tick=tick,
-                            entity_id=ctx.session.entity_id,
+                            entity_id=hb_entity_id,
                             include_health=include_local_state,
                             health=health_val,
                             fuel=fuel_val,

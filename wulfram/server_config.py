@@ -666,6 +666,29 @@ class ConfigMixin:
         # (entity +0x30/+0x34/+0x38), but the playable slice keeps the previous
         # yaw-only body source unless this live OG gate flag is enabled.
         self.projectile_body_pitch = self._projectile_body_pitch_enabled_from_env()
+        # FIRE-POSE LEAD (2026-06-29): the shell fires along the server BODY heading, which lags
+        # the client's mouse-AIM (crosshair) -- and the lag COMPOUNDS as you keep turning the
+        # same way (the gun falls behind the continuously-moving aim). The server can't see the
+        # crosshair (0x35 viewpoint is dead, aim_yaw == -heading), so it can't fire along it
+        # directly. Approximation: extrapolate the fire yaw FORWARD by angular_vel_yaw * lead, so
+        # faster/sustained turns throw the shell further ahead toward where the crosshair actually
+        # is. Tunable; 0 = off (fire along the raw body heading, current behavior). This only
+        # changes the projectile DIRECTION, not the muzzle position.
+        try:
+            self.fire_pose_lead_ticks = float(os.environ.get("WULFRAM_FIRE_POSE_LEAD_TICKS", "0"))
+        except (TypeError, ValueError):
+            self.fire_pose_lead_ticks = 0.0
+        if self.fire_pose_lead_ticks < 0.0:
+            self.fire_pose_lead_ticks = 0.0
+        # SKIP-FIRER (2026-06-29): if the OG client predicts its own shell locally, don't send
+        # the firer the server's projectile -- its own prediction (along its exact mouse-aim) is
+        # pixel-exact down the crosshair, and we stop the self-projectile that may cause the fire
+        # freeze. Others still receive the server-replicated shell. EXPERIMENT: verify the firer
+        # still SEES a shell with this on (if not, the client does NOT predict locally and we
+        # need the viewpoint channel instead). 0 = off (send firer its own shell, current).
+        self.projectile_skip_firer = os.environ.get("WULFRAM_PROJECTILE_SKIP_FIRER", "0").strip().lower() in (
+            "1", "true", "on", "yes"
+        )
         # FIRE-POSE STALE-YAW GUARD (2026-06-28): the muzzle pose comes from the replay
         # history snapshot nearest the fire packet's client_tick. That selector has an
         # UNBOUNDED stale fallback for remote clients (server.py _select_authoritative_
