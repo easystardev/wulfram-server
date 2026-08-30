@@ -801,8 +801,23 @@ class NetMixin:
 
     def _do_login(self, ctx: ClientContext):
         """Handle login sequence."""
-        # Request username
-        ctx.tcp_handler.send(build_login_status(5))  # Code 5 = request handle
+        # Do NOT prompt for a handle unconditionally.
+        #
+        # LOGIN_STATUS(5) means "choose a handle", and the two client shapes react to it in
+        # incompatible ways:
+        #   * a STOCK client needs it -- it is what raises the handle dialog, without which
+        #     the client never produces a LOGIN_REQUEST at all;
+        #   * a CREDENTIALED client (`-login user pass`, or the game-service globals set)
+        #     treats ANY non-8 status as fatal and calls Common_Client_shutdown_and_exit(1,0).
+        #     Verified live 2026-08-30: sending this killed the client even though the server
+        #     had already logged "Auto-login as shiptest" from its LOGIN_REQUEST.
+        #
+        # The distinguishing behaviour is that a credentialed client sends its LOGIN_REQUEST
+        # UNPROMPTED (Login_begin_authentication @0x00461b30 sends LOGIN 0x21 straight out once
+        # both credential globals are populated). So: listen first, and only prompt if nothing
+        # arrives -- which serves both clients without the server having to guess.
+        if not FEATURES.auto_login:
+            ctx.tcp_handler.send(build_login_status(5))  # Code 5 = request handle
 
         if FEATURES.auto_login:
             # Wait briefly for client's LOGIN_REQUEST which carries the username,
@@ -827,6 +842,27 @@ class NetMixin:
                 pass
             finally:
                 ctx.tcp_handler.sock.settimeout(None)
+
+            # Nothing arrived unprompted => stock client. It is waiting to be asked, so ask
+            # now and give it a second window. Safe here precisely because a credentialed
+            # client would already have answered above and never reaches this branch.
+            if not ctx.session.username:
+                ctx.tcp_handler.send(build_login_status(5))
+                ctx.tcp_handler.sock.settimeout(2.0)
+                try:
+                    for _ in range(5):
+                        packet = ctx.tcp_handler.recv()
+                        if packet and len(packet) >= 2 and packet[0] == PacketType.LOGIN_REQUEST:
+                            username, _ = handlers.decode_lp_string(packet, 2)
+                            handlers.apply_submitted_username(ctx.session, username)
+                            break
+                        elif packet and len(packet) >= 1 and packet[0] == PacketType.HELLO:
+                            pending_hellos.append(packet)
+                except Exception:
+                    pass
+                finally:
+                    ctx.tcp_handler.sock.settimeout(None)
+
             if not ctx.session.username:
                 ctx.session.username = f"Player{ctx.client_id}"
             ctx.session.login_complete = True
