@@ -831,7 +831,30 @@ class NetMixin:
                 ctx.session.username = f"Player{ctx.client_id}"
             ctx.session.login_complete = True
             ctx.session.transition_to(Phase.TEAM_SELECT)
+            # ACK the login with status 8 before the bootstrap.
+            #
+            # Required, not cosmetic: a client that presented credentials -- either via
+            # `-login user pass` or with the game-service globals populated -- runs a
+            # fail-closed check in Login_handle_status_response BEFORE the status switch:
+            #
+            #   if (!exit_on_disconnect && (g_using_game_service ||
+            #       (g_login_cmdline_username && g_login_cmdline_password)))
+            #       if (status != 8) { Common_Client_shutdown_and_exit(1, 0); }
+            #
+            # so ANY status other than 8 -- including the status-5 handle request this
+            # function opens with -- terminates the client process outright. Verified live
+            # 2026-08-30 in the VM lane: the server logged "Auto-login as shiptest" (so the
+            # credentials arrived correctly) and the client exited anyway, purely for want
+            # of this ACK. A client that did NOT present credentials is unaffected: it never
+            # enters that branch.
+            # Ordering matters and was determined empirically (2026-08-30, VM lane):
+            # sending the 8 BEFORE the bootstrap made the client disconnect during
+            # TEAM_SELECT without the bootstrap ever being logged. The OG login state
+            # machine expects the bootstrap payload (TEAM_INFO etc.) to follow the
+            # status-5 handle request, so the success ACK goes AFTER it -- which is also
+            # how the late-LOGIN_REQUEST path in handlers.handle_login_request acks.
             handlers.send_initial_game_data(self, ctx)
+            ctx.tcp_handler.send(build_login_status(8, is_donor=True))
             # Now reply to queued HELLOs (after bootstrap, matching old packet order)
             for hello_pkt in pending_hellos:
                 self._handle_hello(ctx, hello_pkt)
