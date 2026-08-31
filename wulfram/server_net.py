@@ -564,7 +564,13 @@ class NetMixin:
                 # Keep a compatibility fallback for older simplified clients.
                 request_id = struct.unpack(">I", data[1:5])[0]
                 self.udp_handler.send_to(build_ping_reply(request_id), addr)
-                print(f"[UDP] PING_REPLY 0x0C to {addr} request_id={request_id} frame_count=0")
+                # NOT "frame_count=0" -- this branch has no frame_count to report, and
+                # printing a literal 0 made it indistinguishable from the full branch
+                # legitimately reporting 0. That cost real time on 2026-08-31: 388 identical
+                # lines were read as "the client reports zero rendered frames" when the value
+                # was a hardcoded constant in the format string. Say "absent", not a number.
+                print(f"[UDP] PING_REPLY 0x0C to {addr} request_id={request_id} "
+                      f"frame_count=absent(short-packet len={len(data)})")
 
         elif pkt_type == 0x0C:
             # STATE_REQUEST - may contain state/position info
