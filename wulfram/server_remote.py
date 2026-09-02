@@ -72,7 +72,11 @@ class RemoteSyncMixin:
                       f"pos={send_pos} is_manned=True mode={mode} ok={ok}")
 
     def _remote_og_movement_input_delay_for_ctx(self, ctx: ClientContext) -> float:
-        """Return the empirically observed remote OG input replay delay."""
+        """Return the optional remote OG movement-only replay delay.
+
+        This probe must remain default-off: delaying forward/strafe without also
+        delaying turn changes the trajectory of simultaneous W+turn input.
+        """
         if ctx is None or ctx.injected_input is not None:
             return 0.0
         if handlers._is_loopback_client(ctx):

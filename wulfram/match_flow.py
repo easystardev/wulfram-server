@@ -30,6 +30,14 @@ def init_match_state(server: object) -> None:
     server._match_round_start = _now()
     server._match_phase = 1
     server._match_last_clock_broadcast = 0.0
+    # A server can sit at the entry map for hours before the first participant
+    # reaches IN_GAME. The clock must begin with that first participant, not at
+    # process startup, or their spawn immediately receives an expired-round
+    # RESET_GAME. Tests and embedded callers may initialize with live clients.
+    try:
+        server._match_waiting_for_players = not bool(server._snapshot_in_game_clients())
+    except (AttributeError, TypeError):
+        server._match_waiting_for_players = True
 
 
 def remaining_ms(server: object) -> int:
@@ -102,8 +110,16 @@ def update_match_flow(server: object) -> None:
         return
     if getattr(server, "_match_round_start", None) is None:
         init_match_state(server)
-    if not server._snapshot_in_game_clients():
+    clients = server._snapshot_in_game_clients()
+    if not clients:
+        server._match_waiting_for_players = True
         return  # no players -> idle (don't burn rounds on an empty server)
+    if getattr(server, "_match_waiting_for_players", False):
+        # Start a fresh duration on the empty -> active transition. In
+        # particular, never send RESET_GAME during a late joiner's spawn.
+        server._match_round_start = _now()
+        server._match_last_clock_broadcast = 0.0
+        server._match_waiting_for_players = False
     if remaining_ms(server) <= 0:
         end_round(server)
         return

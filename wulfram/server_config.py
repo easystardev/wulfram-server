@@ -305,6 +305,79 @@ class ConfigMixin:
         # state_request_burst_min_interval so fire-spam STATE_REQUESTs cannot
         # reproduce the GOAL-2 flood/freeze. Identical for every client.
         self.state_request_burst_enabled = os.environ.get("WULFRAM_STATE_REQUEST_BURST", "1").strip().lower() not in ("0", "off", "false", "no")
+        # Stock-protocol local correction (2026-09-02): answer every client
+        # STATE_REQUEST (0x0C) immediately with ONE VIEW_UPDATE (0x0F) carrying
+        # pos+vel+rot of the owning tank. Decompile (Replication.c
+        # NetworkSync_receive_entity_update / EntityInterp_apply_delta): the
+        # camera entity reads its dead-reckoning timestamp from
+        # interp_record+0x08, which ONLY the VIEW_UPDATE handler fills, and the
+        # record's velocity is read whenever a position is present, so pos must
+        # always travel with vel. The client then pulls its own tank toward
+        # pos+vel*dt at ~2.5%/ms of the remaining error (a smooth rubberband,
+        # deadband 2.3u / 0.5rad in Camera_clamp_network_delta) with the
+        # Prediction.c collision rollback. This replaces the plain UPDATE_ARRAY
+        # snapshot reply, whose +0x08 timestamp is uninitialised heap for the
+        # local player. Default OFF until live-verified; .env turns it on.
+        self.state_request_replay_reply = os.environ.get(
+            "WULFRAM_STATE_REQUEST_REPLAY_REPLY", "0"
+        ).strip().lower() not in ("0", "off", "false", "no")
+        try:
+            self.state_request_replay_min_interval = float(
+                os.environ.get("WULFRAM_STATE_REQUEST_REPLAY_MIN_INTERVAL", "0.05")
+            )
+        except ValueError:
+            self.state_request_replay_min_interval = 0.05
+        # Reply even while the client is holding movement input: lateral drift
+        # accumulates during movement and the client-side deadband + dead
+        # reckoning are what the stock design relies on to keep it smooth.
+        self.state_request_replay_during_movement = os.environ.get(
+            "WULFRAM_STATE_REQUEST_REPLAY_DURING_MOVEMENT", "1"
+        ).strip().lower() not in ("0", "off", "false", "no")
+        # Server PING_REQUEST cadence == the client's STATE_REQUEST (correction)
+        # cadence; see WulframServer._ping_loop.
+        try:
+            self.ping_interval_s = float(os.environ.get("WULFRAM_PING_INTERVAL_S", "2.0"))
+        except ValueError:
+            self.ping_interval_s = 2.0
+        if self.ping_interval_s < 0.25:
+            self.ping_interval_s = 0.25
+        # Release-time input-integral velocity kicks (2026-09-01 approximation
+        # of client-held input duration). With the stock replay reply live
+        # they fight the real correction; keep them as A/B knobs.
+        self.turn_integral_reconcile_enabled = os.environ.get(
+            "WULFRAM_TURN_INTEGRAL_RECONCILE", "1"
+        ).strip().lower() not in ("0", "off", "false", "no")
+        self.movement_integral_reconcile_enabled = os.environ.get(
+            "WULFRAM_MOVEMENT_INTEGRAL_RECONCILE", "1"
+        ).strip().lower() not in ("0", "off", "false", "no")
+        # Vertical velocity nudge on the replay reply so the client's
+        # validate_prediction does not abort the pull at rest (see
+        # server_corrections._send_stock_replay_reply). 0 = stock-faithful.
+        try:
+            self.state_request_replay_vel_nudge = float(
+                os.environ.get("WULFRAM_STATE_REQUEST_REPLAY_VEL_NUDGE", "0")
+            )
+        except ValueError:
+            self.state_request_replay_vel_nudge = 0.0
+        # Max physics catch-up steps per tick after a tick-thread stall (see
+        # WulframServer._client_tick_loop accumulator). 5 = legacy burst.
+        try:
+            self.max_catchup_steps = int(os.environ.get("WULFRAM_MAX_CATCHUP_STEPS", "5"))
+        except ValueError:
+            self.max_catchup_steps = 5
+        # OG-faithful clamp of the suspension height ratio (<= 1.0) before the
+        # altitude mobility factor; see server_tick._sample_tank_surface_state.
+        self.tank_clearance_ratio_clamp = os.environ.get(
+            "WULFRAM_TANK_CLEARANCE_RATIO_CLAMP", "1"
+        ).strip().lower() not in ("0", "off", "false", "no")
+        # Lead extrapolation for the replay reply target. The client dead-reckons
+        # with its own latency estimate, so the stock channel defaults to 0.
+        try:
+            self.state_request_replay_lead_ticks = float(
+                os.environ.get("WULFRAM_STATE_REQUEST_REPLAY_LEAD_TICKS", "0")
+            )
+        except ValueError:
+            self.state_request_replay_lead_ticks = 0.0
         try:
             self.state_request_burst_min_interval = float(os.environ.get("WULFRAM_STATE_REQUEST_BURST_MIN_INTERVAL", "1.75"))
         except ValueError:
@@ -937,10 +1010,10 @@ class ConfigMixin:
         print(f"[CONFIG] use_client_ticks={int(self.use_client_ticks)}")
         try:
             self.remote_og_movement_input_delay = float(
-                os.environ.get("WULFRAM_REMOTE_OG_MOVEMENT_INPUT_DELAY", "0.20")
+                os.environ.get("WULFRAM_REMOTE_OG_MOVEMENT_INPUT_DELAY", "0")
             )
         except ValueError:
-            self.remote_og_movement_input_delay = 0.20
+            self.remote_og_movement_input_delay = 0.0
         if self.remote_og_movement_input_delay < 0.0:
             self.remote_og_movement_input_delay = 0.0
         try:

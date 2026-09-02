@@ -667,6 +667,37 @@ def test_enter_game_can_target_team_select_tcp_only_client():
     return True
 
 
+def test_control_spawn_commands_refuse_login_phase():
+    """Control-plane helpers must not inject team/spawn packets during LOGIN."""
+    from wulfram.control import ControlServer
+
+    session = Session()
+    session.phase = Phase.LOGIN
+    ctx = ClientContext(
+        client_id=7,
+        client_addr=("127.0.0.1", 50000),
+        session=session,
+        entity_id=0x1550,
+    )
+    ctx.tcp_handler = SimpleNamespace()
+
+    control = ControlServer.__new__(ControlServer)
+    control.server = SimpleNamespace()
+    control.ctx = ctx
+    control.session = session
+    control.tcp_handler = ctx.tcp_handler
+    control._select_control_client = lambda args: (ctx, ("127.0.0.1", 50001), args)
+
+    team_result = control._cmd_join_team(["t1"])
+    assert "wait for TEAM_SELECT" in team_result, team_result
+
+    spawn_result = control._cmd_spawn_full([])
+    assert "Spawn refused" in spawn_result, spawn_result
+    assert "wait for TEAM_SELECT" in spawn_result, spawn_result
+    print("test_control_spawn_commands_refuse_login_phase: PASSED")
+    return True
+
+
 def test_tank_softbody_spawn_pose_does_not_pin_ground_override():
     """Softbody tanks should settle on terrain suspension, not a spawn Z clamp."""
     server = WulframServer.__new__(WulframServer)
@@ -4503,6 +4534,131 @@ def test_send_entity_create_uses_udp_only():
     return True
 
 
+def test_weapon_system_held_direct_trigger_requires_release_before_refire():
+    """A number-key pulse demand fires once per press, not again after cooldown."""
+    ws = WeaponSystem()
+    ws.player_pos = (4950.0, 5100.0, 5.0)
+    ws.player_rot = (0.0, 0.0, 0.0)
+    ws.player_team = 2
+    ws.behavior_slots[12] = 1.0
+
+    first, _ = ws.update(dt=1.0, available_energy=100.0)
+    held, _ = ws.update(dt=1.0, available_energy=100.0)
+    ws.behavior_slots[12] = 0.0
+    released, _ = ws.update(dt=1.0, available_energy=100.0)
+    ws.behavior_slots[12] = 1.0
+    repressed, _ = ws.update(dt=1.0, available_energy=100.0)
+
+    assert len(first) == 1, first
+    assert held == [], held
+    assert released == [], released
+    assert len(repressed) == 1, repressed
+    print("test_weapon_system_held_direct_trigger_requires_release_before_refire: PASSED")
+    return True
+
+
+def test_send_entity_create_serializes_initial_definition_race():
+    """Concurrent visibility paths may emit only one initial DEFINITION."""
+    server = WulframServer.__new__(WulframServer)
+    server.remote_yaw_negate = False
+    server.remote_yaw_offset = 0.0
+    server.update_local_state_mode = "wf"
+    server.spawn_tank_weapon_type = 2
+    server.local_state_turret_max = 6.3
+    server.local_state_turret_range = 12.6
+    server._get_health_value = lambda ctx: 1.0
+    server._get_energy_value = lambda ctx: 1.0
+    server._to_client_pos = lambda pos: pos
+    server._get_network_tick = lambda ctx: 0x12345678
+    calls = []
+
+    def slow_send(ctx, payload, *, prefer_tcp=True):
+        calls.append((ctx.client_id, payload))
+        time.sleep(0.05)
+        return True
+
+    server._send_packet_to_client = slow_send
+    target_session = Session()
+    target_session.translation_ack_received = True
+    target_ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=target_session,
+        entity_id=1337,
+    )
+    player_session = Session()
+    player_session.entity_id = 1338
+    player_session.team_id = 2
+    player_ctx = ClientContext(
+        client_id=2,
+        client_addr=("10.10.10.3", 50001),
+        session=player_session,
+        entity_id=1338,
+    )
+    player_ctx.player_pos = (4980.0, 5100.0, 5.0)
+    player_ctx.player_pose = {"roll": 0.0}
+    player_ctx.player_heading = 0.0
+    player_ctx.entity_type = 0
+    barrier = threading.Barrier(3)
+
+    def create():
+        barrier.wait()
+        server._send_entity_create(target_ctx, player_ctx)
+
+    threads = [threading.Thread(target=create) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(timeout=2.0)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(calls) == 1, calls
+    assert 1338 in target_ctx.known_entity_ids
+    print("test_send_entity_create_serializes_initial_definition_race: PASSED")
+    return True
+
+
+def test_multiplayer_visibility_entity_create_is_viewer_owned():
+    """A viewer tick must not also race the reverse entity-create direction."""
+    server = WulframServer.__new__(WulframServer)
+    calls = []
+    server._ensure_uplink_mvp_state = lambda ctx: None
+    server._send_roster_entry = lambda target, player: calls.append(
+        ("roster", target.client_id, player.client_id)
+    )
+    server._send_entity_create = lambda target, player: calls.append(
+        ("entity", target.client_id, player.client_id)
+    )
+
+    viewer_session = Session()
+    viewer_session.translation_ack_received = True
+    viewer_session.tick = 1
+    viewer_ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=viewer_session,
+        entity_id=1337,
+    )
+    other_session = Session()
+    other_session.translation_ack_received = True
+    other_session.tick = 1
+    other_ctx = ClientContext(
+        client_id=2,
+        client_addr=("10.10.10.3", 50001),
+        session=other_session,
+        entity_id=1338,
+    )
+    server._snapshot_in_game_clients = lambda: [viewer_ctx, other_ctx]
+
+    server._ensure_multiplayer_visibility(viewer_ctx)
+
+    assert ("entity", 1, 2) in calls, calls
+    assert ("entity", 2, 1) not in calls, calls
+    print("test_multiplayer_visibility_entity_create_is_viewer_owned: PASSED")
+    return True
+
+
 def test_og_viewer_replication_gates_skip_remote_only():
     """T3 isolation gates apply uniformly — loopback is no longer exempt.
 
@@ -6410,11 +6566,19 @@ def test_tank_surface_state_uses_spring_base_clearance_target():
     ctx.player_pos = (0.0, 0.0, 10.0 + target_clearance)
     ctx.player_heading = 0.0
 
+    # Raw decompile denominator (clamp off): Spring_update_world_state stores
+    # height_sum / (point_count - 1), so a 4-point spring at nominal per-point
+    # clearance reports 4/3.
+    server.tank_clearance_ratio_clamp = False
     _up, clearance_ratio = server._sample_tank_surface_state(ctx)
-
-    # Spring_update_world_state stores height_sum / (point_count - 1), so a
-    # 4-point spring at nominal per-point clearance reports 4/3.
     assert abs(clearance_ratio - (4.0 / 3.0)) < 1e-6, clearance_ratio
+
+    # OG-faithful default (2026-09-02): Spring_update_world_state clamps the
+    # ratio to <= 1.0 before Tank_compute_mobility_factors reads it, so the
+    # altitude mobility penalty never fires at nominal ride height.
+    server.tank_clearance_ratio_clamp = True
+    _up, clamped_ratio = server._sample_tank_surface_state(ctx)
+    assert abs(clamped_ratio - 1.0) < 1e-6, clamped_ratio
     print("test_tank_surface_state_uses_spring_base_clearance_target: PASSED")
     return True
 
@@ -6578,6 +6742,11 @@ def test_server_tank_drive_uses_body_matrix_when_body_pose_live():
             "pos": ctx.player_pos,
             "vel": ctx.player_vel,
         }
+        ctx.spring_body_matrix = _matrix3_from_euler_xyz(
+            ctx.player_pose["roll"],
+            ctx.player_pose["pitch"],
+            ctx.player_pose["yaw"],
+        )
         ctx.spring_body_ang_vel = (0.0, 0.0)
         return ctx
 
@@ -6607,6 +6776,18 @@ def test_server_tank_drive_uses_body_matrix_when_body_pose_live():
     assert stale_debug["drive_basis_source"] == "entity_body_matrix", stale_debug
     assert stale_debug["basis_forward"][0] < -0.99, stale_debug
     assert stale_debug["drive_impulse_capped"][0] < 0.0, stale_debug
+
+    turn_server = make_server(True)
+    turn_ctx = make_ctx()
+    # The decompiled tank drive rotates local +X by entity Euler-Z directly.
+    # A fixed -90-degree Euler therefore drives toward world -Y.
+    turn_ctx.player_heading = -math.pi / 2.0
+    turn_ctx.player_yaw = -turn_ctx.player_heading
+    turn_ctx.player_pose["yaw"] = turn_ctx.player_yaw
+    turn_server._update_player_position(turn_ctx, dt_override=1.0 / 30.0)
+    turn_debug = turn_ctx.debug_last_controller_step
+    assert turn_debug["basis_forward"][1] < -0.95, turn_debug
+    assert turn_debug["drive_impulse_capped"][1] < 0.0, turn_debug
 
     flat_server = make_server(False)
     flat_ctx = make_ctx()
@@ -7008,6 +7189,146 @@ def test_heading_physics_sync_preserves_spring_body_pose():
     assert abs(ctx.spring_body_matrix[0] - math.cos(physics.heading)) < 0.02
     assert abs(ctx.spring_body_matrix[3] - math.sin(physics.heading)) < 0.13
     print("test_heading_physics_sync_preserves_spring_body_pose: PASSED")
+    return True
+
+
+def test_entity_collision_pair_updates_both_bodies_once():
+    """One overlap must exchange momentum atomically and not double-resolve."""
+    server = WulframServer.__new__(WulframServer)
+    server.entity_collision_lock = threading.Lock()
+    server.up_axis = "z"
+    server.terrain = None
+    server._get_entity_world_half_extents = lambda _ctx: (6.4, 7.1, 2.1)
+
+    session_a = Session(phase=Phase.IN_GAME, in_game=True, team_id=2)
+    session_b = Session(phase=Phase.IN_GAME, in_game=True, team_id=2)
+    a = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=session_a,
+        entity_id=1337,
+    )
+    b = ClientContext(
+        client_id=2,
+        client_addr=("10.10.10.3", 50001),
+        session=session_b,
+        entity_id=1338,
+    )
+    a.player_pos = (0.0, 0.0, 3.25)
+    b.player_pos = (12.0, 0.0, 3.25)
+    a.player_vel = (10.0, 0.0, 0.0)
+    b.player_vel = (0.0, 0.0, 0.0)
+    a.player_heading = b.player_heading = 0.0
+    a.player_pose.update(pos=a.player_pos, vel=a.player_vel)
+    b.player_pose.update(pos=b.player_pos, vel=b.player_vel)
+    server._snapshot_in_game_clients = lambda: [a, b]
+
+    server._resolve_entity_entity_collisions(a)
+
+    # Equal tank masses with e=0.4 produce 3/7 m/s after a 10 m/s impact.
+    assert abs(a.player_vel[0] - 3.0) < 1e-6, a.player_vel
+    assert abs(b.player_vel[0] - 7.0) < 1e-6, b.player_vel
+    assert abs((b.player_pos[0] - a.player_pos[0]) - 12.9) < 1e-6
+    first = (a.player_pos, a.player_vel, b.player_pos, b.player_vel)
+
+    # The shared separation buffer leaves the pair clear, so B's tick cannot
+    # apply the same collision a second time.
+    server._resolve_entity_entity_collisions(b)
+    assert (a.player_pos, a.player_vel, b.player_pos, b.player_vel) == first
+    assert a.player_pose["pos"] == a.player_pos
+    assert b.player_pose["vel"] == b.player_vel
+    print("test_entity_collision_pair_updates_both_bodies_once: PASSED")
+    return True
+
+
+def test_settled_movement_correction_fires_once_per_movement_episode():
+    """A crashfix14 reconcile is queued once, and only after input settles."""
+    server = WulframServer.__new__(WulframServer)
+    server.settled_movement_correction_enabled = True
+    server.correction_min_interval = 0.2
+    server.settled_movement_correction_max_speed = 0.5
+    server.settled_movement_correction_max_angular_speed_deg = 1.0
+    server.settled_movement_correction_burst_count = 3
+    server.settled_movement_correction_burst_interval = 0.1
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=Session(),
+        entity_id=0x14EA,
+    )
+    now = time.monotonic()
+    ctx.last_nonzero_move_input_time = now - 1.5
+    ctx.last_correction_send = now - 1.0
+    ctx.player_vel = (0.0, 0.0, 0.0)
+    ctx.vehicle_physics = SimpleNamespace(angular_velocity=0.0)
+
+    assert not server._settled_movement_correction_due(
+        ctx, now=now, movement_suppressed=True
+    )
+    assert server._settled_movement_correction_due(
+        ctx, now=now, movement_suppressed=False
+    )
+
+    ctx.player_vel = (0.6, 0.0, 0.0)
+    assert not server._settled_movement_correction_due(
+        ctx, now=now, movement_suppressed=False
+    )
+    ctx.player_vel = (0.0, 0.0, 0.0)
+    ctx.vehicle_physics.angular_velocity = math.radians(1.1)
+    assert not server._settled_movement_correction_due(
+        ctx, now=now, movement_suppressed=False
+    )
+    ctx.vehicle_physics.angular_velocity = 0.0
+    server._queue_settled_movement_correction_tail(ctx)
+    assert ctx.correction_burst_remaining == 2
+    assert abs(ctx.correction_burst_interval_s - 0.1) < 1e-9
+
+    ctx.last_settled_movement_correction_input_time = ctx.last_nonzero_move_input_time
+    assert not server._settled_movement_correction_due(
+        ctx, now=now, movement_suppressed=False
+    )
+
+    ctx.last_nonzero_move_input_time = now - 0.1
+    ctx.last_correction_send = now - 0.05
+    assert not server._settled_movement_correction_due(
+        ctx, now=now, movement_suppressed=False
+    )
+    ctx.last_correction_send = now - 1.0
+    assert server._settled_movement_correction_due(
+        ctx, now=now, movement_suppressed=False
+    )
+    print("test_settled_movement_correction_fires_once_per_movement_episode: PASSED")
+    return True
+
+
+def test_heading_physics_sync_repairs_nonfinite_spring_body_pose():
+    """A NaN body matrix must not permanently pin movement and projectile fire."""
+    server = WulframServer.__new__(WulframServer)
+    ctx = ClientContext(
+        client_id=3,
+        client_addr=("10.10.10.3", 50000),
+        session=Session(),
+        entity_id=0x053B,
+    )
+    ctx.player_pose["roll"] = float("nan")
+    ctx.player_pose["pitch"] = 0.25
+    ctx.spring_body_ang_vel = (float("nan"), 1.0)
+    ctx.spring_body_matrix = (float("nan"),) * 9
+    physics = SimpleNamespace(
+        heading=math.radians(28.7),
+        angular_velocity=0.0,
+        rotation=(0.0, 0.0, math.radians(28.7)),
+    )
+
+    server._sync_heading_physics_to_context(ctx, physics)
+
+    assert ctx.player_pose["roll"] == 0.0
+    assert ctx.player_pose["pitch"] == 0.0
+    assert ctx.spring_body_ang_vel == (0.0, 0.0)
+    assert all(math.isfinite(v) for v in ctx.spring_body_matrix)
+    assert abs(ctx.spring_body_matrix[0] - math.cos(physics.heading)) < 1e-6
+    assert abs(ctx.spring_body_matrix[3] - math.sin(physics.heading)) < 1e-6
+    print("test_heading_physics_sync_repairs_nonfinite_spring_body_pose: PASSED")
     return True
 
 
@@ -8784,6 +9105,56 @@ def test_repair_pad_collision_does_not_block_vehicle_movement():
             os.environ["WULFRAM_REPAIR_PAD_BLOCKS_VEHICLES"] = old_env
 
     print("test_repair_pad_collision_does_not_block_vehicle_movement: PASSED")
+    return True
+
+
+def test_skypump_pad_collision_does_not_block_vehicle_movement():
+    """Crossroads PAD meshes are traversable in the live OG client."""
+    old_env = os.environ.pop("WULFRAM_PAD_BLOCKS_VEHICLES", None)
+    try:
+        server = WulframServer.__new__(WulframServer)
+        server._building_entities = {
+            10013: SimpleNamespace(
+                x=5064.28369,
+                y=5103.49463,
+                z=3.65436,
+                entity_type=EntityType.PAD,
+                team_id=2,
+                heading=3.803217172623,
+            )
+        }
+        server._building_collision = SimpleNamespace(
+            available=True,
+            has_collision_model=lambda entity_type, team_id: True,
+            test_sphere_collision=lambda building, sphere_pos, sphere_radius: (
+                2.0,
+                (-0.45, -0.89, 0.0),
+            ),
+        )
+        server._snapshot_in_game_clients = lambda: []
+        ctx = ClientContext(
+            client_id=1,
+            client_addr=("10.10.10.2", 50000),
+            session=Session(),
+            entity_id=0x0539,
+        )
+
+        result = server._check_building_collisions(
+            ctx,
+            5057.5,
+            5100.0,
+            3.2565,
+            19.48,
+            0.0,
+        )
+
+        assert result == (5057.5, 5100.0, 19.48, 0.0), result
+        assert ctx.debug_last_collision == {}, ctx.debug_last_collision
+    finally:
+        if old_env is not None:
+            os.environ["WULFRAM_PAD_BLOCKS_VEHICLES"] = old_env
+
+    print("test_skypump_pad_collision_does_not_block_vehicle_movement: PASSED")
     return True
 
 
@@ -19327,6 +19698,14 @@ def test_match_flow_clock_and_round_end():
     match_flow.update_match_flow(srv4)
     assert not srv4.sent, "empty server must not run the round"
 
+    # A late first participant starts a fresh duration instead of receiving an
+    # expired-round RESET_GAME during their spawn transition.
+    srv4._clients.append(Client(1, 0))
+    match_flow.update_match_flow(srv4)
+    assert 0x3F not in srv4.sent, "late join must not receive RESET_GAME"
+    assert 0x2F in srv4.sent, "late join should receive a fresh GAME_CLOCK"
+    assert match_flow.remaining_ms(srv4) > 599_000, "late join did not start a fresh round"
+
     print("test_match_flow_clock_and_round_end: PASSED")
     return True
 
@@ -19437,12 +19816,15 @@ def main():
         test_weapon_system_caltrop_uses_promoted_lifecycle_constants,
         test_weapon_system_chain_gun_autocannon_fire_slot_hitscan_path,
         test_weapon_system_held_fire_repeats_on_cooldown,
+        test_weapon_system_held_direct_trigger_requires_release_before_refire,
         test_weapon_system_accepts_empty_action_update_keepalive,
         test_weapon_system_slot5_release_preserves_og_slider_value,
         test_weapon_system_action_dump_slot5_zero_preserves_og_slider_value,
         test_weapon_system_action_dump_slot5_nonzero_updates_og_slider_value,
         test_tank_softbody_control_ignores_live_slot6_lean_by_default,
         test_send_entity_create_uses_udp_only,
+        test_send_entity_create_serializes_initial_definition_race,
+        test_multiplayer_visibility_entity_create_is_viewer_owned,
         test_og_viewer_replication_gates_skip_remote_only,
         test_transient_fx_stays_off_for_remote_og_by_default,
         test_transient_fx_can_be_enabled_for_remote_clients,
@@ -19464,6 +19846,8 @@ def main():
         test_tank_high_hover_uses_linear_damping_for_w_motion,
         test_remote_og_movement_input_delay_replays_prior_axis_sample,
         test_remote_og_movement_input_delay_can_probe_nearest_axis_sample,
+        test_entity_collision_pair_updates_both_bodies_once,
+        test_settled_movement_correction_fires_once_per_movement_episode,
         test_remote_og_movement_input_can_select_bounded_after_target,
         test_remote_og_movement_input_reports_nonzero_time_candidates,
         test_remote_og_movement_input_history_window_is_bounded_near_target,
@@ -19492,6 +19876,7 @@ def main():
         test_tank_surface_attitude_force_path_uses_point_clearance_torque,
         test_tank_surface_attitude_reuses_force_sample_state_without_resampling,
         test_heading_physics_sync_preserves_spring_body_pose,
+        test_heading_physics_sync_repairs_nonfinite_spring_body_pose,
         test_tank_softbody_support_pulls_down_from_compact_equilibrium,
         test_tank_softbody_supports_gravity_at_og_flat_height,
         test_tank_softbody_slot5_changes_response_without_jumpjet,
@@ -19529,6 +19914,7 @@ def main():
         test_triangle_cbsp_contact_returns_first_leaf_hit,
         test_building_collision_skips_aabb_for_mesh_backed_building,
         test_repair_pad_collision_does_not_block_vehicle_movement,
+        test_skypump_pad_collision_does_not_block_vehicle_movement,
         test_building_collision_team_variant_matches_client_helper,
         test_server_team_model_name_matches_client_helper,
         test_effective_inactivity_timeout_extends_remote_ingame_clients,
@@ -19641,6 +20027,7 @@ def main():
         test_remote_combat_observer_stats_gate_skips_nonparticipant_og,
         test_control_pos_exact_reset_targets_specific_client,
         test_enter_game_can_target_team_select_tcp_only_client,
+        test_control_spawn_commands_refuse_login_phase,
         test_control_pos_can_apply_live_tap_velocity,
         test_control_heading_set_preserves_yaw_sign_convention,
         test_solo_local_player_keepalive_shape_triggers_og_state_request_gate,

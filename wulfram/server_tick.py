@@ -83,6 +83,67 @@ def sane_velocity_triplet(value):
 
 
 class TickMixin:
+    def _repair_nonfinite_body_attitude(
+        self,
+        ctx: ClientContext,
+        heading: float | None = None,
+    ) -> bool:
+        """Reset a poisoned spring/body attitude while preserving finite position/yaw.
+
+        Position and velocity already have root sanity guards, but the spring body
+        matrix is a separate persistent state.  Once it contains NaN, the body-basis
+        drive path produces NaN thrust every tick; the position guard then holds the
+        tank in place, while projectile muzzle construction also becomes NaN.  Reset
+        only that already-invalid attitude state so the next spring sample can recover.
+        """
+        if heading is None:
+            heading = float(getattr(ctx, "player_heading", 0.0) or 0.0)
+        try:
+            heading = float(heading)
+        except (TypeError, ValueError, OverflowError):
+            heading = 0.0
+        if not math.isfinite(heading):
+            heading = 0.0
+
+        pose = getattr(ctx, "player_pose", {}) or {}
+        try:
+            roll = float(pose.get("roll", 0.0) or 0.0)
+            pitch = float(pose.get("pitch", 0.0) or 0.0)
+            body_ang_vel = tuple(
+                float(v)
+                for v in tuple(getattr(ctx, "spring_body_ang_vel", (0.0, 0.0)) or ())[:2]
+            )
+            body_matrix = tuple(
+                float(v)
+                for v in tuple(getattr(ctx, "spring_body_matrix", ()) or ())[:9]
+            )
+        except (TypeError, ValueError, OverflowError):
+            roll = pitch = 0.0
+            body_ang_vel = ()
+            body_matrix = ()
+
+        valid = (
+            math.isfinite(roll)
+            and math.isfinite(pitch)
+            and len(body_ang_vel) == 2
+            and finite_values(body_ang_vel)
+            and len(body_matrix) == 9
+            and finite_values(body_matrix)
+        )
+        if valid:
+            return False
+
+        ctx.player_pose["roll"] = 0.0
+        ctx.player_pose["pitch"] = 0.0
+        ctx.player_pose["yaw"] = -heading
+        ctx.spring_body_ang_vel = (0.0, 0.0)
+        ctx.spring_body_matrix = _matrix3_from_euler_xyz(0.0, 0.0, heading)
+        print(
+            f"[PHYSICS] Client {getattr(ctx, 'client_id', '?')}: "
+            "non-finite body attitude -> reset roll/pitch and preserve yaw"
+        )
+        return True
+
     @staticmethod
     def _piecewise_interpolate(samples: list, t: float) -> float:
         """Piecewise-linear interpolation matching the client's steering curve.
@@ -186,10 +247,19 @@ class TickMixin:
                 )
             except (TypeError, ValueError):
                 body_matrix = ()
-            if len(body_matrix) != 9:
+            if len(body_matrix) != 9 or not finite_values(body_matrix):
+                try:
+                    fallback_roll = float(ctx.player_pose.get("roll", 0.0) or 0.0)
+                    fallback_pitch = float(ctx.player_pose.get("pitch", 0.0) or 0.0)
+                except (TypeError, ValueError, OverflowError):
+                    fallback_roll = fallback_pitch = 0.0
+                if not math.isfinite(fallback_roll):
+                    fallback_roll = 0.0
+                if not math.isfinite(fallback_pitch):
+                    fallback_pitch = 0.0
                 body_matrix = _matrix3_from_euler_xyz(
-                    float(ctx.player_pose.get("roll", 0.0) or 0.0),
-                    float(ctx.player_pose.get("pitch", 0.0) or 0.0),
+                    fallback_roll,
+                    fallback_pitch,
                     heading,
                 )
             else:
@@ -282,6 +352,14 @@ class TickMixin:
         target_clearance = self._tank_hover_clearance_target(ctx)
         average_clearance = tank_spring_average_clearance(sum_clearance, len(offsets))
         clearance_ratio = average_clearance / target_clearance
+        if getattr(self, "tank_clearance_ratio_clamp", True) and clearance_ratio > 1.0:
+            # OG Spring_update_world_state (Physics.c ~2652) clamps the height
+            # ratio to <= 1.0 BEFORE Tank_compute_mobility_factors reads it, so
+            # the altitude mobility penalty never fires for the tank. Without
+            # this clamp a tank idling above its hover target started a drive
+            # at 0.35x mobility (live 2026-09-02: 1.3 u/s first step vs the
+            # client's 9.6). WULFRAM_TANK_CLEARANCE_RATIO_CLAMP=0 restores.
+            clearance_ratio = 1.0
         ctx.debug_last_spring_state = {
             "source": "Spring_update_world_state",
             "point_count": len(offsets),
@@ -463,10 +541,23 @@ class TickMixin:
             else:
                 matrix = _matrix3_from_euler_xyz(roll, pitch, heading)
             up = (matrix[2], matrix[5], matrix[8])
+        matrix = tuple(float(v) for v in matrix)
+        attitude_repaired = False
+        if not finite_values((roll, pitch, *ctx.spring_body_ang_vel, *matrix)):
+            roll = 0.0
+            pitch = 0.0
+            ctx.spring_body_ang_vel = (0.0, 0.0)
+            matrix = _matrix3_from_euler_xyz(0.0, 0.0, heading)
+            up = (matrix[2], matrix[5], matrix[8])
+            attitude_repaired = True
+            print(
+                f"[PHYSICS] Client {getattr(ctx, 'client_id', '?')}: "
+                "spring attitude step produced non-finite state -> reset roll/pitch"
+            )
         ctx.player_pose["roll"] = roll
         ctx.player_pose["pitch"] = pitch
         ctx.player_pose["yaw"] = -ctx.player_heading
-        ctx.spring_body_matrix = tuple(float(v) for v in matrix)
+        ctx.spring_body_matrix = matrix
         debug = {
             "target": (target_roll, target_pitch, ctx.player_heading),
             "angular_velocity": ctx.spring_body_ang_vel,
@@ -505,6 +596,8 @@ class TickMixin:
                         "stiffness": step.stiffness,
                     }
                 )
+        if attitude_repaired:
+            debug["nonfinite_repaired"] = True
         return {
             "source": "terrain_surface",
             "rotation": (roll, pitch, ctx.player_heading),
@@ -567,6 +660,7 @@ class TickMixin:
         ctx.angular_vel_yaw = physics.angular_velocity
         ctx.player_yaw = -ctx.player_heading
         ctx.player_pose["yaw"] = -ctx.player_heading
+        self._repair_nonfinite_body_attitude(ctx, ctx.player_heading)
         ctx.spring_body_matrix = tank_body_matrix_with_heading(
             getattr(ctx, "spring_body_matrix", None),
             ctx.player_heading,
@@ -10730,12 +10824,27 @@ class TickMixin:
         return finish_result(anchor[0], anchor[1], anchor[2], vx, vy, vz)
 
     def _resolve_entity_entity_collisions(self, ctx: ClientContext):
-        """Resolve entity-entity collisions using impulse-based sphere-sphere detection.
+        """Resolve one entity's contacts as atomic two-body collision pairs.
+
+        The OG records a pair, then applies equal-and-opposite impulses to both
+        bodies in one deferred collision-pool pass (Physics.c:6297-6298 and
+        6485-6486).  Resolving only ``ctx`` from two independent tick threads is
+        order-dependent: the first half can separate the pair before the struck
+        body's thread ever receives its impulse.
+        """
+        lock = getattr(self, "entity_collision_lock", None)
+        if lock is None:
+            return self._resolve_entity_entity_collisions_locked(ctx)
+        with lock:
+            return self._resolve_entity_entity_collisions_locked(ctx)
+
+    def _resolve_entity_entity_collisions_locked(self, ctx: ClientContext):
+        """Locked implementation of the shared pair response.
 
         Decompile: Physics.c — time-bucketed deferred collision pairs with impulse dynamics.
         Simplified here to per-tick sphere overlap + impulse response using the verified
-        collision table (exe VA 0x5730C0). Each entity independently resolves its own
-        mass-proportional share of the collision (position and velocity).
+        collision table (exe VA 0x5730C0). Both entities receive their
+        mass-proportional shares of position and velocity in the same event.
 
         Response: J = -(1 + e) * v_rel·n / (1/m_a + 1/m_b)
         where e = avg(elasticity_a, elasticity_b), n = collision normal.
@@ -10746,7 +10855,6 @@ class TickMixin:
 
         pos_a = ctx.player_pos
         vel_a = ctx.player_vel
-        radius_a = self._TANK_RADIUS
         col_a = self._ENTITY_COLLISION_TABLE.get(ctx.entity_type, self._ENTITY_COLLISION_DEFAULT)
         mass_a = col_a["mass"]
 
@@ -10757,28 +10865,40 @@ class TickMixin:
                 continue
 
             pos_b = other.player_pos
-            radius_b = self._TANK_RADIUS
-
-            # Sphere-sphere overlap test (XY plane + Z)
+            # Heading-aware support radii from the real collision meshes.  The
+            # legacy fixed radius (4.0) let two team-2 tanks approach to ~8u,
+            # while tank_1 actually extends 6.39u forward / 7.13u sideways and
+            # the OG client begins resolving the same head-on pair at ~13u.
             dx = pos_a[0] - pos_b[0]
             dy = pos_a[1] - pos_b[1]
             dz = pos_a[2] - pos_b[2]
             dist_sq = dx * dx + dy * dy + dz * dz
-            combined_radius = radius_a + radius_b
-            if dist_sq >= combined_radius * combined_radius:
-                continue
-
             dist = math.sqrt(dist_sq)
             if dist < 0.001:
                 # Perfectly overlapping — use arbitrary separation direction
                 dx, dy, dz = 1.0, 0.0, 0.0
                 dist = 0.001
 
-            # Collision normal: A -> B direction (pushes A away from B)
+            # Collision normal points B -> A (pushes A away from B).
             inv_dist = 1.0 / dist
             nx = dx * inv_dist
             ny = dy * inv_dist
             nz = dz * inv_dist
+
+            def support_radius(body: ClientContext) -> float:
+                hx, hy, hz = self._get_entity_world_half_extents(body)
+                heading = float(getattr(body, "player_heading", 0.0) or 0.0)
+                ch = math.cos(heading)
+                sh = math.sin(heading)
+                # Body forward=(cos,sin), right=(-sin,cos).
+                planar = abs(nx * ch + ny * sh) * hx + abs(-nx * sh + ny * ch) * hy
+                return max(self._TANK_RADIUS, planar + abs(nz) * hz)
+
+            radius_a = support_radius(ctx)
+            radius_b = support_radius(other)
+            combined_radius = radius_a + radius_b
+            if dist >= combined_radius:
+                continue
 
             penetration = combined_radius - dist
 
@@ -10794,19 +10914,29 @@ class TickMixin:
             rel_vz = vel_a[2] - vel_b[2]
             v_rel_n = rel_vx * nx + rel_vy * ny + rel_vz * nz
 
-            # Only resolve if entities are approaching (negative = separating)
+            # With n pointing from B to A, a negative relative normal velocity
+            # means the bodies are approaching.  The old `> 0` test applied
+            # restitution only while separating, so moving tanks bulldozed
+            # stationary tanks via positional correction without exchanging
+            # momentum.
             # But always do position separation
             inv_mass_sum = 1.0 / mass_a + 1.0 / mass_b
 
-            if v_rel_n > 0.0:
+            if v_rel_n < 0.0:
                 # Impulse magnitude (decompile: J = -(1+e) * v_rel·n / (1/m_a + 1/m_b))
                 j = -(1.0 + elasticity) * v_rel_n / inv_mass_sum
 
-                # Apply impulse to this entity only (A gets pushed along +normal)
+                # Apply equal-and-opposite impulse to both entities.  This is
+                # load-bearing: the OG constraint solver updates the pair
+                # together, rather than waiting for B's independent tick.
                 impulse_a = j / mass_a
+                impulse_b = j / mass_b
                 new_vx = vel_a[0] + nx * impulse_a
                 new_vy = vel_a[1] + ny * impulse_a
                 new_vz = vel_a[2] + nz * impulse_a
+                new_bvx = vel_b[0] - nx * impulse_b
+                new_bvy = vel_b[1] - ny * impulse_b
+                new_bvz = vel_b[2] - nz * impulse_b
 
                 # Safety cap: decompile caps impulse magnitude at 200.0
                 speed_sq = new_vx * new_vx + new_vy * new_vy + new_vz * new_vz
@@ -10815,30 +10945,58 @@ class TickMixin:
                     new_vx *= scale
                     new_vy *= scale
                     new_vz *= scale
+                speed_b_sq = new_bvx * new_bvx + new_bvy * new_bvy + new_bvz * new_bvz
+                if speed_b_sq > 200.0 * 200.0:
+                    scale = 200.0 / math.sqrt(speed_b_sq)
+                    new_bvx *= scale
+                    new_bvy *= scale
+                    new_bvz *= scale
 
                 vel_a = (new_vx, new_vy, new_vz)
+                vel_b = (new_bvx, new_bvy, new_bvz)
 
-            # Position separation: push this entity's share of the penetration
-            # Each entity gets pushed proportional to inverse mass
+            # Position separation is also one pair operation. Split the 0.1u
+            # buffer across the two bodies so the total clearance stays 0.1u.
             share_a = (1.0 / mass_a) / inv_mass_sum
-            push = penetration * share_a + 0.1  # small separation buffer
-            new_x = pos_a[0] + nx * push
-            new_y = pos_a[1] + ny * push
-            new_z = pos_a[2] + nz * push
+            share_b = (1.0 / mass_b) / inv_mass_sum
+            push_a = penetration * share_a + 0.05
+            push_b = penetration * share_b + 0.05
+            new_x = pos_a[0] + nx * push_a
+            new_y = pos_a[1] + ny * push_a
+            new_z = pos_a[2] + nz * push_a
+            new_bx = pos_b[0] - nx * push_b
+            new_by = pos_b[1] - ny * push_b
+            new_bz = pos_b[2] - nz * push_b
 
             # Clamp Z to terrain
             if self.up_axis == "z" and self.terrain:
                 terrain_z = self._terrain_physics_ground_z_at(new_x, new_y)
                 if new_z < terrain_z:
                     new_z = terrain_z
+                terrain_b_z = self._terrain_physics_ground_z_at(new_bx, new_by)
+                if new_bz < terrain_b_z:
+                    new_bz = terrain_b_z
 
             pos_a = (new_x, new_y, new_z)
+            pos_b = (new_bx, new_by, new_bz)
+
+            other.player_pos = pos_b
+            other.player_vel = vel_b
+            other.player_pose["pos"] = pos_b
+            other.player_pose["vel"] = vel_b
 
             ctx.debug_last_collision = {
                 "kind": "entity_entity",
                 "other_id": other.client_id,
                 "penetration": penetration,
                 "normal": (nx, ny, nz),
+                "dist": dist,
+            }
+            other.debug_last_collision = {
+                "kind": "entity_entity",
+                "other_id": ctx.client_id,
+                "penetration": penetration,
+                "normal": (-nx, -ny, -nz),
                 "dist": dist,
             }
 
@@ -11694,6 +11852,7 @@ class TickMixin:
                   f"clamp to ({fx:.1f},{fy:.1f},{safe_z:.1f})")
             ctx.player_pos = [fx, fy, safe_z]
             ctx.player_vel = [0.0, 0.0, 0.0]
+        self._repair_nonfinite_body_attitude(ctx, heading_override)
 
         # Read movement input (slot 2 = forward, slot 3 = strafe)
         raw_throttle_input = 0.0

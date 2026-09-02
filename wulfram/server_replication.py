@@ -592,6 +592,11 @@ class ReplicationMixin:
             )
 
     def _send_entity_create(self, target_ctx: ClientContext, player_ctx: ClientContext, *, is_retry: bool = False) -> None:
+        """Serialize create/retry bookkeeping for one receiving client."""
+        with target_ctx.entity_create_lock:
+            self._send_entity_create_locked(target_ctx, player_ctx, is_retry=is_retry)
+
+    def _send_entity_create_locked(self, target_ctx: ClientContext, player_ctx: ClientContext, *, is_retry: bool = False) -> None:
         """Announce player_ctx's entity to target_ctx via UPDATE_ARRAY DEFINITION.
 
         Remote entities are created via UPDATE_ARRAY's fallback path:
@@ -703,10 +708,14 @@ class ReplicationMixin:
             self._send_roster_entry(ctx, other)
             if other.session.translation_ack_received:
                 self._send_roster_entry(other, ctx)
-            # Entity creation requires target translation ack.
+            # Entity creation is viewer-owned: this tick loop only announces
+            # `other` to its own `ctx`.  The other client's tick loop performs
+            # the reverse direction.  Sending both directions here made two
+            # independent tick threads race through `_entity_create_times` and
+            # emit duplicate DEFINITION retries a millisecond apart.  Repeating
+            # a create for an already-live OID can re-enter the OG client's
+            # creation/render path with partially initialized state.
             self._send_entity_create(ctx, other)
-            if other.session.translation_ack_received:
-                self._send_entity_create(other, ctx)
 
     def _build_remote_sync_heartbeat_update(
         self,

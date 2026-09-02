@@ -553,6 +553,21 @@ class WeaponSystem:
                 return weapon_slot
         return None
 
+    def _get_rising_direct_weapon_slot(self, threshold: float = 0.05) -> Optional[int]:
+        """Return the first OG direct-fire slot that changed from up to down.
+
+        Number-key weapon slots are discrete demands in the OG action stream.
+        Replaying a held slot after cooldown turns one short physical key press
+        into multiple projectile spawns when ACTION_DUMP samples straddle the
+        cooldown boundary.
+        """
+        for trigger_slot, weapon_slot in OG_DIRECT_TRIGGER_WEAPON_SLOTS.items():
+            current = self.behavior_slots[trigger_slot] > threshold
+            previous = self.prev_direct_trigger_states.get(trigger_slot, 0.0) > threshold
+            if current and not previous:
+                return weapon_slot
+        return None
+
     def _fire_weapon_slot(self, weapon_slot: int) -> Tuple[List[Projectile], float]:
         """Fire the given weapon slot once and return spawned projectiles + energy."""
         weapon_name = OG_DIRECT_TRIGGER_NAMES.get(
@@ -624,7 +639,7 @@ class WeaponSystem:
 
         # Check fire state (behavior slot FIRE)
         fire_val = self.behavior_slots[BehaviorSlot.FIRE]
-        direct_weapon_slot = self._get_active_direct_weapon_slot()
+        direct_weapon_slot = self._get_rising_direct_weapon_slot()
 
         # Debug: log when fire value changes significantly
         if abs(fire_val - self.prev_fire_state) > 0.01:

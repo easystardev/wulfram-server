@@ -40,13 +40,20 @@ class RaycastMixin:
     def _building_blocks_vehicle_collision(self, building) -> bool:
         """Return whether a map building should block vehicle movement.
 
-        Repair pads are spawn/service pads. Treating their mesh/AABB as a
-        solid blocker makes the authoritative tank shove sideways immediately
-        after a map-flag spawn, while the OG client drives across the pad.
+        Repair pads and Crossroads skypump pads are service/spawn surfaces.
+        Treating their mesh as a solid blocker makes the authoritative tank
+        shove sideways while the OG client drives across the same surface.
         """
         if int(getattr(building, "entity_type", -1)) == int(EntityType.REPAIR_BUILDING):
             return (
                 os.environ.get("WULFRAM_REPAIR_PAD_BLOCKS_VEHICLES", "0")
+                .strip()
+                .lower()
+                in ("1", "true", "on", "yes")
+            )
+        if int(getattr(building, "entity_type", -1)) == int(EntityType.PAD):
+            return (
+                os.environ.get("WULFRAM_PAD_BLOCKS_VEHICLES", "0")
                 .strip()
                 .lower()
                 in ("1", "true", "on", "yes")

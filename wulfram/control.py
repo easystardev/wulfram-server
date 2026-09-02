@@ -368,6 +368,13 @@ class ControlServer:
             ctx.weapon_system.fire_cooldown = 0.0
             ctx.weapon_system.last_update_time = now
 
+        ctx._yaw_segment_start_client_tick = 0
+        ctx._yaw_segment_torque_integral = 0.0
+        ctx.debug_last_turn_integral_reconcile = {}
+        ctx._fwd_integral_prev_input = 0.0
+        ctx._fwd_actual_input_integral = 0.0
+        ctx.debug_last_movement_integral_reconcile = {}
+
         if ctx.vehicle_physics:
             ctx.vehicle_physics.reset()
             ctx.vehicle_physics.heading = heading
@@ -503,6 +510,10 @@ class ControlServer:
             return self._cmd_shell(args)
         elif cmd == 'spread' or cmd == 'fan':
             return self._cmd_spread(args)
+        elif cmd == 'sample':
+            return self._cmd_sample(args)
+        elif cmd == 'attr':
+            return self._cmd_attr(args)
         elif cmd == 'pos' or cmd == 'player_pos':
             return self._cmd_player_pos(args)
         elif cmd == 'attitude' or cmd == 'att':
@@ -1234,6 +1245,11 @@ Examples:
             status = "ON" if interval > 0 or movement_interval > 0 else "OFF"
             lines = [
                 f"Drift correction: {status} mode={self.server.correction_mode}",
+                (
+                    "  shape = "
+                    f"rot_only_guard:{int(bool(getattr(self.server, 'correction_rot_only', False)))} "
+                    f"settled_once:{int(bool(getattr(self.server, 'settled_movement_correction_enabled', False)))}"
+                ),
                 f"  interval = {interval:.2f}s (0=disabled)",
                 (
                     "  movement = "
@@ -1248,8 +1264,13 @@ Examples:
                     lines.append(f"  client {ctx.client_id}: last_correction={age:.1f}s ago{queued}")
                 else:
                     lines.append(f"  client {ctx.client_id}: no corrections sent yet{queued}")
+                lines.append(
+                    f"    move_at={float(getattr(ctx, 'last_nonzero_move_input_time', 0.0) or 0.0):.3f} "
+                    f"settled_consumed={float(getattr(ctx, 'last_settled_movement_correction_input_time', 0.0) or 0.0):.3f} "
+                    f"active={int(bool(self.server._remote_movement_input_active(ctx)))}"
+                )
             lines.append("")
-            lines.append("Usage: correction <seconds|on|off|now|mode <name>|send [c<id>]>")
+            lines.append("Usage: correction <seconds|on|off|now|mode <name>|guard <0|1>|send [c<id>]>")
             lines.append("Modes: full, rot_only, pos_only, dual_entity, view_update, view_update_define")
             return "\n".join(lines)
 
@@ -1265,6 +1286,30 @@ Examples:
                 ctx.correction_burst_remaining = 0
                 ctx.correction_burst_interval_s = 0.0
             return "Correction OFF"
+        if subcmd == "replay":
+            # 2026-09-02 stock-protocol STATE_REQUEST -> VIEW_UPDATE reply
+            # (server_corrections._send_stock_replay_reply).
+            if len(args) < 2 or args[1].lower() not in ("0", "1", "off", "on"):
+                cur = bool(getattr(self.server, "state_request_replay_reply", False))
+                mv = bool(getattr(self.server, "state_request_replay_during_movement", True))
+                return f"STATE_REQUEST replay reply: {'ON' if cur else 'OFF'} during_movement={int(mv)}"
+            enabled = args[1].lower() in ("1", "on")
+            self.server.state_request_replay_reply = enabled
+            if len(args) >= 3 and args[2].lower() in ("0", "1", "off", "on"):
+                self.server.state_request_replay_during_movement = args[2].lower() in ("1", "on")
+            return (
+                f"STATE_REQUEST replay reply: {'ON' if enabled else 'OFF'} "
+                f"during_movement={int(bool(getattr(self.server, 'state_request_replay_during_movement', True)))}"
+            )
+        if subcmd == "settled":
+            if len(args) < 2 or args[1].lower() not in ("0", "1", "off", "on"):
+                return "usage: correction settled <0|1>"
+            enabled = args[1].lower() in ("1", "on")
+            self.server.settled_movement_correction_enabled = enabled
+            if not enabled:
+                for ctx in self.server._snapshot_in_game_clients():
+                    ctx.correction_burst_remaining = 0
+            return f"Settled movement correction: {'ON' if enabled else 'OFF'}"
         if subcmd == "now":
             # Optional trailing tokens: c<id>, burst count, interval seconds.
             # Empirically, a single VIEW_UPDATE push is invisible on the OG
@@ -1330,6 +1375,18 @@ Examples:
             self.server.correction_mode = new_mode
             print(f"[CONTROL] correction mode: {old_mode} -> {new_mode}")
             return f"Correction mode: {old_mode} -> {new_mode}"
+        if subcmd == "guard":
+            if len(args) < 2:
+                enabled = bool(getattr(self.server, "correction_rot_only", False))
+                return f"Correction rotation-only guard: {int(enabled)}"
+            value = args[1].strip().lower()
+            if value not in ("0", "1", "off", "on", "false", "true", "no", "yes"):
+                return "Usage: correction guard <0|1>"
+            enabled = value in ("1", "on", "true", "yes")
+            old = bool(getattr(self.server, "correction_rot_only", False))
+            self.server.correction_rot_only = enabled
+            print(f"[CONTROL] correction rotation-only guard: {int(old)} -> {int(enabled)}")
+            return f"Correction rotation-only guard: {int(old)} -> {int(enabled)}"
 
         try:
             value = float(subcmd)
@@ -1544,6 +1601,10 @@ Examples:
             lines = ["Yaw physics (direct-impulse model):"]
             lines.append(f"  turn_adjust     = {self.server.turn_adjust}")
             lines.append(f"  turn_sign       = {self.server.turn_sign}")
+            lines.append(
+                "  frame_step      = "
+                + ("client" if bool(getattr(self.server, "physics_frame_match", True)) else "fixed_30")
+            )
             if ctx_ref and ctx_ref.vehicle_physics:
                 p = ctx_ref.vehicle_physics
                 lines.append(f"  damp_coeff      = {p.damp_coeff:.4f}")
@@ -1555,7 +1616,7 @@ Examples:
                 lines.append("  (no client connected)")
             lines.append("")
             lines.append("Usage: physics <param> [value]")
-            lines.append("Params: damp, reset")
+            lines.append("Params: damp, frame <client|fixed>, reset")
             return '\n'.join(lines)
 
         param = args[0].lower()
@@ -1572,6 +1633,20 @@ Examples:
                         ctx.angular_vel_yaw = 0.0
                         count += 1
             return f"Reset heading + angular velocity for {count} client(s)"
+
+        if param in ('frame', 'frame_step', 'step'):
+            if len(args) < 2:
+                return "Usage: physics frame <client|fixed>"
+            mode = args[1].strip().lower()
+            if mode not in ('client', 'match', 'fixed', 'fixed_30', '30'):
+                return "Usage: physics frame <client|fixed>"
+            old = bool(getattr(self.server, "physics_frame_match", True))
+            self.server.physics_frame_match = mode in ('client', 'match')
+            return (
+                "Physics frame step: "
+                f"{'client' if old else 'fixed_30'} -> "
+                f"{'client' if self.server.physics_frame_match else 'fixed_30'}"
+            )
 
         if len(args) < 2:
             return "Usage: physics <param> <value>"
@@ -1595,7 +1670,7 @@ Examples:
             print(f"[CONTROL] damp_coeff: {old_val} -> {value} ({count} clients)")
             return f"Set damp_coeff = {value} (was {old_val}, {count} clients)"
 
-        return f"Unknown physics param: {param}. Valid: damp, reset"
+        return f"Unknown physics param: {param}. Valid: damp, frame, reset"
 
     def _cmd_behavior(self, args: list) -> str:
         """
@@ -1719,6 +1794,15 @@ Examples:
                 from . import transport as transport_mod
                 from . import handlers as handlers_mod
                 from . import jump_jets as jump_jets_mod
+                from . import server_config as server_config_mod
+                from . import server_raycast as server_raycast_mod
+                from . import server_replication as server_replication_mod
+                from . import server_spawn as server_spawn_mod
+                from . import server_combat as server_combat_mod
+                from . import server_remote as server_remote_mod
+                from . import server_corrections as server_corrections_mod
+                from . import server_tick as server_tick_mod
+                from . import server_net as server_net_mod
                 from . import server as server_mod
 
                 # Preserve FEATURES global across reload (session.py recreates it)
@@ -1741,6 +1825,15 @@ Examples:
                     (packets_mod, "packets"),
                     (handlers_mod, "handlers"),
                     (control_mod, "control"),
+                    (server_config_mod, "server_config"),
+                    (server_raycast_mod, "server_raycast"),
+                    (server_replication_mod, "server_replication"),
+                    (server_spawn_mod, "server_spawn"),
+                    (server_combat_mod, "server_combat"),
+                    (server_remote_mod, "server_remote"),
+                    (server_corrections_mod, "server_corrections"),
+                    (server_tick_mod, "server_tick"),
+                    (server_net_mod, "server_net"),
                     (server_mod, "server"),
                 ]:
                     importlib.reload(mod)
@@ -3788,6 +3881,11 @@ Examples:
             return f"Error: {e}"
         if not ctx.session or not ctx.tcp_handler:
             return f"Error: Client {ctx.client_id} has no active TCP/session"
+        if ctx.session.phase is not Phase.TEAM_SELECT:
+            return (
+                f"Error: Client {ctx.client_id} is not ready for team selection "
+                f"(phase={ctx.session.phase.name}; wait for TEAM_SELECT)"
+            )
         if not args or not args[0].lower().startswith("t") or not args[0][1:].isdigit():
             return "join_team usage: join_team [c<id>] t<team>"
 
@@ -3970,6 +4068,18 @@ Examples:
             active_ctx, _ = self._get_active_client()
             if active_ctx is not None:
                 self.ctx = active_ctx
+        if active_ctx is None or active_ctx.session is None:
+            return "Spawn refused: no active client session"
+        if active_ctx.session.phase is not Phase.TEAM_SELECT:
+            return (
+                f"Spawn refused: client {active_ctx.client_id} is not ready "
+                f"(phase={active_ctx.session.phase.name}; wait for TEAM_SELECT)"
+            )
+        # Keep the control connection's convenience pointers aligned with the
+        # validated client before any packet is emitted.
+        self.ctx = active_ctx
+        self.session = active_ctx.session
+        self.tcp_handler = active_ctx.tcp_handler
 
         send_translation = True
         if send_world_stats and translation_override is None:
@@ -4508,6 +4618,96 @@ Examples:
         self.server.player_vel = (0.0, 0.0, 0.0)
         self.server.player_speed = 0.0
         return "Reset player pos to (100, 15, 100) yaw=0"
+
+    def _cmd_attr(self, args: list) -> str:
+        """Read or set a scalar config attribute on the live server (A/B knobs).
+
+        usage: attr <name>            -> show current value
+               attr <name> <value>    -> set (bool/int/float/str inferred from
+                                         the current value's type)
+        Only EXISTING attributes with scalar values may be set, so a typo cannot
+        create a silent dead knob.
+        """
+        if not self.server:
+            return "Error: No server reference"
+        if not args:
+            return "usage: attr <name> [value]"
+        name = args[0]
+        if name.startswith("_") or not hasattr(self.server, name):
+            return f"Error: unknown attribute {name!r}"
+        current = getattr(self.server, name)
+        if len(args) == 1:
+            return f"{name} = {current!r} ({type(current).__name__})"
+        if not isinstance(current, (bool, int, float, str)):
+            return f"Error: {name} is {type(current).__name__}, not a scalar"
+        raw = " ".join(args[1:]).strip()
+        try:
+            if isinstance(current, bool):
+                value = raw.lower() in ("1", "on", "true", "yes")
+            elif isinstance(current, int):
+                value = int(float(raw))
+            elif isinstance(current, float):
+                value = float(raw)
+            else:
+                value = raw
+        except ValueError:
+            return f"Error: cannot parse {raw!r} as {type(current).__name__}"
+        setattr(self.server, name, value)
+        print(f"[CONTROL] attr {name}: {current!r} -> {value!r}")
+        return f"{name}: {current!r} -> {value!r}"
+
+    def _cmd_sample(self, args: list) -> str:
+        """Return one compact, exact server-state sample for sync tooling."""
+        import json as _json
+
+        if not self.server:
+            return "Error: No server reference"
+        target_id = None
+        if args and args[0].lower().startswith("c") and args[0][1:].isdigit():
+            target_id = int(args[0][1:])
+        if target_id is not None:
+            ctx, _ = self._get_client_by_id(target_id)
+        else:
+            ctx, _ = self._get_active_client()
+        if not ctx:
+            return f"Error: No client with id {target_id}" if target_id is not None else "Error: No active client"
+
+        controller = getattr(ctx, "debug_last_controller_step", {}) or {}
+        ws = getattr(ctx, "weapon_system", None)
+        physics = getattr(ctx, "vehicle_physics", None)
+        payload = {
+            "client_id": int(ctx.client_id),
+            "pos": [float(v) for v in ctx.player_pos],
+            "vel": [float(v) for v in ctx.player_vel],
+            "heading": float(ctx.player_heading),
+            "yaw_ang_vel": float(physics.angular_velocity) if physics else 0.0,
+            "turn": float(controller.get("turn_input", 0.0) or 0.0),
+            "fwd": float(controller.get("forward_input", 0.0) or 0.0),
+            "basis": list(controller.get("basis_forward", ())),
+            "action_type": controller.get("last_action_packet_type_at_controller", ""),
+            "action_client_tick": int(controller.get("last_action_client_tick_at_controller", 0) or 0),
+            "action_age_s": float(controller.get("last_action_age_s_at_controller", 0.0) or 0.0),
+            "movement_source": controller.get("movement_input_source", ""),
+            "collision": controller.get("motion_collision", {}) or {},
+            "frame_dt": float(ws.effective_frame_dt(self.server.tick_rate_hz)) if ws else 0.0,
+            "physics_steps": int(getattr(ctx, "physics_step_count", 0) or 0),
+            "turn_integral_reconcile": dict(
+                getattr(ctx, "debug_last_turn_integral_reconcile", {}) or {}
+            ),
+            "movement_integral_reconcile": dict(
+                getattr(ctx, "debug_last_movement_integral_reconcile", {}) or {}
+            ),
+            # 2026-09-02 stock replay-reply telemetry (STATE_REQUEST -> VIEW_UPDATE).
+            "state_requests": int(getattr(ctx, "state_request_count", 0) or 0),
+            "state_sync_replies": int(getattr(ctx, "state_sync_reply_count", 0) or 0),
+            "last_state_request_id": int(getattr(ctx, "last_state_request_id", 0) or 0),
+            "last_reply_age_s": (
+                float(time.monotonic() - float(ctx.last_state_sync_reply_time))
+                if getattr(ctx, "last_state_sync_reply_time", 0.0) else -1.0
+            ),
+            "last_reply_source": str(getattr(ctx, "last_state_sync_snapshot_source", "") or ""),
+        }
+        return _json.dumps(payload, separators=(",", ":"))
 
     def _cmd_player_pos(self, args: list) -> str:
         """

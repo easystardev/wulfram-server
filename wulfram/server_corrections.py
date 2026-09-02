@@ -20,6 +20,80 @@ from .packets import build_update_array_multi, build_view_update_create_tank, bu
 
 
 class CorrectionMixin:
+    def _queue_settled_movement_correction_tail(self, ctx: ClientContext) -> None:
+        """Queue the remaining packets in one reliable stopped reconcile burst."""
+        count = max(
+            1,
+            int(getattr(self, "settled_movement_correction_burst_count", 3) or 1),
+        )
+        if count <= 1:
+            return
+        remaining = int(getattr(ctx, "correction_burst_remaining", 0) or 0)
+        ctx.correction_burst_remaining = max(remaining, count - 1)
+        ctx.correction_burst_interval_s = max(
+            0.01,
+            float(
+                getattr(self, "settled_movement_correction_burst_interval", 0.1)
+                or 0.1
+            ),
+        )
+
+    def _settled_movement_correction_due(
+        self,
+        ctx: ClientContext,
+        *,
+        now: float,
+        movement_suppressed: bool,
+    ) -> bool:
+        """Return true once for each movement episode after input has settled.
+
+        The OG does not report its predicted position, so the divergence gate
+        cannot see lateral drift.  A single stopped VIEW_UPDATE is safe on the
+        crashfix14 client and converges that otherwise-unobservable error.  The
+        active-input suppression window is load-bearing: never reset physics
+        while the client is still driving.
+        """
+        if not getattr(self, "settled_movement_correction_enabled", False):
+            return False
+        if movement_suppressed:
+            return False
+        moved_at = float(getattr(ctx, "last_nonzero_move_input_time", 0.0) or 0.0)
+        consumed_at = float(
+            getattr(ctx, "last_settled_movement_correction_input_time", 0.0) or 0.0
+        )
+        if moved_at <= 0.0 or moved_at <= consumed_at:
+            return False
+        max_speed = max(
+            0.0,
+            float(getattr(self, "settled_movement_correction_max_speed", 0.5) or 0.0),
+        )
+        vx, vy, vz = getattr(ctx, "player_vel", (0.0, 0.0, 0.0))
+        linear_speed = math.sqrt(float(vx) ** 2 + float(vy) ** 2 + float(vz) ** 2)
+        if not math.isfinite(linear_speed) or linear_speed > max_speed:
+            return False
+        max_angular_deg = max(
+            0.0,
+            float(
+                getattr(
+                    self,
+                    "settled_movement_correction_max_angular_speed_deg",
+                    1.0,
+                )
+                or 0.0
+            ),
+        )
+        angular_speed = abs(
+            float(
+                getattr(getattr(ctx, "vehicle_physics", None), "angular_velocity", 0.0)
+                or 0.0
+            )
+        )
+        if not math.isfinite(angular_speed) or math.degrees(angular_speed) > max_angular_deg:
+            return False
+        min_interval = max(0.0, float(getattr(self, "correction_min_interval", 0.0) or 0.0))
+        last_sent = float(getattr(ctx, "last_correction_send", 0.0) or 0.0)
+        return (now - last_sent) >= min_interval
+
     def _handle_state_request(self, ctx: Optional[ClientContext], data: bytes, addr: tuple):
         """
         Handle STATE_REQUEST (0x0C) - may contain state/position info.
@@ -56,6 +130,13 @@ class CorrectionMixin:
         # expanded ammo/turret local-state on the correction packet itself.
         self._maybe_promote_remote_full_local_state(ctx, reason="state_request")
 
+        if getattr(self, "state_request_replay_reply", False):
+            # Stock-protocol path (2026-09-02): one immediate VIEW_UPDATE reply
+            # is the client's designed local-tank rubberband channel. See
+            # _send_stock_replay_reply for the decompile-backed rationale.
+            self._send_stock_replay_reply(ctx, request_id=request_id, now=now)
+            return
+
         if self._remote_movement_input_active(ctx, now=now):
             return
 
@@ -85,6 +166,134 @@ class CorrectionMixin:
             self._queue_state_sync_correction_burst(ctx)
         elif getattr(self, "state_request_burst_enabled", False):
             self._maybe_queue_state_request_burst(ctx, now=now)
+
+    def _send_stock_replay_reply(
+        self, ctx: ClientContext, *, request_id: int, now: Optional[float] = None
+    ) -> bool:
+        """Answer a STATE_REQUEST with the stock client's local-correction packet.
+
+        Decompile-backed contract (azurefishy-src Game/Session/Network):
+
+        * ``UpdateArray_process_payload`` only fills ``interp_record+0x08`` in
+          replay mode (VIEW_UPDATE 0x0F).  ``NetworkSync_receive_entity_update``
+          reads exactly that slot for the CAMERA entity, so a plain
+          UPDATE_ARRAY can never be a deterministic local-player correction.
+        * ``PacketHandler_VIEW_UPDATE`` (0x46cc20) clamps a future timestamp to
+          the client's current tick; ``UpdateArray_check_eligible`` then rejects
+          the record when ``now - ts`` exceeds the client's smoothed latency by
+          more than 1.25 sigma.  With the client's latency statistics at zero
+          (live probe 2026-09-02) only ``ts >= now`` survives, hence the
+          fresh-ahead timestamp from ``_fresh_remote_view_update_timestamp``.
+        * ``receive_entity_update`` dead-reckons the target as
+          ``pos + vel * dt`` reading the record's velocity whenever a position
+          is present -- so position MUST travel with velocity or the target is
+          built from uninitialised heap (the NaN sync target seen on VM2).
+        * The pull itself is ``EntityInterp_apply_delta``: each frame the tank
+          moves ``frame_ms * 0.0025 * remaining`` toward the target, applied
+          on top of local prediction in ``Entity_apply_server_correction``
+          (every physics substep), with ``Camera_clamp_network_delta``
+          discarding sub-2.3u / sub-0.5rad differences and
+          ``EntityPrediction_server_reconcile`` rolling back into-wall snaps.
+
+        One packet per request; the client's request cadence is the rate.
+        """
+        if not self.udp_handler or not ctx.session or not ctx.session.udp_addr:
+            return False
+        if not ctx.session.in_game or ctx.session.entity_id == 0:
+            return False
+        if now is None:
+            now = time.monotonic()
+        min_interval = float(getattr(self, "state_request_replay_min_interval", 0.05) or 0.0)
+        if (now - ctx.last_state_sync_send) < min_interval:
+            return False
+        if not getattr(self, "state_request_replay_during_movement", True):
+            if self._remote_movement_input_active(ctx, now=now):
+                return False
+        if getattr(ctx, "_spawn_settle_suppress_until", 0.0) and now < ctx._spawn_settle_suppress_until:
+            return False
+        entity_id = ctx.session.entity_id
+        tick = self._get_network_tick(ctx)
+        vel = tuple(float(v) for v in getattr(ctx, "player_vel", (0.0, 0.0, 0.0)))
+        nudge = float(getattr(self, "state_request_replay_vel_nudge", 0.0) or 0.0)
+        if nudge:
+            # Prediction.c LocalPlayer_validate_prediction: when the client's
+            # predicted velocity/rotation EXACTLY equal the server's (true at
+            # rest, since receive_entity_update writes entity.vel = server vel)
+            # it clears in_progress and removes the tank from the interp apply
+            # list, aborting the smooth pull; the reconcile snap only fires when
+            # the raycast to the server position HITS something. A sub-quantum
+            # vertical velocity nudge keeps the verify failing so a resting
+            # residual is still pulled out. Off by default (stock-faithful).
+            vel = (vel[0], vel[1], vel[2] + nudge)
+        lead = float(getattr(self, "state_request_replay_lead_ticks", 0.0) or 0.0)
+        rot = self._local_player_sync_rotation(ctx)
+        if lead > 0.0:
+            # Optional forward extrapolation (A/B). Live 2026-09-02: with the
+            # server already ~1 step ahead of the client's predictor mid-drive,
+            # a 1-tick lead made the pull overshoot (client ended ~7u ahead).
+            dt_lead = lead / max(1.0, float(getattr(self, "tick_rate_hz", 30.0)))
+            px, py, pz = ctx.player_pos
+            send_pos = self._to_client_pos((px + vel[0] * dt_lead, py + vel[1] * dt_lead, pz + vel[2] * dt_lead))
+            ang = float(getattr(ctx, "angular_vel_yaw", 0.0) or 0.0)
+            rot = (rot[0], rot[1], rot[2] + ang * dt_lead)
+        else:
+            send_pos = self._to_client_pos(ctx.player_pos)
+        if not all(math.isfinite(v) for v in (*send_pos, *rot, *vel)):
+            return False
+        if handlers._is_loopback_client(ctx):
+            view_timestamp = int(request_id or 0) & 0xFFFFFFFF
+        else:
+            view_timestamp = self._fresh_remote_view_update_timestamp(ctx, tick)
+        include_local_state, ls = self._get_update_array_local_state_for_viewer(ctx)
+        if include_local_state:
+            ammo_bits, ammo_mask = ls["ammo_count_bits"], ls["ammo_count"]
+            pt_bits, pt_angle = ls["primary_turret_bits"], ls["primary_turret_angle"]
+            st_bits, st_angle = ls["secondary_turret_bits"], ls["secondary_turret_angle"]
+        else:
+            ammo_bits = ammo_mask = pt_bits = st_bits = 0
+            pt_angle = st_angle = 0.0
+        payload = build_view_update_player_update(
+            tick=tick,
+            entity_id=entity_id,
+            pos=send_pos,
+            vel=vel,
+            rot=rot,
+            include_pos=True,
+            include_vel=True,
+            include_rot=True,
+            include_local_state=include_local_state,
+            include_entity_vitals=self.view_update_entity_vitals,
+            weapon_id=ls["weapon_id"],
+            health=self._get_health_value(ctx),
+            fuel=self._get_energy_value(ctx),
+            ammo_count_bits=ammo_bits,
+            ammo_count=ammo_mask,
+            primary_turret_bits=pt_bits,
+            primary_turret_angle=pt_angle,
+            secondary_turret_bits=st_bits,
+            secondary_turret_angle=st_angle,
+            turret_max=self.local_state_turret_max,
+            turret_range=self.local_state_turret_range,
+            is_manned=True,
+            speed_scale=1.0,
+            timestamp=view_timestamp,
+        )
+        self.udp_handler.send_to(payload, ctx.session.udp_addr)
+        ctx.last_state_sync_send = now
+        ctx.state_sync_reply_count += 1
+        ctx.last_state_sync_reply_time = now
+        ctx.last_state_sync_reply_tick = tick
+        ctx.last_state_sync_replay_timestamp = int(request_id or 0)
+        ctx.last_state_sync_snapshot_source = "stock_replay"
+        ctx.correction_send_count = int(getattr(ctx, "correction_send_count", 0) or 0) + 1
+        ctx.last_correction_send = now
+        if self.debug_sync:
+            print(
+                f"[STATE-SYNC] stock replay reply c{ctx.client_id} req={request_id} "
+                f"ts={view_timestamp} tick={tick} pos=({send_pos[0]:.2f},{send_pos[1]:.2f},{send_pos[2]:.2f}) "
+                f"vel=({vel[0]:.2f},{vel[1]:.2f},{vel[2]:.2f}) yaw={rot[2]:.4f}"
+            )
+        return True
 
     def _queue_state_sync_correction_burst(self, ctx: ClientContext) -> bool:
         """Queue enough replay updates for OG's local correction to visibly settle."""

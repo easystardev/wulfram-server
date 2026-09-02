@@ -526,6 +526,12 @@ class SpawnMixin:
         # Reset tick-sync transition tracking so respawn gap doesn't cause huge correction
         ctx._turn_transition_client_tick = 0
         ctx._turn_transition_server_tick = 0
+        ctx._yaw_segment_start_client_tick = 0
+        ctx._yaw_segment_torque_integral = 0.0
+        ctx.debug_last_turn_integral_reconcile = {}
+        ctx._fwd_integral_prev_input = 0.0
+        ctx._fwd_actual_input_integral = 0.0
+        ctx.debug_last_movement_integral_reconcile = {}
 
         # Spawn heading â€” can't set local client heading (physics overwrites it),
         # but this affects how OTHER clients see your tank at spawn.

@@ -134,6 +134,10 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
         # Multi-client management
         self.clients: Dict[int, ClientContext] = {}
         self.clients_lock = threading.Lock()
+        # OG collision pairs are resolved as one shared event after all bodies
+        # are stepped.  Our per-client tick threads still need one lock around
+        # the pair response so both equal-and-opposite updates are atomic.
+        self.entity_collision_lock = threading.Lock()
         self.next_client_id = 1
 
         # UDP address to client mapping for packet routing
@@ -397,6 +401,10 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
             self.tick_rate_hz = float(os.environ.get("WULFRAM_TICK_RATE_HZ", "30.0"))
         except ValueError:
             self.tick_rate_hz = 30.0
+        self.physics_frame_match = (
+            os.environ.get("WULFRAM_PHYSICS_FRAME_MATCH", "1").strip().lower()
+            not in {"0", "false", "off", "no"}
+        )
         # Keep steady full-rate updates by default; sparse/on-change updates have
         # shown intermittent HUD red-overlay regressions during active gameplay.
         self.update_on_change = os.environ.get("WULFRAM_UPDATE_ON_CHANGE", "0") == "1"
@@ -801,10 +809,10 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
             self.linear_damp_coasting = 1.5
         try:
             self.tank_ground_contact_damp = float(
-                os.environ.get("WULFRAM_TANK_GROUND_CONTACT_DAMP", "6.0")
+                os.environ.get("WULFRAM_TANK_GROUND_CONTACT_DAMP", "1.5")
             )
         except ValueError:
-            self.tank_ground_contact_damp = 6.0
+            self.tank_ground_contact_damp = 1.5
         if self.tank_ground_contact_damp < 0.0:
             self.tank_ground_contact_damp = 0.0
 
@@ -881,6 +889,42 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
         self.correction_rot_only = os.environ.get("WULFRAM_CORRECTION_ROT_ONLY", "1").strip().lower() in (
             "1", "true", "on", "yes"
         )
+        # Default-off compatibility gate: full stopped corrections require the
+        # crashfix14 client clamp.  When explicitly enabled, emit one reconcile
+        # after each movement episode once active-input suppression has elapsed.
+        self.settled_movement_correction_enabled = os.environ.get(
+            "WULFRAM_SETTLED_MOVEMENT_CORRECTION", "0"
+        ).strip().lower() in ("1", "true", "on", "yes")
+        # VIEW_UPDATE resets the OG client's local motion reservoirs.  Waiting
+        # only for key-up is too early: a tank can still coast several metres
+        # after input becomes idle, reopening the very gap we just corrected.
+        # Require the authoritative body to be nearly at rest first.
+        self.settled_movement_correction_max_speed = max(
+            0.0,
+            float(os.environ.get("WULFRAM_SETTLED_MOVEMENT_CORRECTION_MAX_SPEED", "0.5")),
+        )
+        self.settled_movement_correction_max_angular_speed_deg = max(
+            0.0,
+            float(
+                os.environ.get(
+                    "WULFRAM_SETTLED_MOVEMENT_CORRECTION_MAX_ANGULAR_SPEED_DEG",
+                    "1.0",
+                )
+            ),
+        )
+        self.settled_movement_correction_burst_count = max(
+            1,
+            int(os.environ.get("WULFRAM_SETTLED_MOVEMENT_CORRECTION_BURST_COUNT", "3")),
+        )
+        self.settled_movement_correction_burst_interval = max(
+            0.01,
+            float(
+                os.environ.get(
+                    "WULFRAM_SETTLED_MOVEMENT_CORRECTION_BURST_INTERVAL",
+                    "0.1",
+                )
+            ),
+        )
 
         self._init_correction_config()
 
@@ -893,7 +937,10 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
             f"movement_correction={self.movement_correction_interval}s/"
             f"{self.movement_correction_window}s "
             f"active_suppress={self.active_input_correction_suppress_window}s "
-            f"correction_mode={self.correction_mode}"
+            f"correction_mode={self.correction_mode} "
+            f"settled_correction={int(self.settled_movement_correction_enabled)} "
+            f"settled_speed={self.settled_movement_correction_max_speed} "
+            f"settled_angular_deg={self.settled_movement_correction_max_angular_speed_deg}"
         )
 
         self.estimated_speed = 15.0  # Units per second (tunable)
@@ -1796,7 +1843,13 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
     def _ping_loop(self, ctx: ClientContext):
         """Send periodic ping requests to keep connection alive (like wulf-forge)."""
         from .packets import build_ping_request
-        while ctx.running and not ctx.ping_stop_event.wait(2.0):
+        # 2026-09-02: the OG client answers every server PING_REQUEST with a
+        # STATE_REQUEST (Network_sync_timing_update), and the reply to that is
+        # its local-tank correction (see server_corrections._send_stock_replay_reply).
+        # The ping interval is therefore the correction cadence; keep it a knob.
+        while ctx.running and not ctx.ping_stop_event.wait(
+            float(getattr(self, "ping_interval_s", 2.0) or 2.0)
+        ):
             if ctx.tcp_handler:
                 try:
                     ctx.tcp_handler.send(build_ping_request())
@@ -3028,6 +3081,59 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
         # Re-read .env file so new vars are visible
         server_config.load_env_file(overwrite=True)
 
+        # 2026-09-02 stock-protocol STATE_REQUEST replay reply (see
+        # server_config._init_correction_config / server_corrections).
+        _default(
+            "state_request_replay_reply",
+            os.environ.get("WULFRAM_STATE_REQUEST_REPLAY_REPLY", "0").strip().lower()
+            not in ("0", "off", "false", "no"),
+        )
+        try:
+            _default(
+                "state_request_replay_min_interval",
+                float(os.environ.get("WULFRAM_STATE_REQUEST_REPLAY_MIN_INTERVAL", "0.05")),
+            )
+        except ValueError:
+            _default("state_request_replay_min_interval", 0.05)
+        _default(
+            "state_request_replay_during_movement",
+            os.environ.get("WULFRAM_STATE_REQUEST_REPLAY_DURING_MOVEMENT", "1").strip().lower()
+            not in ("0", "off", "false", "no"),
+        )
+        try:
+            _default("ping_interval_s", float(os.environ.get("WULFRAM_PING_INTERVAL_S", "2.0")))
+        except ValueError:
+            _default("ping_interval_s", 2.0)
+        _default(
+            "turn_integral_reconcile_enabled",
+            os.environ.get("WULFRAM_TURN_INTEGRAL_RECONCILE", "1").strip().lower()
+            not in ("0", "off", "false", "no"),
+        )
+        _default(
+            "movement_integral_reconcile_enabled",
+            os.environ.get("WULFRAM_MOVEMENT_INTEGRAL_RECONCILE", "1").strip().lower()
+            not in ("0", "off", "false", "no"),
+        )
+        try:
+            _default(
+                "state_request_replay_lead_ticks",
+                float(os.environ.get("WULFRAM_STATE_REQUEST_REPLAY_LEAD_TICKS", "0")),
+            )
+        except ValueError:
+            _default("state_request_replay_lead_ticks", 0.0)
+        try:
+            _default(
+                "state_request_replay_vel_nudge",
+                float(os.environ.get("WULFRAM_STATE_REQUEST_REPLAY_VEL_NUDGE", "0")),
+            )
+        except ValueError:
+            _default("state_request_replay_vel_nudge", 0.0)
+        _default(
+            "tank_clearance_ratio_clamp",
+            os.environ.get("WULFRAM_TANK_CLEARANCE_RATIO_CLAMP", "1").strip().lower()
+            not in ("0", "off", "false", "no"),
+        )
+
         print("[RELOAD] _apply_reload_defaults done")
 
     def _ensure_tick_loop(self, ctx: ClientContext) -> bool:
@@ -3162,6 +3268,43 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
                 raw_input = self._get_raw_turn_input(ctx)
                 prev_input = getattr(ctx, 'prev_raw_turn_input', 0.0)
                 torque = self._compute_turn_torque(ctx, raw_input)  # lateral_mobility=1.0
+                raw_fwd_input = self._normalize_behavior_axis_value(
+                    ctx,
+                    ctx.weapon_system.behavior_slots[BehaviorSlot.MOVING_FORWARD],
+                )
+                if abs(raw_fwd_input) < 0.05:
+                    raw_fwd_input = 0.0
+                prev_fwd_input = float(getattr(ctx, "_fwd_integral_prev_input", 0.0) or 0.0)
+                fwd_input_changed = abs(raw_fwd_input - prev_fwd_input) > 0.001
+                movement_integral_reconcile = None
+                if fwd_input_changed:
+                    if abs(prev_fwd_input) <= 0.001 and abs(raw_fwd_input) > 0.001:
+                        ctx._fwd_actual_input_integral = 0.0
+                    elif abs(prev_fwd_input) > 0.001 and abs(raw_fwd_input) <= 0.001:
+                        history = list(getattr(ctx, "movement_input_history", []) or [])
+                        last_nonzero_idx = len(history) - 1
+                        while last_nonzero_idx >= 0 and abs(float(history[last_nonzero_idx].get("fwd", 0.0) or 0.0)) <= 0.05:
+                            last_nonzero_idx -= 1
+                        release_idx = last_nonzero_idx + 1
+                        if last_nonzero_idx >= 0 and release_idx < len(history):
+                            start_idx = last_nonzero_idx
+                            while start_idx >= 0 and abs(float(history[start_idx].get("fwd", 0.0) or 0.0)) > 0.05:
+                                start_idx -= 1
+                            start_idx += 1
+                            desired_input_integral = 0.0
+                            for hist_idx in range(start_idx, release_idx):
+                                left = history[hist_idx]
+                                right = history[hist_idx + 1]
+                                left_tick = int(left.get("client_tick", 0) or 0)
+                                right_tick = int(right.get("client_tick", 0) or 0)
+                                if right_tick > left_tick > 0:
+                                    desired_input_integral += (
+                                        float(left.get("fwd", 0.0) or 0.0)
+                                        * ((right_tick - left_tick) / 1000.0)
+                                    )
+                            if desired_input_integral > 0.0:
+                                movement_integral_reconcile = desired_input_integral
+                ctx._fwd_integral_prev_input = raw_fwd_input
 
                 physics = ctx.vehicle_physics
                 ws = ctx.weapon_system
@@ -3169,6 +3312,7 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
                 # Log input transitions (key press/release)
                 input_changed = abs(raw_input - prev_input) > 0.001
                 now_mono = time.monotonic()
+                turn_integral_reconcile = None
                 if input_changed:
                     transition = "PRESS" if abs(raw_input) > abs(prev_input) else "RELEASE"
                     last_transition_time = getattr(ctx, '_yaw_transition_time', now_mono)
@@ -3178,6 +3322,23 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
                     effective_hz = elapsed_ticks / max(0.001, now_mono - last_transition_time)
                     ctx._yaw_transition_time = now_mono
                     ctx._yaw_transition_tick = ctx.session.tick
+                    transition_client_tick = int(
+                        getattr(ws, "turn_input_change_client_tick", 0) or 0
+                    )
+                    segment_start_tick = int(
+                        getattr(ctx, "_yaw_segment_start_client_tick", 0) or 0
+                    )
+                    if abs(prev_input) > 0.001 and abs(raw_input) <= 0.001:
+                        if transition_client_tick > segment_start_tick > 0:
+                            client_duration = (transition_client_tick - segment_start_tick) / 1000.0
+                            if 0.0 < client_duration <= 10.0:
+                                turn_integral_reconcile = {
+                                    "desired": self._compute_turn_torque(ctx, prev_input) * client_duration,
+                                    "client_duration": client_duration,
+                                }
+                    elif abs(prev_input) <= 0.001 and abs(raw_input) > 0.001:
+                        ctx._yaw_segment_start_client_tick = transition_client_tick
+                        ctx._yaw_segment_torque_integral = 0.0
                     if self.debug_sync:
                         yaw_msg = (
                             f"[YAW-INPUT] {transition} c{ctx.client_id} "
@@ -3224,7 +3385,15 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
                 # behavior. GOAL-6's real-time accumulator is preserved (sim-time ==
                 # wall-time); only the per-step chunk changes from a fixed 1/30 to the
                 # client's actual frame rate. WULFRAM_GOAL7_LEGACY=1 restores 1/30.
-                goal7_legacy = os.environ.get("WULFRAM_GOAL7_LEGACY") == "1"
+                # Matching the client's coarse frame *size* without sharing its
+                # frame phase makes input edges land a whole frame early or late.
+                # Keep this independently switchable from GOAL7's replication fix
+                # so live A/B tests can use a fine server step safely.
+                frame_match_physics = bool(getattr(self, "physics_frame_match", True))
+                goal7_legacy = (
+                    not frame_match_physics or
+                    os.environ.get("WULFRAM_GOAL7_LEGACY") == "1"
+                )
                 if goal7_legacy:
                     step_dt = physics_dt
                 else:
@@ -3241,6 +3410,16 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
                 if phys_accumulator > _max_backlog:
                     phys_accumulator = _max_backlog
                 n_phys_steps = int(phys_accumulator / step_dt)
+                # 2026-09-02: a tick-thread stall (GOAL-8 triple substep + world
+                # collision at motion onset, control polling, GC) used to be paid
+                # back as up to 5 consecutive steps in ONE tick, all with the
+                # current input -> the server jumped ~4 steps ahead of the
+                # client's predictor exactly when a key was pressed (live: 11.5
+                # -> 21.2 u/s in 47 ms). Spread the backlog over ticks instead;
+                # the accumulator keeps the remainder so sim time is conserved.
+                _max_catchup = int(getattr(self, "max_catchup_steps", 5) or 5)
+                if _max_catchup > 0 and n_phys_steps > _max_catchup:
+                    n_phys_steps = _max_catchup
                 phys_accumulator -= n_phys_steps * step_dt
                 if os.environ.get("WULFRAM_GOAL6_LEGACY") == "1":
                     # A/B baseline: legacy fixed-dt one-step-per-raw-tick behavior.
@@ -3289,11 +3468,22 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
                         prev_torque = self._compute_turn_torque(ctx, prev_turn_input)
                         if pre_dt > 1e-6:
                             physics.step_client_substeps(prev_torque, pre_dt)
+                            if abs(prev_turn_input) > 0.001:
+                                ctx._yaw_segment_torque_integral = float(
+                                    getattr(ctx, "_yaw_segment_torque_integral", 0.0) or 0.0
+                                ) + prev_torque * pre_dt
                             self._sync_heading_physics_to_context(ctx, physics)
                             self._update_player_position_stepped(ctx, pre_dt, heading_override=old_heading)
+                            ctx._fwd_actual_input_integral = float(
+                                getattr(ctx, "_fwd_actual_input_integral", 0.0) or 0.0
+                            ) + raw_fwd_input * pre_dt
                             move_heading = ctx.player_heading
                         if post_dt > 1e-6:
                             physics.step_client_substeps(torque, post_dt)
+                            if abs(raw_input) > 0.001:
+                                ctx._yaw_segment_torque_integral = float(
+                                    getattr(ctx, "_yaw_segment_torque_integral", 0.0) or 0.0
+                                ) + torque * post_dt
                         move_dt = post_dt
                         ws.turn_input_change_time = 0.0
                         if self.debug_sync:
@@ -3304,10 +3494,76 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
                             )
                     else:
                         physics.step_client_substeps(torque, step_dt)
+                        if abs(raw_input) > 0.001:
+                            ctx._yaw_segment_torque_integral = float(
+                                getattr(ctx, "_yaw_segment_torque_integral", 0.0) or 0.0
+                            ) + torque * step_dt
 
                     self._sync_heading_physics_to_context(ctx, physics)
                     if move_dt > 1e-6:
                         self._update_player_position_stepped(ctx, move_dt, heading_override=move_heading)
+                        ctx._fwd_actual_input_integral = float(
+                            getattr(ctx, "_fwd_actual_input_integral", 0.0) or 0.0
+                        ) + raw_fwd_input * move_dt
+                if turn_integral_reconcile is not None and not getattr(
+                    self, "turn_integral_reconcile_enabled", True
+                ):
+                    # Gated off (WULFRAM_TURN_INTEGRAL_RECONCILE=0): the stock
+                    # STATE_REQUEST replay reply is the convergence channel.
+                    ctx._yaw_segment_start_client_tick = 0
+                    ctx._yaw_segment_torque_integral = 0.0
+                    turn_integral_reconcile = None
+                if movement_integral_reconcile is not None and not getattr(
+                    self, "movement_integral_reconcile_enabled", True
+                ):
+                    ctx._fwd_actual_input_integral = 0.0
+                    movement_integral_reconcile = None
+                if turn_integral_reconcile is not None:
+                    actual_integral = float(
+                        getattr(ctx, "_yaw_segment_torque_integral", 0.0) or 0.0
+                    )
+                    integral_delta = float(turn_integral_reconcile["desired"]) - actual_integral
+                    # Client transition ticks measure the duration for which its
+                    # local predictor applied the held input. Correct only the
+                    # missing/excess angular impulse at release; this removes
+                    # network/frame-phase jitter without changing turn constants.
+                    max_delta = abs(float(self.turn_adjust)) * 0.25
+                    integral_delta = max(-max_delta, min(max_delta, integral_delta))
+                    physics.angular_velocity = float(physics.angular_velocity) + integral_delta
+                    ctx.angular_vel_yaw = physics.angular_velocity
+                    ctx.debug_last_turn_integral_reconcile = {
+                        "client_duration": float(turn_integral_reconcile["client_duration"]),
+                        "desired": float(turn_integral_reconcile["desired"]),
+                        "actual": actual_integral,
+                        "delta": integral_delta,
+                    }
+                    ctx._yaw_segment_start_client_tick = 0
+                    ctx._yaw_segment_torque_integral = 0.0
+                if movement_integral_reconcile is not None:
+                    actual_input_integral = float(
+                        getattr(ctx, "_fwd_actual_input_integral", 0.0) or 0.0
+                    )
+                    input_integral_delta = movement_integral_reconcile - actual_input_integral
+                    input_integral_delta = max(-0.25, min(0.25, input_integral_delta))
+                    veh_config = VEHICLE_PHYSICS_CONFIGS.get(ctx.entity_type)
+                    move_adjust = veh_config.move_adjust if veh_config else 85.0
+                    velocity_delta = input_integral_delta * move_adjust
+                    basis_x = math.cos(ctx.player_heading)
+                    basis_y = math.sin(ctx.player_heading)
+                    vx, vy, vz = ctx.player_vel
+                    ctx.player_vel = (
+                        vx + basis_x * velocity_delta,
+                        vy + basis_y * velocity_delta,
+                        vz,
+                    )
+                    ctx.player_speed = math.hypot(ctx.player_vel[0], ctx.player_vel[1])
+                    ctx.debug_last_movement_integral_reconcile = {
+                        "desired": movement_integral_reconcile,
+                        "actual": actual_input_integral,
+                        "delta": input_integral_delta,
+                        "velocity_delta": velocity_delta,
+                    }
+                    ctx._fwd_actual_input_integral = 0.0
                 if _phase_timing:
                     _phase_t_upp = time.perf_counter()
                 self._resolve_entity_entity_collisions(ctx)
@@ -3405,6 +3661,7 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
                 send_pos = self._to_client_pos(ctx.player_pos)
                 payload: Optional[bytes] = None
                 send_payload = False
+                suppress_periodic_heartbeat = False
 
                 self._maybe_promote_remote_full_local_state(ctx, reason="post_spawn")
 
@@ -3444,6 +3701,14 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
                     burst_due = self._correction_burst_due(
                         ctx, now, active_movement_correction_suppressed
                     )
+                    settled_movement_due = (
+                        not handlers._is_loopback_client(ctx)
+                        and self._settled_movement_correction_due(
+                            ctx,
+                            now=now,
+                            movement_suppressed=active_movement_correction_suppressed,
+                        )
+                    )
                     # Periodic correction: steady-cadence drift clear. It rides
                     # VIEW_UPDATE, which the OG client applies as snap-pose + ZERO
                     # VELOCITY (apply_lag_compensation). Firing it WHILE the player
@@ -3468,10 +3733,16 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
                         correction_reason = "burst"
                     elif divergence_correction_due:
                         correction_reason = "divergence"
+                    elif settled_movement_due:
+                        correction_reason = "movement_settled"
                     elif periodic_due:
                         correction_reason = "periodic"
                     correction_due = (
-                        force_due or burst_due or divergence_correction_due or periodic_due
+                        force_due
+                        or burst_due
+                        or divergence_correction_due
+                        or settled_movement_due
+                        or periodic_due
                     )
                 else:
                     # Legacy proactive streams — A/B only (WULFRAM_CORRECTION_GATE=0).
@@ -3523,6 +3794,23 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
                     if self.update_heartbeat_interval > 0:
                         if (now - ctx.last_update_send) < self.update_heartbeat_interval:
                             send_update = False
+
+                # Remote-player replication is independent of the viewer's local
+                # heartbeat.  Keep it ahead of the spawn-safe local-heartbeat
+                # suppression below: that path deliberately `continue`s to avoid
+                # touching the fragile local entity, but must not freeze every
+                # already-created remote entity at its DEFINITION pose.
+                remote_due = (
+                    self.remote_update_interval <= 0
+                    or (now - ctx.last_remote_update_send) >= self.remote_update_interval
+                )
+                if self.send_remote_updates and not self.combine_update_arrays and remote_due:
+                    ctx.last_remote_update_send = now
+                    self._send_remote_player_updates(
+                        ctx,
+                        tick,
+                        prefer_tcp=(self.send_updates_tcp and not tcp_failed),
+                    )
 
                 if self.send_player_updates and send_full_update and send_update:
                     # Send UPDATE_ARRAY with position/velocity
@@ -3739,15 +4027,20 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
                     # shape here; the synthetic mask-0 stub causes the
                     # original client to protocol-mismatch on spawn.
 
-                    if self._suppress_remote_spawn_safe_heartbeat(ctx):
+                    # Spawn-safe suppression applies to periodic heartbeats only.
+                    # A forced/divergence/settled correction is an explicit
+                    # transform packet and must not be discarded by this guard.
+                    if self._suppress_remote_spawn_safe_heartbeat(ctx) and not correction_due:
                         if not getattr(ctx, "_spawn_safe_heartbeat_suppressed_logged", False):
                             print(
                                 f"[HEARTBEAT] Client {ctx.client_id}: suppressing periodic "
                                 "spawn-safe remote heartbeat until targeted sync is active"
                             )
                             ctx._spawn_safe_heartbeat_suppressed_logged = True
-                        send_payload = False
-                        continue
+                        # Keep running the rest of the tick. The old early
+                        # continue also skipped remote replication and the
+                        # wall-clock pacing sleep, creating a UDP flood.
+                        suppress_periodic_heartbeat = True
 
                     local_state_kwargs = self._get_local_state_kwargs(ctx)
                     weapon_type = local_state_kwargs["weapon_id"]
@@ -3792,12 +4085,17 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
                         ctx.divergence_accum_pos = 0.0
                         ctx.divergence_accum_heading = 0.0
                         ctx.correction_send_count = int(getattr(ctx, "correction_send_count", 0) or 0) + 1
+                        if correction_reason == "movement_settled":
+                            ctx.last_settled_movement_correction_input_time = float(
+                                getattr(ctx, "last_nonzero_move_input_time", 0.0) or 0.0
+                            )
+                            self._queue_settled_movement_correction_tail(ctx)
                         # Decrement against the LIVE value, not the tick-entry
                         # snapshot: the UDP thread may have re-queued a fresh
                         # burst between snapshot and here, and a stale-snapshot
                         # write-back would silently cancel it.
                         live_burst_remaining = int(getattr(ctx, "correction_burst_remaining", 0) or 0)
-                        if live_burst_remaining > 0:
+                        if live_burst_remaining > 0 and correction_reason == "burst":
                             ctx.correction_burst_remaining = live_burst_remaining - 1
                         if correction_reason == "movement":
                             ctx.movement_correction_count = int(
@@ -3868,21 +4166,22 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
                         note="heartbeat local_state=0",
                     )
 
-                    send_payload = True
-                    self._maybe_send_view_update_loop(
-                        ctx,
-                        tick=tick,
-                        send_pos=send_pos,
-                        health_val=health_val,
-                        fuel_val=fuel_val,
-                        weapon_type=weapon_type,
-                        ammo_bits=ammo_bits,
-                        ammo_mask=ammo_mask,
-                        pt_bits=pt_bits,
-                        pt_angle=pt_angle,
-                        st_bits=st_bits,
-                        st_angle=st_angle,
-                    )
+                    send_payload = not suppress_periodic_heartbeat
+                    if not suppress_periodic_heartbeat:
+                        self._maybe_send_view_update_loop(
+                            ctx,
+                            tick=tick,
+                            send_pos=send_pos,
+                            health_val=health_val,
+                            fuel_val=fuel_val,
+                            weapon_type=weapon_type,
+                            ammo_bits=ammo_bits,
+                            ammo_mask=ammo_mask,
+                            pt_bits=pt_bits,
+                            pt_angle=pt_angle,
+                            st_bits=st_bits,
+                            st_angle=st_angle,
+                        )
 
                 # SPAWN SETTLE: suppress the local-player heartbeat/correction for a brief
                 # window after spawn so the at-rest tank SLEEPS (RigidBody_should_sleep) instead
@@ -4066,19 +4365,6 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
                                 f"tick={tick} addr={ctx.session.udp_addr}"
                             )
 
-                # Send other players' transforms to this client (multiplayer visibility).
-                remote_due = (
-                    self.remote_update_interval <= 0
-                    or (now - ctx.last_remote_update_send) >= self.remote_update_interval
-                )
-                if self.send_remote_updates and not self.combine_update_arrays and remote_due:
-                    ctx.last_remote_update_send = now
-                    self._send_remote_player_updates(
-                        ctx,
-                        tick,
-                        prefer_tcp=(self.send_updates_tcp and not tcp_failed),
-                    )
-
                 # Track last sent player state for projectile alignment diagnostics.
                 # Use player_pos if send_pos not set (heartbeat-only mode)
                 if payload is not None:
@@ -4191,6 +4477,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-

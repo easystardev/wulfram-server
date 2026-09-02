@@ -192,6 +192,7 @@ class ClientContext:
     # Multiplayer sync tracking (per receiving client)
     known_entity_ids: set = field(default_factory=set)
     known_roster_ids: set = field(default_factory=set)
+    entity_create_lock: threading.Lock = field(default_factory=threading.Lock)
 
     # Health/vitals heartbeat tracking
     last_vitals_send: float = field(default_factory=time.monotonic)
