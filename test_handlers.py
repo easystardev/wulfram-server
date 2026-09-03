@@ -19717,6 +19717,7 @@ def main():
 
     tests = [
         test_decode_lp_string_basic,
+        test_effective_heartbeat_interval_community_cadence,
         test_decode_lp_string_offset,
         test_decode_lp_string_empty,
         test_decode_lp_string_truncated,
@@ -20087,6 +20088,40 @@ def main():
     print("=" * 60)
 
     return failed == 0
+
+
+
+def test_effective_heartbeat_interval_community_cadence():
+    """Community cadence (docs/community-parity-plan-2026-09-03.md): the periodic
+    local_state beat runs at 1 Hz while health and energy are full and 20 Hz while
+    either is below full; fixed mode keeps WULFRAM_UPDATE_HEARTBEAT."""
+    server = WulframServer.__new__(WulframServer)
+    server.update_heartbeat_interval = 0.1
+    server.local_state_idle_interval_s = 1.0
+    server.local_state_active_interval_s = 0.05
+    server.player_energy_max = 100.0
+    server.debug_health_value = 1.0
+    server.debug_health_pattern = ""
+    server._get_health_value = lambda ctx=None: 1.0 if ctx is None or ctx.player_health >= 100.0 else ctx.player_health / 100.0
+
+    session = Session()
+    ctx = ClientContext(client_id=1, client_addr=("10.10.10.2", 50000), session=session, entity_id=0x14EA)
+    ctx.player_energy = 100.0
+    ctx.player_health = 100.0
+
+    server.local_state_cadence = "fixed"
+    assert server._effective_heartbeat_interval(ctx) == 0.1
+
+    server.local_state_cadence = "community"
+    assert server._community_cadence_active()
+    assert server._effective_heartbeat_interval(ctx) == 1.0
+    ctx.player_energy = 60.0
+    assert server._effective_heartbeat_interval(ctx) == 0.05
+    ctx.player_energy = 100.0
+    ctx.player_health = 78.0
+    assert server._effective_heartbeat_interval(ctx) == 0.05
+    print("  test_effective_heartbeat_interval_community_cadence: PASSED")
+    return True
 
 
 if __name__ == "__main__":

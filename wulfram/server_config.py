@@ -182,6 +182,33 @@ class ConfigMixin:
             self.update_local_state_mode = "off"
             self.update_local_state = False
 
+    def _init_community_profile_config(self):
+        """Knobs that make the wire profile match the wulfram3.com relay server
+        (docs/community-parity-plan-2026-09-03.md).
+
+        WULFRAM_LOCAL_STATE_CADENCE=community: the periodic local heartbeat becomes a
+        zero-entity VIEW_UPDATE carrying local_state only, at
+        WULFRAM_LOCAL_STATE_IDLE_INTERVAL_S (1.0) while health and energy are both full
+        and WULFRAM_LOCAL_STATE_ACTIVE_INTERVAL_S (0.05) otherwise -- measured on the
+        community server (host-public-2 / pad-session-1).
+        WULFRAM_SHIP_STATUS_INTERVAL_S: rebroadcast SHIP_STATUS + SUPPLY_SHIP_INFO for
+        every supply ship at this interval (community: 1.0; 0 = event-driven only).
+        """
+        mode = os.environ.get("WULFRAM_LOCAL_STATE_CADENCE", "fixed").strip().lower()
+        self.local_state_cadence = "community" if mode == "community" else "fixed"
+        try:
+            self.local_state_idle_interval_s = max(0.05, float(os.environ.get("WULFRAM_LOCAL_STATE_IDLE_INTERVAL_S", "1.0")))
+        except ValueError:
+            self.local_state_idle_interval_s = 1.0
+        try:
+            self.local_state_active_interval_s = max(0.01, float(os.environ.get("WULFRAM_LOCAL_STATE_ACTIVE_INTERVAL_S", "0.05")))
+        except ValueError:
+            self.local_state_active_interval_s = 0.05
+        try:
+            self.ship_status_interval_s = max(0.0, float(os.environ.get("WULFRAM_SHIP_STATUS_INTERVAL_S", "0")))
+        except ValueError:
+            self.ship_status_interval_s = 0.0
+
     def _init_correction_config(self):
         # ── OG-faithful GATED-RARE correction gate (GOAL 2, 2026-06-02) ──────
         # The OG client corrects RARELY and reactively. The proactive streams

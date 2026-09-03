@@ -927,6 +927,7 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
         )
 
         self._init_correction_config()
+        self._init_community_profile_config()
 
         print(
             f"[CONFIG-HEADING] turn_adjust={self.turn_adjust} turn_sign={self.turn_sign} "
@@ -3081,6 +3082,22 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
         # Re-read .env file so new vars are visible
         server_config.load_env_file(overwrite=True)
 
+        # 2026-09-03 community wire-profile knobs (server_config._init_community_profile_config).
+        _default("local_state_cadence",
+                 "community" if os.environ.get("WULFRAM_LOCAL_STATE_CADENCE", "fixed").strip().lower() == "community" else "fixed")
+        try:
+            _default("local_state_idle_interval_s", max(0.05, float(os.environ.get("WULFRAM_LOCAL_STATE_IDLE_INTERVAL_S", "1.0"))))
+        except ValueError:
+            _default("local_state_idle_interval_s", 1.0)
+        try:
+            _default("local_state_active_interval_s", max(0.01, float(os.environ.get("WULFRAM_LOCAL_STATE_ACTIVE_INTERVAL_S", "0.05"))))
+        except ValueError:
+            _default("local_state_active_interval_s", 0.05)
+        try:
+            _default("ship_status_interval_s", max(0.0, float(os.environ.get("WULFRAM_SHIP_STATUS_INTERVAL_S", "0"))))
+        except ValueError:
+            _default("ship_status_interval_s", 0.0)
+
         # 2026-09-02 stock-protocol STATE_REQUEST replay reply (see
         # server_config._init_correction_config / server_corrections).
         _default(
@@ -3786,13 +3803,15 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
                     pos_changed = any(abs(a - b) > self.update_epsilon for a, b in zip(send_pos, ctx.last_sent_pos))
                     vel_changed = any(abs(a - b) > self.update_epsilon for a, b in zip(ctx.player_vel, ctx.last_sent_vel))
                     yaw_changed = abs(ctx.player_yaw - ctx.last_sent_yaw) > self.update_epsilon
-                    heartbeat_due = self.update_heartbeat_interval > 0 and (now - ctx.last_update_send) >= self.update_heartbeat_interval
+                    _hb_interval = self._effective_heartbeat_interval(ctx)
+                    heartbeat_due = _hb_interval > 0 and (now - ctx.last_update_send) >= _hb_interval
                     if not (pos_changed or vel_changed or yaw_changed or heartbeat_due):
                         send_update = False
                 else:
                     # Throttle heartbeat to configured interval instead of every tick
-                    if self.update_heartbeat_interval > 0:
-                        if (now - ctx.last_update_send) < self.update_heartbeat_interval:
+                    _hb_interval = self._effective_heartbeat_interval(ctx)
+                    if _hb_interval > 0:
+                        if (now - ctx.last_update_send) < _hb_interval:
                             send_update = False
 
                 # Remote-player replication is independent of the viewer's local
@@ -3811,6 +3830,13 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
                         tick,
                         prefer_tcp=(self.send_updates_tcp and not tcp_failed),
                     )
+
+                # Community profile: SHIP_STATUS + SUPPLY_SHIP_INFO for every supply ship
+                # at a steady interval (wulfram3.com: 1 Hz per ship, UDP).
+                _ship_iv = float(getattr(self, "ship_status_interval_s", 0.0) or 0.0)
+                if _ship_iv > 0 and (now - float(getattr(ctx, "last_ship_status_send", 0.0) or 0.0)) >= _ship_iv:
+                    ctx.last_ship_status_send = now
+                    self._send_periodic_ship_status(ctx)
 
                 if self.send_player_updates and send_full_update and send_update:
                     # Send UPDATE_ARRAY with position/velocity
@@ -4117,7 +4143,9 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
                                 f"burst_left={int(getattr(ctx, 'correction_burst_remaining', 0))}"
                             )
                     else:
-                        use_view = self.heartbeat_view_update
+                        # Community cadence: the periodic beat is a zero-entity
+                        # VIEW_UPDATE (local_state only), like wulfram3.com sends.
+                        use_view = self.heartbeat_view_update or self._community_cadence_active()
                         pkt_label = "VIEW_UPDATE_BEAT" if use_view else "UPDATE_ARRAY_BEAT"
                         hb_rot = None
                         if self.heartbeat_include_rot:

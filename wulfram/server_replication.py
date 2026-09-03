@@ -12,6 +12,7 @@ from typing import Optional
 from . import handlers
 from .client import ClientContext
 from .packets import (
+    build_ship_status,
     build_update_array_heartbeat,
     build_add_to_roster,
     build_remove_from_roster,
@@ -299,6 +300,47 @@ class ReplicationMixin:
         if weapon_type in LOCAL_STATE_SECONDARY_TURRET_WEAPON_TYPES and secondary_bits <= 0:
             return False
         return True
+
+    def _community_cadence_active(self) -> bool:
+        return getattr(self, "local_state_cadence", "fixed") == "community"
+
+    def _vitals_full(self, ctx: ClientContext) -> bool:
+        """True when health and energy are both at 1.0 (within local_state quantisation)."""
+        try:
+            return self._get_health_value(ctx) >= 0.999 and self._get_energy_value(ctx) >= 0.999
+        except Exception:
+            return True
+
+    def _effective_heartbeat_interval(self, ctx: ClientContext) -> float:
+        """Periodic local heartbeat interval for this client.
+
+        fixed:     WULFRAM_UPDATE_HEARTBEAT (legacy behaviour).
+        community: 1 Hz while health and energy are full, 20 Hz while either is
+                   below full -- the wulfram3.com VIEW_UPDATE local_state cadence
+                   (docs/sync-comparison-2026-09-03.md section 3b).
+        """
+        if not self._community_cadence_active():
+            return float(self.update_heartbeat_interval)
+        if self._vitals_full(ctx):
+            return float(getattr(self, "local_state_idle_interval_s", 1.0))
+        return float(getattr(self, "local_state_active_interval_s", 0.05))
+
+    def _send_periodic_ship_status(self, ctx: ClientContext) -> int:
+        """Rebroadcast SHIP_STATUS + SUPPLY_SHIP_INFO for every known supply ship (UDP)."""
+        ships = getattr(self, "_uplink_ships", None) or {}
+        if not ships or not ctx.session or not ctx.session.in_game:
+            return 0
+        sent = 0
+        for team_id, ship in list(ships.items()):
+            try:
+                status = build_ship_status(int(ship["oid"]), int(team_id), str(ship["name"]))
+                info = self._build_uplink_ship_info_packet(ship)
+            except Exception:
+                continue
+            for payload in (status, info):
+                if self._send_packet_to_client(ctx, payload, prefer_tcp=False):
+                    sent += 1
+        return sent
 
     def _should_send_local_state(self, ctx: ClientContext, primary_bits: int, secondary_bits: int, mode: str) -> bool:
         """Decide whether to include local-state based on mode and required fields."""

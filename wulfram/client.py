@@ -220,6 +220,7 @@ class ClientContext:
     last_solo_local_keepalive: float = 0.0
     # Remote player update throttle
     last_remote_update_send: float = 0.0
+    last_ship_status_send: float = 0.0
     # Combat stats
     kills: int = 0
     deaths: int = 0
