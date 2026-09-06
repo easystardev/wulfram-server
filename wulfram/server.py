@@ -126,7 +126,7 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
         self.logger = PacketLogger()
         self.udp_handler: Optional[UDPHandler] = None
         self.running = False
-        self.control_server = ControlServer(port=port + 1)  # Control on port+1 (2628)
+        self.control_server = ControlServer(port=self.port + 1)
 
         # Game clock — tracks elapsed time since first player spawned
         self._game_start_time: float = 0.0  # monotonic time of first spawn (0 = not started)
