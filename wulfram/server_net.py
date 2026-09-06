@@ -156,6 +156,25 @@ class NetMixin:
 
             pkt_type = data[cursor]
 
+            # OG identification is length-prefixed and can precede D_HANDSHAKE
+            # in the same datagram (captured 15 + 200 byte bootstrap batch).
+            if pkt_type == 0x08 and len(data) - cursor >= 3 and data[cursor + 1] == 0:
+                size = struct.unpack_from(">H", data, cursor + 1)[0]
+                end = cursor + 3 + size
+                if not size or end > len(data) or data[end - 1] != 0:
+                    return
+                yield data[cursor:end]
+                cursor = end
+                continue
+
+            if pkt_type == 0x03:
+                parsed = handlers._parse_empirical_client_d_handshake(data[cursor:], allow_trailing=True)
+                if parsed is not None:
+                    end = cursor + parsed["consumed"]
+                    yield data[cursor:end]
+                    cursor = end
+                    continue
+
             # D_ACK / control acknowledgments.
             # Common wire forms from decompile + captures:
             # - 0x02 0x00 <u32 timestamp>                     (6 bytes)
@@ -404,7 +423,13 @@ class NetMixin:
                     print(f"[UDP] D_Protocol type=0x{d_type:02X} from {addr} (len={len(data)})")
             else:
                 # HELLO_ACK - this registers the UDP address for a client
-                text = data[1:].decode('ascii', errors='ignore').strip('\x00')
+                if len(data) >= 3 and data[1] == 0:
+                    size = struct.unpack_from(">H", data, 1)[0]
+                    if not size or len(data) != size + 3 or data[-1] != 0:
+                        return
+                    text = data[3:-1].decode('ascii', errors='ignore')
+                else:
+                    text = data[1:].decode('ascii', errors='ignore').strip('\x00')
                 print(f"[UDP] HELLO_ACK from {addr}: '{text}'")
 
                 # Try session-key-based match first (deterministic)

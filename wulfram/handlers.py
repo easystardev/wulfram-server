@@ -68,15 +68,19 @@ def _pack_lp_string(text: str) -> bytes:
     return struct.pack(">H", len(raw)) + raw
 
 
-def _parse_empirical_client_d_handshake(data: bytes) -> Optional[dict]:
+def _parse_empirical_client_d_handshake(data: bytes, *, allow_trailing: bool = False) -> Optional[dict]:
     """Parse the OG-style client D_HANDSHAKE seen in live captures."""
-    if len(data) < 9 or data[0] != 0x03:
+    if len(data) < 17 or data[0] != 0x03:
         return None
 
     try:
         offset = 1
         sequence = struct.unpack_from(">I", data, offset)[0]
         offset += 4
+        receive_window = struct.unpack_from(">I", data, offset)[0]
+        offset += 4
+        if not 1 <= receive_window <= 32767:
+            return None
         stream_count = struct.unpack_from(">I", data, offset)[0]
         offset += 4
         if stream_count > 64:
@@ -84,6 +88,14 @@ def _parse_empirical_client_d_handshake(data: bytes) -> Optional[dict]:
 
         streams = []
         for _ in range(stream_count):
+            if offset + 2 > len(data):
+                return None
+            name_size = struct.unpack_from(">H", data, offset)[0]
+            end = offset + 2 + name_size
+            if not 1 <= name_size <= 256 or end > len(data):
+                return None
+            if data[end - 1] != 0 or b'\0' in data[offset + 2:end - 1]:
+                return None
             name, offset = decode_lp_string(data, offset)
             if not name or offset + 4 > len(data):
                 return None
@@ -95,7 +107,10 @@ def _parse_empirical_client_d_handshake(data: bytes) -> Optional[dict]:
             for _ in range(index_count):
                 if offset + 4 > len(data):
                     return None
-                indices.append(struct.unpack_from(">I", data, offset)[0])
+                channel = struct.unpack_from(">I", data, offset)[0]
+                if channel > 255:
+                    return None
+                indices.append(channel)
                 offset += 4
             streams.append((name, tuple(indices)))
 
@@ -112,15 +127,19 @@ def _parse_empirical_client_d_handshake(data: bytes) -> Optional[dict]:
                 return None
             packet_id, delivery_mode = struct.unpack_from(">II", data, offset)
             offset += 8
+            if packet_id > 255 or delivery_mode > 3:
+                return None
             private_modes.append((packet_id, delivery_mode))
 
-        if offset != len(data):
+        if not allow_trailing and offset != len(data):
             return None
 
         return {
             "kind": "empirical",
             "sequence": sequence,
             "session_id": 0,
+            "receive_window": receive_window,
+            "consumed": offset,
             "streams": tuple(streams),
             "private_modes": tuple(private_modes),
         }
@@ -151,13 +170,12 @@ def _parse_legacy_client_d_handshake(data: bytes) -> Optional[dict]:
 def _build_server_d_handshake(ctx: Optional["ClientContext"]) -> bytes:
     """Build a server D_HANDSHAKE with empirical OG stream/private mappings."""
     sequence = int(time.monotonic() * 1000) & 0xFFFFFFFF
-    session_id = 1
-    if ctx is not None:
-        session_id = ctx.session.player_id or ctx.client_id or 1
+    # Original ServiceLayer advertises its sequence window here, not a player ID.
+    receive_window = 15
 
     payload = bytearray()
     payload += struct.pack(">I", sequence)
-    payload += struct.pack(">I", session_id)
+    payload += struct.pack(">I", receive_window)
     payload += struct.pack(">I", len(_OG_D_HANDSHAKE_STREAMS))
 
     for name, indices in _OG_D_HANDSHAKE_STREAMS:
