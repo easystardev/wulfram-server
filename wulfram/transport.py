@@ -55,6 +55,7 @@ class TCPHandler:
         self.sock = sock
         self.logger = logger
         self.recv_buffer = b""
+        self.closed = False
 
     # Packet types that can crash OG client when sent over TCP with entity data.
     # 0x0E (UPDATE_ARRAY): complex bitstreams corrupt g_render_context
@@ -94,6 +95,8 @@ class TCPHandler:
         Receive one complete packet.
         Returns packet body (without length prefix) or None if disconnected.
         """
+        if self.closed:
+            return None
         while True:
             # Try to extract a packet from buffer
             packet, self.recv_buffer = unframe_packet(self.recv_buffer)
@@ -108,12 +111,19 @@ class TCPHandler:
             try:
                 chunk = self.sock.recv(4096)
                 if not chunk:
+                    self.closed = True
                     return None  # Disconnected
                 self.recv_buffer += chunk
             except socket.timeout:
                 return None
             except ConnectionResetError:
+                self.closed = True
                 return None
+            except OSError:
+                if self.sock.fileno() < 0:
+                    self.closed = True
+                    return None
+                raise
 
 
 class UDPHandler:

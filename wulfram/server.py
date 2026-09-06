@@ -1851,6 +1851,8 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
         while ctx.running and not ctx.ping_stop_event.wait(
             float(getattr(self, "ping_interval_s", 2.0) or 2.0)
         ):
+            if not ctx.running or ctx.ping_stop_event.is_set():
+                break
             if ctx.tcp_handler:
                 try:
                     ctx.tcp_handler.send(build_ping_request())
@@ -1874,6 +1876,9 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
     def _stop_ping_loop(self, ctx: ClientContext):
         """Stop the ping loop thread for a client."""
         ctx.ping_stop_event.set()
+        thread = ctx.ping_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
         ctx.ping_thread = None
 
     def _ghost_rejoin(self, addr: tuple) -> Optional[ClientContext]:
@@ -2630,6 +2635,8 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
 
             packet = ctx.tcp_handler.recv()
             if packet is None:
+                if ctx.tcp_handler.closed:
+                    break
                 # Timeout - check for inactivity (dead connection)
                 # Also check UDP activity since client sends TRANSLATION_ACKs
                 if ctx.session.last_udp_activity:

@@ -746,6 +746,7 @@ class NetMixin:
             was_in_game = bool(ctx.session.in_game and disconnected_entity_id)
             ctx.running = False
             ctx.session.in_game = False
+            self._stop_ping_loop(ctx)
 
             # Remove from client tracking
             with self.clients_lock:
