@@ -964,6 +964,13 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
 
     def _get_network_tick(self, ctx: ClientContext) -> int:
         """Return a monotonic tick aligned to the client tick domain when possible."""
+        if self.use_client_ticks and ctx.tick_offset is None:
+            # Spawn definitions precede the first timestamped client input.
+            # Publishing server uptime here would seed last_sent_tick in a
+            # different domain and permanently clamp later aligned updates.
+            # Zero is an undated bootstrap snapshot; start the monotonic
+            # sequence only once the client's clock has been observed.
+            return 0
         tick = get_ticks()
         if self.use_client_ticks and ctx.tick_offset is not None:
             tick = tick + ctx.tick_offset
