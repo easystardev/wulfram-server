@@ -846,6 +846,10 @@ class SpawnMixin:
             print(f"[SPAWN] Skipping TCP PLAYER_INFO ({reason})")
         else:
             player_info_pkt = build_player_info(
+                # PLAYER_INFO admission requires a timestamp above the initial
+                # deletion watermark (zero). Before the first client input,
+                # use the earliest admissible bootstrap tick, never host uptime.
+                state_tick=max(1, self._get_network_tick(ctx)),
                 entity_oid=net_id,
                 vehicle_type=unit_type,
                 pos=send_pos,

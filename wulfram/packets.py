@@ -486,6 +486,7 @@ def build_player_info(entity_oid: int, vehicle_type: int, pos: Tuple[float, floa
                       fuel: float = 1.0,
                       properties: int = 0,
                       frame_id: int | None = None,
+                      state_tick: int | None = None,
                       ammo_count_bits: int = 0,
                       ammo_count: int = 0,
                       primary_turret_bits: int = 0,
@@ -496,7 +497,10 @@ def build_player_info(entity_oid: int, vehicle_type: int, pos: Tuple[float, floa
                       turret_range: float = 12.6) -> bytes:
     """Build PLAYER_INFO packet (0x18) for spawning the local player's vehicle."""
     bw = BitWriter()
-    bw.write_bits(32, entity_oid)
+    # The original PLAYER_INFO reader consumes a state timestamp here.
+    # Preserve omitted-argument behavior for legacy callers pending their audit;
+    # live spawning supplies the same network clock as DELETE_OBJECT.
+    bw.write_bits(32, entity_oid if state_tick is None else state_tick)
 
     _write_local_player_state(
         bw,

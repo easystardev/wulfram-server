@@ -28,6 +28,7 @@ from .packets import (
     build_identified_udp,
     build_login_status,
     build_ping_reply,
+    build_player_info,
 )
 from wulfram2_protocol.entities import ACTION_ANALOG_SLOTS, ACTION_DUMP_CONTROL_SLOTS
 
@@ -251,7 +252,7 @@ class NetMixin:
                 break
 
             # Reliable stream packets with length at bytes 3-4
-            if pkt_type in (0x20, 0x25, 0x26, 0x2B, 0x33, 0x35, 0x3A, 0x3B):
+            if pkt_type in (0x19, 0x20, 0x25, 0x26, 0x2B, 0x33, 0x35, 0x3A, 0x3B):
                 if cursor + 5 > len(data):
                     yield data[cursor:]
                     break
@@ -512,6 +513,29 @@ class NetMixin:
                 if self.debug_udp_raw:
                     print(f"[UDP] RETARGET seq={seq_num} from {addr}")
 
+        elif pkt_type == 0x19:
+            # TANK_RESEND_REQUEST is advertised as a private mode-1 reliable
+            # packet.  ACK its stream sequence even when the current entity is
+            # not eligible for a state resend, otherwise the OG client retries
+            # the frame until its reliable-send window is exhausted.
+            if len(data) == 5 and struct.unpack(">H", data[3:5])[0] == 5:
+                seq_num = struct.unpack(">H", data[1:3])[0]
+                if ctx is not None:
+                    self._send_udp_ack(ctx, addr, 0x19, seq_num)
+                    request_key = (
+                        int(ctx.session.entity_id or 0),
+                        float(ctx.session.last_spawn_time),
+                        seq_num,
+                    )
+                    duplicate = getattr(ctx, "_last_tank_resend_request", None) == request_key
+                    resent = False if duplicate else self._resend_current_tank_state(ctx)
+                    ctx._last_tank_resend_request = request_key
+                    if self.debug_udp_raw:
+                        print(
+                            f"[UDP] TANK_RESEND seq={seq_num} "
+                            f"duplicate={int(duplicate)} state_resent={int(resent)} from {addr}"
+                        )
+
         elif pkt_type == 0x35:
             # VIEWPOINT_INFO - client sends camera/view position and orientation
             # This is the ACTUAL player pose, not reconstructed from inputs!
@@ -686,6 +710,64 @@ class NetMixin:
     def _send_udp_ack(self, ctx: Optional[ClientContext], addr: tuple, packet_id: int, seq_num: int, subcmd: int = 1):
         """Send a Wulf-Forge style UDP ACK (0x02)."""
         handlers.send_udp_ack(self, ctx, addr, packet_id, seq_num, subcmd)
+
+    def _resend_current_tank_state(self, ctx: Optional[ClientContext]) -> bool:
+        """Resend an existing live player's TANK state without changing lifecycle."""
+        if ctx is None or ctx.session is None:
+            return False
+        session = ctx.session
+        if not session.in_game or session.phase != Phase.IN_GAME:
+            return False
+        entity_id = int(session.entity_id or 0)
+        if entity_id <= 0 or ctx.tcp_handler is None:
+            return False
+        health = float(self._get_health_value(ctx))
+        energy = float(self._get_energy_value(ctx))
+        pos = tuple(ctx.player_pos) if ctx.player_pos and len(ctx.player_pos) == 3 else ()
+        rot = tuple(self._local_player_sync_rotation(ctx))
+        if (
+            health <= 0.0
+            or not math.isfinite(health)
+            or not math.isfinite(energy)
+            or len(pos) != 3
+            or len(rot) != 3
+            or not all(math.isfinite(float(value)) for value in (*pos, *rot))
+        ):
+            return False
+        include_local_state, local_state = self._get_player_info_local_state_kwargs(ctx)
+        local_state = dict(local_state)
+        local_state["health"] = health
+        local_state["fuel"] = energy
+        properties = 0
+        if self.player_info_properties_mode in ("team", "team_id"):
+            properties = int(session.team_id) & 0xFF
+        elif self.player_info_properties_mode:
+            try:
+                properties = int(self.player_info_properties_mode, 0) & 0xFF
+            except ValueError:
+                properties = 0
+        packet = build_player_info(
+            state_tick=max(1, self._get_network_tick(ctx)),
+            entity_oid=entity_id,
+            vehicle_type=int(ctx.entity_type),
+            pos=self._to_client_pos(pos),
+            rot=rot,
+            include_local_state=include_local_state,
+            weapon_id=local_state["weapon_id"],
+            health=local_state["health"],
+            fuel=local_state["fuel"],
+            properties=properties,
+            ammo_count_bits=local_state["ammo_count_bits"],
+            ammo_count=local_state["ammo_count"],
+            primary_turret_bits=local_state["primary_turret_bits"],
+            primary_turret_angle=local_state["primary_turret_angle"],
+            secondary_turret_bits=local_state["secondary_turret_bits"],
+            secondary_turret_angle=local_state["secondary_turret_angle"],
+            turret_max=local_state["turret_max"],
+            turret_range=local_state["turret_range"],
+        )
+        ctx.tcp_handler.send(packet)
+        return True
 
     def _handle_udp_chat(self, ctx: Optional[ClientContext], data: bytes, addr: tuple):
         """Handle UDP COMM_REQ (0x20) for /s spawn."""
