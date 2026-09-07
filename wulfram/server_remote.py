@@ -9,7 +9,7 @@ from typing import Optional
 
 from . import handlers
 from .client import ClientContext
-from .packets import build_update_array_player_update
+from .packets import build_update_array_multi
 
 
 class RemoteSyncMixin:
@@ -45,25 +45,33 @@ class RemoteSyncMixin:
             health_val = self._get_health_value(other)
             include_local_state, local_state_kwargs = self._get_update_array_local_state_for_viewer(ctx)
             send_pos = self._to_client_pos(other.player_pos)
-            payload = build_update_array_player_update(
-                tick,
-                entity_id,
-                pos=send_pos,
-                vel=other.player_vel,
-                rot=(
+            subject_rot = (
                     other.player_pose.get("roll", 0.0),
                     other.player_pose.get("pitch", 0.0),
                     (-other.player_heading if self.remote_yaw_negate else other.player_heading) + self.remote_yaw_offset,
-                ),
-                include_pos=include_pos,
-                include_vel=include_vel,
-                include_rot=include_rot,
-                include_spin=include_rot,
-                spin=(0.0, 0.0, other.angular_vel_yaw),
+                )
+            is_tank = int(getattr(other, "entity_type", -1)) == 0
+            payload = build_update_array_multi(
+                tick,
                 include_local_state=include_local_state,
-                include_entity_vitals=getattr(self, "remote_entity_vitals", True),
-                speed_scale=health_val,
-                is_manned=True,
+                entities=[dict(
+                    entity_id=entity_id,
+                    is_manned=True,
+                    pos=send_pos,
+                    vel=other.player_vel,
+                    rot=subject_rot,
+                    include_pos=include_pos,
+                    include_vel=include_vel,
+                    include_rot=include_rot,
+                    include_spin=include_rot,
+                    spin=(0.0, 0.0, other.angular_vel_yaw),
+                    include_entity_vitals=getattr(self, "remote_entity_vitals", True),
+                    speed_scale=health_val,
+                    fuel=self._get_energy_value(other),
+                    ammo_unit=0 if is_tank else None,
+                    ammo_active_bits=9 if is_tank else 0,
+                    ammo_active_mask=1 if is_tank and self._tank_primary_replication_active(other) else 0,
+                )],
                 **local_state_kwargs,
             )
             ok = self._send_packet_to_client(ctx, payload, prefer_tcp=prefer_tcp)

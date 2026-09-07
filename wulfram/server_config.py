@@ -9,6 +9,10 @@ from __future__ import annotations
 
 import os
 import math
+from wulfram2_protocol.hud_state import (
+    HUD_FRACTION_BITS, HUD_FRACTION_MAX, HUD_FRACTION_RANGE,
+    validate_hud_fraction_schema,
+)
 
 from .session import FEATURES
 
@@ -145,18 +149,27 @@ class ConfigMixin:
             or "WULFRAM_LOCAL_STATE_AMMO_MASK" in os.environ
         )
         # Turret angle bits for local state (if weapon def flags require them).
+        # TRANSLATION entries 13 and 14 both declare an 8-bit fixed scalar.
+        # A different width shifts the following entity count in UPDATE_ARRAY.
         try:
-            self.local_state_turret_bits = int(os.environ.get("WULFRAM_LOCAL_STATE_TURRET_BITS", "16"))
-        except ValueError:
-            self.local_state_turret_bits = 16
+            self.local_state_turret_bits = int(os.environ.get("WULFRAM_LOCAL_STATE_TURRET_BITS", str(HUD_FRACTION_BITS)))
+        except ValueError as ex:
+            raise ValueError("WULFRAM_LOCAL_STATE_TURRET_BITS must be 8") from ex
+        if self.local_state_turret_bits != HUD_FRACTION_BITS:
+            raise ValueError("WULFRAM_LOCAL_STATE_TURRET_BITS must match TRANSLATION width 8")
         try:
-            self.local_state_turret_max = float(os.environ.get("WULFRAM_LOCAL_STATE_TURRET_MAX", "6.3"))
+            self.local_state_turret_max = float(os.environ.get("WULFRAM_LOCAL_STATE_TURRET_MAX", str(HUD_FRACTION_MAX)))
         except ValueError:
-            self.local_state_turret_max = 6.3
+            self.local_state_turret_max = HUD_FRACTION_MAX
         try:
-            self.local_state_turret_range = float(os.environ.get("WULFRAM_LOCAL_STATE_TURRET_RANGE", "12.6"))
+            self.local_state_turret_range = float(os.environ.get("WULFRAM_LOCAL_STATE_TURRET_RANGE", str(HUD_FRACTION_RANGE)))
         except ValueError:
-            self.local_state_turret_range = 12.6
+            self.local_state_turret_range = HUD_FRACTION_RANGE
+        validate_hud_fraction_schema(
+            self.local_state_turret_bits,
+            self.local_state_turret_max,
+            self.local_state_turret_range,
+        )
         self.local_state_primary_override = os.environ.get("WULFRAM_LOCAL_STATE_PRIMARY_TURRET", "").strip()
         self.local_state_secondary_override = os.environ.get("WULFRAM_LOCAL_STATE_SECONDARY_TURRET", "").strip()
         self.allow_unsafe_local_state = os.environ.get("WULFRAM_ALLOW_UNSAFE_LOCAL_STATE", "0") == "1"

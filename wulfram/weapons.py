@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Optional, Tuple, Callable, List
 
 from .codec import BitReader
+from wulfram2_protocol.hud_state import HUD_FRACTION_MAX, HUD_FRACTION_RANGE
 from .packets import (
     VEC_POS_MAX, VEC_POS_RANGE,
     VEC_VEL_MAX, VEC_VEL_RANGE,
@@ -66,6 +67,16 @@ class WeaponSystem:
     """
     Handles weapon firing and projectile management.
     """
+
+    def reset_input_state(self) -> None:
+        """Start an incarnation with released controls; retain weapon/projectile state."""
+        self.behavior_slots = [0.0] * 22
+        self.behavior_slots[TANK_SOFTBODY_CONTROL_SLOT] = OG_TANK_SOFTBODY_IDLE_SLOT5
+        self.prev_fire_state = 0.0
+        self.prev_direct_trigger_states = {slot: 0.0 for slot in OG_DIRECT_TRIGGER_WEAPON_SLOTS}
+        self.turn_input_change_time = 0.0
+        self.turn_input_prev_value = 0.0
+        self.turn_input_change_client_tick = 0
 
     def __init__(self):
         self.behavior_slots: List[float] = [0.0] * 22  # Current behavior values
@@ -1194,8 +1205,8 @@ def build_projectile_spawn_packet(
     primary_turret_angle: float = 0.0,
     secondary_turret_bits: int = 0,
     secondary_turret_angle: float = 0.0,
-    turret_max: float = 6.3,
-    turret_range: float = 12.6,
+    turret_max: float = HUD_FRACTION_MAX,
+    turret_range: float = HUD_FRACTION_RANGE,
     entity_config: int = 0,
     is_static: bool = True,
 ) -> bytes:
@@ -1355,8 +1366,8 @@ def build_projectile_update_packet(
     primary_turret_angle: float = 0.0,
     secondary_turret_bits: int = 0,
     secondary_turret_angle: float = 0.0,
-    turret_max: float = 6.3,
-    turret_range: float = 12.6,
+    turret_max: float = HUD_FRACTION_MAX,
+    turret_range: float = HUD_FRACTION_RANGE,
 ) -> bytes:
     """
     Build UPDATE_ARRAY packet to update a projectile's transform.

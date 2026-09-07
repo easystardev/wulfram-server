@@ -11,6 +11,7 @@ from typing import Optional
 
 from . import handlers
 from .client import ClientContext
+from .weapons import BehaviorSlot
 from .packets import (
     build_ship_status,
     build_update_array_heartbeat,
@@ -29,13 +30,24 @@ from wulfram2_protocol.entities import (
 class ReplicationMixin:
     def _get_local_state_weapon_type(self, ctx: ClientContext) -> int:
         """Return weapon type index used by local player state (entity type index, not weapon slot)."""
-        if self.update_local_state_mode == "wf":
+        if self.update_local_state_mode == "wf" and self._wf_minimal_local_state_for_client(ctx):
             return self.local_state_weapon_type or 0
-        if self.local_state_weapon_type:
-            return self.local_state_weapon_type
         if getattr(ctx, "entity_type", None) is not None:
             return int(ctx.entity_type)
+        if self.local_state_weapon_type:
+            return self.local_state_weapon_type
         return 0
+
+    @staticmethod
+    def _tank_primary_replication_active(ctx: ClientContext) -> bool:
+        """Return current applied Tank FIRE state; lifecycle reset is caller-owned."""
+        if ctx is None or not ctx.session or not ctx.session.in_game:
+            return False
+        if int(getattr(ctx, "entity_type", -1)) != 0:
+            return False
+        weapon_system = getattr(ctx, "weapon_system", None)
+        slots = getattr(weapon_system, "behavior_slots", ())
+        return len(slots) > int(BehaviorSlot.FIRE) and float(slots[BehaviorSlot.FIRE]) > 0.5
 
     def _get_spawn_tank_weapon_type(self, ctx: Optional[ClientContext] = None) -> int:
         """Return weapon id used for spawn TankPacket vitals (short local-state parse-safe)."""
@@ -164,11 +176,9 @@ class ReplicationMixin:
         active_bits = 0
         if 0 <= weapon_type < len(self.behavior_weapon_caps):
             active_bits = self.behavior_weapon_caps[weapon_type][2]
-        # Send 0 mask (no weapons actively firing).  The active-flags bitmask
-        # controls AmmoSlotState+0x05 via update_active_flags(); bit=1 causes
-        # the client's WeaponCooldown_update_all() to auto-fire that slot.
-        # Only set bits when the player is actually firing (TODO).
-        active_mask = 0
+        # Tank row 0 compresses active slots [0,4,5,6,7,8,9,10,11], so its
+        # primary slot 0 is mask bit 0.
+        active_mask = 1 if weapon_type == 0 and self._tank_primary_replication_active(ctx) else 0
         return active_bits, active_mask
 
     def _get_local_state_turret_bits(self, ctx: ClientContext, *, force_full_remote: bool = False) -> tuple:
@@ -191,14 +201,17 @@ class ReplicationMixin:
 
         if primary_flag:
             primary_bits = max(0, self.local_state_turret_bits)
-            primary_angle = ctx.player_aim_yaw if ctx else 0.0
+            # Legacy packet name: original consumer treats q13 as slot-4 pulse
+            # charge. No grounded charge model exists, so publish unavailable.
+            primary_angle = 0.0
         else:
             primary_bits = 0
             primary_angle = 0.0
 
         if secondary_flag:
             secondary_bits = max(0, self.local_state_turret_bits)
-            secondary_angle = ctx.player_aim_yaw if ctx else 0.0
+            # Legacy packet name: q14 is the slot-1 repair HUD fraction.
+            secondary_angle = 0.0
         else:
             secondary_bits = 0
             secondary_angle = 0.0

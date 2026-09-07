@@ -312,6 +312,12 @@ def _send_og_login_bootstrap(server: "WulframServer", ctx: "ClientContext") -> N
 
     tcp.send(build_team_info())
     tcp.send(build_login_status(8, is_donor=True))
+    # Original WORLD_STATS cleanup computes the construction deadline from
+    # BEHAVIOR. Send configuration before that later post-team-select cleanup;
+    # an unset delay otherwise becomes a persistent 60-second fallback.
+    if FEATURES.send_behavior_packet and not session.behavior_sent:
+        tcp.send(build_behavior_packet())
+        session.behavior_sent = True
     tcp.send(build_player(entity_id=session.player_id, spectator=True))
 
 

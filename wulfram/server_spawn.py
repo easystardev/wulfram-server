@@ -134,6 +134,8 @@ class SpawnMixin:
 
         Returns the preserved team_id (for logging/assertions).
         """
+        if target.weapon_system is not None:
+            target.weapon_system.reset_input_state()
         sess = target.session
         # PRESERVE team across death. Never zero it, never default it here -- the
         # redeploy must land on the SAME team. handle_spawn_at_point reads the clicked
@@ -611,6 +613,8 @@ class SpawnMixin:
         # sleep bypasses suppression and sends a velocity UPDATE_ARRAY
         # that sets prev_health positive before a retransmit re-creates
         # the entity with health=0 â†’ permanent DeathScreen.
+        if ctx.weapon_system is not None:
+            ctx.weapon_system.reset_input_state()
         ctx.session.last_spawn_time = time.monotonic()
         if not self.spawn_send_udp_tank:
             print("[SPAWN] Skipping UDP TankPacket (WULFRAM_SPAWN_UDP_TANK=0)")

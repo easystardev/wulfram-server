@@ -3245,18 +3245,18 @@ Examples:
         ctx.player_health = max(0.0, old_health - amount)
         new_health = ctx.player_health
 
-        # Send health update
-        from .packets import build_update_array_heartbeat
+        # Use the same row-dependent ammo/turret schema as gameplay updates.
+        # A sparse heartbeat with a promoted Tank row shifts the entity count.
         if self.server.udp_handler and ctx.session and ctx.session.udp_addr:
             tick = self.server._get_network_tick(ctx)
-            weapon_type = self.server._get_local_state_weapon_type(ctx)
-            packet = build_update_array_heartbeat(
+            packet = self.server._build_local_state_heartbeat(
+                ctx,
                 tick=tick,
                 entity_id=ctx.session.entity_id or ctx.entity_id,
                 include_health=True,
-                weapon_id=weapon_type,
                 health=self.server._get_health_value(ctx),
-                fuel=1.0,
+                fuel=self.server._get_energy_value(ctx),
+                is_view_update=False,
             )
             self.server.udp_handler.send_to(packet, ctx.session.udp_addr)
 

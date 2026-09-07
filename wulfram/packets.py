@@ -14,6 +14,7 @@ import os
 from typing import Optional, Tuple, List
 
 from wulfram2_protocol.codec import BitWriter, pack_fixed16, frame_packet
+from wulfram2_protocol.hud_state import HUD_FRACTION_MAX, HUD_FRACTION_RANGE
 from wulfram2_protocol.packets import (  # noqa: F401 - re-export for existing importers
     PacketType,
     PACKET_NAMES,
@@ -493,8 +494,8 @@ def build_player_info(entity_oid: int, vehicle_type: int, pos: Tuple[float, floa
                       primary_turret_angle: float = 0.0,
                       secondary_turret_bits: int = 0,
                       secondary_turret_angle: float = 0.0,
-                      turret_max: float = 6.3,
-                      turret_range: float = 12.6) -> bytes:
+                      turret_max: float = HUD_FRACTION_MAX,
+                      turret_range: float = HUD_FRACTION_RANGE) -> bytes:
     """Build PLAYER_INFO packet (0x18) for spawning the local player's vehicle."""
     bw = BitWriter()
     # The original PLAYER_INFO reader consumes a state timestamp here.
@@ -651,8 +652,8 @@ def build_update_array_heartbeat(tick: int, entity_id: int, include_health: bool
                                  primary_turret_angle: float = 0.0,
                                  secondary_turret_bits: int = 0,
                                  secondary_turret_angle: float = 0.0,
-                                 turret_max: float = 6.3,
-                                 turret_range: float = 12.6,
+                                 turret_max: float = HUD_FRACTION_MAX,
+                                 turret_range: float = HUD_FRACTION_RANGE,
                                  is_view_update: bool = False,
                                  include_entities: bool = True,
                                  use_local_entity_when_no_transform: bool = False,
@@ -752,8 +753,8 @@ def build_update_array_player_update(tick: int, entity_id: int,
                                      primary_turret_angle: float = 0.0,
                                      secondary_turret_bits: int = 0,
                                      secondary_turret_angle: float = 0.0,
-                                     turret_max: float = 6.3,
-                                     turret_range: float = 12.6) -> bytes:
+                                     turret_max: float = HUD_FRACTION_MAX,
+                                     turret_range: float = HUD_FRACTION_RANGE) -> bytes:
     """Build UPDATE_ARRAY packet with player position/velocity updates."""
     tick_bytes = struct.pack(">I", tick)
     bw = BitWriter()
@@ -845,8 +846,8 @@ def build_view_update_player_update(tick: int, entity_id: int,
                                     primary_turret_angle: float = 0.0,
                                     secondary_turret_bits: int = 0,
                                     secondary_turret_angle: float = 0.0,
-                                    turret_max: float = 6.3,
-                                    turret_range: float = 12.6,
+                                    turret_max: float = HUD_FRACTION_MAX,
+                                    turret_range: float = HUD_FRACTION_RANGE,
                                     timestamp: Optional[int] = None) -> bytes:
     """Build VIEW_UPDATE packet (0x0F) with player position/velocity updates.
 
@@ -933,8 +934,8 @@ def build_update_array_multi(tick: int,
                              primary_turret_angle: float = 0.0,
                              secondary_turret_bits: int = 0,
                              secondary_turret_angle: float = 0.0,
-                             turret_max: float = 6.3,
-                             turret_range: float = 12.6,
+                             turret_max: float = HUD_FRACTION_MAX,
+                             turret_range: float = HUD_FRACTION_RANGE,
                              entities: Optional[list] = None) -> bytes:
     """Build UPDATE_ARRAY packet with multiple entity updates."""
     tick_bytes = struct.pack(">I", tick)
@@ -977,8 +978,8 @@ def build_view_update_multi(tick: int,
                             primary_turret_angle: float = 0.0,
                             secondary_turret_bits: int = 0,
                             secondary_turret_angle: float = 0.0,
-                            turret_max: float = 6.3,
-                            turret_range: float = 12.6,
+                            turret_max: float = HUD_FRACTION_MAX,
+                            turret_range: float = HUD_FRACTION_RANGE,
                             entities: Optional[list] = None,
                             timestamp: Optional[int] = None) -> bytes:
     """Build VIEW_UPDATE (0x0F) packet with a timestamp + update array payload.
@@ -1038,8 +1039,8 @@ def build_update_array_create_tank(tick: int, entity_id: int, entity_type: int, 
                                     primary_turret_angle: float = 0.0,
                                     secondary_turret_bits: int = 0,
                                     secondary_turret_angle: float = 0.0,
-                                    turret_max: float = 6.3,
-                                    turret_range: float = 12.6,
+                                    turret_max: float = HUD_FRACTION_MAX,
+                                    turret_range: float = HUD_FRACTION_RANGE,
                                     cargo_contained_type: Optional[int] = None) -> bytes:
     """Build UPDATE_ARRAY that creates a tank entity with position inline."""
     tick_bytes = struct.pack(">I", tick)
@@ -1112,8 +1113,8 @@ def build_view_update_create_tank(tick: int, entity_id: int, entity_type: int, t
                                   primary_turret_angle: float = 0.0,
                                   secondary_turret_bits: int = 0,
                                   secondary_turret_angle: float = 0.0,
-                                  turret_max: float = 6.3,
-                                  turret_range: float = 12.6,
+                                  turret_max: float = HUD_FRACTION_MAX,
+                                  turret_range: float = HUD_FRACTION_RANGE,
                                   cargo_contained_type: Optional[int] = None,
                                   timestamp: Optional[int] = None) -> bytes:
     """Build VIEW_UPDATE carrying the same definition-bearing tank shape.
@@ -1167,8 +1168,8 @@ def build_update_array_teleport(tick: int, entity_id: int,
                                 primary_turret_angle: float = 0.0,
                                 secondary_turret_bits: int = 0,
                                 secondary_turret_angle: float = 0.0,
-                                turret_max: float = 6.3,
-                                turret_range: float = 12.6) -> bytes:
+                                turret_max: float = HUD_FRACTION_MAX,
+                                turret_range: float = HUD_FRACTION_RANGE) -> bytes:
     """Build UPDATE_ARRAY that teleports an existing entity to a new position."""
     tick_bytes = struct.pack(">I", tick)
     bw = BitWriter()
