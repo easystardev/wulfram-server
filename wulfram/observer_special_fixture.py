@@ -21,7 +21,7 @@ SUPPORTED_TYPES = {19, 20}
 def spawn_definition(control, args: list[str]) -> str:
     if len(args) not in (6, 7) or not args[5].startswith("c"):
         return ("Error: expected observer_special <19|20> <x> <y> <z> "
-                "<team> c<id> [local-invalid|enemy-uplink]")
+                "<team> c<id> [plain|local-invalid|enemy-uplink]")
     try:
         entity_type = int(args[0])
         pos = tuple(float(value) for value in args[1:4])
@@ -34,8 +34,8 @@ def spawn_definition(control, args: list[str]) -> str:
     if team_id not in (1, 2):
         return "Error: observer_special team must be 1 or 2"
     mode = args[6] if len(args) == 7 else "local-invalid"
-    if mode not in ("local-invalid", "enemy-uplink"):
-        return "Error: observer_special mode must be local-invalid or enemy-uplink"
+    if mode not in ("plain", "local-invalid", "enemy-uplink"):
+        return "Error: observer_special mode must be plain, local-invalid, or enemy-uplink"
     if mode == "enemy-uplink" and entity_type != 20:
         return "Error: enemy-uplink mode requires type 20"
 
@@ -65,14 +65,17 @@ def spawn_definition(control, args: list[str]) -> str:
     # by its sole writer as game_clock_active, and exposes the normal opposing-team
     # uplink path. A short isolated pause orders the TCP gate before the UDP
     # definition.
-    gate_state = None if mode == "enemy-uplink" else 5
-    gate_kind = "paused-game-clock" if mode == "enemy-uplink" else "inactive-holder"
-    gate_payload = (build_game_clock(running=False) if mode == "enemy-uplink" else
-                    build_uplink_info(local_team, local_entity_id, gate_state))
-    gate_sent = server._send_packet_to_client(ctx, gate_payload, prefer_tcp=True)
-    if not gate_sent:
-        return "Error: failed to send observer special gate"
-    time.sleep(0.2)
+    gate_state = None if mode in ("plain", "enemy-uplink") else 5
+    gate_kind = {"plain": "none", "enemy-uplink": "paused-game-clock",
+                 "local-invalid": "inactive-holder"}[mode]
+    gate_sent = False
+    if mode != "plain":
+        gate_payload = (build_game_clock(running=False) if mode == "enemy-uplink" else
+                        build_uplink_info(local_team, local_entity_id, gate_state))
+        gate_sent = server._send_packet_to_client(ctx, gate_payload, prefer_tcp=True)
+        if not gate_sent:
+            return "Error: failed to send observer special gate"
+        time.sleep(0.2)
 
     known_ids = {entity_id for client in clients for entity_id in client.known_entity_ids}
     candidate = max(5000, int(getattr(control, "_entity_id", 5000) or 5000)) + 1
