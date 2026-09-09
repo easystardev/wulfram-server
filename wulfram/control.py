@@ -635,7 +635,7 @@ class ControlServer:
   spawn_full [args]      - Force spawn sequence (see example)
   spawn_udp [args]       - Send UDP TANK (Wulf-Forge style)
   spawn_entity [type] [x y z] [vx vy vz] - Spawn entity (type 6=pulse, 5=flak)
-  observer_special <19|20> <x> <y> <z> <team> c<id> - Exact isolated observer fixture
+  observer_special <19|20> <x> <y> <z> <team> c<id> [local-invalid|enemy-uplink]
   spawn_points [count] [team] - Send spawn point entities
   test_vel [speed] [dir] - Test projectile velocity (dir: x, z, xz, up, down, arc)
   shell [x y z] [yaw] [pitch] [speed] [duration] - Spawn shell with full control + updates

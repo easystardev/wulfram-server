@@ -11,7 +11,7 @@ import json
 import time
 
 from .observer_lifecycle import serialized
-from .packets import build_uplink_info
+from .packets import build_game_clock, build_uplink_info
 
 
 SUPPORTED_TYPES = {19, 20}
@@ -19,8 +19,9 @@ SUPPORTED_TYPES = {19, 20}
 
 @serialized
 def spawn_definition(control, args: list[str]) -> str:
-    if len(args) != 6 or not args[5].startswith("c"):
-        return "Error: expected observer_special <19|20> <x> <y> <z> <team> c<id>"
+    if len(args) not in (6, 7) or not args[5].startswith("c"):
+        return ("Error: expected observer_special <19|20> <x> <y> <z> "
+                "<team> c<id> [local-invalid|enemy-uplink]")
     try:
         entity_type = int(args[0])
         pos = tuple(float(value) for value in args[1:4])
@@ -32,6 +33,11 @@ def spawn_definition(control, args: list[str]) -> str:
         return f"Error: observer_special type {entity_type} is outside {sorted(SUPPORTED_TYPES)}"
     if team_id not in (1, 2):
         return "Error: observer_special team must be 1 or 2"
+    mode = args[6] if len(args) == 7 else "local-invalid"
+    if mode not in ("local-invalid", "enemy-uplink"):
+        return "Error: observer_special mode must be local-invalid or enemy-uplink"
+    if mode == "enemy-uplink" and entity_type != 20:
+        return "Error: enemy-uplink mode requires type 20"
 
     server = control.server
     if (server is None or server.port != 2727 or control.port != 2728
@@ -53,11 +59,16 @@ def spawn_definition(control, args: list[str]) -> str:
     if local_team not in (1, 2) or local_entity_id <= 0:
         return "Error: observer client has no stable local team/entity identity"
 
-    # Force the documented local-invalid handler branch without changing the
-    # original process: the inactive local uplink-holder state makes 0044608b
-    # return one. A short isolated pause lets the TCP gate precede the UDP
-    # definition at the client.
-    gate_payload = build_uplink_info(local_team, local_entity_id, 5)
+    # Select an exact original handler branch with canonical server packets. The
+    # inactive local-holder state makes 0044608b return one and reaches the
+    # local-invalid response path. A paused GAME_CLOCK clears 00679068, identified
+    # by its sole writer as game_clock_active, and exposes the normal opposing-team
+    # uplink path. A short isolated pause orders the TCP gate before the UDP
+    # definition.
+    gate_state = None if mode == "enemy-uplink" else 5
+    gate_kind = "paused-game-clock" if mode == "enemy-uplink" else "inactive-holder"
+    gate_payload = (build_game_clock(running=False) if mode == "enemy-uplink" else
+                    build_uplink_info(local_team, local_entity_id, gate_state))
     gate_sent = server._send_packet_to_client(ctx, gate_payload, prefer_tcp=True)
     if not gate_sent:
         return "Error: failed to send observer special gate"
@@ -91,11 +102,13 @@ def spawn_definition(control, args: list[str]) -> str:
         "pos": list(pos),
         "owned_by_local_bit": False,
         "cargo_contained_type": 0 if entity_type == 19 else None,
+        "mode": mode,
         "gate": {
-            "sent": True,
+            "sent": bool(gate_sent),
+            "kind": gate_kind,
             "team_id": local_team,
             "holder_entity_id": local_entity_id,
-            "state": 5,
+            "state": gate_state,
         },
         "replication_targets": int(bool(created)),
     }
