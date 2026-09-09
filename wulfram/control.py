@@ -16,6 +16,7 @@ Commands:
   help                   - Show commands
   quit                   - Disconnect
 """
+from .observer_lifecycle import serialized, reject_active_debug
 
 import socket
 import struct
@@ -522,6 +523,10 @@ class ControlServer:
             return self._cmd_reset_pos(args)
         elif cmd == 'spawn_entity' or cmd == 'entity':
             return self._cmd_spawn_entity(args)
+        elif cmd == 'observer_special':
+            import importlib
+            from . import observer_special_fixture
+            return importlib.reload(observer_special_fixture).spawn_definition(self, args)
         elif cmd == 'health':
             return self._cmd_send_health(args)
         elif cmd == 'energy' or cmd == 'fuel':
@@ -630,6 +635,7 @@ class ControlServer:
   spawn_full [args]      - Force spawn sequence (see example)
   spawn_udp [args]       - Send UDP TANK (Wulf-Forge style)
   spawn_entity [type] [x y z] [vx vy vz] - Spawn entity (type 6=pulse, 5=flak)
+  observer_special <19|20> <x> <y> <z> <team> c<id> - Exact isolated observer fixture
   spawn_points [count] [team] - Send spawn point entities
   test_vel [speed] [dir] - Test projectile velocity (dir: x, z, xz, up, down, arc)
   shell [x y z] [yaw] [pitch] [speed] [duration] - Spawn shell with full control + updates
