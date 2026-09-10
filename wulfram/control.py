@@ -36,6 +36,7 @@ from .packets import (
     build_update_array_player_update, build_view_update_player_update,
     build_update_array_multi,
     build_update_array_create_tank, build_update_array_spawn_points,
+    build_update_array_teleport, build_update_array_reset_probe,
     build_behavior_packet, build_translation_packet,
     build_login_status, build_bps_response, build_game_clock,
     build_udp_tank_packet_wf,
@@ -258,6 +259,7 @@ class ControlServer:
                     return c, c.session.udp_addr
         return None, None
 
+    @serialized
     def _apply_exact_client_pose(
         self,
         ctx,
@@ -479,8 +481,15 @@ class ControlServer:
             return self._cmd_help()
         elif cmd == 'state':
             return self._cmd_state()
+        elif cmd == 'native':
+            import json
+            native = getattr(self.server, "native_physics", None)
+            return json.dumps(native.status() if native is not None else {"backend": "legacy"})
         elif cmd == 'packets':
             return self._cmd_packets()
+        elif cmd == 'observer_zero':
+            from .observer_zero_probe import send_observer_zero_probe
+            return send_observer_zero_probe(self, args)
         elif cmd == 'raw':
             return self._cmd_raw(args)
         elif cmd == 'send':
@@ -493,6 +502,9 @@ class ControlServer:
             return self._cmd_spawn_full(args)
         elif cmd == 'enter_game' or cmd == 'spawn_now':
             return self._cmd_enter_game(args)
+        elif cmd == 'spawn_fixture':
+            from .spawn_fixture import queue_placement
+            return queue_placement(self, args)
         elif cmd == 'join_team' or cmd == 'jt':
             return self._cmd_join_team(args)
         elif cmd == 'spawn_point' or cmd == 'sp':
@@ -521,6 +533,8 @@ class ControlServer:
             return self._cmd_attitude(args)
         elif cmd == 'reset_pos' or cmd == 'rp':
             return self._cmd_reset_pos(args)
+        elif cmd == 'resetprobe':
+            return self._cmd_resetprobe(args)
         elif cmd == 'spawn_entity' or cmd == 'entity':
             return self._cmd_spawn_entity(args)
         elif cmd == 'observer_special':
@@ -727,6 +741,7 @@ Examples:
         lines.append("  1F <code:1> <msg>               # REINCARNATE")
         return '\n'.join(lines)
 
+    @reject_active_debug
     def _cmd_raw(self, args: list) -> str:
         if not args:
             return "Usage: raw <hex>"
@@ -746,6 +761,7 @@ Examples:
         except Exception as e:
             return f"Send error: {e}"
 
+    @reject_active_debug
     def _cmd_send(self, args: list) -> str:
         if not args:
             return "Usage: send <type> [args...]"
@@ -770,6 +786,7 @@ Examples:
             import traceback
             return f"Build/send error: {e}\n{traceback.format_exc()}"
 
+    @reject_active_debug
     def _cmd_phase(self, args: list) -> str:
         if not args:
             return "Usage: phase <name> (HANDSHAKE, LOGIN, TEAM_SELECT, SPAWNING, IN_GAME)"
@@ -786,6 +803,7 @@ Examples:
         self.session.phase = new_phase  # Force it (bypass validation)
         return f"Phase: {old_phase.name} -> {new_phase.name}"
 
+    @reject_active_debug
     def _cmd_flag(self, args: list) -> str:
         if len(args) < 2:
             return "Usage: flag <name> <0|1>"
@@ -1765,6 +1783,7 @@ Examples:
         print(f"[CONTROL] behavior {param}: {old_value} -> {value}, re-sent ({len(data)} bytes)")
         return f"Set {param} = {value} (was {old_value}), re-sent BEHAVIOR ({len(data)} bytes)\n{desc}"
 
+    @reject_active_debug
     def _cmd_reload(self, args: list) -> str:
         """Hot-reload server modules without restarting.
 
@@ -1908,6 +1927,7 @@ Examples:
             print(f"[RELOAD] ERROR: {e}\n{tb}")
             return f"Reload failed: {e}"
 
+    @serialized
     def _cmd_players(self, args: list) -> str:
         """Show all connected players' positions and headings.
 
@@ -2175,6 +2195,22 @@ Examples:
                     "entity_id": ctx.session.entity_id if ctx.session else None,
                     "entity_type": getattr(ctx, "entity_type", None),
                     "phase": phase,
+                    "observer_worker_starts": ctx.observer_worker_starts,
+                    "observer_worker_generation": ctx.observer_worker_generation,
+                    "observer_steps": ctx.observer_steps,
+                    "observer_local_entries": ctx.observer_local_entries,
+                    "observer_pacing_resets": ctx.observer_pacing_resets,
+                    "local_epoch": ctx.session.local_epoch,
+                    "world_epoch": ctx.session.world_epoch,
+                    "physics_step_count": getattr(ctx, "physics_step_count", None),
+                    "observer_tick_offset": ctx.tick_offset,
+                    "clock_alignment_source": getattr(ctx, "tick_alignment_source", None),
+                    "transport_clock_bootstrap": getattr(ctx, "transport_clock_bootstrap", None),
+                    "observer_want_updates": ctx.session.want_updates_received,
+                    "observer_translation_ready": ctx.session.translation_ack_received,
+                    "observer_login_complete": ctx.session.login_complete,
+                    "observer_transition": ctx.observer_transition,
+                    "observer_worker_alive": bool(ctx.tick_thread and ctx.tick_thread.is_alive()),
                     "username": ctx.session.username if ctx.session else "",
                     "team_id": ctx.session.team_id if ctx.session else 0,
                     "client_addr": list(ctx.client_addr) if getattr(ctx, "client_addr", None) else None,
@@ -3040,6 +3076,7 @@ Examples:
             )
         return "\n".join(lines)
 
+    @reject_active_debug
     def _cmd_input(self, args: list) -> str:
         """Show raw input slot values for all connected clients."""
         if not self.server:
@@ -3079,6 +3116,7 @@ Examples:
         except Exception as e:
             return f"Error: {e}"
 
+    @reject_active_debug
     def _cmd_move(self, args: list) -> str:
         """Inject movement input for a client.
 
@@ -3164,6 +3202,7 @@ Examples:
         t.start()
         return f"Moving {direction} for {duration:.1f}s ({len(targets)} client(s))"
 
+    @reject_active_debug
     def _cmd_jump(self, args: list) -> str:
         """Pulse the opt-in server-side jumpjet input for a client.
 
@@ -3213,6 +3252,7 @@ Examples:
         status = "enabled" if enabled else "disabled"
         return f"Pulsed jumpjet for {duration:.2f}s ({len(targets)} client(s), server jump_jets={status})"
 
+    @serialized
     def _cmd_damage(self, args: list) -> str:
         """Apply damage to a player for testing.
 
@@ -3289,6 +3329,7 @@ Examples:
             f"Client {ctx.client_id}: {old_health*100:.0f}% -> {new_health*100:.0f}%"
         )
 
+    @serialized
     def _do_respawn(self, ctx, pos: tuple = None, offset_x: float = 0.0, team: int = None) -> str:
         """Core respawn logic for a single client. Returns status string.
 
@@ -3337,20 +3378,27 @@ Examples:
         # Send DELETE to all clients
         if ctx.tcp_handler:
             ctx.tcp_handler.send(delete_pkt)
-        for other in self.server._snapshot_in_game_clients():
+        for other in self.server._snapshot_world_delete_viewers():
             if other is ctx:
                 continue
             other.known_entity_ids.discard(entity_id)
+            getattr(other, "_entity_create_times", {}).pop(entity_id, None)
             if other.tcp_handler:
-                other.tcp_handler.send(delete_pkt)
+                other.tcp_handler.send(delete_pkt if other.session.in_game else build_delete_object(
+                    tick=self.server._get_network_tick(other),
+                    entity_ids=[entity_id],
+                    with_effects=True,
+                ))
 
         # Stop tick loop (entity no longer exists on client)
+        ctx.session.local_epoch += 1
         ctx.session.in_game = False
 
         # Clear dead player's own known entities so respawn re-creates all
-        ctx.known_entity_ids.clear()
+        ctx.known_entity_ids.discard(entity_id)
+        getattr(ctx, "_entity_create_times", {}).pop(entity_id, None)
         if hasattr(ctx, '_entity_create_times'):
-            ctx._entity_create_times.clear()
+            ctx._entity_create_times.pop(entity_id, None)
 
         # Store pending respawn pos for _auto_join_team to use
         if spawn_pos:
@@ -3363,6 +3411,7 @@ Examples:
         print(f"[RESPAWN] Scheduled respawn for c{ctx.client_id} in {respawn_delay:.0f}s")
         return f"spawn={pos_str} -- respawning in {respawn_delay:.0f}s"
 
+    @serialized
     def _despawn_client(self, ctx) -> str:
         """Despawn a single client's tank and return them to TEAM_SELECT.
 
@@ -3392,14 +3441,20 @@ Examples:
         )
         if ctx.tcp_handler:
             ctx.tcp_handler.send(delete_pkt)
-        for other in self.server._snapshot_in_game_clients():
+        for other in self.server._snapshot_world_delete_viewers():
             if other is ctx:
                 continue
             other.known_entity_ids.discard(entity_id)
+            getattr(other, "_entity_create_times", {}).pop(entity_id, None)
             if other.tcp_handler:
-                other.tcp_handler.send(delete_pkt)
+                other.tcp_handler.send(delete_pkt if other.session.in_game else build_delete_object(
+                    tick=self.server._get_network_tick(other),
+                    entity_ids=[entity_id],
+                    with_effects=True,
+                ))
 
         # Reset session state — no delayed respawn
+        ctx.session.local_epoch += 1
         ctx.session.in_game = False
         ctx.session.phase = Phase.TEAM_SELECT
         ctx.session.entity_id = 0
@@ -3488,6 +3543,7 @@ Examples:
                     if other is ctx:
                         continue
                     other.known_entity_ids.discard(entity_id)
+                    getattr(other, "_entity_create_times", {}).pop(entity_id, None)
                     if other.tcp_handler:
                         try:
                             other.tcp_handler.send(delete_pkt)
@@ -3573,6 +3629,7 @@ Examples:
             return "No clients with weapon_system"
         return "Client frame dt:\n" + "\n".join(lines)
 
+    @reject_active_debug
     def _cmd_terrain(self, args: list) -> str:
         """Show terrain info at player positions or arbitrary coordinates.
 
@@ -3671,6 +3728,7 @@ Examples:
                     continue
                 eid = override_eid or (other.session.entity_id or other.entity_id)
                 ctx.known_entity_ids.discard(eid)
+                getattr(ctx, "_entity_create_times", {}).pop(eid, None)
 
                 # Build packet
                 pos = self.server._to_client_pos(other.player_pos)
@@ -3785,6 +3843,7 @@ Examples:
         team_name = {1: "Red", 2: "Blue"}.get(team, str(team)) if team else "same"
         return f"Respawned client {ctx.client_id} (team={team_name}) at {result}"
 
+    @reject_active_debug
     def _cmd_enter_game(self, args: list) -> str:
         """Force a connected client into game through the normal TankPacket spawn path.
 
@@ -3968,6 +4027,7 @@ Examples:
             f"pos=({pos[0]:.1f},{pos[1]:.1f},{pos[2]:.1f})"
         )
 
+    @reject_active_debug
     def _cmd_spawn_full(self, args: list) -> str:
         """
         Force a full spawn sequence for the current client.
@@ -4354,6 +4414,7 @@ Examples:
         return (f"Spawned moving projectile id={proj.entity_id} "
                 f"duration={duration}s rate={update_rate}Hz")
 
+    @reject_active_debug
     def _cmd_shell(self, args: list) -> str:
         """
         Spawn a pulse shell with full control over position and direction.
@@ -4571,6 +4632,7 @@ Examples:
 
         return f"Fired {count} shells in spread pattern from ({x:.0f},{y:.0f},{z:.0f}): {', '.join(results)}"
 
+    @reject_active_debug
     def _cmd_attitude(self, args: list) -> str:
         """Dump the live body-attitude derivation (CH2 slope pitch-flip diagnosis).
 
@@ -4611,6 +4673,7 @@ Examples:
             lines.append("(no debug_last_spring_state — attitude not sampled this tick)")
         return "\n".join(lines)
 
+    @reject_active_debug
     def _cmd_reset_pos(self, args: list) -> str:
         """Reset player position to spawn location."""
         if not self.server:
@@ -4625,6 +4688,86 @@ Examples:
         self.server.player_speed = 0.0
         return "Reset player pos to (100, 15, 100) yaw=0"
 
+    def _cmd_resetprobe(self, args: list) -> str:
+        """Send one UPDATE_ARRAY that drives the client's direct/reset branch.
+
+        usage: resetprobe [c<id>]         -- shape A, bit 9 alone, CRASH-FREE
+               resetprobe hard [c<id>]    -- shape B, bits 1+3+9, CAN CRASH
+
+        This is a capture instrument for the S1 ingress-ownership journal, whose
+        requirement 2 could not be closed because the reset branch at 0047d3e9
+        had never executed -- nothing in this server had ever set mask bit 9.
+
+        Shape A sets bit 9 with no vectors. It reaches 0047d3e9 but provably NOT
+        Entity_reset_physics, whose call at 0047d6c2 requires record+0x50 and
+        record+0x52 -- the presence fields that bits 1 and 3 set. Safe.
+
+        Shape B sets bits 1+3+9 and is the documented client-crash path: the
+        reset routes into an attitude slerp with an unclamped acos(dot), giving
+        NaN on a sub-epsilon delta, ~1 in 2 on a native ~60fps host and ~never on
+        a ~12fps WARP VM. It requires the literal word 'hard' so it cannot be
+        reached by accident. Run shape A first, always.
+        """
+        if not self.server:
+            return "Error: No server reference"
+
+        hard = False
+        target_client_id = None
+        for a in args:
+            low = str(a).lower()
+            if low == 'hard':
+                hard = True
+            elif low.startswith('c') and low[1:].isdigit():
+                target_client_id = int(low[1:])
+
+        ctx = None
+        addr = None
+        with self.server.clients_lock:
+            for c in self.server.clients.values():
+                if c.session and c.session.udp_addr:
+                    if target_client_id is not None and c.client_id != target_client_id:
+                        continue
+                    ctx = c
+                    addr = c.session.udp_addr
+                    break
+
+        if not ctx:
+            suffix = f" c{target_client_id}" if target_client_id is not None else ""
+            return f"Error: No connected client{suffix} with a UDP address"
+
+        entity_id = ctx.session.entity_id or ctx.entity_id
+        if not entity_id:
+            return "Error: client has no entity id yet (spawn it first)"
+
+        if not self.server.udp_handler:
+            return "Error: No UDP handler"
+
+        tick = self.server._get_network_tick(ctx)
+
+        if hard:
+            pose = getattr(self.server, "player_pose", {}) or {}
+            pos = tuple(pose.get("pos") or getattr(self.server, "player_pos", (0.0, 0.0, 0.0)))
+            rot = (0.0, float(getattr(self.server, "player_yaw", 0.0)), 0.0)
+            payload = build_update_array_teleport(
+                tick, entity_id, pos=pos, rot=rot, hard_snap=True,
+            )
+            shape = "B hard_snap bits=1+3+9"
+        else:
+            payload = build_update_array_reset_probe(tick, entity_id)
+            shape = "A probe bit=9"
+
+        self.server.udp_handler.send_to(payload, addr)
+        print(
+            f"[CONTROL-RESETPROBE] shape={shape} client={ctx.client_id} "
+            f"entity={entity_id} tick={tick} bytes={len(payload)}"
+        )
+        warn = "  *** shape B can crash the client; VM only ***" if hard else ""
+        return (
+            f"Sent reset {shape} to client {ctx.client_id} entity {entity_id} "
+            f"({len(payload)} bytes, tick {tick}){warn}"
+        )
+
+    @reject_active_debug
     def _cmd_attr(self, args: list) -> str:
         """Read or set a scalar config attribute on the live server (A/B knobs).
 
@@ -4715,6 +4858,7 @@ Examples:
         }
         return _json.dumps(payload, separators=(",", ":"))
 
+    @reject_active_debug
     def _cmd_player_pos(self, args: list) -> str:
         """
         Show or set player position.
@@ -4849,6 +4993,7 @@ Examples:
                 import traceback
                 return f"Error reading pos: {e}\n{traceback.format_exc()}"
 
+    @reject_active_debug
     def _cmd_test_velocity(self, args: list) -> str:
         """
         Test different projectile velocities to see what client accepts.
@@ -5084,6 +5229,7 @@ Examples:
         return (f"Sent projectile spawn to {self.session.udp_addr}: "
                 f"id={proj.entity_id} pos=({x:.1f},{y:.1f},{z:.1f}) vel=({vx:.1f},{vy:.1f},{vz:.1f})")
 
+    @reject_active_debug
     def _cmd_send_health(self, args: list) -> str:
         """
         Show or set player health.
@@ -5319,6 +5465,7 @@ Examples:
         return (f"Spawned {type_name} (type={entity_type}) id={self._entity_id} "
                 f"pos=({x:.1f},{y:.1f},{z:.1f})")
 
+    @reject_active_debug
     def _cmd_spawn_udp(self, args: list) -> str:
         """
         Send a UDP TANK packet using the Wulf-Forge bit layout.
