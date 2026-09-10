@@ -23,7 +23,11 @@ from wulfram.handlers import (
     _send_spawn_points_for_client,
 )
 from wulfram.client import ClientContext
-from wulfram2_protocol.hud_state import HUD_FRACTION_BITS
+from wulfram2_protocol.hud_state import (
+    HUD_FRACTION_BITS,
+    HUD_FRACTION_MAX,
+    HUD_FRACTION_RANGE,
+)
 from wulfram.control import ControlServer, build_input_sync_diagnosis, build_player_terrain_probe
 from wulfram.session import Session, Phase, FEATURES
 from wulfram.server import WulframServer, _StaticWorldRayNode
@@ -143,6 +147,62 @@ def test_decode_lp_string_empty():
     assert offset == 3
     print("test_decode_lp_string_empty: PASSED")
     return True
+
+
+def _make_world_viewer(server, *contexts, in_game=True, phase=None):
+    """Make `contexts` satisfy `WulframServer._world_viewer_ready` on a server
+    built with `__new__` (no `__init__`).
+
+    The 2026-09 observer refactor replaced the lone
+    `session.translation_ack_received` check that used to gate replication with
+    a full viewer-readiness contract: the server must be running, the client
+    running and not mid observer-transition, the session past
+    login/want-updates/TRANSLATION, in a world-bearing phase, with a known
+    client tick domain, and still registered in `server.clients`. A fixture
+    that sets only `translation_ack_received` now describes a client that is
+    not a viewer at all, so every gated stream short-circuits before the
+    behaviour under test can run.
+    """
+    server.running = True
+    if not hasattr(server, "use_client_ticks"):
+        server.use_client_ticks = False
+    if not hasattr(server, "clients_lock"):
+        server.clients_lock = threading.Lock()
+    if not hasattr(server, "clients"):
+        server.clients = {}
+    for ctx in contexts:
+        ctx.running = True
+        ctx.observer_transition = False
+        ctx.tick_offset = 0
+        session = ctx.session
+        session.login_complete = True
+        session.want_updates_received = True
+        session.translation_ack_received = True
+        session.in_game = in_game
+        if phase is not None:
+            session.phase = phase
+        else:
+            session.phase = Phase.IN_GAME if in_game else Phase.TEAM_SELECT
+        server.clients[ctx.client_id] = ctx
+    return server
+
+
+def _bind_control_server(control, server):
+    """Attach a (possibly partial) server stub to a ControlServer under test.
+
+    `observer_lifecycle.reject_active_debug` guards every raw lifecycle/debug
+    control by snapshotting the server's clients and refusing while an observer
+    worker thread is alive, so a stub server has to expose `_snapshot_clients`
+    or the guard raises before the command under test ever runs. Deriving the
+    snapshot from `server.clients` keeps the guard honest (a stub client with a
+    live tick_thread still trips it) instead of stubbing the guard away.
+    """
+    control.server = server
+    if not hasattr(server, "clients"):
+        server.clients = {}
+    if not hasattr(server, "_snapshot_clients"):
+        server._snapshot_clients = lambda: list(server.clients.values())
+    return server
 
 
 def test_decode_lp_string_truncated():
@@ -604,7 +664,7 @@ def test_control_pose_reset_updates_ground_override():
         up_axis="z",
         _get_network_tick=lambda ctx: 123,
     )
-    control.server = server
+    _bind_control_server(control, server)
     ctx = ClientContext(
         client_id=1,
         client_addr=("127.0.0.1", 50000),
@@ -653,7 +713,7 @@ def test_enter_game_can_target_team_select_tcp_only_client():
         _spawn_wf_style=spawn_wf_style,
     )
     control = ControlServer.__new__(ControlServer)
-    control.server = server
+    _bind_control_server(control, server)
     control._sync_to_active_client = lambda: None
 
     output = control._cmd_enter_game(["c5", "t2"])
@@ -683,7 +743,7 @@ def test_control_spawn_commands_refuse_login_phase():
     ctx.tcp_handler = SimpleNamespace()
 
     control = ControlServer.__new__(ControlServer)
-    control.server = SimpleNamespace()
+    _bind_control_server(control, SimpleNamespace())
     control.ctx = ctx
     control.session = session
     control.tcp_handler = ctx.tcp_handler
@@ -1227,10 +1287,22 @@ def test_send_initial_game_data_og_bootstrap_order():
         send_initial_game_data(server, ctx)
 
         opcodes = [payload[0] for payload in ctx.tcp_handler.sent]
-        assert opcodes == [0x28, 0x22, 0x17], opcodes
+        # TEAM_INFO(0x28), LOGIN_STATUS(0x22), BEHAVIOR(0x24), PLAYER(0x17).
+        # BEHAVIOR joined the team-select-safe set in 11f7b90: the original
+        # client's post-team-select WORLD_STATS cleanup derives the
+        # construction deadline from BEHAVIOR, and without it that deadline
+        # sticks at the 60-second fallback. It stays gated on the feature flag,
+        # and the packets that DO bounce a team-selecting OG client
+        # (GAME_CLOCK, roster, TRANSLATION, WORLD_STATS) are still withheld --
+        # see the assertions below.
+        expected = [0x28, 0x22]
+        if FEATURES.send_behavior_packet:
+            expected.append(0x24)
+        expected.append(0x17)
+        assert opcodes == expected, opcodes
         assert session.player_id == 1337
         assert ctx.tcp_handler.sent[-1][-1] == 0x01  # spectator
-        assert session.behavior_sent is False
+        assert session.behavior_sent is FEATURES.send_behavior_packet
         assert session.translation_sent is False
         assert session.roster_sent is False
         assert session.world_stats_sent is False
@@ -1369,7 +1441,7 @@ def test_player_chat_respawn_despawns_and_clears_cached_spawn():
     server._snapshot_clients = lambda: []  # normal chat now relays via 0x1F; no peers here
 
     control = ControlServer.__new__(ControlServer)
-    control.server = server
+    _bind_control_server(control, server)
     server.control_server = control
 
     sent = []
@@ -1465,11 +1537,16 @@ def test_player_chat_respawn_via_tcp_comm_handler():
     server._build_uplink_command_events = []
 
     control = ControlServer.__new__(ControlServer)
-    control.server = server
+    _bind_control_server(control, server)
     server.control_server = control
 
     sent = []
     ctx = _make_spawned_chat_ctx(sent, wonked_pos)
+    # ControlServer._despawn_client now broadcasts DELETE_OBJECT to
+    # _snapshot_world_delete_viewers() (which reads server.clients under
+    # clients_lock) instead of _snapshot_in_game_clients(), so the fake server
+    # needs a real client registry rather than only the stubbed snapshot above.
+    _make_world_viewer(server, ctx)
 
     # TCP COMM_MESSAGE_REQUEST body: message_type(u16) + flags(u16) + lp_string.
     # Use message_type=4 (ALL) to prove it is NOT gated to team(2) like uplink.
@@ -1501,7 +1578,7 @@ def test_build_update_array_remote_heartbeat_shape():
         ammo_count_bits=9,
         ammo_count=0,
         primary_turret_bits=HUD_FRACTION_BITS,
-        primary_turret_angle=1.234,
+        primary_turret_angle=0.5,
         include_entities=True,
         use_local_entity_when_no_transform=True,
     )
@@ -1513,6 +1590,11 @@ def test_build_update_array_remote_heartbeat_shape():
     assert tick == 0x12345678
     assert local_state is not None
     assert local_state.weapon_id == 0
+    # q13 is an 8-bit 0..1 HUD fraction (TRANSLATION entry 13), not a 16-bit
+    # angle. If either side used the legacy 16-bit width the entity count that
+    # follows would be read from the wrong bit offset and this decode would
+    # yield zero entities.
+    assert abs(local_state.primary_turret - 0.5) <= 1.0 / (1 << HUD_FRACTION_BITS), local_state
     assert len(entities) == 1
     assert entities[0].entity_id == 0x14EA
     print("test_build_update_array_remote_heartbeat_shape: PASSED")
@@ -1536,8 +1618,8 @@ def test_server_remote_heartbeat_helper_keeps_full_local_state():
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
     server.local_state_turret_bits = HUD_FRACTION_BITS
-    server.local_state_turret_max = 6.3
-    server.local_state_turret_range = 12.6
+    server.local_state_turret_max = HUD_FRACTION_MAX
+    server.local_state_turret_range = HUD_FRACTION_RANGE
     server.heartbeat_view_update = False
     server.heartbeat_include_rot = True
     server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
@@ -1578,8 +1660,16 @@ def test_server_remote_heartbeat_helper_keeps_full_local_state():
     # Promoted/full form uses the HUD weapon type (local_state_weapon_type=0),
     # not the spawn-safe short-form weapon (spawn_tank_weapon_type=2).
     assert local_state.weapon_id == 0
-    # Full form carries the live turret aim (short form zeroes it).
-    assert abs(local_state.primary_turret - 1.234) < 0.01, local_state
+    # q13/q14 are no longer turret aim angles: the shared schema
+    # (wulfram2_protocol/hud_state.py) declares them as 8-bit 0..1 HUD
+    # fractions (slot-4 pulse charge / slot-1 repair). The server has no
+    # grounded charge model, so the full form publishes the field at its
+    # declared width carrying the "unavailable" value 0.0 -- in particular it
+    # must NOT leak ctx.player_aim_yaw (1.234, set above) onto the wire.
+    # (the declared 8-bit width itself is covered by
+    # test_build_update_array_remote_heartbeat_shape and
+    # test_server_remote_local_state_kwargs_use_full_tank_shape)
+    assert local_state.primary_turret == 0.0, local_state
     # GOAL 7: no transform requested -> no entity record (stomp-entity dropped).
     assert len(entities) == 0, entities
     print("test_server_remote_heartbeat_helper_keeps_full_local_state: PASSED")
@@ -1597,8 +1687,8 @@ def test_server_remote_heartbeat_helper_pre_state_request_is_spawn_safe():
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
     server.local_state_turret_bits = HUD_FRACTION_BITS
-    server.local_state_turret_max = 6.3
-    server.local_state_turret_range = 12.6
+    server.local_state_turret_max = HUD_FRACTION_MAX
+    server.local_state_turret_range = HUD_FRACTION_RANGE
     server.heartbeat_view_update = False
     server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
     server.up_axis = "z"
@@ -1651,8 +1741,8 @@ def test_remote_state_sync_reply_uses_safe_local_player_shape_when_ready():
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
     server.local_state_turret_bits = HUD_FRACTION_BITS
-    server.local_state_turret_max = 6.3
-    server.local_state_turret_range = 12.6
+    server.local_state_turret_max = HUD_FRACTION_MAX
+    server.local_state_turret_range = HUD_FRACTION_RANGE
     server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
     server._get_health_value = lambda ctx: 1.0
     server._get_energy_value = lambda ctx: 1.0
@@ -1723,8 +1813,8 @@ def test_remote_state_sync_reply_stays_spawn_safe_immediately_after_spawn():
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
     server.local_state_turret_bits = HUD_FRACTION_BITS
-    server.local_state_turret_max = 6.3
-    server.local_state_turret_range = 12.6
+    server.local_state_turret_max = HUD_FRACTION_MAX
+    server.local_state_turret_range = HUD_FRACTION_RANGE
     server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
     server._get_health_value = lambda ctx: 1.0
     server._get_energy_value = lambda ctx: 1.0
@@ -1796,8 +1886,8 @@ def test_remote_state_sync_reply_stays_spawn_safe_after_spawn_delay():
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
     server.local_state_turret_bits = HUD_FRACTION_BITS
-    server.local_state_turret_max = 6.3
-    server.local_state_turret_range = 12.6
+    server.local_state_turret_max = HUD_FRACTION_MAX
+    server.local_state_turret_range = HUD_FRACTION_RANGE
     server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
     server._get_health_value = lambda ctx: 1.0
     server._get_energy_value = lambda ctx: 1.0
@@ -1880,8 +1970,8 @@ def test_remote_state_sync_reply_stays_safe_without_post_spawn_input_after_delay
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
     server.local_state_turret_bits = HUD_FRACTION_BITS
-    server.local_state_turret_max = 6.3
-    server.local_state_turret_range = 12.6
+    server.local_state_turret_max = HUD_FRACTION_MAX
+    server.local_state_turret_range = HUD_FRACTION_RANGE
     server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
     server._get_health_value = lambda ctx: 1.0
     server._get_energy_value = lambda ctx: 1.0
@@ -1956,8 +2046,8 @@ def test_remote_state_sync_reply_emits_view_update_with_fresh_remote_timestamp()
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
     server.local_state_turret_bits = HUD_FRACTION_BITS
-    server.local_state_turret_max = 6.3
-    server.local_state_turret_range = 12.6
+    server.local_state_turret_max = HUD_FRACTION_MAX
+    server.local_state_turret_range = HUD_FRACTION_RANGE
     server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
     server._get_health_value = lambda ctx: 1.0
     server._get_energy_value = lambda ctx: 1.0
@@ -2060,8 +2150,8 @@ def test_loopback_state_sync_reply_keeps_request_timestamp():
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
     server.local_state_turret_bits = HUD_FRACTION_BITS
-    server.local_state_turret_max = 6.3
-    server.local_state_turret_range = 12.6
+    server.local_state_turret_max = HUD_FRACTION_MAX
+    server.local_state_turret_range = HUD_FRACTION_RANGE
     server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
     server._get_health_value = lambda ctx: 1.0
     server._get_energy_value = lambda ctx: 1.0
@@ -2323,8 +2413,8 @@ def test_state_request_active_movement_skips_view_update_correction():
     server.active_input_correction_suppress_window = 0.35
     server.remote_full_local_state_delay = 2.0
     server.spawn_tank_weapon_type = 2
-    server.local_state_turret_max = 6.3
-    server.local_state_turret_range = 12.6
+    server.local_state_turret_max = HUD_FRACTION_MAX
+    server.local_state_turret_range = HUD_FRACTION_RANGE
     server._get_health_value = lambda ctx: 1.0
     server._get_energy_value = lambda ctx: 1.0
     server._to_client_pos = lambda pos: pos
@@ -2400,8 +2490,8 @@ def test_remote_empirical_view_update_correction_uses_fresh_remote_timestamp():
     """Explicit OG correction bursts should use a fresh remote replay wrapper."""
     server = WulframServer.__new__(WulframServer)
     server.correction_mode = "view_update"
-    server.local_state_turret_max = 6.3
-    server.local_state_turret_range = 12.6
+    server.local_state_turret_max = HUD_FRACTION_MAX
+    server.local_state_turret_range = HUD_FRACTION_RANGE
     server.spawn_tank_weapon_type = 2
     server._get_health_value = lambda ctx: 1.0
     server._get_energy_value = lambda ctx: 1.0
@@ -2472,8 +2562,8 @@ def test_correction_rot_only_drops_position():
     server = WulframServer.__new__(WulframServer)
     server.correction_mode = "view_update"
     server.correction_rot_only = True
-    server.local_state_turret_max = 6.3
-    server.local_state_turret_range = 12.6
+    server.local_state_turret_max = HUD_FRACTION_MAX
+    server.local_state_turret_range = HUD_FRACTION_RANGE
     server.spawn_tank_weapon_type = 2
     server._get_health_value = lambda ctx: 1.0
     server._get_energy_value = lambda ctx: 1.0
@@ -2566,8 +2656,8 @@ def test_remote_empirical_view_update_define_correction_uses_definition_shape():
     """The experimental OG correction mode should set definition, pos, and rot under VIEW_UPDATE."""
     server = WulframServer.__new__(WulframServer)
     server.correction_mode = "view_update_define"
-    server.local_state_turret_max = 6.3
-    server.local_state_turret_range = 12.6
+    server.local_state_turret_max = HUD_FRACTION_MAX
+    server.local_state_turret_range = HUD_FRACTION_RANGE
     server.spawn_tank_weapon_type = 2
     server._get_health_value = lambda ctx: 1.0
     server._get_energy_value = lambda ctx: 1.0
@@ -2649,8 +2739,8 @@ def test_remote_state_sync_defaults_to_live_snapshot_for_remote_og():
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
     server.local_state_turret_bits = HUD_FRACTION_BITS
-    server.local_state_turret_max = 6.3
-    server.local_state_turret_range = 12.6
+    server.local_state_turret_max = HUD_FRACTION_MAX
+    server.local_state_turret_range = HUD_FRACTION_RANGE
     server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
     server._get_health_value = lambda ctx: 1.0
     server._get_energy_value = lambda ctx: 1.0
@@ -2733,8 +2823,8 @@ def test_remote_state_sync_reply_uses_request_aligned_authoritative_pose():
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
     server.local_state_turret_bits = HUD_FRACTION_BITS
-    server.local_state_turret_max = 6.3
-    server.local_state_turret_range = 12.6
+    server.local_state_turret_max = HUD_FRACTION_MAX
+    server.local_state_turret_range = HUD_FRACTION_RANGE
     server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
     server._get_health_value = lambda ctx: 1.0
     server._get_energy_value = lambda ctx: 1.0
@@ -2827,8 +2917,8 @@ def test_remote_state_sync_reply_remaps_client_tick_to_server_history():
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
     server.local_state_turret_bits = HUD_FRACTION_BITS
-    server.local_state_turret_max = 6.3
-    server.local_state_turret_range = 12.6
+    server.local_state_turret_max = HUD_FRACTION_MAX
+    server.local_state_turret_range = HUD_FRACTION_RANGE
     server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
     server.use_client_ticks = False
     server._get_health_value = lambda ctx: 1.0
@@ -2965,8 +3055,8 @@ def test_remote_promoted_heartbeat_stays_short_form_safe():
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
     server.local_state_turret_bits = HUD_FRACTION_BITS
-    server.local_state_turret_max = 6.3
-    server.local_state_turret_range = 12.6
+    server.local_state_turret_max = HUD_FRACTION_MAX
+    server.local_state_turret_range = HUD_FRACTION_RANGE
     server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
     server.update_entity_vitals = False
     server.heartbeat_view_update = False
@@ -3051,8 +3141,8 @@ def test_remote_state_sync_reply_keeps_full_motion_when_stable():
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
     server.local_state_turret_bits = HUD_FRACTION_BITS
-    server.local_state_turret_max = 6.3
-    server.local_state_turret_range = 12.6
+    server.local_state_turret_max = HUD_FRACTION_MAX
+    server.local_state_turret_range = HUD_FRACTION_RANGE
     server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
     server.update_epsilon = 0.001
     server._get_health_value = lambda ctx: 1.0
@@ -3285,8 +3375,8 @@ def test_player_body_rotation_preserves_pitch_for_remote_entities():
 def test_remote_sync_heartbeat_helper_uses_heading_not_player_yaw():
     """Promoted remote heartbeat packets should decode with body heading."""
     server = WulframServer.__new__(WulframServer)
-    server.local_state_turret_max = 6.3
-    server.local_state_turret_range = 12.6
+    server.local_state_turret_max = HUD_FRACTION_MAX
+    server.local_state_turret_range = HUD_FRACTION_RANGE
     server._to_client_pos = lambda pos: pos
     server._get_spawn_tank_weapon_type = lambda ctx: 2
 
@@ -3342,8 +3432,8 @@ def test_remote_sync_heartbeat_helper_uses_heading_not_player_yaw():
 def test_remote_spawn_bootstrap_heartbeat_uses_safe_full_transform_shape():
     """Fresh remote OG spawn bootstrap should get a complete transform heartbeat."""
     server = WulframServer.__new__(WulframServer)
-    server.local_state_turret_max = 6.3
-    server.local_state_turret_range = 12.6
+    server.local_state_turret_max = HUD_FRACTION_MAX
+    server.local_state_turret_range = HUD_FRACTION_RANGE
     server._to_client_pos = lambda pos: pos
     server._get_spawn_tank_weapon_type = lambda ctx: 2
 
@@ -3486,8 +3576,8 @@ def test_jump_velocity_update_packet_uses_spawn_safe_local_state_for_remote_og()
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
     server.local_state_turret_bits = HUD_FRACTION_BITS
-    server.local_state_turret_max = 6.3
-    server.local_state_turret_range = 12.6
+    server.local_state_turret_max = HUD_FRACTION_MAX
+    server.local_state_turret_range = HUD_FRACTION_RANGE
     server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
     server._get_health_value = lambda ctx: 1.0
     server._get_energy_value = lambda ctx: 0.9
@@ -3541,8 +3631,8 @@ def test_server_remote_local_state_kwargs_use_full_tank_shape():
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
     server.local_state_turret_bits = HUD_FRACTION_BITS
-    server.local_state_turret_max = 6.3
-    server.local_state_turret_range = 12.6
+    server.local_state_turret_max = HUD_FRACTION_MAX
+    server.local_state_turret_range = HUD_FRACTION_RANGE
     server.behavior_weapon_caps = [(0, 0, 9, 0)]
     server._get_health_value = lambda ctx: 1.0
     server._get_energy_value = lambda ctx: 1.0
@@ -3563,7 +3653,7 @@ def test_server_remote_local_state_kwargs_use_full_tank_shape():
     assert kwargs["weapon_id"] == 0
     assert kwargs["ammo_count_bits"] == 9
     assert kwargs["ammo_count"] == 0
-    assert kwargs["primary_turret_bits"] == 16
+    assert kwargs["primary_turret_bits"] == HUD_FRACTION_BITS
     assert kwargs["secondary_turret_bits"] == 0
     print("test_server_remote_local_state_kwargs_use_full_tank_shape: PASSED")
     return True
@@ -3580,8 +3670,8 @@ def test_server_remote_projectile_spawn_uses_viewer_local_state():
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
     server.local_state_turret_bits = HUD_FRACTION_BITS
-    server.local_state_turret_max = 6.3
-    server.local_state_turret_range = 12.6
+    server.local_state_turret_max = HUD_FRACTION_MAX
+    server.local_state_turret_range = HUD_FRACTION_RANGE
     server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
     server.debug_health_value = 1.0
     server.debug_health_pattern = False
@@ -3589,6 +3679,10 @@ def test_server_remote_projectile_spawn_uses_viewer_local_state():
 
     session = Session()
     session.translation_ack_received = True
+    # The local-state prefix describes the VIEWER's own tank, so it is only
+    # emitted for a viewer that actually has one (in_game); a TEAM_SELECT
+    # observer takes the entity-only path.
+    session.in_game = True
     ctx = ClientContext(
         client_id=1,
         client_addr=("10.10.10.2", 50000),
@@ -3644,8 +3738,8 @@ def test_server_remote_entity_packets_use_safe_local_state_after_promotion():
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
     server.local_state_turret_bits = HUD_FRACTION_BITS
-    server.local_state_turret_max = 6.3
-    server.local_state_turret_range = 12.6
+    server.local_state_turret_max = HUD_FRACTION_MAX
+    server.local_state_turret_range = HUD_FRACTION_RANGE
     server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
     server.debug_health_value = 1.0
     server.debug_health_pattern = False
@@ -3653,6 +3747,10 @@ def test_server_remote_entity_packets_use_safe_local_state_after_promotion():
 
     session = Session()
     session.translation_ack_received = True
+    # The local-state prefix describes the VIEWER's own tank, so it is only
+    # emitted for a viewer that actually has one (in_game); a TEAM_SELECT
+    # observer takes the entity-only path.
+    session.in_game = True
     ctx = ClientContext(
         client_id=1,
         client_addr=("10.10.10.2", 50000),
@@ -3683,8 +3781,8 @@ def test_server_remote_projectile_update_uses_safe_local_state_after_promotion()
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
     server.local_state_turret_bits = HUD_FRACTION_BITS
-    server.local_state_turret_max = 6.3
-    server.local_state_turret_range = 12.6
+    server.local_state_turret_max = HUD_FRACTION_MAX
+    server.local_state_turret_range = HUD_FRACTION_RANGE
     server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
     server.debug_health_value = 1.0
     server.debug_health_pattern = False
@@ -3692,6 +3790,10 @@ def test_server_remote_projectile_update_uses_safe_local_state_after_promotion()
 
     session = Session()
     session.translation_ack_received = True
+    # The local-state prefix describes the VIEWER's own tank, so it is only
+    # emitted for a viewer that actually has one (in_game); a TEAM_SELECT
+    # observer takes the entity-only path.
+    session.in_game = True
     ctx = ClientContext(
         client_id=1,
         client_addr=("10.10.10.2", 50000),
@@ -3785,8 +3887,8 @@ def test_loopback_projectile_update_stays_entity_only():
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
     server.local_state_turret_bits = HUD_FRACTION_BITS
-    server.local_state_turret_max = 6.3
-    server.local_state_turret_range = 12.6
+    server.local_state_turret_max = HUD_FRACTION_MAX
+    server.local_state_turret_range = HUD_FRACTION_RANGE
     server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
     server.debug_health_value = 1.0
     server.debug_health_pattern = False
@@ -3794,6 +3896,10 @@ def test_loopback_projectile_update_stays_entity_only():
 
     session = Session()
     session.translation_ack_received = True
+    # The local-state prefix describes the VIEWER's own tank, so it is only
+    # emitted for a viewer that actually has one (in_game); a TEAM_SELECT
+    # observer takes the entity-only path.
+    session.in_game = True
     ctx = ClientContext(
         client_id=2,
         client_addr=("127.0.0.1", 50001),
@@ -3844,8 +3950,8 @@ def test_server_remote_player_info_uses_spawn_safe_local_state():
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
     server.local_state_turret_bits = HUD_FRACTION_BITS
-    server.local_state_turret_max = 6.3
-    server.local_state_turret_range = 12.6
+    server.local_state_turret_max = HUD_FRACTION_MAX
+    server.local_state_turret_range = HUD_FRACTION_RANGE
     server.behavior_weapon_caps = [(0, 0, 9, 0), (0, 0, 0, 0), (0, 0, 0, 0), (0, 0, 0, 0)]
 
     session = Session()
@@ -3885,8 +3991,8 @@ def test_remote_player_info_packet_short_local_state_layout():
         ammo_count=0,
         primary_turret_bits=0,
         secondary_turret_bits=0,
-        turret_max=6.3,
-        turret_range=12.6,
+        turret_max=HUD_FRACTION_MAX,
+        turret_range=HUD_FRACTION_RANGE,
     )
 
     assert payload[0] == 0x18
@@ -4488,8 +4594,8 @@ def test_send_entity_create_uses_udp_only():
     server.remote_yaw_offset = 0.0
     server.update_local_state_mode = "wf"
     server.spawn_tank_weapon_type = 2
-    server.local_state_turret_max = 6.3
-    server.local_state_turret_range = 12.6
+    server.local_state_turret_max = HUD_FRACTION_MAX
+    server.local_state_turret_range = HUD_FRACTION_RANGE
     server._get_health_value = lambda ctx: 1.0
     server._get_energy_value = lambda ctx: 1.0
     server._to_client_pos = lambda pos: pos
@@ -4524,6 +4630,7 @@ def test_send_entity_create_uses_udp_only():
     player_ctx.player_pose = {"roll": 0.0}
     player_ctx.player_heading = 0.0
     player_ctx.entity_type = 0
+    _make_world_viewer(server, target_ctx, player_ctx)
 
     server._send_entity_create(target_ctx, player_ctx)
 
@@ -4565,8 +4672,8 @@ def test_send_entity_create_serializes_initial_definition_race():
     server.remote_yaw_offset = 0.0
     server.update_local_state_mode = "wf"
     server.spawn_tank_weapon_type = 2
-    server.local_state_turret_max = 6.3
-    server.local_state_turret_range = 12.6
+    server.local_state_turret_max = HUD_FRACTION_MAX
+    server.local_state_turret_range = HUD_FRACTION_RANGE
     server._get_health_value = lambda ctx: 1.0
     server._get_energy_value = lambda ctx: 1.0
     server._to_client_pos = lambda pos: pos
@@ -4600,6 +4707,7 @@ def test_send_entity_create_serializes_initial_definition_race():
     player_ctx.player_pose = {"roll": 0.0}
     player_ctx.player_heading = 0.0
     player_ctx.entity_type = 0
+    _make_world_viewer(server, target_ctx, player_ctx)
     barrier = threading.Barrier(3)
 
     def create():
@@ -4620,45 +4728,76 @@ def test_send_entity_create_serializes_initial_definition_race():
     return True
 
 
-def test_multiplayer_visibility_entity_create_is_viewer_owned():
-    """A viewer tick must not also race the reverse entity-create direction."""
-    server = WulframServer.__new__(WulframServer)
-    calls = []
-    server._ensure_uplink_mvp_state = lambda ctx: None
-    server._send_roster_entry = lambda target, player: calls.append(
-        ("roster", target.client_id, player.client_id)
-    )
-    server._send_entity_create = lambda target, player: calls.append(
-        ("entity", target.client_id, player.client_id)
-    )
+def test_multiplayer_visibility_announces_both_directions_under_frame_lock():
+    """Per-tick visibility repair is bidirectional, and observer-aware.
 
-    viewer_session = Session()
-    viewer_session.translation_ack_received = True
-    viewer_session.tick = 1
-    viewer_ctx = ClientContext(
-        client_id=1,
-        client_addr=("10.10.10.2", 50000),
-        session=viewer_session,
-        entity_id=1337,
-    )
-    other_session = Session()
-    other_session.translation_ack_received = True
-    other_session.tick = 1
-    other_ctx = ClientContext(
-        client_id=2,
-        client_addr=("10.10.10.3", 50001),
-        session=other_session,
-        entity_id=1338,
-    )
-    server._snapshot_in_game_clients = lambda: [viewer_ctx, other_ctx]
+    The retired rule was "entity create is viewer-owned": a tick announced
+    other players only TO its own ctx, because two tick threads announcing in
+    both directions raced through `target_ctx._entity_create_times` and emitted
+    duplicate DEFINITION retries a millisecond apart.
 
-    server._ensure_multiplayer_visibility(viewer_ctx)
+    The 2026-09 observer refactor removes that race structurally --
+    `_send_entity_create` is `@observer_lifecycle.serialized` (process-wide
+    FRAME_LOCK) on top of `target_ctx.entity_create_lock`, and
+    `_ensure_multiplayer_visibility` itself only runs while the caller holds
+    FRAME_LOCK -- so the reverse direction is safe again, and it is needed: a
+    world viewer that is not in_game (a TEAM_SELECT observer) never appears in
+    `_snapshot_in_game_clients()`, and need not be running `_observer_step` at
+    all (send_remote_updates off, or between remote_update_interval windows),
+    so an in-game player has to announce ITSELF to every world viewer.
 
-    assert ("entity", 1, 2) in calls, calls
-    assert ("entity", 2, 1) not in calls, calls
-    print("test_multiplayer_visibility_entity_create_is_viewer_owned: PASSED")
+    An observer owns no entity, so it only announces in the inbound direction.
+    Roster entries are no longer emitted from this path at all.
+    """
+    def visibility_calls(viewer_in_game, other_in_game):
+        server = WulframServer.__new__(WulframServer)
+        calls = []
+        server._ensure_uplink_mvp_state = lambda ctx: None
+        server._send_roster_entry = lambda target, player: calls.append(
+            ("roster", target.client_id, player.client_id)
+        )
+        server._send_entity_create = lambda target, player: calls.append(
+            ("entity", target.client_id, player.client_id)
+        )
+        viewer_ctx = ClientContext(
+            client_id=1,
+            client_addr=("10.10.10.2", 50000),
+            session=Session(),
+            entity_id=1337,
+        )
+        other_ctx = ClientContext(
+            client_id=2,
+            client_addr=("10.10.10.3", 50001),
+            session=Session(),
+            entity_id=1338,
+        )
+        _make_world_viewer(server, viewer_ctx, in_game=viewer_in_game)
+        _make_world_viewer(server, other_ctx, in_game=other_in_game)
+        server._ensure_multiplayer_visibility(viewer_ctx)
+        return calls
+
+    # Two in-game players: the viewer learns the peer AND announces itself.
+    both = visibility_calls(True, True)
+    assert ("entity", 1, 2) in both, both
+    assert ("entity", 2, 1) in both, both
+
+    # A TEAM_SELECT observer has no entity of its own to announce.
+    observer = visibility_calls(False, True)
+    assert ("entity", 1, 2) in observer, observer
+    assert ("entity", 2, 1) not in observer, observer
+
+    # ...and an in-game player still announces itself to that observer.
+    to_observer = visibility_calls(True, False)
+    assert ("entity", 2, 1) in to_observer, to_observer
+    assert ("entity", 1, 2) not in to_observer, to_observer
+
+    # Roster presence is announced from the login/spawn paths, not from the
+    # per-tick visibility repair.
+    for calls in (both, observer, to_observer):
+        assert not [c for c in calls if c[0] == "roster"], calls
+
+    print("test_multiplayer_visibility_announces_both_directions_under_frame_lock: PASSED")
     return True
-
 
 def test_og_viewer_replication_gates_skip_remote_only():
     """T3 isolation gates apply uniformly — loopback is no longer exempt.
@@ -4671,6 +4810,9 @@ def test_og_viewer_replication_gates_skip_remote_only():
     server.og_viewer_roster_entry = False
     server.og_viewer_entity_create = False
     server.og_viewer_remote_updates = False
+    # Remote updates are globally enabled: the og_viewer gate must be the only
+    # thing that stops them below.
+    server.send_remote_updates = True
 
     remote_session = Session()
     remote_session.translation_ack_received = True
@@ -4713,6 +4855,9 @@ def test_og_viewer_replication_gates_skip_remote_only():
     )
     player_ctx.kills = 0
     player_ctx.deaths = 0
+    # The og_viewer_* gates -- not an unready viewer -- must be what suppresses
+    # these streams, so make the viewer genuinely world-ready first.
+    _make_world_viewer(server, remote_ctx, player_ctx)
 
     sent = []
     server._send_packet_to_client = lambda *args, **kwargs: sent.append((args, kwargs)) or True
@@ -4822,8 +4967,8 @@ def test_entity_create_uses_spawn_safe_local_state_for_og_viewer():
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
     server.local_state_turret_bits = HUD_FRACTION_BITS
-    server.local_state_turret_max = 6.3
-    server.local_state_turret_range = 12.6
+    server.local_state_turret_max = HUD_FRACTION_MAX
+    server.local_state_turret_range = HUD_FRACTION_RANGE
     server.behavior_weapon_caps = [(0, 0, 9, 0), (0, 0, 0, 0), (0, 0, 0, 0), (0, 0, 0, 0)]
     server._get_health_value = lambda ctx: 1.0
     server._get_energy_value = lambda ctx: 1.0
@@ -4831,6 +4976,10 @@ def test_entity_create_uses_spawn_safe_local_state_for_og_viewer():
 
     viewer_session = Session()
     viewer_session.translation_ack_received = True
+    # The local-state prefix describes the VIEWER's own tank, so it is only
+    # emitted for a viewer that actually has one (in_game). A TEAM_SELECT
+    # observer gets the entity-only form.
+    viewer_session.in_game = True
     viewer_ctx = ClientContext(
         client_id=1,
         client_addr=("10.10.10.2", 50000),
@@ -4879,8 +5028,8 @@ def test_remote_player_update_uses_spawn_safe_viewer_local_state():
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
     server.local_state_turret_bits = HUD_FRACTION_BITS
-    server.local_state_turret_max = 6.3
-    server.local_state_turret_range = 12.6
+    server.local_state_turret_max = HUD_FRACTION_MAX
+    server.local_state_turret_range = HUD_FRACTION_RANGE
     server.behavior_weapon_caps = [(0, 0, 9, 0), (0, 0, 0, 0), (0, 0, 0, 0), (0, 0, 0, 0)]
     server._get_health_value = lambda ctx: 1.0
     server._get_energy_value = lambda ctx: 1.0
@@ -4922,7 +5071,12 @@ def test_remote_player_update_uses_spawn_safe_viewer_local_state():
     other_ctx.angular_vel_yaw = 0.0
     other_ctx.entity_type = 0
 
+    server.send_remote_updates = True
+    # WULFRAM_COMBINE_UPDATE_ARRAYS default (off): one UPDATE_ARRAY per remote
+    # entity, which is the shape asserted below.
+    server.combine_update_arrays = False
     server._snapshot_in_game_clients = lambda: [viewer_ctx, other_ctx]
+    _make_world_viewer(server, viewer_ctx, other_ctx)
 
     server._send_remote_player_updates(viewer_ctx, tick=0x12345678, prefer_tcp=False)
 
@@ -4953,8 +5107,8 @@ def test_loopback_entity_create_decodes_roundtrip():
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
     server.local_state_turret_bits = HUD_FRACTION_BITS
-    server.local_state_turret_max = 6.3
-    server.local_state_turret_range = 12.6
+    server.local_state_turret_max = HUD_FRACTION_MAX
+    server.local_state_turret_range = HUD_FRACTION_RANGE
     server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
     server._get_health_value = lambda ctx: 1.0
     server._get_energy_value = lambda ctx: 1.0
@@ -5015,8 +5169,8 @@ def test_loopback_remote_player_update_decodes_roundtrip():
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
     server.local_state_turret_bits = HUD_FRACTION_BITS
-    server.local_state_turret_max = 6.3
-    server.local_state_turret_range = 12.6
+    server.local_state_turret_max = HUD_FRACTION_MAX
+    server.local_state_turret_range = HUD_FRACTION_RANGE
     server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
     server._get_health_value = lambda ctx: 1.0
     server._get_energy_value = lambda ctx: 1.0
@@ -5058,7 +5212,12 @@ def test_loopback_remote_player_update_decodes_roundtrip():
     other_ctx.angular_vel_yaw = 0.0
     other_ctx.entity_type = 0
 
+    server.send_remote_updates = True
+    # WULFRAM_COMBINE_UPDATE_ARRAYS default (off): one UPDATE_ARRAY per remote
+    # entity, which is the shape asserted below.
+    server.combine_update_arrays = False
     server._snapshot_in_game_clients = lambda: [viewer_ctx, other_ctx]
+    _make_world_viewer(server, viewer_ctx, other_ctx)
     server._send_remote_player_updates(viewer_ctx, tick=0x12345678, prefer_tcp=False)
 
     assert len(captured) == 1, captured
@@ -5096,8 +5255,8 @@ def test_loopback_heartbeat_decodes_roundtrip():
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
     server.local_state_turret_bits = HUD_FRACTION_BITS
-    server.local_state_turret_max = 6.3
-    server.local_state_turret_range = 12.6
+    server.local_state_turret_max = HUD_FRACTION_MAX
+    server.local_state_turret_range = HUD_FRACTION_RANGE
     server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
     server._get_health_value = lambda ctx: 1.0
     server._get_energy_value = lambda ctx: 1.0
@@ -17901,7 +18060,7 @@ def test_control_pos_exact_reset_targets_specific_client():
     server.clients[ctx.client_id] = ctx
 
     control = ControlServer(port=0)
-    control.server = server
+    _bind_control_server(control, server)
 
     result = control._cmd_player_pos(["c7", "100", "200", "300", "45"])
 
@@ -17968,7 +18127,7 @@ def test_control_pos_can_apply_live_tap_velocity():
     server.clients[ctx.client_id] = ctx
 
     control = ControlServer(port=0)
-    control.server = server
+    _bind_control_server(control, server)
 
     result = control._cmd_player_pos(["c8", "10", "20", "30", "vel", "1.5", "-2.0", "0.25"])
 
@@ -18002,7 +18161,7 @@ def test_control_heading_set_preserves_yaw_sign_convention():
     server.clients[ctx.client_id] = ctx
 
     control = ControlServer(port=0)
-    control.server = server
+    _bind_control_server(control, server)
 
     result = control._cmd_heading(["set", "45", "c7"])
 
@@ -18456,7 +18615,7 @@ def test_players_json_includes_transport_addresses():
     server.clients[ctx.client_id] = ctx
 
     control = ControlServer(port=0)
-    control.server = server
+    _bind_control_server(control, server)
 
     payload = control._cmd_players(["json"])
     entries = json.loads(payload)
@@ -18537,7 +18696,7 @@ def test_health_control_uses_server_heartbeat_helper():
     server.clients[ctx.client_id] = ctx
 
     control = ControlServer(port=0)
-    control.server = server
+    _bind_control_server(control, server)
 
     result = control._cmd_send_health(["set", "0.5", "c12"])
 
@@ -18584,7 +18743,7 @@ def test_energy_control_sets_absolute_or_fractional_energy():
     server.clients[ctx.client_id] = ctx
 
     control = ControlServer(port=0)
-    control.server = server
+    _bind_control_server(control, server)
 
     result = control._cmd_energy(["set", "25", "c10"])
     assert "25.0/100.0" in result, result
@@ -18660,7 +18819,7 @@ def test_buildings_json_exposes_playable_slice_observability():
     server.clients[2] = enemy_ctx
 
     control = ControlServer(port=0)
-    control.server = server
+    _bind_control_server(control, server)
 
     entries = json.loads(control._cmd_buildings(["json"]))
     by_oid = {entry["oid"]: entry for entry in entries}
@@ -18722,8 +18881,8 @@ def _minimal_build_uplink_server(ctx: ClientContext) -> WulframServer:
     server.debug_health_pattern = False
     server.player_energy_max = 100.0
     server.spawn_tank_weapon_type = 2
-    server.local_state_turret_max = 6.3
-    server.local_state_turret_range = 12.6
+    server.local_state_turret_max = HUD_FRACTION_MAX
+    server.local_state_turret_range = HUD_FRACTION_RANGE
     server.build_uplink_mvp = True
     server._building_entities = {}
     server._building_health = {}
@@ -18946,7 +19105,7 @@ def test_dynamic_building_damage_control_destroys_and_records_delete():
     oid = int(event["result"]["oid"])
 
     control = ControlServer(port=0)
-    control.server = server
+    _bind_control_server(control, server)
 
     first = json.loads(control._cmd_building_damage([str(oid), "250"]))
     assert first["ok"] is True, first
@@ -18995,7 +19154,7 @@ def test_dynamic_building_projectile_damage_destroys_and_records_delete():
     server._rebuild_static_world_raycast_index()
 
     control = ControlServer(port=0)
-    control.server = server
+    _bind_control_server(control, server)
     result = json.loads(control._cmd_building_projectile_damage([str(oid), "destroy", "heavy", "c1"]))
 
     assert result["ok"] is True, result
@@ -19826,7 +19985,7 @@ def main():
         test_tank_softbody_control_ignores_live_slot6_lean_by_default,
         test_send_entity_create_uses_udp_only,
         test_send_entity_create_serializes_initial_definition_race,
-        test_multiplayer_visibility_entity_create_is_viewer_owned,
+        test_multiplayer_visibility_announces_both_directions_under_frame_lock,
         test_og_viewer_replication_gates_skip_remote_only,
         test_transient_fx_stays_off_for_remote_og_by_default,
         test_transient_fx_can_be_enabled_for_remote_clients,

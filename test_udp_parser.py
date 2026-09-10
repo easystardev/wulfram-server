@@ -74,10 +74,18 @@ def test_parse_d_set_start() -> bool:
 
 
 def test_parse_empirical_d_handshake() -> bool:
-    """Empirical client D_HANDSHAKE with named/private streams should parse cleanly."""
+    """Empirical client D_HANDSHAKE with named/private streams should parse cleanly.
+
+    Layout (rebuild/analysis/udp-bootstrap/capture.json packet[1], the 200-byte
+    client D_HANDSHAKE of the captured OG bootstrap batch):
+      0x03 | sequence u32 | receive_window u32 | stream_count u32 | ...
+    The window word was missing from this fixture, which described the
+    pre-43fd357 reading of the packet; the live client advertises 15 there.
+    """
     data = bytes.fromhex(
         "03"
         "005f6504"
+        "0000000f"
         "00000002"
         "000e426561636f6e2053747265616d00"
         "00000002"
@@ -105,6 +113,8 @@ def test_parse_empirical_d_handshake() -> bool:
     parsed = handlers._parse_empirical_client_d_handshake(data)
     assert parsed is not None
     assert parsed["sequence"] == 0x005F6504
+    assert parsed["receive_window"] == 0x0F
+    assert parsed["consumed"] == len(data)
     assert parsed["streams"][0] == ("Beacon Stream", (0x3A, 0x3B))
     assert parsed["private_modes"][0] == (0x19, 1)
     assert parsed["private_modes"][-1] == (0x4F, 3)
@@ -113,13 +123,22 @@ def test_parse_empirical_d_handshake() -> bool:
 
 
 def test_build_server_d_handshake() -> bool:
-    """Server D_HANDSHAKE should emit the empirical OG mappings."""
+    """Server D_HANDSHAKE should emit the empirical OG mappings.
+
+    The u32 after the sequence is the ServiceLayer receive/sequence window, not
+    a session id (43fd357, grounded in the captured client handshake above), so
+    it no longer tracks player_id/client_id. Assert it through the parser
+    instead of restating the advertised constant.
+    """
     packet = handlers._build_server_d_handshake(None)
     assert packet[0] == 0x03
     _sequence = struct.unpack_from(">I", packet, 1)[0]
-    session_id = struct.unpack_from(">I", packet, 5)[0]
     stream_count = struct.unpack_from(">I", packet, 9)[0]
-    assert session_id == 1
+    parsed = handlers._parse_empirical_client_d_handshake(packet)
+    assert parsed is not None, packet.hex()
+    assert parsed["sequence"] == _sequence
+    assert 1 <= parsed["receive_window"] <= 32767
+    assert struct.unpack_from(">I", packet, 5)[0] == parsed["receive_window"]
     assert stream_count == 2
     assert _sequence >= 0
     print("test_build_server_d_handshake: PASSED")
