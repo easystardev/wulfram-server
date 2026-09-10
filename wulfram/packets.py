@@ -11,6 +11,7 @@ import struct
 import time
 import math
 import os
+from .production_springs import SPRING_POINT_FIXED16
 from typing import Optional, Tuple, List
 
 from wulfram2_protocol.codec import BitWriter, pack_fixed16, frame_packet
@@ -59,10 +60,12 @@ _SERVER_START = time.monotonic()
 BEHAVIOR_ACTIVE_EXTRAS = os.environ.get("WULFRAM_BEHAVIOR_ACTIVE_EXTRAS", "1") == "1"
 
 # Behavior packet physics defaults.
+BEHAVIOR_GRAVITY = 100.0  # Header field consumed as gravity by 004f0f40/004f0f60.
 BEHAVIOR_GROUND_FRICTION = _read_float_env("WULFRAM_BEHAVIOR_GROUND_FRICTION", 0.8)
 BEHAVIOR_TURN_RATE = _read_float_env("WULFRAM_BEHAVIOR_TURN_RATE", 0.05)
 BEHAVIOR_SUSPENSION_DAMPENING = _read_float_env("WULFRAM_BEHAVIOR_SUSP_DAMPENING", 1.3)
-BEHAVIOR_MAX_ALTITUDE = _read_float_env("WULFRAM_BEHAVIOR_MAX_ALTITUDE", 3.25)
+# Production BEHAVIOR, 2026-09-07: tank target-height/lift scale, not spawn Z.
+BEHAVIOR_MAX_ALTITUDE = _read_float_env("WULFRAM_BEHAVIOR_MAX_ALTITUDE", 16.0)
 BEHAVIOR_GRAVITY_PCT = _read_float_env("WULFRAM_BEHAVIOR_GRAVITY_PCT", 1.0)
 BEHAVIOR_SPRING_STATES = (
     os.environ.get(
@@ -76,12 +79,22 @@ BEHAVIOR_TANK_SPRING_LATERAL = _read_float_env("WULFRAM_BEHAVIOR_TANK_SPRING_LAT
 
 def get_behavior_tank_spring_local_offsets() -> Tuple[Tuple[float, float], ...]:
     """Return the tank-local XY offsets emitted in BEHAVIOR Section 5."""
+    if not _spring_geometry_override():
+        return tuple((x / 65536, y / 65536) for x, y, _ in SPRING_POINT_FIXED16[0])
     return (
         (BEHAVIOR_TANK_SPRING_LONGITUDINAL, BEHAVIOR_TANK_SPRING_LATERAL),
         (BEHAVIOR_TANK_SPRING_LONGITUDINAL, -BEHAVIOR_TANK_SPRING_LATERAL),
         (-BEHAVIOR_TANK_SPRING_LONGITUDINAL, BEHAVIOR_TANK_SPRING_LATERAL),
         (-BEHAVIOR_TANK_SPRING_LONGITUDINAL, -BEHAVIOR_TANK_SPRING_LATERAL),
     )
+
+
+def _spring_geometry_override() -> bool:
+    """Retain the old symmetric geometry only when explicitly requested."""
+    return any(name in os.environ for name in (
+        "WULFRAM_BEHAVIOR_TANK_SPRING_LONGITUDINAL",
+        "WULFRAM_BEHAVIOR_TANK_SPRING_LATERAL",
+    ))
 
 
 def get_ticks() -> int:
@@ -1169,8 +1182,32 @@ def build_update_array_teleport(tick: int, entity_id: int,
                                 secondary_turret_bits: int = 0,
                                 secondary_turret_angle: float = 0.0,
                                 turret_max: float = HUD_FRACTION_MAX,
-                                turret_range: float = HUD_FRACTION_RANGE) -> bytes:
-    """Build UPDATE_ARRAY that teleports an existing entity to a new position."""
+                                turret_range: float = HUD_FRACTION_RANGE,
+                                hard_snap: bool = False) -> bytes:
+    """Build UPDATE_ARRAY that moves an existing entity to a new position.
+
+    By default this sets update-mask bits 1 and 3 (position, rotation) only,
+    which the client handles on its ORDINARY INTERPOLATED path -- it wakes the
+    body at 0047dd2c and interpolates toward the new pose. Despite the name,
+    that is not a teleport in the client's sense.
+
+    ``hard_snap`` adds bit 9, the death/teleport bit, which is what actually
+    selects the client's direct reset path. Traced in the pristine image: the
+    10-bit mask is read at 0047d889 (``MemBuff_read_nbits(payload, 10, &mask)``)
+    inside 0047d760; bit 9 reaches BL in 0047d2f0, where ``TEST BL,BL`` / ``JZ``
+    at 0047d3e1 selects 0047dd2c (clear, ordinary wake) or 0047d3e9 (set,
+    ``Entity_reset_physics``). Bits 1 and 3 must also be present, as they are
+    here, for reset_physics to run its full side effects rather than its
+    zero-motion fallback.
+
+    WARNING: hard_snap is the documented client-crash path. Entity_reset_physics
+    routes into an attitude slerp whose acos(dot) is unclamped, so a sub-epsilon
+    attitude delta gives NaN and takes the client down roughly one time in two on
+    a native ~60 fps host, and almost never on a ~12 fps WARP VM. Default is off
+    and no production path sets it; it exists for the S1 ingress-ownership
+    capture, whose requirement 2 could not be exercised because nothing in this
+    server had ever set the bit.
+    """
     tick_bytes = struct.pack(">I", tick)
     bw = BitWriter()
 
@@ -1184,7 +1221,9 @@ def build_update_array_teleport(tick: int, entity_id: int,
     bw.write_bits(8, 1)
     bw.write_bits(32, entity_id)
     bw.write_bits(1, 1)
-    bw.write_bits(10, 0b0000001010)
+    # bits 1 (pos) + 3 (rot); bit 9 (death/teleport, hard snap) only on request.
+    teleport_mask = 0b0000001010 | ((1 << 9) if hard_snap else 0)
+    bw.write_bits(10, teleport_mask)
     bw.write_bits(16, 0)
 
     bw.write_bits(4, 15)
@@ -1198,6 +1237,48 @@ def build_update_array_teleport(tick: int, entity_id: int,
         bw.write_bits(16, quantized)
 
     return b'\x0E' + tick_bytes + bw.get_bytes()
+
+
+def build_update_array_reset_probe(tick: int, entity_id: int,
+                                   include_health: bool = True,
+                                   weapon_id: int = 2,
+                                   health: float = 1.0,
+                                   fuel: float = 1.0) -> bytes:
+    """UPDATE_ARRAY carrying update-mask bit 9 ALONE, with no vectors.
+
+    This is the conservative way to exercise the client's direct/reset branch.
+    Bit 9 selects it: ``TEST BL,BL`` / ``JZ`` at 0047d3e1 routes to 0047d3e9
+    when set, and to the ordinary wake at 0047dd2c when clear.
+
+    Crucially, bit 9 on its own reaches 0047d3e9 but provably does NOT reach
+    ``Entity_reset_physics`` -- that call at 0047d6c2 additionally requires
+    record+0x50 and record+0x52, which are the position and rotation presence
+    fields set by mask bits 1 and 3. With those bits clear the branch executes
+    and stops short of the physics reset.
+
+    That matters because bits 1+3+9 together are the documented client-crash
+    path (unclamped acos in the attitude slerp -> NaN, ~1 in 2 on a native
+    ~60 fps host). This probe exercises the same branch without it, so a
+    capture can prove reset-branch reachability before risking the client.
+    Use ``build_update_array_teleport(..., hard_snap=True)`` for the full
+    side-effect shape, and only against a VM.
+
+    No vectors follow the mask, because the client parses vector payloads
+    conditionally on the presence bits and none are set here.
+    """
+    tick_bytes = struct.pack(">I", tick)
+    bw = BitWriter()
+
+    _write_local_player_state(bw, include_health, weapon_id=weapon_id,
+                              health=health, fuel=fuel)
+
+    bw.write_bits(8, 1)
+    bw.write_bits(32, entity_id)
+    bw.write_bits(1, 1)
+    bw.write_bits(10, 1 << 9)
+    bw.write_bits(16, 0)
+
+    return b'' + tick_bytes + bw.get_bytes()
 
 
 def build_update_array_spawn_points(tick: int, spawn_points: list) -> bytes:
@@ -1324,7 +1405,7 @@ def build_behavior_packet() -> bytes:
     payload += struct.pack(">I", 25000)
     payload += struct.pack(">I", 35000)
 
-    payload += pack_fixed16(100.0)
+    payload += pack_fixed16(BEHAVIOR_GRAVITY)
     payload += struct.pack(">I", 1)
     payload += struct.pack(">I", 1)
     payload += pack_fixed16(1.0)
@@ -1381,14 +1462,18 @@ def build_behavior_packet() -> bytes:
                 payload += bytes(flags)
             else:
                 payload += b'\x00\x00\x00\x00\x00'
-            payload += pack_fixed16(1.0)                            # +0x18: accuracy (cos)
+            # Tank primary trajectory fields from the retained 2026-09-07
+            # community BEHAVIOR capture (testdata/production-behavior-20260907.bin).
+            # Exact signed 16.16 values; other slots remain independently unqualified.
+            primary = _unit == 0 and _slot == 0
+            payload += pack_fixed16(61584 / 65536 if primary else 1.0)  # +0x18: cone cosine
             fire_rate = TANK_FIRE_RATE_MS.get(_slot, 1000) if _unit == 0 else 1000
             payload += struct.pack(">I", fire_rate)                 # +0x20: fire_rate_ms
             payload += struct.pack(">I", 0) * 4                    # +0x24..+0x30: params
             payload += pack_fixed16(100.0)                          # +0x38: param_double_0
-            payload += pack_fixed16(1000.0)                         # +0x40: min_range (250.0 default)
-            payload += pack_fixed16(500.0)                          # +0x48: max_range (450.0 default)
-            payload += pack_fixed16(1.0)                            # +0x50: spread (0.08 default)
+            payload += pack_fixed16(350.0 if primary else 1000.0)    # +0x40: base range
+            payload += pack_fixed16(5898 / 65536 if primary else 500.0)  # +0x48: range jitter
+            payload += pack_fixed16(5243 / 65536 if primary else 1.0) # +0x50: spread per range
 
     assert len(payload) == 95 + 2340, f"After Section 2: expected 2435, got {len(payload)}"
 
@@ -1417,7 +1502,7 @@ def build_behavior_packet() -> bytes:
     # Section 5: Spring states
     section5_start = len(payload)
 
-    def _write_spring_state(local_offsets: Tuple[Tuple[float, float], ...]) -> None:
+    def _write_spring_state(local_offsets: Tuple[Tuple[float, float, float], ...]) -> None:
         # Spring_read_from_stream reads u32 count, then position Vec3,
         # normal Vec3, pinned flag per point, followed by one fixed16 scalar.
         # The decompile calls the second Vec3 "velocity" in the stream reader,
@@ -1425,10 +1510,10 @@ def build_behavior_packet() -> bytes:
         # allocator default is (0, 0, -1); writing zero normals leaves OG with a
         # live softbody state that cannot generate visible vertical spring force.
         payload.extend(struct.pack(">I", len(local_offsets)))
-        for x_pos, y_pos in local_offsets:
+        for x_pos, y_pos, z_pos in local_offsets:
             payload.extend(pack_fixed16(float(x_pos)))
             payload.extend(pack_fixed16(float(y_pos)))
-            payload.extend(pack_fixed16(0.0))
+            payload.extend(pack_fixed16(float(z_pos)))
             payload.extend(pack_fixed16(0.0))
             payload.extend(pack_fixed16(0.0))
             payload.extend(pack_fixed16(-1.0))
@@ -1436,11 +1521,13 @@ def build_behavior_packet() -> bytes:
         payload.extend(pack_fixed16(0.0))
 
     if BEHAVIOR_SPRING_STATES:
-        tank_offsets = get_behavior_tank_spring_local_offsets()
-        _write_spring_state(tank_offsets)
-        _write_spring_state(tank_offsets)
-        _write_spring_state(tank_offsets)
-        _write_spring_state(tank_offsets)
+        if _spring_geometry_override():
+            tank_offsets = tuple((x, y, 0.0) for x, y in get_behavior_tank_spring_local_offsets())
+            for _ in range(4):
+                _write_spring_state(tank_offsets)
+        else:
+            for points in SPRING_POINT_FIXED16:
+                _write_spring_state(tuple(tuple(v / 65536 for v in point) for point in points))
     else:
         for _ in range(4):
             _write_spring_state(())
