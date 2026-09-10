@@ -23,6 +23,7 @@ from wulfram.handlers import (
     _send_spawn_points_for_client,
 )
 from wulfram.client import ClientContext
+from wulfram2_protocol.hud_state import HUD_FRACTION_BITS
 from wulfram.control import ControlServer, build_input_sync_diagnosis, build_player_terrain_probe
 from wulfram.session import Session, Phase, FEATURES
 from wulfram.server import WulframServer, _StaticWorldRayNode
@@ -1499,7 +1500,7 @@ def test_build_update_array_remote_heartbeat_shape():
         fuel=1.0,
         ammo_count_bits=9,
         ammo_count=0,
-        primary_turret_bits=16,
+        primary_turret_bits=HUD_FRACTION_BITS,
         primary_turret_angle=1.234,
         include_entities=True,
         use_local_entity_when_no_transform=True,
@@ -1534,7 +1535,7 @@ def test_server_remote_heartbeat_helper_keeps_full_local_state():
     server.local_state_ammo_from_behavior = True
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
-    server.local_state_turret_bits = 16
+    server.local_state_turret_bits = HUD_FRACTION_BITS
     server.local_state_turret_max = 6.3
     server.local_state_turret_range = 12.6
     server.heartbeat_view_update = False
@@ -1595,7 +1596,7 @@ def test_server_remote_heartbeat_helper_pre_state_request_is_spawn_safe():
     server.local_state_ammo_from_behavior = True
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
-    server.local_state_turret_bits = 16
+    server.local_state_turret_bits = HUD_FRACTION_BITS
     server.local_state_turret_max = 6.3
     server.local_state_turret_range = 12.6
     server.heartbeat_view_update = False
@@ -1649,7 +1650,7 @@ def test_remote_state_sync_reply_uses_safe_local_player_shape_when_ready():
     server.local_state_ammo_from_behavior = True
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
-    server.local_state_turret_bits = 16
+    server.local_state_turret_bits = HUD_FRACTION_BITS
     server.local_state_turret_max = 6.3
     server.local_state_turret_range = 12.6
     server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
@@ -1721,7 +1722,7 @@ def test_remote_state_sync_reply_stays_spawn_safe_immediately_after_spawn():
     server.local_state_ammo_from_behavior = True
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
-    server.local_state_turret_bits = 16
+    server.local_state_turret_bits = HUD_FRACTION_BITS
     server.local_state_turret_max = 6.3
     server.local_state_turret_range = 12.6
     server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
@@ -1794,7 +1795,7 @@ def test_remote_state_sync_reply_stays_spawn_safe_after_spawn_delay():
     server.local_state_ammo_from_behavior = True
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
-    server.local_state_turret_bits = 16
+    server.local_state_turret_bits = HUD_FRACTION_BITS
     server.local_state_turret_max = 6.3
     server.local_state_turret_range = 12.6
     server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
@@ -1878,7 +1879,7 @@ def test_remote_state_sync_reply_stays_safe_without_post_spawn_input_after_delay
     server.local_state_ammo_from_behavior = True
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
-    server.local_state_turret_bits = 16
+    server.local_state_turret_bits = HUD_FRACTION_BITS
     server.local_state_turret_max = 6.3
     server.local_state_turret_range = 12.6
     server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
@@ -1954,7 +1955,7 @@ def test_remote_state_sync_reply_emits_view_update_with_fresh_remote_timestamp()
     server.local_state_ammo_from_behavior = True
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
-    server.local_state_turret_bits = 16
+    server.local_state_turret_bits = HUD_FRACTION_BITS
     server.local_state_turret_max = 6.3
     server.local_state_turret_range = 12.6
     server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
@@ -2058,7 +2059,7 @@ def test_loopback_state_sync_reply_keeps_request_timestamp():
     server.local_state_ammo_from_behavior = True
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
-    server.local_state_turret_bits = 16
+    server.local_state_turret_bits = HUD_FRACTION_BITS
     server.local_state_turret_max = 6.3
     server.local_state_turret_range = 12.6
     server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
@@ -2647,7 +2648,7 @@ def test_remote_state_sync_defaults_to_live_snapshot_for_remote_og():
     server.local_state_ammo_from_behavior = True
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
-    server.local_state_turret_bits = 16
+    server.local_state_turret_bits = HUD_FRACTION_BITS
     server.local_state_turret_max = 6.3
     server.local_state_turret_range = 12.6
     server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
@@ -2731,7 +2732,7 @@ def test_remote_state_sync_reply_uses_request_aligned_authoritative_pose():
     server.local_state_ammo_from_behavior = True
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
-    server.local_state_turret_bits = 16
+    server.local_state_turret_bits = HUD_FRACTION_BITS
     server.local_state_turret_max = 6.3
     server.local_state_turret_range = 12.6
     server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
@@ -2825,7 +2826,7 @@ def test_remote_state_sync_reply_remaps_client_tick_to_server_history():
     server.local_state_ammo_from_behavior = True
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
-    server.local_state_turret_bits = 16
+    server.local_state_turret_bits = HUD_FRACTION_BITS
     server.local_state_turret_max = 6.3
     server.local_state_turret_range = 12.6
     server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
@@ -2963,7 +2964,7 @@ def test_remote_promoted_heartbeat_stays_short_form_safe():
     server.local_state_ammo_from_behavior = True
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
-    server.local_state_turret_bits = 16
+    server.local_state_turret_bits = HUD_FRACTION_BITS
     server.local_state_turret_max = 6.3
     server.local_state_turret_range = 12.6
     server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
@@ -3049,7 +3050,7 @@ def test_remote_state_sync_reply_keeps_full_motion_when_stable():
     server.local_state_ammo_from_behavior = True
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
-    server.local_state_turret_bits = 16
+    server.local_state_turret_bits = HUD_FRACTION_BITS
     server.local_state_turret_max = 6.3
     server.local_state_turret_range = 12.6
     server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
@@ -3484,7 +3485,7 @@ def test_jump_velocity_update_packet_uses_spawn_safe_local_state_for_remote_og()
     server.local_state_ammo_from_behavior = True
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
-    server.local_state_turret_bits = 16
+    server.local_state_turret_bits = HUD_FRACTION_BITS
     server.local_state_turret_max = 6.3
     server.local_state_turret_range = 12.6
     server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
@@ -3539,7 +3540,7 @@ def test_server_remote_local_state_kwargs_use_full_tank_shape():
     server.local_state_ammo_from_behavior = True
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
-    server.local_state_turret_bits = 16
+    server.local_state_turret_bits = HUD_FRACTION_BITS
     server.local_state_turret_max = 6.3
     server.local_state_turret_range = 12.6
     server.behavior_weapon_caps = [(0, 0, 9, 0)]
@@ -3578,7 +3579,7 @@ def test_server_remote_projectile_spawn_uses_viewer_local_state():
     server.local_state_ammo_from_behavior = True
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
-    server.local_state_turret_bits = 16
+    server.local_state_turret_bits = HUD_FRACTION_BITS
     server.local_state_turret_max = 6.3
     server.local_state_turret_range = 12.6
     server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
@@ -3642,7 +3643,7 @@ def test_server_remote_entity_packets_use_safe_local_state_after_promotion():
     server.local_state_ammo_from_behavior = True
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
-    server.local_state_turret_bits = 16
+    server.local_state_turret_bits = HUD_FRACTION_BITS
     server.local_state_turret_max = 6.3
     server.local_state_turret_range = 12.6
     server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
@@ -3681,7 +3682,7 @@ def test_server_remote_projectile_update_uses_safe_local_state_after_promotion()
     server.local_state_ammo_from_behavior = True
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
-    server.local_state_turret_bits = 16
+    server.local_state_turret_bits = HUD_FRACTION_BITS
     server.local_state_turret_max = 6.3
     server.local_state_turret_range = 12.6
     server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
@@ -3783,7 +3784,7 @@ def test_loopback_projectile_update_stays_entity_only():
     server.local_state_ammo_from_behavior = True
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
-    server.local_state_turret_bits = 16
+    server.local_state_turret_bits = HUD_FRACTION_BITS
     server.local_state_turret_max = 6.3
     server.local_state_turret_range = 12.6
     server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
@@ -3842,7 +3843,7 @@ def test_server_remote_player_info_uses_spawn_safe_local_state():
     server.local_state_ammo_from_behavior = True
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
-    server.local_state_turret_bits = 16
+    server.local_state_turret_bits = HUD_FRACTION_BITS
     server.local_state_turret_max = 6.3
     server.local_state_turret_range = 12.6
     server.behavior_weapon_caps = [(0, 0, 9, 0), (0, 0, 0, 0), (0, 0, 0, 0), (0, 0, 0, 0)]
@@ -3948,8 +3949,8 @@ def test_remote_spawn_entry_transition_sends_canonical_packets():
     return True
 
 
-def test_udp_team_switch_sends_update_stats_before_reincarnate():
-    """OG team switch should mirror captured UPDATE_STATS -> REINCARNATE order."""
+def test_udp_team_switch_orders_stats_after_player():
+    """Local team stats must follow identity on the ordered TCP stream."""
     from wulfram.handlers import handle_team_switch
 
     class DummyTCP:
@@ -3993,10 +3994,10 @@ def test_udp_team_switch_sends_update_stats_before_reincarnate():
 
     handle_team_switch(server, ctx, 1, ("10.10.10.2", 59507))
 
-    assert [payload[0] for payload, _ in server.udp_handler.sent] == [0x1C, 0x25]
-    assert [payload[0] for payload in ctx.tcp_handler.sent] == [0x17, 0x2F]
+    assert [payload[0] for payload, _ in server.udp_handler.sent] == [0x25]
+    assert [payload[0] for payload in ctx.tcp_handler.sent] == [0x17, 0x2F, 0x1C]
     assert session.team_id == 1
-    print("test_udp_team_switch_sends_update_stats_before_reincarnate: PASSED")
+    print("test_udp_team_switch_orders_stats_after_player: PASSED")
     return True
 
 
@@ -4820,7 +4821,7 @@ def test_entity_create_uses_spawn_safe_local_state_for_og_viewer():
     server.local_state_ammo_from_behavior = True
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
-    server.local_state_turret_bits = 16
+    server.local_state_turret_bits = HUD_FRACTION_BITS
     server.local_state_turret_max = 6.3
     server.local_state_turret_range = 12.6
     server.behavior_weapon_caps = [(0, 0, 9, 0), (0, 0, 0, 0), (0, 0, 0, 0), (0, 0, 0, 0)]
@@ -4877,7 +4878,7 @@ def test_remote_player_update_uses_spawn_safe_viewer_local_state():
     server.local_state_ammo_from_behavior = True
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
-    server.local_state_turret_bits = 16
+    server.local_state_turret_bits = HUD_FRACTION_BITS
     server.local_state_turret_max = 6.3
     server.local_state_turret_range = 12.6
     server.behavior_weapon_caps = [(0, 0, 9, 0), (0, 0, 0, 0), (0, 0, 0, 0), (0, 0, 0, 0)]
@@ -4951,7 +4952,7 @@ def test_loopback_entity_create_decodes_roundtrip():
     server.local_state_ammo_from_behavior = True
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
-    server.local_state_turret_bits = 16
+    server.local_state_turret_bits = HUD_FRACTION_BITS
     server.local_state_turret_max = 6.3
     server.local_state_turret_range = 12.6
     server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
@@ -5013,7 +5014,7 @@ def test_loopback_remote_player_update_decodes_roundtrip():
     server.local_state_ammo_from_behavior = True
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
-    server.local_state_turret_bits = 16
+    server.local_state_turret_bits = HUD_FRACTION_BITS
     server.local_state_turret_max = 6.3
     server.local_state_turret_range = 12.6
     server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
@@ -5094,7 +5095,7 @@ def test_loopback_heartbeat_decodes_roundtrip():
     server.local_state_ammo_from_behavior = True
     server.local_state_primary_override = ""
     server.local_state_secondary_override = ""
-    server.local_state_turret_bits = 16
+    server.local_state_turret_bits = HUD_FRACTION_BITS
     server.local_state_turret_max = 6.3
     server.local_state_turret_range = 12.6
     server.behavior_weapon_caps = [(0, 0, 9, 0)] * 32
@@ -20062,7 +20063,7 @@ def main():
         test_udp_team_switch_can_send_update_stats_over_tcp,
         test_udp_team_switch_can_suppress_duplicate_entry_packets,
         test_udp_team_switch_can_use_team_first_update_stats_variant,
-        test_udp_team_switch_sends_update_stats_before_reincarnate,
+        test_udp_team_switch_orders_stats_after_player,
         test_cargo_deploy_and_drop_request,
         test_match_flow_clock_and_round_end,
         test_death_auto_respawn_schedules_delayed_spawn,
