@@ -3,6 +3,7 @@ state-sync snapshot, and debug-sync, extracted verbatim from WulframServer
 (server.py decomposition, step 6). Method-only mixin; shares state via `self`.
 """
 from __future__ import annotations
+from .observer_lifecycle import serialized
 
 import ipaddress
 import math
@@ -94,6 +95,7 @@ class CorrectionMixin:
         last_sent = float(getattr(ctx, "last_correction_send", 0.0) or 0.0)
         return (now - last_sent) >= min_interval
 
+    @serialized
     def _handle_state_request(self, ctx: Optional[ClientContext], data: bytes, addr: tuple):
         """
         Handle STATE_REQUEST (0x0C) - may contain state/position info.
@@ -167,6 +169,7 @@ class CorrectionMixin:
         elif getattr(self, "state_request_burst_enabled", False):
             self._maybe_queue_state_request_burst(ctx, now=now)
 
+    @serialized
     def _send_stock_replay_reply(
         self, ctx: ClientContext, *, request_id: int, now: Optional[float] = None
     ) -> bool:
@@ -199,7 +202,7 @@ class CorrectionMixin:
         """
         if not self.udp_handler or not ctx.session or not ctx.session.udp_addr:
             return False
-        if not ctx.session.in_game or ctx.session.entity_id == 0:
+        if not ctx.running or ctx.observer_transition or not ctx.session.in_game or ctx.session.entity_id == 0:
             return False
         if now is None:
             now = time.monotonic()
@@ -357,6 +360,7 @@ class CorrectionMixin:
         burst_interval = float(getattr(ctx, "correction_burst_interval_s", 0.0) or 0.0)
         return (now - ctx.last_correction_send) >= burst_interval
 
+    @serialized
     def _send_state_sync_snapshot(
         self,
         ctx: ClientContext,
@@ -378,7 +382,7 @@ class CorrectionMixin:
         # Do not fabricate local-player sync packets before the session has an
         # actual spawned in-game entity. Pre-spawn spectator/player IDs are not
         # safe stand-ins for the OG client's local vehicle sync path.
-        if not ctx.session.in_game or ctx.session.entity_id == 0:
+        if not ctx.running or ctx.observer_transition or not ctx.session.in_game or ctx.session.entity_id == 0:
             if self.debug_udp_raw:
                 print(
                     f"[STATE-SYNC] Skipping {reason} for client {ctx.client_id}: "
@@ -844,6 +848,27 @@ class CorrectionMixin:
         ext_rot = (roll, pitch, yaw + ang * dt_lead)
         return self._to_client_pos(ext_pos), ext_rot
 
+    @staticmethod
+    def _attitude_delta_rad(a, b) -> float:
+        """Largest per-axis wrapped angular difference between two euler triples.
+
+        A conservative proxy for the delta the client computes. The client does it
+        properly -- GUESS5_Camera_clamp_network_delta converts both triples through
+        0x00415260 and compares via 0x004e1e80 -- so a per-axis maximum can only
+        over-estimate the true angle, never under-estimate it. Over-estimating is
+        the safe direction here: it suppresses fewer packets than a true angle
+        would, so the guard never drops a correction the client would have acted on.
+        """
+        worst = 0.0
+        for left, right in zip(a, b):
+            delta = math.fmod(float(left) - float(right), math.tau)
+            if delta > math.pi:
+                delta -= math.tau
+            elif delta < -math.pi:
+                delta += math.tau
+            worst = max(worst, abs(delta))
+        return worst
+
     def _build_empirical_correction_payload(
         self,
         ctx: ClientContext,
@@ -859,8 +884,15 @@ class CorrectionMixin:
         pt_angle: float,
         st_bits: int,
         st_angle: float,
+        allow_suppression: bool = False,
     ) -> tuple[bytes, str, tuple[float, float, float], tuple[float, float, float], bool, bool]:
         """Build one of the older empirical local-correction packet shapes.
+
+        With ``allow_suppression`` the builder may return an EMPTY payload when the
+        packet it would produce cannot change the client. Callers must treat an
+        empty payload as "do not send". Only the automatic tick path passes it; an
+        explicit `correction send` from the control port does not, because an
+        operator asking for a packet should get one.
 
         The rotation tuple MUST match what every other local-player packet
         path emits (heartbeat, full UPDATE_ARRAY, VIEW_UPDATE loop,
@@ -889,6 +921,31 @@ class CorrectionMixin:
         if getattr(self, "correction_rot_only", False) and inc_rot:
             inc_pos = False
             inc_vel = False
+        # Sub-epsilon attitude guard. The client replaces the wire rotation sample
+        # with its own whenever the two already agree -- 0048c126..0048c135 inside
+        # GUESS5_Camera_clamp_network_delta, reached from 0047d67e for the local
+        # player -- so such a packet provably cannot move entity+0x30. Measured in
+        # rebuild analysis/moravec-s1/ingress-capture-v14-shapeB against its
+        # 90-degree control. The baseline is the server's own authoritative
+        # attitude, which is also its model of the client's; with lead=0 the delta
+        # is exactly zero, and with lead>0 it is the extrapolation, which is ~0 at
+        # rest. So this suppresses precisely the at-rest no-op the lead docstring
+        # already describes as "a no-op".
+        suppressed = None
+        epsilon = float(getattr(self, "correction_rot_epsilon_rad", 0.0) or 0.0)
+        if allow_suppression and inc_rot and epsilon > 0.0:
+            baseline = self._local_player_sync_rotation(ctx)
+            delta = self._attitude_delta_rad(corr_rot, baseline)
+            if delta < epsilon:
+                inc_rot = False
+                suppressed = f"rot_subepsilon({math.degrees(delta):.4f}deg)"
+        if allow_suppression and not (inc_pos or inc_vel or inc_rot):
+            # Nothing transform-bearing left. Do NOT fall through to a mask=0
+            # entity: a zero-transform entity zeroes the client's angular
+            # velocity (see the heartbeat notes), so an "empty correction" is not
+            # harmless. Refuse instead and let the caller skip the send.
+            return (b"", f"CORRECTION(suppressed:{suppressed or 'empty'})",
+                    corr_pos, corr_rot, False, False)
         def _fresh_ts():
             if cmode in ("view_update", "view_update_define"):
                 if handlers._is_loopback_client(ctx):

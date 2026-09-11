@@ -2486,6 +2486,139 @@ def test_batched_state_request_sees_later_action_update_movement():
     return True
 
 
+def _subepsilon_guard_server(epsilon_rad):
+    """Minimal server wired for the correction-payload builder."""
+    server = WulframServer.__new__(WulframServer)
+    server.correction_mode = "view_update"
+    server.correction_rot_only = True
+    server.correction_rot_epsilon_rad = epsilon_rad
+    server.correction_lead_ticks = 0.0
+    server.local_state_turret_max = HUD_FRACTION_MAX
+    server.local_state_turret_range = HUD_FRACTION_RANGE
+    server.spawn_tank_weapon_type = 2
+    server._get_health_value = lambda ctx: 1.0
+    server._get_energy_value = lambda ctx: 1.0
+    server._to_client_pos = lambda pos: pos
+    return server
+
+
+def _subepsilon_guard_ctx():
+    session = Session()
+    session.translation_ack_received = True
+    session.in_game = True
+    session.entity_id = 0x14EA
+    session.udp_addr = ("10.10.10.2", 50000)
+    ctx = ClientContext(
+        client_id=1,
+        client_addr=("10.10.10.2", 50000),
+        session=session,
+        entity_id=0x14EA,
+    )
+    ctx.player_pos = (4950.0, 5100.0, 5.0)
+    ctx.player_vel = (0.0, 0.0, 0.0)
+    ctx.player_pose = {"roll": 0.0, "pitch": 0.0}
+    ctx.player_heading = 0.5
+    return ctx
+
+
+def _subepsilon_guard_build(server, ctx, **extra):
+    return server._build_empirical_correction_payload(
+        ctx,
+        tick=0x00123456,
+        include_local_state=True,
+        health=1.0,
+        fuel=1.0,
+        weapon_type=0,
+        ammo_bits=0,
+        ammo_mask=0,
+        pt_bits=0,
+        pt_angle=0.0,
+        st_bits=0,
+        st_angle=0.0,
+        **extra,
+    )
+
+
+def test_attitude_delta_rad_wraps_and_takes_the_worst_axis():
+    """The proxy must wrap at +/-pi and never under-report a delta."""
+    delta = WulframServer._attitude_delta_rad
+    assert delta((0.0, 0.0, 0.0), (0.0, 0.0, 0.0)) == 0.0
+    # 2pi apart is the SAME attitude: this is the case the live tape hit, where
+    # the client read 6.2821 and the wire carried 0.0.
+    assert delta((0.0, 0.0, math.tau), (0.0, 0.0, 0.0)) < 1e-9
+    # Just under and just over pi must both come back as ~pi, not ~-pi or ~3pi.
+    assert abs(delta((0.0, 0.0, math.pi - 1e-4), (0.0, 0.0, 0.0)) - (math.pi - 1e-4)) < 1e-6
+    assert abs(delta((0.0, 0.0, math.pi + 0.1), (0.0, 0.0, 0.0)) - (math.pi - 0.1)) < 1e-6
+    # The worst axis wins, not the first or the sum.
+    assert abs(delta((0.01, 0.5, 0.02), (0.0, 0.0, 0.0)) - 0.5) < 1e-9
+    print("test_attitude_delta_rad_wraps_and_takes_the_worst_axis: PASSED")
+    return True
+
+
+def test_subepsilon_rotation_correction_is_suppressed():
+    """A rot-only correction the client would ignore must not be built.
+
+    The client substitutes its own attitude for the wire sample when the two
+    already agree (0048c126..0048c135 inside GUESS5_Camera_clamp_network_delta,
+    reached from 0047d67e), so the packet provably cannot move entity+0x30.
+    Measured in rebuild analysis/moravec-s1/ingress-capture-v14-shapeB.
+    """
+    server = _subepsilon_guard_server(math.radians(0.05))
+    ctx = _subepsilon_guard_ctx()
+    # lead=0, so corr_rot IS the baseline attitude and the delta is exactly zero.
+    payload, label, _, _, inc_pos, inc_rot = _subepsilon_guard_build(
+        server, ctx, allow_suppression=True)
+    assert payload == b"", f"expected an empty payload, got {len(payload)} bytes"
+    assert label.startswith("CORRECTION(suppressed:rot_subepsilon"), label
+    assert inc_pos is False and inc_rot is False
+    print("test_subepsilon_rotation_correction_is_suppressed: PASSED")
+    return True
+
+
+def test_real_rotation_delta_is_not_suppressed():
+    """NEGATIVE CONTROL: a correction carrying a real attitude delta must be built.
+
+    Without this, a guard that suppressed everything would look like a pass.
+    """
+    server = _subepsilon_guard_server(math.radians(0.05))
+    ctx = _subepsilon_guard_ctx()
+    # Lead the heading so corr_rot differs from the baseline by ~90 degrees, the
+    # same delta the live 90-degree control tape used.
+    server.correction_lead_ticks = 1.0
+    ctx.angular_vel_yaw = math.pi / 2.0
+    payload, label, _, corr_rot, _, inc_rot = _subepsilon_guard_build(
+        server, ctx, allow_suppression=True)
+    baseline = server._local_player_sync_rotation(ctx)
+    assert WulframServer._attitude_delta_rad(corr_rot, baseline) > math.radians(1.0), (
+        "fixture failed to produce a real attitude delta; the control proves nothing")
+    assert payload, "a real attitude delta must still produce a correction"
+    assert "suppressed" not in label, label
+    assert inc_rot is True
+    print("test_real_rotation_delta_is_not_suppressed: PASSED")
+    return True
+
+
+def test_suppression_requires_opt_in_and_nonzero_epsilon():
+    """The guard must be inert for the control port and when epsilon is 0.
+
+    An explicit `correction send` should always produce a packet, and setting the
+    epsilon to 0 must restore the pre-guard behaviour exactly.
+    """
+    ctx = _subepsilon_guard_ctx()
+    # Opt-out by default: the control port never passes allow_suppression.
+    payload, label, _, _, _, inc_rot = _subepsilon_guard_build(
+        _subepsilon_guard_server(math.radians(0.05)), ctx)
+    assert payload and "suppressed" not in label, label
+    assert inc_rot is True
+    # Epsilon 0 disables it even on the automatic path.
+    payload, label, _, _, _, inc_rot = _subepsilon_guard_build(
+        _subepsilon_guard_server(0.0), _subepsilon_guard_ctx(), allow_suppression=True)
+    assert payload and "suppressed" not in label, label
+    assert inc_rot is True
+    print("test_suppression_requires_opt_in_and_nonzero_epsilon: PASSED")
+    return True
+
+
 def test_remote_empirical_view_update_correction_uses_fresh_remote_timestamp():
     """Explicit OG correction bursts should use a fresh remote replay wrapper."""
     server = WulframServer.__new__(WulframServer)
@@ -19876,6 +20009,10 @@ def main():
     print("=" * 60)
 
     tests = [
+        test_attitude_delta_rad_wraps_and_takes_the_worst_axis,
+        test_subepsilon_rotation_correction_is_suppressed,
+        test_real_rotation_delta_is_not_suppressed,
+        test_suppression_requires_opt_in_and_nonzero_epsilon,
         test_decode_lp_string_basic,
         test_effective_heartbeat_interval_community_cadence,
         test_decode_lp_string_offset,

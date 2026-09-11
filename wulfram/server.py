@@ -8,6 +8,7 @@ This avoids orphaned processes and provides clean shutdown handling.
     python server/manage_server.py stop
     python server/manage_server.py restart
 """
+from .observer_lifecycle import FRAME_LOCK, serialized
 
 import ipaddress
 import json
@@ -133,6 +134,7 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
 
         # Multi-client management
         self.clients: Dict[int, ClientContext] = {}
+        self.native_physics = None
         self.clients_lock = threading.Lock()
         # OG collision pairs are resolved as one shared event after all bodies
         # are stepped.  Our per-client tick threads still need one lock around
@@ -261,6 +263,15 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
         self.tank_drive_terrain_aligned = (
             os.environ.get("WULFRAM_TANK_DRIVE_TERRAIN_ALIGNED", "0") == "1"
         )
+        # Source-backed correction, default-on per the 2026-09-07 review.
+        # See docs/physics-core-server-review-2026-09-07.md for T0/live limits.
+        self.tank_longitudinal_mobility_enabled = (
+            os.environ.get("WULFRAM_TANK_LONGITUDINAL_MOBILITY", "1") == "1"
+        )
+        self.tank_jet_physics_enabled = os.environ.get("WULFRAM_TANK_JET_PHYSICS", "1") == "1"
+        self.input_window_mode = os.environ.get("WULFRAM_INPUT_WINDOW_MODE", "shadow").lower()
+        if self.input_window_mode not in {"off", "shadow", "apply"}:
+            raise ValueError("WULFRAM_INPUT_WINDOW_MODE must be off, shadow or apply")
         self.tank_drive_body_matrix = (
             os.environ.get("WULFRAM_TANK_DRIVE_BODY_MATRIX", "1").strip().lower()
             not in ("0", "false", "off", "no")
@@ -889,6 +900,26 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
         self.correction_rot_only = os.environ.get("WULFRAM_CORRECTION_ROT_ONLY", "1").strip().lower() in (
             "1", "true", "on", "yes"
         )
+
+        # Attitude-delta epsilon for the automatic correction path, in degrees.
+        # The client substitutes its OWN attitude for the wire sample when the
+        # two already agree: GUESS5_Camera_clamp_network_delta (0x0048bff0),
+        # reached from 0047d67e for the local player, stores entity+0x30..+0x38
+        # over record+0x38..+0x40 on its small-delta branch (0048c126..0048c135).
+        # Measured live in rebuild analysis/moravec-s1/ingress-capture-v14-shapeB
+        # against its 90-degree control: at a negligible delta the record's
+        # rotation sample is rewritten and the copy lands nothing; at 90 degrees
+        # it survives and lands. So a correction whose rotation already matches
+        # cannot change the client, and sending it is pure waste.
+        #
+        # Set to 0 to disable. This gates only the AUTOMATIC path; an explicit
+        # `correction send` from the control port is never suppressed, because an
+        # operator asking for a packet should get one.
+        try:
+            _rot_eps_deg = float(os.environ.get("WULFRAM_CORRECTION_ROT_EPSILON_DEG", "0.05"))
+        except ValueError:
+            _rot_eps_deg = 0.05
+        self.correction_rot_epsilon_rad = max(0.0, math.radians(_rot_eps_deg))
         # Default-off compatibility gate: full stopped corrections require the
         # crashfix14 client clamp.  When explicitly enabled, emit one reconcile
         # after each movement episode once active-input suppression has elapsed.
@@ -933,6 +964,8 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
             f"[CONFIG-HEADING] turn_adjust={self.turn_adjust} turn_sign={self.turn_sign} "
             f"deadzone={self.turn_deadzone} damp_coeff={self.damp_coeff} "
             f"linear_damp=driving:{self.linear_damp_driving}/coast:{self.linear_damp_coasting} "
+            f"tank_jet_physics={int(self.tank_jet_physics_enabled)} "
+            f"input_window={self.input_window_mode} "
             f"tank_ground_contact_damp={self.tank_ground_contact_damp} "
             f"tick_rate={self.tick_rate_hz}Hz correction_interval={self.correction_interval}s "
             f"movement_correction={self.movement_correction_interval}s/"
@@ -961,7 +994,9 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
             print(f"[TICK] Sync tick offset: client={client_tick} server={server_tick} offset={new_offset}")
         ctx.tick_offset = new_offset
         ctx.last_client_tick = client_tick
+        ctx.tick_alignment_source = "action"
 
+    @serialized
     def _get_network_tick(self, ctx: ClientContext) -> int:
         """Return a monotonic tick aligned to the client tick domain when possible."""
         if self.use_client_ticks and ctx.tick_offset is None:
@@ -1241,7 +1276,7 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
 
     def _snapshot_in_game_clients(self):
         """Return a snapshot list of in-game clients (thread-safe)."""
-        return [c for c in self._snapshot_clients() if c.session and c.session.in_game]
+        return [c for c in self._snapshot_clients() if c.running and c.session and c.session.in_game and not c.observer_transition]
 
     def _snapshot_logged_in_clients(self):
         """Snapshot of clients past login — roster presence is announced here,
@@ -1267,6 +1302,7 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
                 or "aborted by the software" in s or "Broken pipe" in s
                 or "Bad file descriptor" in s or "not a socket" in s)
 
+    @serialized
     def _reap_dead_client(self, ctx: ClientContext, reason: str = "") -> None:
         """Mark a client whose TCP socket is dead for teardown.
 
@@ -1573,16 +1609,15 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
             return True
         return getattr(self, "remote_combat_observer_packets", True)
 
-    def _sync_clients_on_spawn(self, ctx: ClientContext) -> None:
-        """Ensure new spawns are visible to all in-game clients."""
-        others = [c for c in self._snapshot_in_game_clients() if c is not ctx]
-        for other in others:
-            # Roster entries both directions
-            self._send_roster_entry(other, ctx)
-            self._send_roster_entry(ctx, other)
-            # Entity creation both directions
-            self._send_entity_create(other, ctx)
-            self._send_entity_create(ctx, other)
+    def _sync_clients_on_spawn(self, ctx):
+        for viewer in self._snapshot_world_viewers():
+            if viewer is not ctx:
+                self._send_roster_entry(viewer, ctx)
+                self._send_entity_create(viewer, ctx)
+        for subject in self._snapshot_in_game_clients():
+            if subject is not ctx:
+                self._send_roster_entry(ctx, subject)
+                self._send_entity_create(ctx, subject)
 
     def _create_client_context(self, client_addr: tuple) -> ClientContext:
         """Create a new ClientContext with unique IDs and initialized systems."""
@@ -1654,9 +1689,14 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
         udp_sock.settimeout(0.1)
 
         self.udp_handler = UDPHandler(udp_sock, self.logger)
+        self.udp_handler.peer_owner = self.udp_addr_to_client.get
 
         # Start UDP listener thread (set running first to avoid race)
+        from .native_live import configured_service
+        self.native_physics = configured_service(self)
         self.running = True
+        if self.native_physics is not None:
+            self.native_physics.start()
         udp_thread = threading.Thread(target=self._udp_loop, daemon=True)
         udp_thread.start()
 
@@ -1688,12 +1728,15 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
             print("\n[SERVER] Shutting down...")
         finally:
             self.running = False
+            if self.native_physics is not None:
+                self.native_physics.close()
             # Clean up all client contexts
             with self.clients_lock:
                 for ctx in self.clients.values():
                     ctx.running = False
                 self.clients.clear()
             tcp_sock.close()
+            self.udp_handler.close_channels()
             udp_sock.close()
 
     def _udp_loop(self):
@@ -1709,6 +1752,18 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
 
             # Find or identify client for this UDP address
             ctx = self.udp_addr_to_client.get(addr)
+            destination_owner = getattr(self.udp_handler, 'received_owner', None)
+            if destination_owner is not None:
+                # Correlation comes from the port sent on this owner's TCP,
+                # never from the order in which constant identifies arrive.
+                if (not destination_owner.running
+                        or self.clients.get(destination_owner.client_id) is not destination_owner
+                        or addr[0] != destination_owner.client_addr[0]
+                        or (ctx is not None and ctx is not destination_owner)):
+                    continue
+                ctx = destination_owner
+            elif ctx is not None and getattr(ctx, 'udp_socket', None) is not None:
+                continue  # An owned endpoint must use its advertised destination.
 
             # Debug: log raw datagrams that might contain ACTION packets
             if self.debug_udp_raw and len(data) > 5 and 0x09 in data:
@@ -2575,17 +2630,19 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
             scale=self.map_scale,
         )
 
+    @serialized
     def _broadcast_disconnected_player_delete(self, ctx: ClientContext, entity_id: int) -> None:
         """Tell remaining clients to remove a disconnected player's entity."""
         tick = get_ticks()
         delete_pkt = build_delete_object(tick, [entity_id], with_effects=False)
         sent_count = 0
-        for other in self._snapshot_in_game_clients():
+        for other in self._snapshot_world_delete_viewers():
             if other is ctx:
                 continue
             if entity_id in other.known_entity_ids:
                 other.known_entity_ids.discard(entity_id)
-            if self._send_packet_to_client(other, delete_pkt, prefer_tcp=True):
+                getattr(other, "_entity_create_times", {}).pop(entity_id, None)
+            if self._send_packet_to_client(other, build_delete_object(self._get_network_tick(other), [entity_id], with_effects=False), prefer_tcp=True):
                 sent_count += 1
         if sent_count:
             print(
@@ -3202,63 +3259,125 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
             sleep_dt = next_tick_time - now
         return next_tick_time, max(0.0, sleep_dt)
 
+    def _local_epoch_current(self, ctx, token):
+        return (self._world_viewer_ready(ctx) and ctx.session.in_game
+                and token == (ctx.session.world_epoch, ctx.session.local_epoch))
+
+    def _world_viewer_ready(self, ctx, allow_transition=False):
+        s = ctx.session
+        return bool(self.running and ctx.running and (allow_transition or not ctx.observer_transition) and s
+                    and s.login_complete and s.want_updates_received
+                    and s.translation_ack_received
+                    and s.phase in (Phase.TEAM_SELECT, Phase.SPAWNING, Phase.IN_GAME)
+                    and (not self.use_client_ticks or ctx.tick_offset is not None)
+                    and self.clients.get(ctx.client_id) is ctx)
+
+    def _snapshot_world_viewers(self):
+        return [c for c in self._snapshot_clients() if self._world_viewer_ready(c)]
+
+    def _snapshot_world_delete_viewers(self):
+        # A spawn wait retains the world and known remote objects. Deletes carry
+        # no local state and must retire those objects even during that wait.
+        return [c for c in self._snapshot_clients() if self._world_viewer_ready(c, allow_transition=True)]
+
+    def _observer_step(self, ctx):
+        # Caller holds FRAME_LOCK. No local controller, vitals or correction path.
+        if not self._world_viewer_ready(ctx) or ctx.session.in_game:
+            return False
+        if not self.send_remote_updates:
+            return False
+        now = time.monotonic()
+        if self.remote_update_interval > 0 and now - ctx.last_remote_update_send < self.remote_update_interval:
+            return False
+        ctx.last_remote_update_send = now
+        self._ensure_multiplayer_visibility(ctx)
+        self._send_remote_player_updates(ctx, self._get_network_tick(ctx), prefer_tcp=self.send_updates_tcp)
+        ctx.observer_steps += 1
+        return True
+
     def _tick_loop(self, ctx: ClientContext):
-        """Game tick loop - sends UPDATE_ARRAY periodically."""
         current_thread = threading.current_thread()
         with ctx.tick_lock:
             if ctx.tick_thread is not current_thread:
-                print(f"[TICK] Stale tick loop rejected for client {ctx.client_id}")
                 return
-        print(f"[TICK] Starting tick loop for client {ctx.client_id}")
-        tcp_failed = False
-        tick_start_time = time.monotonic()
-        logged_wait_translation = False
-        logged_wait_client_tick = False
-        grace_period_logged = False
-        grace_period_end = None  # Set when client is ready
+            ctx.observer_worker_starts += 1
+            ctx.observer_worker_generation += 1
+            generation = ctx.observer_worker_generation
+        try:
+            while self.running and ctx.running:
+                if ctx.tick_thread is not current_thread or ctx.observer_worker_generation != generation:
+                    return
+                with FRAME_LOCK:
+                    token = (ctx.session.world_epoch, ctx.session.local_epoch)
+                    local = self._world_viewer_ready(ctx) and ctx.session.in_game
+                    if not local:
+                        try:
+                            self._observer_step(ctx)
+                        except Exception as error:
+                            print(f"[OBSERVER] Client {ctx.client_id}: update failed: {error}")
+                if local:
+                    self._run_local_incarnation(ctx, token)
+                else:
+                    time.sleep(0.02)
+        finally:
+            with ctx.tick_lock:
+                if ctx.tick_thread is current_thread:
+                    ctx.tick_thread = None
 
-        # Desync detection state
-        last_position = ctx.player_pos
-        last_position_change_time = time.monotonic()
-        last_input_time = time.monotonic()
-        desync_warned = False
+    def _run_local_incarnation(self, ctx: ClientContext, token):
+        with FRAME_LOCK:
+            if not self._local_epoch_current(ctx, token):
+                return
+            ctx.observer_local_entries += 1
+            ctx.observer_pacing_resets += 1
+            tcp_failed = False
+            tick_start_time = time.monotonic()
+            logged_wait_translation = False
+            logged_wait_client_tick = False
+            grace_period_logged = False
+            grace_period_end = None  # Set when client is ready
 
-        # Wall-clock tick pacing: Windows time.sleep(0.033) often sleeps ~15-21ms,
-        # causing the tick loop to run at ~47Hz instead of 30Hz.  Use a monotonic
-        # accumulator to guarantee exactly tick_rate_hz ticks per wall-clock second.
-        next_tick_time = time.monotonic()
-        tick_period = 1.0 / self.tick_rate_hz if self.tick_rate_hz > 0 else 0.1
-        # Default-off per-step phase timing probe (physics vs network-send split).
-        # Used to localize rough-terrain controller-cadence collapse. Never on by default.
-        _phase_timing = os.environ.get("WULFRAM_TICK_PHASE_TIMING", "0") == "1"
-        _phase_timing_threshold_ms = float(
-            os.environ.get("WULFRAM_TICK_PHASE_TIMING_MS", "40") or 40.0
-        )
-        _phase_timing_path = os.environ.get(
-            "WULFRAM_TICK_PHASE_TIMING_LOG",
-            r"C:\Users\wstri\dev\wolfram\tick_phase_timing.log",
-        )
-        _phase_t0 = 0.0
-        _phase_t_upp = 0.0
-        _phase_t_phys = 0.0
-        # NOTE: use perf_counter (QPC, sub-us) NOT monotonic (GetTickCount64,
-        # 15.6 ms resolution on Windows) so the split is not clock-quantized.
-        # Physics steps once per tick at native 30Hz (no accumulator needed).
-        ctx.physics_step_count = 0
-        last_physics_wall_time = time.monotonic()
-        # Real-time physics-rate accumulator (perf_counter = sub-us; monotonic is
-        # 16ms-coarse on Windows). See GOAL 6: the tick loop free-runs faster than
-        # tick_rate_hz under load, so stepping a fixed 1/30 dt every raw tick made
-        # the server integrate ~1.05 sim-seconds per real second and over-rotate
-        # every turn. The accumulator runs 0/1/2 fixed steps per tick so simulated
-        # time tracks wall-clock, matching the client's LocalPhysics.step.
-        phys_accum_last = time.perf_counter()
-        phys_accumulator = 0.0
-        # (frame_locked mode removed â€” not part of original decompile)
+            # Desync detection state
+            last_position = ctx.player_pos
+            last_position_change_time = time.monotonic()
+            last_input_time = time.monotonic()
+            desync_warned = False
 
-        while ctx.running and ctx.session.in_game:
+            # Wall-clock tick pacing: Windows time.sleep(0.033) often sleeps ~15-21ms,
+            # causing the tick loop to run at ~47Hz instead of 30Hz.  Use a monotonic
+            # accumulator to guarantee exactly tick_rate_hz ticks per wall-clock second.
+            next_tick_time = time.monotonic()
+            tick_period = 1.0 / self.tick_rate_hz if self.tick_rate_hz > 0 else 0.1
+            # Default-off per-step phase timing probe (physics vs network-send split).
+            # Used to localize rough-terrain controller-cadence collapse. Never on by default.
+            _phase_timing = os.environ.get("WULFRAM_TICK_PHASE_TIMING", "0") == "1"
+            _phase_timing_threshold_ms = float(
+                os.environ.get("WULFRAM_TICK_PHASE_TIMING_MS", "40") or 40.0
+            )
+            _phase_timing_path = os.environ.get(
+                "WULFRAM_TICK_PHASE_TIMING_LOG",
+                r"C:\Users\wstri\dev\wolfram\tick_phase_timing.log",
+            )
+            _phase_t0 = 0.0
+            _phase_t_upp = 0.0
+            _phase_t_phys = 0.0
+            # NOTE: use perf_counter (QPC, sub-us) NOT monotonic (GetTickCount64,
+            # 15.6 ms resolution on Windows) so the split is not clock-quantized.
+            # Physics steps once per tick at native 30Hz (no accumulator needed).
+            ctx.physics_step_count = 0
+            last_physics_wall_time = time.monotonic()
+            # Real-time physics-rate accumulator (perf_counter = sub-us; monotonic is
+            # 16ms-coarse on Windows). See GOAL 6: the tick loop free-runs faster than
+            # tick_rate_hz under load, so stepping a fixed 1/30 dt every raw tick made
+            # the server integrate ~1.05 sim-seconds per real second and over-rotate
+            # every turn. The accumulator runs 0/1/2 fixed steps per tick so simulated
+            # time tracks wall-clock, matching the client's LocalPhysics.step.
+            phys_accum_last = time.perf_counter()
+            phys_accumulator = 0.0
+            # (frame_locked mode removed â€” not part of original decompile)
+
+        while self._local_epoch_current(ctx, token):
             try:
-                ctx.session.tick += 1
 
                 # Wait until client has quantizers and at least one input tick.
                 # This avoids mis-decoding local stats before TRANSLATION is applied.
@@ -3292,823 +3411,792 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
                         time.sleep(0.05)
                         continue
 
-                # Once translation is ready, make sure this client sees others and vice versa.
-                self._ensure_multiplayer_visibility(ctx)
+                with FRAME_LOCK:
+                    if not self._local_epoch_current(ctx, token):
+                        return
+                    ctx.session.tick += 1
+                    # Once translation is ready, make sure this client sees others and vice versa.
+                    self._ensure_multiplayer_visibility(ctx)
 
-                # Read current input state (needed every tick for transition detection)
-                raw_input = self._get_raw_turn_input(ctx)
-                prev_input = getattr(ctx, 'prev_raw_turn_input', 0.0)
-                torque = self._compute_turn_torque(ctx, raw_input)  # lateral_mobility=1.0
-                raw_fwd_input = self._normalize_behavior_axis_value(
-                    ctx,
-                    ctx.weapon_system.behavior_slots[BehaviorSlot.MOVING_FORWARD],
-                )
-                if abs(raw_fwd_input) < 0.05:
-                    raw_fwd_input = 0.0
-                prev_fwd_input = float(getattr(ctx, "_fwd_integral_prev_input", 0.0) or 0.0)
-                fwd_input_changed = abs(raw_fwd_input - prev_fwd_input) > 0.001
-                movement_integral_reconcile = None
-                if fwd_input_changed:
-                    if abs(prev_fwd_input) <= 0.001 and abs(raw_fwd_input) > 0.001:
-                        ctx._fwd_actual_input_integral = 0.0
-                    elif abs(prev_fwd_input) > 0.001 and abs(raw_fwd_input) <= 0.001:
-                        history = list(getattr(ctx, "movement_input_history", []) or [])
-                        last_nonzero_idx = len(history) - 1
-                        while last_nonzero_idx >= 0 and abs(float(history[last_nonzero_idx].get("fwd", 0.0) or 0.0)) <= 0.05:
-                            last_nonzero_idx -= 1
-                        release_idx = last_nonzero_idx + 1
-                        if last_nonzero_idx >= 0 and release_idx < len(history):
-                            start_idx = last_nonzero_idx
-                            while start_idx >= 0 and abs(float(history[start_idx].get("fwd", 0.0) or 0.0)) > 0.05:
-                                start_idx -= 1
-                            start_idx += 1
-                            desired_input_integral = 0.0
-                            for hist_idx in range(start_idx, release_idx):
-                                left = history[hist_idx]
-                                right = history[hist_idx + 1]
-                                left_tick = int(left.get("client_tick", 0) or 0)
-                                right_tick = int(right.get("client_tick", 0) or 0)
-                                if right_tick > left_tick > 0:
-                                    desired_input_integral += (
-                                        float(left.get("fwd", 0.0) or 0.0)
-                                        * ((right_tick - left_tick) / 1000.0)
-                                    )
-                            if desired_input_integral > 0.0:
-                                movement_integral_reconcile = desired_input_integral
-                ctx._fwd_integral_prev_input = raw_fwd_input
-
-                physics = ctx.vehicle_physics
-                ws = ctx.weapon_system
-
-                # Log input transitions (key press/release)
-                input_changed = abs(raw_input - prev_input) > 0.001
-                now_mono = time.monotonic()
-                turn_integral_reconcile = None
-                if input_changed:
-                    transition = "PRESS" if abs(raw_input) > abs(prev_input) else "RELEASE"
-                    last_transition_time = getattr(ctx, '_yaw_transition_time', now_mono)
-                    last_transition_tick = getattr(ctx, '_yaw_transition_tick', ctx.session.tick)
-                    elapsed_ms = (now_mono - last_transition_time) * 1000
-                    elapsed_ticks = ctx.session.tick - last_transition_tick
-                    effective_hz = elapsed_ticks / max(0.001, now_mono - last_transition_time)
-                    ctx._yaw_transition_time = now_mono
-                    ctx._yaw_transition_tick = ctx.session.tick
-                    transition_client_tick = int(
-                        getattr(ws, "turn_input_change_client_tick", 0) or 0
+                    # Read current input state (needed every tick for transition detection)
+                    raw_input = self._get_raw_turn_input(ctx)
+                    prev_input = getattr(ctx, 'prev_raw_turn_input', 0.0)
+                    torque = self._compute_turn_torque(ctx, raw_input)  # lateral_mobility=1.0
+                    raw_fwd_input = self._normalize_behavior_axis_value(
+                        ctx,
+                        ctx.weapon_system.behavior_slots[BehaviorSlot.MOVING_FORWARD],
                     )
-                    segment_start_tick = int(
-                        getattr(ctx, "_yaw_segment_start_client_tick", 0) or 0
-                    )
-                    if abs(prev_input) > 0.001 and abs(raw_input) <= 0.001:
-                        if transition_client_tick > segment_start_tick > 0:
-                            client_duration = (transition_client_tick - segment_start_tick) / 1000.0
-                            if 0.0 < client_duration <= 10.0:
-                                turn_integral_reconcile = {
-                                    "desired": self._compute_turn_torque(ctx, prev_input) * client_duration,
-                                    "client_duration": client_duration,
-                                }
-                    elif abs(prev_input) <= 0.001 and abs(raw_input) > 0.001:
-                        ctx._yaw_segment_start_client_tick = transition_client_tick
-                        ctx._yaw_segment_torque_integral = 0.0
-                    if self.debug_sync:
-                        yaw_msg = (
-                            f"[YAW-INPUT] {transition} c{ctx.client_id} "
-                            f"input={prev_input:.3f}->{raw_input:.3f} "
-                            f"ang_vel={physics.angular_velocity:.4f} "
-                            f"heading={math.degrees(physics.heading):.2f}deg "
-                            f"t={ctx.session.tick} "
-                            f"wall={elapsed_ms:.0f}ms ticks={elapsed_ticks} hz={effective_hz:.1f}"
+                    if abs(raw_fwd_input) < 0.05:
+                        raw_fwd_input = 0.0
+                    prev_fwd_input = float(getattr(ctx, "_fwd_integral_prev_input", 0.0) or 0.0)
+                    fwd_input_changed = abs(raw_fwd_input - prev_fwd_input) > 0.001
+                    movement_integral_reconcile = None
+                    if fwd_input_changed:
+                        if abs(prev_fwd_input) <= 0.001 and abs(raw_fwd_input) > 0.001:
+                            ctx._fwd_actual_input_integral = 0.0
+                        elif abs(prev_fwd_input) > 0.001 and abs(raw_fwd_input) <= 0.001:
+                            history = list(getattr(ctx, "movement_input_history", []) or [])
+                            last_nonzero_idx = len(history) - 1
+                            while last_nonzero_idx >= 0 and abs(float(history[last_nonzero_idx].get("fwd", 0.0) or 0.0)) <= 0.05:
+                                last_nonzero_idx -= 1
+                            release_idx = last_nonzero_idx + 1
+                            if last_nonzero_idx >= 0 and release_idx < len(history):
+                                start_idx = last_nonzero_idx
+                                while start_idx >= 0 and abs(float(history[start_idx].get("fwd", 0.0) or 0.0)) > 0.05:
+                                    start_idx -= 1
+                                start_idx += 1
+                                desired_input_integral = 0.0
+                                for hist_idx in range(start_idx, release_idx):
+                                    left = history[hist_idx]
+                                    right = history[hist_idx + 1]
+                                    left_tick = int(left.get("client_tick", 0) or 0)
+                                    right_tick = int(right.get("client_tick", 0) or 0)
+                                    if right_tick > left_tick > 0:
+                                        desired_input_integral += (
+                                            float(left.get("fwd", 0.0) or 0.0)
+                                            * ((right_tick - left_tick) / 1000.0)
+                                        )
+                                if desired_input_integral > 0.0:
+                                    movement_integral_reconcile = desired_input_integral
+                    ctx._fwd_integral_prev_input = raw_fwd_input
+
+                    physics = ctx.vehicle_physics
+                    ws = ctx.weapon_system
+
+                    # Log input transitions (key press/release)
+                    input_changed = abs(raw_input - prev_input) > 0.001
+                    now_mono = time.monotonic()
+                    turn_integral_reconcile = None
+                    if input_changed:
+                        transition = "PRESS" if abs(raw_input) > abs(prev_input) else "RELEASE"
+                        last_transition_time = getattr(ctx, '_yaw_transition_time', now_mono)
+                        last_transition_tick = getattr(ctx, '_yaw_transition_tick', ctx.session.tick)
+                        elapsed_ms = (now_mono - last_transition_time) * 1000
+                        elapsed_ticks = ctx.session.tick - last_transition_tick
+                        effective_hz = elapsed_ticks / max(0.001, now_mono - last_transition_time)
+                        ctx._yaw_transition_time = now_mono
+                        ctx._yaw_transition_tick = ctx.session.tick
+                        transition_client_tick = int(
+                            getattr(ws, "turn_input_change_client_tick", 0) or 0
                         )
-                        print(yaw_msg)
-                        try:
-                            with open(r"C:\Users\wstri\dev\wolfram\yaw_events.log", "a") as _yf:
-                                _yf.write(yaw_msg + "\n")
-                        except Exception:
-                            pass
+                        segment_start_tick = int(
+                            getattr(ctx, "_yaw_segment_start_client_tick", 0) or 0
+                        )
+                        if abs(prev_input) > 0.001 and abs(raw_input) <= 0.001:
+                            if transition_client_tick > segment_start_tick > 0:
+                                client_duration = (transition_client_tick - segment_start_tick) / 1000.0
+                                if 0.0 < client_duration <= 10.0:
+                                    turn_integral_reconcile = {
+                                        "desired": self._compute_turn_torque(ctx, prev_input) * client_duration,
+                                        "client_duration": client_duration,
+                                    }
+                        elif abs(prev_input) <= 0.001 and abs(raw_input) > 0.001:
+                            ctx._yaw_segment_start_client_tick = transition_client_tick
+                            ctx._yaw_segment_torque_integral = 0.0
+                        if self.debug_sync:
+                            yaw_msg = (
+                                f"[YAW-INPUT] {transition} c{ctx.client_id} "
+                                f"input={prev_input:.3f}->{raw_input:.3f} "
+                                f"ang_vel={physics.angular_velocity:.4f} "
+                                f"heading={math.degrees(physics.heading):.2f}deg "
+                                f"t={ctx.session.tick} "
+                                f"wall={elapsed_ms:.0f}ms ticks={elapsed_ticks} hz={effective_hz:.1f}"
+                            )
+                            print(yaw_msg)
+                            try:
+                                with open(r"C:\Users\wstri\dev\wolfram\yaw_events.log", "a") as _yf:
+                                    _yf.write(yaw_msg + "\n")
+                            except Exception:
+                                pass
 
-                ctx.prev_raw_turn_input = raw_input
+                    ctx.prev_raw_turn_input = raw_input
 
-                # === PHYSICS STEPPING ===
-                # Advance physics at EXACTLY real-time via a wall-clock accumulator
-                # stepping fixed 1/tick_rate increments (GOAL 6). The tick loop free-
-                # runs faster than tick_rate_hz under load (measured 31.5Hz vs the
-                # client's 30Hz); stepping a fixed dt every raw tick over-integrated
-                # ~1.05 sim-seconds per real second, so the server out-rotated the
-                # client on every turn and compounded a multi-degree heading drift.
-                # Run 0/1/2 fixed steps per tick so simulated time == wall-clock time,
-                # matching the client's LocalPhysics.step accumulator on both sides.
-                physics_dt = 1.0 / self.tick_rate_hz
+                    # === PHYSICS STEPPING ===
+                    # Advance physics at EXACTLY real-time via a wall-clock accumulator
+                    # stepping fixed 1/tick_rate increments (GOAL 6). The tick loop free-
+                    # runs faster than tick_rate_hz under load (measured 31.5Hz vs the
+                    # client's 30Hz); stepping a fixed dt every raw tick over-integrated
+                    # ~1.05 sim-seconds per real second, so the server out-rotated the
+                    # client on every turn and compounded a multi-degree heading drift.
+                    # Run 0/1/2 fixed steps per tick so simulated time == wall-clock time,
+                    # matching the client's LocalPhysics.step accumulator on both sides.
+                    physics_dt = 1.0 / self.tick_rate_hz
 
-                # === GOAL 7: per-client frame-rate-matched physics stepping ===
-                # The client integrates physics once per RENDER FRAME, subdividing the
-                # real frame delta in GUESS6_GameSim_substep_update (azurefishy-src
-                # Physics.c:1974): one outer pass of substep_count = delta/110ms + 1
-                # (capped 5), each inner-split at 40ms (or dt*0.5 for dt>80ms), with
-                # ang_vel += accel*substep_dt (Physics.c:5169/5264). The server must
-                # advance simulated time in chunks of THIS client's frame_dt so the
-                # outer/inner substep STRUCTURE and f32-quantization boundaries match
-                # the client's per-frame integration exactly — not merely the total
-                # simulated time. At ~84ms (OG WARP) vs ~33ms (py @30Hz) the resulting
-                # rotation differs only ~1.3% (the coarser frame rotates slightly MORE
-                # under explicit Euler): the premise's "2.5x over-rotation from step
-                # count" does NOT exist because torque AND heading are both dt-scaled.
-                # This change aligns that ~1.3% residual to the real per-frame client
-                # behavior. GOAL-6's real-time accumulator is preserved (sim-time ==
-                # wall-time); only the per-step chunk changes from a fixed 1/30 to the
-                # client's actual frame rate. WULFRAM_GOAL7_LEGACY=1 restores 1/30.
-                # Matching the client's coarse frame *size* without sharing its
-                # frame phase makes input edges land a whole frame early or late.
-                # Keep this independently switchable from GOAL7's replication fix
-                # so live A/B tests can use a fine server step safely.
-                frame_match_physics = bool(getattr(self, "physics_frame_match", True))
-                goal7_legacy = (
-                    not frame_match_physics or
-                    os.environ.get("WULFRAM_GOAL7_LEGACY") == "1"
-                )
-                if goal7_legacy:
-                    step_dt = physics_dt
-                else:
-                    step_dt = ctx.weapon_system.effective_frame_dt(self.tick_rate_hz)
-                    # Clamp to the client's own bounds: a ~120fps floor and the 550ms
-                    # outer-delta clamp GameSim_substep_update enforces (Physics.c:1974).
-                    step_dt = max(1.0 / 120.0, min(step_dt, 0.55))
-
-                _pc_now = time.perf_counter()
-                phys_accumulator += max(0.0, _pc_now - phys_accum_last)
-                phys_accum_last = _pc_now
-                # Cap backlog at the client's 0.55s elapsed clamp (<=5 catch-up steps).
-                _max_backlog = 5.0 * step_dt
-                if phys_accumulator > _max_backlog:
-                    phys_accumulator = _max_backlog
-                n_phys_steps = int(phys_accumulator / step_dt)
-                # 2026-09-02: a tick-thread stall (GOAL-8 triple substep + world
-                # collision at motion onset, control polling, GC) used to be paid
-                # back as up to 5 consecutive steps in ONE tick, all with the
-                # current input -> the server jumped ~4 steps ahead of the
-                # client's predictor exactly when a key was pressed (live: 11.5
-                # -> 21.2 u/s in 47 ms). Spread the backlog over ticks instead;
-                # the accumulator keeps the remainder so sim time is conserved.
-                _max_catchup = int(getattr(self, "max_catchup_steps", 5) or 5)
-                if _max_catchup > 0 and n_phys_steps > _max_catchup:
-                    n_phys_steps = _max_catchup
-                phys_accumulator -= n_phys_steps * step_dt
-                if os.environ.get("WULFRAM_GOAL6_LEGACY") == "1":
-                    # A/B baseline: legacy fixed-dt one-step-per-raw-tick behavior.
-                    n_phys_steps = 1
-                    phys_accumulator = 0.0
-                    step_dt = physics_dt
-
-                if _phase_timing:
-                    _phase_t0 = time.perf_counter()
-
-                # Split window uses monotonic (the clock turn_input_change_time is
-                # stamped with); it is a coarse sub-tick refinement, kept decoupled
-                # from the perf_counter rate accumulator above.
-                step_wall_now = time.monotonic()
-                step_wall_dt = max(1e-6, step_wall_now - last_physics_wall_time)
-                last_physics_wall_time = step_wall_now
-                _window_start = step_wall_now - step_wall_dt
-
-                old_heading = ctx.player_heading
-                move_dt = 0.0
-                move_heading = old_heading
-                for _phys_i in range(n_phys_steps):
-                    ctx.physics_step_count += 1
-                    old_heading = ctx.player_heading
-
-                    # Live ACTION_UPDATE packets arrive asynchronously relative to the
-                    # tick loop. If turning changed partway through this tick's wall
-                    # window, split the first sub-step so the pre-change slice uses the
-                    # previous turn input and the remainder uses the latest input.
-                    transition_time = float(getattr(ws, "turn_input_change_time", 0.0) or 0.0)
-                    prev_turn_slot = float(getattr(ws, "turn_input_prev_value", 0.0) or 0.0)
-                    prev_turn_input = self._normalize_turn_input_value(ctx, prev_turn_slot)
-                    split_turn_step = (
-                        _phys_i == 0 and
-                        transition_time > _window_start and
-                        transition_time < step_wall_now and
-                        abs(prev_turn_input - raw_input) > 0.001
+                    # === GOAL 7: per-client frame-rate-matched physics stepping ===
+                    # The client integrates physics once per RENDER FRAME, subdividing the
+                    # real frame delta in GUESS6_GameSim_substep_update (azurefishy-src
+                    # Physics.c:1974): one outer pass of substep_count = delta/110ms + 1
+                    # (capped 5), each inner-split at 40ms (or dt*0.5 for dt>80ms), with
+                    # ang_vel += accel*substep_dt (Physics.c:5169/5264). The server must
+                    # advance simulated time in chunks of THIS client's frame_dt so the
+                    # outer/inner substep STRUCTURE and f32-quantization boundaries match
+                    # the client's per-frame integration exactly — not merely the total
+                    # simulated time. At ~84ms (OG WARP) vs ~33ms (py @30Hz) the resulting
+                    # rotation differs only ~1.3% (the coarser frame rotates slightly MORE
+                    # under explicit Euler): the premise's "2.5x over-rotation from step
+                    # count" does NOT exist because torque AND heading are both dt-scaled.
+                    # This change aligns that ~1.3% residual to the real per-frame client
+                    # behavior. GOAL-6's real-time accumulator is preserved (sim-time ==
+                    # wall-time); only the per-step chunk changes from a fixed 1/30 to the
+                    # client's actual frame rate. WULFRAM_GOAL7_LEGACY=1 restores 1/30.
+                    # Matching the client's coarse frame *size* without sharing its
+                    # frame phase makes input edges land a whole frame early or late.
+                    # Keep this independently switchable from GOAL7's replication fix
+                    # so live A/B tests can use a fine server step safely.
+                    frame_match_physics = bool(getattr(self, "physics_frame_match", True))
+                    goal7_legacy = (
+                        not frame_match_physics or
+                        os.environ.get("WULFRAM_GOAL7_LEGACY") == "1"
                     )
-                    move_dt = step_dt
+                    if goal7_legacy:
+                        step_dt = physics_dt
+                    else:
+                        step_dt = ctx.weapon_system.effective_frame_dt(self.tick_rate_hz)
+                        # Clamp to the client's own bounds: a ~120fps floor and the 550ms
+                        # outer-delta clamp GameSim_substep_update enforces (Physics.c:1974).
+                        step_dt = max(1.0 / 120.0, min(step_dt, 0.55))
+
+                    _pc_now = time.perf_counter()
+                    phys_accumulator += max(0.0, _pc_now - phys_accum_last)
+                    phys_accum_last = _pc_now
+                    # Cap backlog at the client's 0.55s elapsed clamp (<=5 catch-up steps).
+                    _max_backlog = 5.0 * step_dt
+                    if phys_accumulator > _max_backlog:
+                        phys_accumulator = _max_backlog
+                    n_phys_steps = int(phys_accumulator / step_dt)
+                    # 2026-09-02: a tick-thread stall (GOAL-8 triple substep + world
+                    # collision at motion onset, control polling, GC) used to be paid
+                    # back as up to 5 consecutive steps in ONE tick, all with the
+                    # current input -> the server jumped ~4 steps ahead of the
+                    # client's predictor exactly when a key was pressed (live: 11.5
+                    # -> 21.2 u/s in 47 ms). Spread the backlog over ticks instead;
+                    # the accumulator keeps the remainder so sim time is conserved.
+                    _max_catchup = int(getattr(self, "max_catchup_steps", 5) or 5)
+                    if _max_catchup > 0 and n_phys_steps > _max_catchup:
+                        n_phys_steps = _max_catchup
+                    phys_accumulator -= n_phys_steps * step_dt
+                    if os.environ.get("WULFRAM_GOAL6_LEGACY") == "1":
+                        # A/B baseline: legacy fixed-dt one-step-per-raw-tick behavior.
+                        n_phys_steps = 1
+                        phys_accumulator = 0.0
+                        step_dt = physics_dt
+
+                    if _phase_timing:
+                        _phase_t0 = time.perf_counter()
+
+                    # Split window uses monotonic (the clock turn_input_change_time is
+                    # stamped with); it is a coarse sub-tick refinement, kept decoupled
+                    # from the perf_counter rate accumulator above.
+                    step_wall_now = time.monotonic()
+                    step_wall_dt = max(1e-6, step_wall_now - last_physics_wall_time)
+                    last_physics_wall_time = step_wall_now
+                    _window_start = step_wall_now - step_wall_dt
+
+                    old_heading = ctx.player_heading
+                    move_dt = 0.0
                     move_heading = old_heading
-                    if split_turn_step:
-                        pre_ratio = (transition_time - _window_start) / step_wall_dt
-                        pre_ratio = max(0.0, min(1.0, pre_ratio))
-                        pre_dt = step_dt * pre_ratio
-                        post_dt = step_dt - pre_dt
-                        prev_torque = self._compute_turn_torque(ctx, prev_turn_input)
-                        if pre_dt > 1e-6:
-                            physics.step_client_substeps(prev_torque, pre_dt)
-                            if abs(prev_turn_input) > 0.001:
-                                ctx._yaw_segment_torque_integral = float(
-                                    getattr(ctx, "_yaw_segment_torque_integral", 0.0) or 0.0
-                                ) + prev_torque * pre_dt
-                            self._sync_heading_physics_to_context(ctx, physics)
-                            self._update_player_position_stepped(ctx, pre_dt, heading_override=old_heading)
-                            ctx._fwd_actual_input_integral = float(
-                                getattr(ctx, "_fwd_actual_input_integral", 0.0) or 0.0
-                            ) + raw_fwd_input * pre_dt
-                            move_heading = ctx.player_heading
-                        if post_dt > 1e-6:
-                            physics.step_client_substeps(torque, post_dt)
+                    native = getattr(self, "native_physics", None)
+                    native_managed = native is not None and native.manages(ctx)
+                    if native_managed:
+                        native.publish(ctx)
+                        n_phys_steps = 0
+                        phys_accumulator = 0.0
+                        turn_integral_reconcile = None
+                        movement_integral_reconcile = None
+                    for _phys_i in range(n_phys_steps):
+                        ctx.physics_step_count += 1
+                        old_heading = ctx.player_heading
+                        # Consecutive windows account for the unconsumed accumulator;
+                        # catch-up steps must not all sample the same wall interval.
+                        window_end = (step_wall_now - phys_accumulator
+                                      - (n_phys_steps - _phys_i - 1) * step_dt)
+                        self._prepare_physics_input_window(ctx, window_end - step_dt, window_end)
+                        window = getattr(ctx, "physics_input_window", None)
+                        step_input = window["turn"] if window is not None else raw_input
+                        torque = self._compute_turn_torque(ctx, step_input)
+
+                        # Live ACTION_UPDATE packets arrive asynchronously relative to the
+                        # tick loop. If turning changed partway through this tick's wall
+                        # window, split the first sub-step so the pre-change slice uses the
+                        # previous turn input and the remainder uses the latest input.
+                        transition_time = float(getattr(ws, "turn_input_change_time", 0.0) or 0.0)
+                        prev_turn_slot = float(getattr(ws, "turn_input_prev_value", 0.0) or 0.0)
+                        prev_turn_input = self._normalize_turn_input_value(ctx, prev_turn_slot)
+                        split_turn_step = (
+                            window is None and
+                            _phys_i == 0 and
+                            transition_time > _window_start and
+                            transition_time < step_wall_now and
+                            abs(prev_turn_input - raw_input) > 0.001
+                        )
+                        move_dt = step_dt
+                        move_heading = old_heading
+                        if split_turn_step:
+                            pre_ratio = (transition_time - _window_start) / step_wall_dt
+                            pre_ratio = max(0.0, min(1.0, pre_ratio))
+                            pre_dt = step_dt * pre_ratio
+                            post_dt = step_dt - pre_dt
+                            prev_torque = self._compute_turn_torque(ctx, prev_turn_input)
+                            if pre_dt > 1e-6:
+                                physics.step_client_substeps(prev_torque, pre_dt)
+                                if abs(prev_turn_input) > 0.001:
+                                    ctx._yaw_segment_torque_integral = float(
+                                        getattr(ctx, "_yaw_segment_torque_integral", 0.0) or 0.0
+                                    ) + prev_torque * pre_dt
+                                self._sync_heading_physics_to_context(ctx, physics)
+                                self._update_player_position_stepped(ctx, pre_dt, heading_override=old_heading)
+                                ctx._fwd_actual_input_integral = float(
+                                    getattr(ctx, "_fwd_actual_input_integral", 0.0) or 0.0
+                                ) + raw_fwd_input * pre_dt
+                                move_heading = ctx.player_heading
+                            if post_dt > 1e-6:
+                                physics.step_client_substeps(torque, post_dt)
+                                if abs(raw_input) > 0.001:
+                                    ctx._yaw_segment_torque_integral = float(
+                                        getattr(ctx, "_yaw_segment_torque_integral", 0.0) or 0.0
+                                    ) + torque * post_dt
+                            move_dt = post_dt
+                            ws.turn_input_change_time = 0.0
+                            if self.debug_sync:
+                                print(
+                                    f"[YAW-SPLIT] c{ctx.client_id} "
+                                    f"old={prev_turn_input:.3f} new={raw_input:.3f} "
+                                    f"pre_dt={pre_dt * 1000.0:.1f}ms post_dt={post_dt * 1000.0:.1f}ms"
+                                )
+                        else:
+                            physics.step_client_substeps(torque, step_dt)
                             if abs(raw_input) > 0.001:
                                 ctx._yaw_segment_torque_integral = float(
                                     getattr(ctx, "_yaw_segment_torque_integral", 0.0) or 0.0
-                                ) + torque * post_dt
-                        move_dt = post_dt
-                        ws.turn_input_change_time = 0.0
-                        if self.debug_sync:
-                            print(
-                                f"[YAW-SPLIT] c{ctx.client_id} "
-                                f"old={prev_turn_input:.3f} new={raw_input:.3f} "
-                                f"pre_dt={pre_dt * 1000.0:.1f}ms post_dt={post_dt * 1000.0:.1f}ms"
-                            )
-                    else:
-                        physics.step_client_substeps(torque, step_dt)
-                        if abs(raw_input) > 0.001:
-                            ctx._yaw_segment_torque_integral = float(
-                                getattr(ctx, "_yaw_segment_torque_integral", 0.0) or 0.0
-                            ) + torque * step_dt
+                                ) + torque * step_dt
 
-                    self._sync_heading_physics_to_context(ctx, physics)
-                    if move_dt > 1e-6:
-                        self._update_player_position_stepped(ctx, move_dt, heading_override=move_heading)
-                        ctx._fwd_actual_input_integral = float(
+                        self._sync_heading_physics_to_context(ctx, physics)
+                        if move_dt > 1e-6:
+                            self._update_player_position_stepped(ctx, move_dt, heading_override=move_heading)
+                            ctx._fwd_actual_input_integral = float(
+                                getattr(ctx, "_fwd_actual_input_integral", 0.0) or 0.0
+                            ) + raw_fwd_input * move_dt
+                        ctx.physics_input_window = None
+                    if turn_integral_reconcile is not None and not getattr(
+                        self, "turn_integral_reconcile_enabled", True
+                    ):
+                        # Gated off (WULFRAM_TURN_INTEGRAL_RECONCILE=0): the stock
+                        # STATE_REQUEST replay reply is the convergence channel.
+                        ctx._yaw_segment_start_client_tick = 0
+                        ctx._yaw_segment_torque_integral = 0.0
+                        turn_integral_reconcile = None
+                    if movement_integral_reconcile is not None and not getattr(
+                        self, "movement_integral_reconcile_enabled", True
+                    ):
+                        ctx._fwd_actual_input_integral = 0.0
+                        movement_integral_reconcile = None
+                    if turn_integral_reconcile is not None:
+                        actual_integral = float(
+                            getattr(ctx, "_yaw_segment_torque_integral", 0.0) or 0.0
+                        )
+                        integral_delta = float(turn_integral_reconcile["desired"]) - actual_integral
+                        # Client transition ticks measure the duration for which its
+                        # local predictor applied the held input. Correct only the
+                        # missing/excess angular impulse at release; this removes
+                        # network/frame-phase jitter without changing turn constants.
+                        max_delta = abs(float(self.turn_adjust)) * 0.25
+                        integral_delta = max(-max_delta, min(max_delta, integral_delta))
+                        physics.angular_velocity = float(physics.angular_velocity) + integral_delta
+                        ctx.angular_vel_yaw = physics.angular_velocity
+                        ctx.debug_last_turn_integral_reconcile = {
+                            "client_duration": float(turn_integral_reconcile["client_duration"]),
+                            "desired": float(turn_integral_reconcile["desired"]),
+                            "actual": actual_integral,
+                            "delta": integral_delta,
+                        }
+                        ctx._yaw_segment_start_client_tick = 0
+                        ctx._yaw_segment_torque_integral = 0.0
+                    if movement_integral_reconcile is not None:
+                        actual_input_integral = float(
                             getattr(ctx, "_fwd_actual_input_integral", 0.0) or 0.0
-                        ) + raw_fwd_input * move_dt
-                if turn_integral_reconcile is not None and not getattr(
-                    self, "turn_integral_reconcile_enabled", True
-                ):
-                    # Gated off (WULFRAM_TURN_INTEGRAL_RECONCILE=0): the stock
-                    # STATE_REQUEST replay reply is the convergence channel.
-                    ctx._yaw_segment_start_client_tick = 0
-                    ctx._yaw_segment_torque_integral = 0.0
-                    turn_integral_reconcile = None
-                if movement_integral_reconcile is not None and not getattr(
-                    self, "movement_integral_reconcile_enabled", True
-                ):
-                    ctx._fwd_actual_input_integral = 0.0
-                    movement_integral_reconcile = None
-                if turn_integral_reconcile is not None:
-                    actual_integral = float(
-                        getattr(ctx, "_yaw_segment_torque_integral", 0.0) or 0.0
-                    )
-                    integral_delta = float(turn_integral_reconcile["desired"]) - actual_integral
-                    # Client transition ticks measure the duration for which its
-                    # local predictor applied the held input. Correct only the
-                    # missing/excess angular impulse at release; this removes
-                    # network/frame-phase jitter without changing turn constants.
-                    max_delta = abs(float(self.turn_adjust)) * 0.25
-                    integral_delta = max(-max_delta, min(max_delta, integral_delta))
-                    physics.angular_velocity = float(physics.angular_velocity) + integral_delta
-                    ctx.angular_vel_yaw = physics.angular_velocity
-                    ctx.debug_last_turn_integral_reconcile = {
-                        "client_duration": float(turn_integral_reconcile["client_duration"]),
-                        "desired": float(turn_integral_reconcile["desired"]),
-                        "actual": actual_integral,
-                        "delta": integral_delta,
-                    }
-                    ctx._yaw_segment_start_client_tick = 0
-                    ctx._yaw_segment_torque_integral = 0.0
-                if movement_integral_reconcile is not None:
-                    actual_input_integral = float(
-                        getattr(ctx, "_fwd_actual_input_integral", 0.0) or 0.0
-                    )
-                    input_integral_delta = movement_integral_reconcile - actual_input_integral
-                    input_integral_delta = max(-0.25, min(0.25, input_integral_delta))
-                    veh_config = VEHICLE_PHYSICS_CONFIGS.get(ctx.entity_type)
-                    move_adjust = veh_config.move_adjust if veh_config else 85.0
-                    velocity_delta = input_integral_delta * move_adjust
-                    basis_x = math.cos(ctx.player_heading)
-                    basis_y = math.sin(ctx.player_heading)
-                    vx, vy, vz = ctx.player_vel
-                    ctx.player_vel = (
-                        vx + basis_x * velocity_delta,
-                        vy + basis_y * velocity_delta,
-                        vz,
-                    )
-                    ctx.player_speed = math.hypot(ctx.player_vel[0], ctx.player_vel[1])
-                    ctx.debug_last_movement_integral_reconcile = {
-                        "desired": movement_integral_reconcile,
-                        "actual": actual_input_integral,
-                        "delta": input_integral_delta,
-                        "velocity_delta": velocity_delta,
-                    }
-                    ctx._fwd_actual_input_integral = 0.0
-                if _phase_timing:
-                    _phase_t_upp = time.perf_counter()
-                self._resolve_entity_entity_collisions(ctx)
-                self._update_player_aim(ctx)
-                self._regen_player_energy(ctx, physics_dt)
-                self._update_supply_buildings(ctx, physics_dt)
-                if os.environ.get("WULFRAM_TURRET_AI", "1") == "1":
-                    self._update_turret_ai()
+                        )
+                        input_integral_delta = movement_integral_reconcile - actual_input_integral
+                        input_integral_delta = max(-0.25, min(0.25, input_integral_delta))
+                        veh_config = VEHICLE_PHYSICS_CONFIGS.get(ctx.entity_type)
+                        move_adjust = veh_config.move_adjust if veh_config else 85.0
+                        velocity_delta = input_integral_delta * move_adjust
+                        basis_x = math.cos(ctx.player_heading)
+                        basis_y = math.sin(ctx.player_heading)
+                        vx, vy, vz = ctx.player_vel
+                        ctx.player_vel = (
+                            vx + basis_x * velocity_delta,
+                            vy + basis_y * velocity_delta,
+                            vz,
+                        )
+                        ctx.player_speed = math.hypot(ctx.player_vel[0], ctx.player_vel[1])
+                        ctx.debug_last_movement_integral_reconcile = {
+                            "desired": movement_integral_reconcile,
+                            "actual": actual_input_integral,
+                            "delta": input_integral_delta,
+                            "velocity_delta": velocity_delta,
+                        }
+                        ctx._fwd_actual_input_integral = 0.0
+                    if _phase_timing:
+                        _phase_t_upp = time.perf_counter()
+                    if not native_managed:
+                        self._resolve_entity_entity_collisions(ctx)
+                    self._update_player_aim(ctx)
+                    self._regen_player_energy(ctx, physics_dt)
+                    self._update_supply_buildings(ctx, physics_dt)
+                    if os.environ.get("WULFRAM_TURRET_AI", "1") == "1":
+                        self._update_turret_ai()
+                    if not self._local_epoch_current(ctx, token):
+                        return
 
-                if _phase_timing:
-                    _phase_t_phys = time.perf_counter()
+                    if _phase_timing:
+                        _phase_t_phys = time.perf_counter()
 
-                # Send debug sync state for measuring client-server divergence
-                if self.debug_sync:
+                    # Send debug sync state for measuring client-server divergence
+                    if self.debug_sync:
+                        fwd_input = self._normalize_behavior_axis_value(
+                            ctx,
+                            ws.behavior_slots[BehaviorSlot.MOVING_FORWARD],
+                        )
+                        strafe_input = self._decode_network_strafe_input(
+                            ctx,
+                            ws.behavior_slots[BehaviorSlot.MOVING_SIDEWAYS],
+                        )
+                        self._send_debug_sync(ctx, ws.client_frame_counter,
+                                              raw_input, fwd_input, strafe_input)
+
+                    # YAW-TRACK: disabled to avoid per-tick console I/O slowing tick loop
+                    # if abs(ctx.angular_vel_yaw) > 0.01:
+                    #     print(f"[YAW-TRACK] ...")
+
+                    # Desync detection: track position changes and input
+                    now = time.monotonic()
+                    pos_changed = (
+                        abs(ctx.player_pos[0] - last_position[0]) > 0.1 or
+                        abs(ctx.player_pos[1] - last_position[1]) > 0.1 or
+                        abs(ctx.player_pos[2] - last_position[2]) > 0.1
+                    )
+                    if pos_changed:
+                        last_position = ctx.player_pos
+                        last_position_change_time = now
+                        ctx.last_position_update = now
+                        ctx.position_change_count += 1
+                        desync_warned = False
+
+                    # Check for non-zero input in behavior slots (only movement, not thrust)
                     fwd_input = self._normalize_behavior_axis_value(
                         ctx,
-                        ws.behavior_slots[BehaviorSlot.MOVING_FORWARD],
+                        ctx.weapon_system.behavior_slots[BehaviorSlot.MOVING_FORWARD],
                     )
                     strafe_input = self._decode_network_strafe_input(
                         ctx,
-                        ws.behavior_slots[BehaviorSlot.MOVING_SIDEWAYS],
+                        ctx.weapon_system.behavior_slots[BehaviorSlot.MOVING_SIDEWAYS],
                     )
-                    self._send_debug_sync(ctx, ws.client_frame_counter,
-                                          raw_input, fwd_input, strafe_input)
+                    thrust_input = tank_softbody_control_slot_value(ctx.weapon_system.behavior_slots)
+                    # Only consider actual movement input (fwd/strafe), not thrust which may be constant
+                    has_movement_input = abs(fwd_input) > 0.05 or abs(strafe_input) > 0.05
+                    if has_movement_input:
+                        last_input_time = now
 
-                # YAW-TRACK: disabled to avoid per-tick console I/O slowing tick loop
-                # if abs(ctx.angular_vel_yaw) > 0.01:
-                #     print(f"[YAW-TRACK] ...")
+                    # Warn if position stuck but receiving movement input
+                    stuck_duration = now - last_position_change_time
+                    movement_input_active = (now - last_input_time) < 2.0
+                    if stuck_duration > 5.0 and movement_input_active and not desync_warned:
+                        print(f"[DESYNC] Client {ctx.client_id}: Position stuck for {stuck_duration:.1f}s but movement input active!")
+                        print(f"[DESYNC]   pos={ctx.player_pos} vel={ctx.player_vel}")
+                        print(f"[DESYNC]   fwd={fwd_input:.3f} strafe={strafe_input:.3f}")
+                        desync_warned = True
 
-                # Desync detection: track position changes and input
-                now = time.monotonic()
-                pos_changed = (
-                    abs(ctx.player_pos[0] - last_position[0]) > 0.1 or
-                    abs(ctx.player_pos[1] - last_position[1]) > 0.1 or
-                    abs(ctx.player_pos[2] - last_position[2]) > 0.1
-                )
-                if pos_changed:
-                    last_position = ctx.player_pos
-                    last_position_change_time = now
-                    ctx.last_position_update = now
-                    ctx.position_change_count += 1
-                    desync_warned = False
-
-                # Check for non-zero input in behavior slots (only movement, not thrust)
-                fwd_input = self._normalize_behavior_axis_value(
-                    ctx,
-                    ctx.weapon_system.behavior_slots[BehaviorSlot.MOVING_FORWARD],
-                )
-                strafe_input = self._decode_network_strafe_input(
-                    ctx,
-                    ctx.weapon_system.behavior_slots[BehaviorSlot.MOVING_SIDEWAYS],
-                )
-                thrust_input = tank_softbody_control_slot_value(ctx.weapon_system.behavior_slots)
-                # Only consider actual movement input (fwd/strafe), not thrust which may be constant
-                has_movement_input = abs(fwd_input) > 0.05 or abs(strafe_input) > 0.05
-                if has_movement_input:
-                    last_input_time = now
-
-                # Warn if position stuck but receiving movement input
-                stuck_duration = now - last_position_change_time
-                movement_input_active = (now - last_input_time) < 2.0
-                if stuck_duration > 5.0 and movement_input_active and not desync_warned:
-                    print(f"[DESYNC] Client {ctx.client_id}: Position stuck for {stuck_duration:.1f}s but movement input active!")
-                    print(f"[DESYNC]   pos={ctx.player_pos} vel={ctx.player_vel}")
-                    print(f"[DESYNC]   fwd={fwd_input:.3f} strafe={strafe_input:.3f}")
-                    desync_warned = True
-
-                # Periodic status for debugging (every 30 seconds)
-                if ctx.session.tick % 900 == 0:  # ~30 seconds at 30Hz
-                    input_status = "IDLE" if (abs(fwd_input) < 0.01 and abs(strafe_input) < 0.01) else "ACTIVE"
-                    print(
-                        f"[STATUS] Client {ctx.client_id}: pos={ctx.player_pos} "
-                        f"input={input_status}(fwd={fwd_input:.2f},strafe={strafe_input:.2f}) "
-                        f"stuck={stuck_duration:.0f}s "
-                        f"corrections={int(getattr(ctx, 'correction_send_count', 0) or 0)} "
-                        f"divergence_accum={float(getattr(ctx, 'divergence_accum_pos', 0.0) or 0.0):.3f}u "
-                        f"z_jitter={float(getattr(ctx, 'sync_z_jitter', 0.0) or 0.0):.3f}u "
-                        f"xy_jitter={float(getattr(ctx, 'sync_xy_jitter', 0.0) or 0.0):.3f}u"
-                    )
-
-                tick = self._get_network_tick(ctx)
-                self._record_authoritative_state(ctx, tick=tick)
-                # Debug: log tick value periodically
-                if ctx.session.tick % 300 == 0:
-                    print(f"[TICK-DEBUG] Client {ctx.client_id}: network_tick={tick} client_tick={ctx.last_client_tick} offset={ctx.tick_offset}")
-                health_val = self._get_health_value(ctx)
-                fuel_val = self._get_energy_value(ctx)
-                # Full position updates (server authoritative).
-                # Default OFF: wulf-forge does NOT send the local player's position
-                # in UPDATE_ARRAY. Sending position overrides the client's own physics
-                # and causes underground clipping + red health overlay on hilly terrain
-                # (server ground_level is flat, terrain is not).
-                send_full_update = os.environ.get("WULFRAM_SEND_FULL_UPDATES", "0") == "1"
-                # Default to current position for tracking even if we skip UPDATE_ARRAY.
-                send_pos = self._to_client_pos(ctx.player_pos)
-                payload: Optional[bytes] = None
-                send_payload = False
-                suppress_periodic_heartbeat = False
-
-                self._maybe_promote_remote_full_local_state(ctx, reason="post_spawn")
-
-                send_update = True
-                burst_remaining = int(getattr(ctx, "correction_burst_remaining", 0) or 0)
-                burst_interval = float(getattr(ctx, "correction_burst_interval_s", 0.0) or 0.0)
-                active_movement_correction_suppressed = self._remote_movement_input_active(
-                    ctx,
-                    now=now,
-                )
-                correction_reason = ""
-                force_due = bool(getattr(ctx, "force_correction_once", False))
-                if self.correction_gate_enabled:
-                    # OG-faithful GATED-RARE reactive correction (GOAL 2, amended
-                    # 2026-06-09). No proactive timer streams: a correction emits
-                    # only when (a) explicitly forced, (b) a queued reactive burst
-                    # is draining (operator `correction now`, jump-jet hop, or the
-                    # rate-capped STATE_REQUEST settle burst — see
-                    # _maybe_queue_state_request_burst; queue sites are all
-                    # event-driven and rate-capped), or (c) the authoritative
-                    # state has genuinely DIVERGED (accumulated server-only,
-                    # client-unpredictable displacement — terrain-Z clamp /
-                    # collision push — since the last correction) beyond a
-                    # threshold, and never faster than the hard rate cap. The gate
-                    # is IDENTICAL for every client: a zero-latency loopback client
-                    # is bounded by the same caps, with no _is_loopback_client fork.
-                    accum_pos = float(getattr(ctx, "divergence_accum_pos", 0.0) or 0.0)
-                    accum_heading_deg = math.degrees(
-                        abs(float(getattr(ctx, "divergence_accum_heading", 0.0) or 0.0))
-                    )
-                    rate_ok = (now - ctx.last_correction_send) >= self.correction_min_interval
-                    diverged = (
-                        accum_pos >= self.correction_divergence_pos
-                        or accum_heading_deg >= self.correction_divergence_heading_deg
-                    )
-                    divergence_correction_due = diverged and rate_ok
-                    burst_due = self._correction_burst_due(
-                        ctx, now, active_movement_correction_suppressed
-                    )
-                    settled_movement_due = (
-                        not handlers._is_loopback_client(ctx)
-                        and self._settled_movement_correction_due(
-                            ctx,
-                            now=now,
-                            movement_suppressed=active_movement_correction_suppressed,
+                    # Periodic status for debugging (every 30 seconds)
+                    if ctx.session.tick % 900 == 0:  # ~30 seconds at 30Hz
+                        input_status = "IDLE" if (abs(fwd_input) < 0.01 and abs(strafe_input) < 0.01) else "ACTIVE"
+                        print(
+                            f"[STATUS] Client {ctx.client_id}: pos={ctx.player_pos} "
+                            f"input={input_status}(fwd={fwd_input:.2f},strafe={strafe_input:.2f}) "
+                            f"stuck={stuck_duration:.0f}s "
+                            f"corrections={int(getattr(ctx, 'correction_send_count', 0) or 0)} "
+                            f"divergence_accum={float(getattr(ctx, 'divergence_accum_pos', 0.0) or 0.0):.3f}u "
+                            f"z_jitter={float(getattr(ctx, 'sync_z_jitter', 0.0) or 0.0):.3f}u "
+                            f"xy_jitter={float(getattr(ctx, 'sync_xy_jitter', 0.0) or 0.0):.3f}u"
                         )
-                    )
-                    # Periodic correction: steady-cadence drift clear. It rides
-                    # VIEW_UPDATE, which the OG client applies as snap-pose + ZERO
-                    # VELOCITY (apply_lag_compensation). Firing it WHILE the player
-                    # drives zeros their momentum every ~0.5s -> a real-latency movement
-                    # FREEZE (2026-06-27). So by default it is SUPPRESSED during active
-                    # movement input (same gate burst/divergence already respect); the
-                    # accumulated drift then clears the instant the player stops, with no
-                    # freeze. WULFRAM_PERIODIC_CORRECTION_DURING_MOVEMENT=1 restores the
-                    # old fire-during-movement behavior (A/B only; freezes OG clients).
-                    periodic_due = (
-                        self.periodic_correction_interval > 0.0
-                        and not handlers._is_loopback_client(ctx)
-                        and (
-                            self.periodic_correction_during_movement
-                            or not active_movement_correction_suppressed
-                        )
-                        and (now - ctx.last_correction_send) >= self.periodic_correction_interval
-                    )
-                    if force_due:
-                        correction_reason = "forced"
-                    elif burst_due:
-                        correction_reason = "burst"
-                    elif divergence_correction_due:
-                        correction_reason = "divergence"
-                    elif settled_movement_due:
-                        correction_reason = "movement_settled"
-                    elif periodic_due:
-                        correction_reason = "periodic"
-                    correction_due = (
-                        force_due
-                        or burst_due
-                        or divergence_correction_due
-                        or settled_movement_due
-                        or periodic_due
-                    )
-                else:
-                    # Legacy proactive streams — A/B only (WULFRAM_CORRECTION_GATE=0).
-                    burst_due = self._correction_burst_due(
-                        ctx, now, active_movement_correction_suppressed
-                    )
-                    movement_interval = float(getattr(self, "movement_correction_interval", 0.0) or 0.0)
-                    movement_window = float(getattr(self, "movement_correction_window", 0.0) or 0.0)
-                    recent_move_input_time = float(getattr(ctx, "last_nonzero_move_input_time", 0.0) or 0.0)
-                    movement_correction_recent = (
-                        movement_interval > 0
-                        and recent_move_input_time > 0.0
-                        and (now - recent_move_input_time) <= movement_window
-                        and not handlers._is_loopback_client(ctx)
-                    )
-                    movement_correction_due = (
-                        movement_correction_recent
-                        and not active_movement_correction_suppressed
-                        and (now - ctx.last_correction_send) >= movement_interval
-                    )
-                    interval_correction_due = (
-                        self.correction_interval > 0
-                        and not active_movement_correction_suppressed
-                        and (now - ctx.last_correction_send) >= self.correction_interval
-                    )
-                    if force_due:
-                        correction_reason = "forced"
-                    elif burst_due:
-                        correction_reason = "burst"
-                    elif movement_correction_due:
-                        correction_reason = "movement"
-                    elif interval_correction_due:
-                        correction_reason = "interval"
-                    correction_due = (
-                        force_due
-                        or burst_due
-                        or movement_correction_due
-                        or interval_correction_due
-                    )
-                if self.update_on_change:
-                    pos_changed = any(abs(a - b) > self.update_epsilon for a, b in zip(send_pos, ctx.last_sent_pos))
-                    vel_changed = any(abs(a - b) > self.update_epsilon for a, b in zip(ctx.player_vel, ctx.last_sent_vel))
-                    yaw_changed = abs(ctx.player_yaw - ctx.last_sent_yaw) > self.update_epsilon
-                    _hb_interval = self._effective_heartbeat_interval(ctx)
-                    heartbeat_due = _hb_interval > 0 and (now - ctx.last_update_send) >= _hb_interval
-                    if not (pos_changed or vel_changed or yaw_changed or heartbeat_due):
-                        send_update = False
-                else:
-                    # Throttle heartbeat to configured interval instead of every tick
-                    _hb_interval = self._effective_heartbeat_interval(ctx)
-                    if _hb_interval > 0:
-                        if (now - ctx.last_update_send) < _hb_interval:
-                            send_update = False
 
-                # Remote-player replication is independent of the viewer's local
-                # heartbeat.  Keep it ahead of the spawn-safe local-heartbeat
-                # suppression below: that path deliberately `continue`s to avoid
-                # touching the fragile local entity, but must not freeze every
-                # already-created remote entity at its DEFINITION pose.
-                remote_due = (
-                    self.remote_update_interval <= 0
-                    or (now - ctx.last_remote_update_send) >= self.remote_update_interval
-                )
-                if self.send_remote_updates and not self.combine_update_arrays and remote_due:
-                    ctx.last_remote_update_send = now
-                    self._send_remote_player_updates(
-                        ctx,
-                        tick,
-                        prefer_tcp=(self.send_updates_tcp and not tcp_failed),
-                    )
-
-                # Community profile: SHIP_STATUS + SUPPLY_SHIP_INFO for every supply ship
-                # at a steady interval (wulfram3.com: 1 Hz per ship, UDP).
-                _ship_iv = float(getattr(self, "ship_status_interval_s", 0.0) or 0.0)
-                if _ship_iv > 0 and (now - float(getattr(ctx, "last_ship_status_send", 0.0) or 0.0)) >= _ship_iv:
-                    ctx.last_ship_status_send = now
-                    self._send_periodic_ship_status(ctx)
-
-                if self.send_player_updates and send_full_update and send_update:
-                    # Send UPDATE_ARRAY with position/velocity
+                    tick = self._get_network_tick(ctx)
+                    self._record_authoritative_state(ctx, tick=tick)
+                    # Debug: log tick value periodically
+                    if ctx.session.tick % 300 == 0:
+                        print(f"[TICK-DEBUG] Client {ctx.client_id}: network_tick={tick} client_tick={ctx.last_client_tick} offset={ctx.tick_offset}")
+                    health_val = self._get_health_value(ctx)
+                    fuel_val = self._get_energy_value(ctx)
+                    # Full position updates (server authoritative).
+                    # Default OFF: wulf-forge does NOT send the local player's position
+                    # in UPDATE_ARRAY. Sending position overrides the client's own physics
+                    # and causes underground clipping + red health overlay on hilly terrain
+                    # (server ground_level is flat, terrain is not).
+                    send_full_update = os.environ.get("WULFRAM_SEND_FULL_UPDATES", "0") == "1"
+                    # Default to current position for tracking even if we skip UPDATE_ARRAY.
                     send_pos = self._to_client_pos(ctx.player_pos)
-                    local_state_kwargs = self._get_local_state_kwargs(ctx)
-                    weapon_type = local_state_kwargs["weapon_id"]
-                    ammo_bits = local_state_kwargs["ammo_count_bits"]
-                    ammo_mask = local_state_kwargs["ammo_count"]
-                    pt_bits = local_state_kwargs["primary_turret_bits"]
-                    pt_angle = local_state_kwargs["primary_turret_angle"]
-                    st_bits = local_state_kwargs["secondary_turret_bits"]
-                    st_angle = local_state_kwargs["secondary_turret_angle"]
-                    include_local_state = self._should_send_local_state(
+                    payload: Optional[bytes] = None
+                    send_payload = False
+                    suppress_periodic_heartbeat = False
+
+                    self._maybe_promote_remote_full_local_state(ctx, reason="post_spawn")
+
+                    send_update = True
+                    burst_remaining = int(getattr(ctx, "correction_burst_remaining", 0) or 0)
+                    burst_interval = float(getattr(ctx, "correction_burst_interval_s", 0.0) or 0.0)
+                    active_movement_correction_suppressed = self._remote_movement_input_active(
                         ctx,
-                        pt_bits,
-                        st_bits,
-                        self.update_local_state_mode,
+                        now=now,
                     )
-                    if not getattr(ctx, "_ammo_turret_logged", False) and include_local_state:
-                        print(
-                            f"[LOCAL-STATE] weapon_type={weapon_type} "
-                            f"ammo_bits={ammo_bits} ammo_mask=0x{ammo_mask:X} "
-                            f"pt_bits={pt_bits} st_bits={st_bits}"
+                    correction_reason = ""
+                    force_due = bool(getattr(ctx, "force_correction_once", False))
+                    if self.correction_gate_enabled:
+                        # OG-faithful GATED-RARE reactive correction (GOAL 2, amended
+                        # 2026-06-09). No proactive timer streams: a correction emits
+                        # only when (a) explicitly forced, (b) a queued reactive burst
+                        # is draining (operator `correction now`, jump-jet hop, or the
+                        # rate-capped STATE_REQUEST settle burst — see
+                        # _maybe_queue_state_request_burst; queue sites are all
+                        # event-driven and rate-capped), or (c) the authoritative
+                        # state has genuinely DIVERGED (accumulated server-only,
+                        # client-unpredictable displacement — terrain-Z clamp /
+                        # collision push — since the last correction) beyond a
+                        # threshold, and never faster than the hard rate cap. The gate
+                        # is IDENTICAL for every client: a zero-latency loopback client
+                        # is bounded by the same caps, with no _is_loopback_client fork.
+                        accum_pos = float(getattr(ctx, "divergence_accum_pos", 0.0) or 0.0)
+                        accum_heading_deg = math.degrees(
+                            abs(float(getattr(ctx, "divergence_accum_heading", 0.0) or 0.0))
                         )
-                        ctx._ammo_turret_logged = True
-                    include_lpos = True
-                    include_lvel = self.local_update_mode in ("pos_vel", "pos_vel_rot")
-                    include_lrot = self.local_update_mode in ("pos_rot", "pos_vel_rot")
-                    if not getattr(ctx, "_update_mode_logged", False):
-                        print(
-                            "[UPDATE-MODE] "
-                            f"mode={self.local_update_mode!r} "
-                            f"include_pos={int(include_lpos)} "
-                            f"include_vel={int(include_lvel)} "
-                            f"include_rot={int(include_lrot)}"
+                        rate_ok = (now - ctx.last_correction_send) >= self.correction_min_interval
+                        diverged = (
+                            accum_pos >= self.correction_divergence_pos
+                            or accum_heading_deg >= self.correction_divergence_heading_deg
                         )
-                        ctx._update_mode_logged = True
-                    if self.combine_update_arrays and self.send_player_updates:
-                        entities = [
-                            {
-                                "entity_id": ctx.session.entity_id,
-                                "is_manned": True,
-                                "pos": send_pos,
-                                "vel": ctx.player_vel,
-                                "rot": (
-                                    ctx.player_pose.get("roll", 0.0),
-                                    ctx.player_pose.get("pitch", 0.0),
-                                    ctx.player_heading,  # entity+0x38 convention
-                                ),
-                                "include_pos": include_lpos,
-                                "include_vel": include_lvel,
-                                "include_rot": include_lrot,
-                                "include_entity_vitals": self.update_entity_vitals,
-                                "speed_scale": 1.0,
-                                "fuel": fuel_val,
-                            }
-                        ]
-                        mode = self.remote_update_mode
-                        include_rpos = mode not in ("heartbeat", "mask0", "off", "none", "disabled")
-                        include_rvel = mode in ("pos_vel", "pos_vel_rot", "full", "all")
-                        include_rrot = mode in ("pos_rot", "pos_vel_rot", "full", "all")
-                        if mode not in ("off", "none", "disabled") and self._og_viewer_replication_enabled(ctx, "remote_updates"):
-                            for other in self._snapshot_in_game_clients():
-                                if other is ctx:
-                                    continue
-                                entity_id = other.session.entity_id or other.entity_id
-                                if entity_id not in ctx.known_entity_ids:
-                                    continue
-                                entities.append(
-                                    {
-                                        "entity_id": entity_id,
-                                        "is_manned": self.remote_update_is_manned,
-                                        "pos": self._to_client_pos(other.player_pos),
-                                        "vel": other.player_vel,
-                                        "rot": (
-                                            other.player_pose.get("roll", 0.0),
-                                            other.player_pose.get("pitch", 0.0),
-                                            (-other.player_heading if self.remote_yaw_negate else other.player_heading) + self.remote_yaw_offset,
-                                        ),
-                                        "include_pos": include_rpos,
-                                        "include_vel": include_rvel,
-                                        "include_rot": include_rrot,
-                                        "include_spin": include_rrot,
-                                        "spin": (0.0, 0.0, other.angular_vel_yaw),
-                                        "include_entity_vitals": False,
-                                    }
-                                )
-                        if self.update_packet_type == "view":
-                            payload = build_view_update_multi(
-                                tick,
-                                include_local_state=include_local_state,
-                                weapon_id=weapon_type,
-                                health=health_val,
-                                fuel=fuel_val,
-                                ammo_count_bits=ammo_bits,
-                                ammo_count=ammo_mask,
-                                primary_turret_bits=pt_bits,
-                                primary_turret_angle=pt_angle,
-                                secondary_turret_bits=st_bits,
-                                secondary_turret_angle=st_angle,
-                                turret_max=self.local_state_turret_max,
-                                turret_range=self.local_state_turret_range,
-                                entities=entities,
+                        divergence_correction_due = diverged and rate_ok
+                        burst_due = self._correction_burst_due(
+                            ctx, now, active_movement_correction_suppressed
+                        )
+                        settled_movement_due = (
+                            not handlers._is_loopback_client(ctx)
+                            and self._settled_movement_correction_due(
+                                ctx,
+                                now=now,
+                                movement_suppressed=active_movement_correction_suppressed,
                             )
-                        else:
-                            payload = build_update_array_multi(
-                                tick,
-                                include_local_state=include_local_state,
-                                weapon_id=weapon_type,
-                                health=health_val,
-                                fuel=fuel_val,
-                                ammo_count_bits=ammo_bits,
-                                ammo_count=ammo_mask,
-                                primary_turret_bits=pt_bits,
-                                primary_turret_angle=pt_angle,
-                                secondary_turret_bits=st_bits,
-                                secondary_turret_angle=st_angle,
-                                turret_max=self.local_state_turret_max,
-                                turret_range=self.local_state_turret_range,
-                                entities=entities,
+                        )
+                        # Periodic correction: steady-cadence drift clear. It rides
+                        # VIEW_UPDATE, which the OG client applies as snap-pose + ZERO
+                        # VELOCITY (apply_lag_compensation). Firing it WHILE the player
+                        # drives zeros their momentum every ~0.5s -> a real-latency movement
+                        # FREEZE (2026-06-27). So by default it is SUPPRESSED during active
+                        # movement input (same gate burst/divergence already respect); the
+                        # accumulated drift then clears the instant the player stops, with no
+                        # freeze. WULFRAM_PERIODIC_CORRECTION_DURING_MOVEMENT=1 restores the
+                        # old fire-during-movement behavior (A/B only; freezes OG clients).
+                        periodic_due = (
+                            self.periodic_correction_interval > 0.0
+                            and not handlers._is_loopback_client(ctx)
+                            and (
+                                self.periodic_correction_during_movement
+                                or not active_movement_correction_suppressed
                             )
+                            and (now - ctx.last_correction_send) >= self.periodic_correction_interval
+                        )
+                        if force_due:
+                            correction_reason = "forced"
+                        elif burst_due:
+                            correction_reason = "burst"
+                        elif divergence_correction_due:
+                            correction_reason = "divergence"
+                        elif settled_movement_due:
+                            correction_reason = "movement_settled"
+                        elif periodic_due:
+                            correction_reason = "periodic"
+                        correction_due = (
+                            force_due
+                            or burst_due
+                            or divergence_correction_due
+                            or settled_movement_due
+                            or periodic_due
+                        )
                     else:
-                        if self.update_packet_type == "view":
-                            payload = build_view_update_player_update(
-                                tick,
-                                ctx.session.entity_id,
-                                pos=send_pos,
-                                vel=ctx.player_vel,
-                                # Rotation vector order follows wulf-forge: (roll, pitch, yaw)
-                                rot=self._local_player_sync_rotation(ctx),
-                                include_pos=include_lpos,
-                                include_vel=include_lvel,
-                                include_rot=include_lrot,
-                                include_local_state=include_local_state,
-                                include_entity_vitals=self.update_entity_vitals,
-                                weapon_id=weapon_type,
-                                health=health_val,
-                                fuel=fuel_val,
-                                speed_scale=1.0,
-                                ammo_count_bits=ammo_bits,
-                                ammo_count=ammo_mask,
-                                primary_turret_bits=pt_bits,
-                                primary_turret_angle=pt_angle,
-                                secondary_turret_bits=st_bits,
-                                secondary_turret_angle=st_angle,
-                                turret_max=self.local_state_turret_max,
-                                turret_range=self.local_state_turret_range,
-                            )
-                        else:
-                            payload = build_update_array_player_update(
-                                tick,
-                                ctx.session.entity_id,
-                                pos=send_pos,
-                                vel=ctx.player_vel,
-                                # Rotation vector order follows wulf-forge: (roll, pitch, yaw)
-                                rot=self._local_player_sync_rotation(ctx),
-                                include_pos=include_lpos,
-                                include_vel=include_lvel,
-                                include_rot=include_lrot,
-                                include_local_state=include_local_state,
-                                include_entity_vitals=self.update_entity_vitals,
-                                weapon_id=weapon_type,
-                                health=health_val,
-                                fuel=fuel_val,
-                                speed_scale=1.0,
-                                ammo_count_bits=ammo_bits,
-                                ammo_count=ammo_mask,
-                                primary_turret_bits=pt_bits,
-                                primary_turret_angle=pt_angle,
-                                secondary_turret_bits=st_bits,
-                                secondary_turret_angle=st_angle,
-                                turret_max=self.local_state_turret_max,
-                                turret_range=self.local_state_turret_range,
-                            )
-                    if include_local_state:
-                        self._log_vitals(
-                            ctx,
-                            "UPDATE_ARRAY_FULL",
-                            include_vitals=True,
-                            health=health_val,
-                            energy=fuel_val,
-                            weapon_id=weapon_type,
-                            note=f"ammo_bits={ammo_bits} pt_bits={pt_bits} st_bits={st_bits}",
+                        # Legacy proactive streams — A/B only (WULFRAM_CORRECTION_GATE=0).
+                        burst_due = self._correction_burst_due(
+                            ctx, now, active_movement_correction_suppressed
                         )
-                    elif self.debug_vitals and ctx.session.tick % 300 == 0:
-                        self._log_vitals(
-                            ctx,
-                            "UPDATE_ARRAY_FULL",
-                            include_vitals=False,
-                            health=health_val,
-                            energy=fuel_val,
-                            weapon_id=weapon_type,
-                            note="local_state=0",
+                        movement_interval = float(getattr(self, "movement_correction_interval", 0.0) or 0.0)
+                        movement_window = float(getattr(self, "movement_correction_window", 0.0) or 0.0)
+                        recent_move_input_time = float(getattr(ctx, "last_nonzero_move_input_time", 0.0) or 0.0)
+                        movement_correction_recent = (
+                            movement_interval > 0
+                            and recent_move_input_time > 0.0
+                            and (now - recent_move_input_time) <= movement_window
+                            and not handlers._is_loopback_client(ctx)
                         )
-                    send_payload = True
-                    if not correction_due:
-                        self._maybe_send_view_update_loop(
-                            ctx,
-                            tick=tick,
-                            send_pos=send_pos,
-                            health_val=health_val,
-                            fuel_val=fuel_val,
-                            weapon_type=weapon_type,
-                            ammo_bits=ammo_bits,
-                            ammo_mask=ammo_mask,
-                            pt_bits=pt_bits,
-                            pt_angle=pt_angle,
-                            st_bits=st_bits,
-                            st_angle=st_angle,
+                        movement_correction_due = (
+                            movement_correction_recent
+                            and not active_movement_correction_suppressed
+                            and (now - ctx.last_correction_send) >= movement_interval
                         )
-                elif self.send_player_updates and not send_full_update and (send_update or correction_due):
-                    # Heartbeat path. Remote OG clients that have left the
-                    # spawn-safe path need a real single-local-player update
-                    # shape here; the synthetic mask-0 stub causes the
-                    # original client to protocol-mismatch on spawn.
+                        interval_correction_due = (
+                            self.correction_interval > 0
+                            and not active_movement_correction_suppressed
+                            and (now - ctx.last_correction_send) >= self.correction_interval
+                        )
+                        if force_due:
+                            correction_reason = "forced"
+                        elif burst_due:
+                            correction_reason = "burst"
+                        elif movement_correction_due:
+                            correction_reason = "movement"
+                        elif interval_correction_due:
+                            correction_reason = "interval"
+                        correction_due = (
+                            force_due
+                            or burst_due
+                            or movement_correction_due
+                            or interval_correction_due
+                        )
+                    if self.update_on_change:
+                        pos_changed = any(abs(a - b) > self.update_epsilon for a, b in zip(send_pos, ctx.last_sent_pos))
+                        vel_changed = any(abs(a - b) > self.update_epsilon for a, b in zip(ctx.player_vel, ctx.last_sent_vel))
+                        yaw_changed = abs(ctx.player_yaw - ctx.last_sent_yaw) > self.update_epsilon
+                        _hb_interval = self._effective_heartbeat_interval(ctx)
+                        heartbeat_due = _hb_interval > 0 and (now - ctx.last_update_send) >= _hb_interval
+                        if not (pos_changed or vel_changed or yaw_changed or heartbeat_due):
+                            send_update = False
+                    else:
+                        # Throttle heartbeat to configured interval instead of every tick
+                        _hb_interval = self._effective_heartbeat_interval(ctx)
+                        if _hb_interval > 0:
+                            if (now - ctx.last_update_send) < _hb_interval:
+                                send_update = False
 
-                    # Spawn-safe suppression applies to periodic heartbeats only.
-                    # A forced/divergence/settled correction is an explicit
-                    # transform packet and must not be discarded by this guard.
-                    if self._suppress_remote_spawn_safe_heartbeat(ctx) and not correction_due:
-                        if not getattr(ctx, "_spawn_safe_heartbeat_suppressed_logged", False):
-                            print(
-                                f"[HEARTBEAT] Client {ctx.client_id}: suppressing periodic "
-                                "spawn-safe remote heartbeat until targeted sync is active"
-                            )
-                            ctx._spawn_safe_heartbeat_suppressed_logged = True
-                        # Keep running the rest of the tick. The old early
-                        # continue also skipped remote replication and the
-                        # wall-clock pacing sleep, creating a UDP flood.
-                        suppress_periodic_heartbeat = True
-
-                    local_state_kwargs = self._get_local_state_kwargs(ctx)
-                    weapon_type = local_state_kwargs["weapon_id"]
-                    ammo_bits = local_state_kwargs["ammo_count_bits"]
-                    ammo_mask = local_state_kwargs["ammo_count"]
-                    pt_bits = local_state_kwargs["primary_turret_bits"]
-                    pt_angle = local_state_kwargs["primary_turret_angle"]
-                    st_bits = local_state_kwargs["secondary_turret_bits"]
-                    st_angle = local_state_kwargs["secondary_turret_angle"]
-                    include_local_state = self._should_send_local_state(
-                        ctx,
-                        pt_bits,
-                        st_bits,
-                        self.update_local_state_mode,
+                    # Remote-player replication is independent of the viewer's local
+                    # heartbeat.  Keep it ahead of the spawn-safe local-heartbeat
+                    # suppression below: that path deliberately `continue`s to avoid
+                    # touching the fragile local entity, but must not freeze every
+                    # already-created remote entity at its DEFINITION pose.
+                    remote_due = (
+                        self.remote_update_interval <= 0
+                        or (now - ctx.last_remote_update_send) >= self.remote_update_interval
                     )
+                    if self.send_remote_updates and not self.combine_update_arrays and remote_due:
+                        ctx.last_remote_update_send = now
+                        self._send_remote_player_updates(
+                            ctx,
+                            tick,
+                            prefer_tcp=(self.send_updates_tcp and not tcp_failed),
+                        )
 
-                    # Heartbeat: dummy-entity packet (health only, no position override).
-                    # NOTE: Local player corrections were removed â€” the client runs
-                    # lockstep deterministic physics and overwrites any server position/
-                    # rotation corrections every frame. See server __init__ for details.
-                    if correction_due:
-                        payload, pkt_label, corr_pos, corr_rot, inc_pos, inc_rot = (
-                            self._build_empirical_correction_payload(
+                    # Community profile: SHIP_STATUS + SUPPLY_SHIP_INFO for every supply ship
+                    # at a steady interval (wulfram3.com: 1 Hz per ship, UDP).
+                    _ship_iv = float(getattr(self, "ship_status_interval_s", 0.0) or 0.0)
+                    if _ship_iv > 0 and (now - float(getattr(ctx, "last_ship_status_send", 0.0) or 0.0)) >= _ship_iv:
+                        ctx.last_ship_status_send = now
+                        self._send_periodic_ship_status(ctx)
+
+                    if self.send_player_updates and send_full_update and send_update:
+                        # Send UPDATE_ARRAY with position/velocity
+                        send_pos = self._to_client_pos(ctx.player_pos)
+                        local_state_kwargs = self._get_local_state_kwargs(ctx)
+                        weapon_type = local_state_kwargs["weapon_id"]
+                        ammo_bits = local_state_kwargs["ammo_count_bits"]
+                        ammo_mask = local_state_kwargs["ammo_count"]
+                        pt_bits = local_state_kwargs["primary_turret_bits"]
+                        pt_angle = local_state_kwargs["primary_turret_angle"]
+                        st_bits = local_state_kwargs["secondary_turret_bits"]
+                        st_angle = local_state_kwargs["secondary_turret_angle"]
+                        include_local_state = self._should_send_local_state(
+                            ctx,
+                            pt_bits,
+                            st_bits,
+                            self.update_local_state_mode,
+                        )
+                        if not getattr(ctx, "_ammo_turret_logged", False) and include_local_state:
+                            print(
+                                f"[LOCAL-STATE] weapon_type={weapon_type} "
+                                f"ammo_bits={ammo_bits} ammo_mask=0x{ammo_mask:X} "
+                                f"pt_bits={pt_bits} st_bits={st_bits}"
+                            )
+                            ctx._ammo_turret_logged = True
+                        include_lpos = True
+                        include_lvel = self.local_update_mode in ("pos_vel", "pos_vel_rot")
+                        include_lrot = self.local_update_mode in ("pos_rot", "pos_vel_rot")
+                        if not getattr(ctx, "_update_mode_logged", False):
+                            print(
+                                "[UPDATE-MODE] "
+                                f"mode={self.local_update_mode!r} "
+                                f"include_pos={int(include_lpos)} "
+                                f"include_vel={int(include_lvel)} "
+                                f"include_rot={int(include_lrot)}"
+                            )
+                            ctx._update_mode_logged = True
+                        if self.combine_update_arrays and self.send_player_updates:
+                            entities = [
+                                {
+                                    "entity_id": ctx.session.entity_id,
+                                    "is_manned": True,
+                                    "pos": send_pos,
+                                    "vel": ctx.player_vel,
+                                    "rot": (
+                                        ctx.player_pose.get("roll", 0.0),
+                                        ctx.player_pose.get("pitch", 0.0),
+                                        ctx.player_heading,  # entity+0x38 convention
+                                    ),
+                                    "include_pos": include_lpos,
+                                    "include_vel": include_lvel,
+                                    "include_rot": include_lrot,
+                                    "include_entity_vitals": self.update_entity_vitals,
+                                    "speed_scale": 1.0,
+                                    "fuel": fuel_val,
+                                }
+                            ]
+                            mode = self.remote_update_mode
+                            include_rpos = mode not in ("heartbeat", "mask0", "off", "none", "disabled")
+                            include_rvel = mode in ("pos_vel", "pos_vel_rot", "full", "all")
+                            include_rrot = mode in ("pos_rot", "pos_vel_rot", "full", "all")
+                            if mode not in ("off", "none", "disabled") and self._og_viewer_replication_enabled(ctx, "remote_updates"):
+                                for other in self._snapshot_in_game_clients():
+                                    if other is ctx:
+                                        continue
+                                    entity_id = other.session.entity_id or other.entity_id
+                                    if entity_id not in ctx.known_entity_ids:
+                                        continue
+                                    entities.append(
+                                        {
+                                            "entity_id": entity_id,
+                                            "is_manned": self.remote_update_is_manned,
+                                            "pos": self._to_client_pos(other.player_pos),
+                                            "vel": other.player_vel,
+                                            "rot": (
+                                                other.player_pose.get("roll", 0.0),
+                                                other.player_pose.get("pitch", 0.0),
+                                                (-other.player_heading if self.remote_yaw_negate else other.player_heading) + self.remote_yaw_offset,
+                                            ),
+                                            "include_pos": include_rpos,
+                                            "include_vel": include_rvel,
+                                            "include_rot": include_rrot,
+                                            "include_spin": include_rrot,
+                                            "spin": (0.0, 0.0, other.angular_vel_yaw),
+                                            "include_entity_vitals": False,
+                                        }
+                                    )
+                            if self.update_packet_type == "view":
+                                payload = build_view_update_multi(
+                                    tick,
+                                    include_local_state=include_local_state,
+                                    weapon_id=weapon_type,
+                                    health=health_val,
+                                    fuel=fuel_val,
+                                    ammo_count_bits=ammo_bits,
+                                    ammo_count=ammo_mask,
+                                    primary_turret_bits=pt_bits,
+                                    primary_turret_angle=pt_angle,
+                                    secondary_turret_bits=st_bits,
+                                    secondary_turret_angle=st_angle,
+                                    turret_max=self.local_state_turret_max,
+                                    turret_range=self.local_state_turret_range,
+                                    entities=entities,
+                                )
+                            else:
+                                payload = build_update_array_multi(
+                                    tick,
+                                    include_local_state=include_local_state,
+                                    weapon_id=weapon_type,
+                                    health=health_val,
+                                    fuel=fuel_val,
+                                    ammo_count_bits=ammo_bits,
+                                    ammo_count=ammo_mask,
+                                    primary_turret_bits=pt_bits,
+                                    primary_turret_angle=pt_angle,
+                                    secondary_turret_bits=st_bits,
+                                    secondary_turret_angle=st_angle,
+                                    turret_max=self.local_state_turret_max,
+                                    turret_range=self.local_state_turret_range,
+                                    entities=entities,
+                                )
+                        else:
+                            if self.update_packet_type == "view":
+                                payload = build_view_update_player_update(
+                                    tick,
+                                    ctx.session.entity_id,
+                                    pos=send_pos,
+                                    vel=ctx.player_vel,
+                                    # Rotation vector order follows wulf-forge: (roll, pitch, yaw)
+                                    rot=self._local_player_sync_rotation(ctx),
+                                    include_pos=include_lpos,
+                                    include_vel=include_lvel,
+                                    include_rot=include_lrot,
+                                    include_local_state=include_local_state,
+                                    include_entity_vitals=self.update_entity_vitals,
+                                    weapon_id=weapon_type,
+                                    health=health_val,
+                                    fuel=fuel_val,
+                                    speed_scale=1.0,
+                                    ammo_count_bits=ammo_bits,
+                                    ammo_count=ammo_mask,
+                                    primary_turret_bits=pt_bits,
+                                    primary_turret_angle=pt_angle,
+                                    secondary_turret_bits=st_bits,
+                                    secondary_turret_angle=st_angle,
+                                    turret_max=self.local_state_turret_max,
+                                    turret_range=self.local_state_turret_range,
+                                )
+                            else:
+                                payload = build_update_array_player_update(
+                                    tick,
+                                    ctx.session.entity_id,
+                                    pos=send_pos,
+                                    vel=ctx.player_vel,
+                                    # Rotation vector order follows wulf-forge: (roll, pitch, yaw)
+                                    rot=self._local_player_sync_rotation(ctx),
+                                    include_pos=include_lpos,
+                                    include_vel=include_lvel,
+                                    include_rot=include_lrot,
+                                    include_local_state=include_local_state,
+                                    include_entity_vitals=self.update_entity_vitals,
+                                    weapon_id=weapon_type,
+                                    health=health_val,
+                                    fuel=fuel_val,
+                                    speed_scale=1.0,
+                                    ammo_count_bits=ammo_bits,
+                                    ammo_count=ammo_mask,
+                                    primary_turret_bits=pt_bits,
+                                    primary_turret_angle=pt_angle,
+                                    secondary_turret_bits=st_bits,
+                                    secondary_turret_angle=st_angle,
+                                    turret_max=self.local_state_turret_max,
+                                    turret_range=self.local_state_turret_range,
+                                )
+                        if include_local_state:
+                            self._log_vitals(
+                                ctx,
+                                "UPDATE_ARRAY_FULL",
+                                include_vitals=True,
+                                health=health_val,
+                                energy=fuel_val,
+                                weapon_id=weapon_type,
+                                note=f"ammo_bits={ammo_bits} pt_bits={pt_bits} st_bits={st_bits}",
+                            )
+                        elif self.debug_vitals and ctx.session.tick % 300 == 0:
+                            self._log_vitals(
+                                ctx,
+                                "UPDATE_ARRAY_FULL",
+                                include_vitals=False,
+                                health=health_val,
+                                energy=fuel_val,
+                                weapon_id=weapon_type,
+                                note="local_state=0",
+                            )
+                        send_payload = True
+                        if not correction_due:
+                            self._maybe_send_view_update_loop(
                                 ctx,
                                 tick=tick,
-                                include_local_state=include_local_state,
-                                health=health_val,
-                                fuel=fuel_val,
+                                send_pos=send_pos,
+                                health_val=health_val,
+                                fuel_val=fuel_val,
                                 weapon_type=weapon_type,
                                 ammo_bits=ammo_bits,
                                 ammo_mask=ammo_mask,
@@ -4117,360 +4205,440 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
                                 st_bits=st_bits,
                                 st_angle=st_angle,
                             )
-                        )
-                        ctx.last_correction_send = now
-                        ctx.force_correction_once = False
-                        # Gate consumed the divergence: clear the accumulators so a
-                        # single correction settles the client before the next can fire.
-                        ctx.divergence_accum_pos = 0.0
-                        ctx.divergence_accum_heading = 0.0
-                        ctx.correction_send_count = int(getattr(ctx, "correction_send_count", 0) or 0) + 1
-                        if correction_reason == "movement_settled":
-                            ctx.last_settled_movement_correction_input_time = float(
-                                getattr(ctx, "last_nonzero_move_input_time", 0.0) or 0.0
-                            )
-                            self._queue_settled_movement_correction_tail(ctx)
-                        # Decrement against the LIVE value, not the tick-entry
-                        # snapshot: the UDP thread may have re-queued a fresh
-                        # burst between snapshot and here, and a stale-snapshot
-                        # write-back would silently cancel it.
-                        live_burst_remaining = int(getattr(ctx, "correction_burst_remaining", 0) or 0)
-                        if live_burst_remaining > 0 and correction_reason == "burst":
-                            ctx.correction_burst_remaining = live_burst_remaining - 1
-                        if correction_reason == "movement":
-                            ctx.movement_correction_count = int(
-                                getattr(ctx, "movement_correction_count", 0) or 0
-                            ) + 1
-                            ctx.last_movement_correction_send_time = now
-                        log_due = correction_reason != "movement" or (
-                            now - float(getattr(ctx, "last_movement_correction_log", 0.0) or 0.0)
-                        ) >= 1.0
-                        if log_due:
-                            if correction_reason == "movement":
-                                ctx.last_movement_correction_log = now
-                            print(
-                                f"[CORRECTION] reason={correction_reason or 'unknown'} "
-                                f"mode={self.correction_mode} client={ctx.client_id} "
-                                f"pos=({corr_pos[0]:.1f},{corr_pos[1]:.1f},{corr_pos[2]:.1f}) "
-                                f"yaw={math.degrees(corr_rot[2]):.1f}deg "
-                                f"inc_pos={int(inc_pos)} inc_rot={int(inc_rot)} "
-                                f"burst_left={int(getattr(ctx, 'correction_burst_remaining', 0))}"
-                            )
-                    else:
-                        # Community cadence: the periodic beat is a zero-entity
-                        # VIEW_UPDATE (local_state only), like wulfram3.com sends.
-                        use_view = self.heartbeat_view_update or self._community_cadence_active()
-                        pkt_label = "VIEW_UPDATE_BEAT" if use_view else "UPDATE_ARRAY_BEAT"
-                        hb_rot = None
-                        if self.heartbeat_include_rot:
-                            hb_rot = self._local_player_sync_rotation(ctx)
-                        hb_pos = None
-                        if self.heartbeat_include_pos:
-                            hb_pos = self._to_client_pos(ctx.player_pos)
-                        # Send a mask=0 (health-only) heartbeat on the NULL/dummy entity so it
-                        # does NOT wake the local tank (see heartbeat_dummy_entity note). Only
-                        # when there is no pos/rot bit -- a transform-bearing heartbeat must use
-                        # the real entity.
-                        hb_entity_id = ctx.session.entity_id
-                        if (getattr(self, "heartbeat_dummy_entity", False)
-                                and hb_rot is None and hb_pos is None):
-                            hb_entity_id = 0xFFFFFFFE
-                        payload = self._build_local_state_heartbeat(
+                    elif self.send_player_updates and not send_full_update and (send_update or correction_due):
+                        # Heartbeat path. Remote OG clients that have left the
+                        # spawn-safe path need a real single-local-player update
+                        # shape here; the synthetic mask-0 stub causes the
+                        # original client to protocol-mismatch on spawn.
+
+                        # Spawn-safe suppression applies to periodic heartbeats only.
+                        # A forced/divergence/settled correction is an explicit
+                        # transform packet and must not be discarded by this guard.
+                        if self._suppress_remote_spawn_safe_heartbeat(ctx) and not correction_due:
+                            if not getattr(ctx, "_spawn_safe_heartbeat_suppressed_logged", False):
+                                print(
+                                    f"[HEARTBEAT] Client {ctx.client_id}: suppressing periodic "
+                                    "spawn-safe remote heartbeat until targeted sync is active"
+                                )
+                                ctx._spawn_safe_heartbeat_suppressed_logged = True
+                            # Keep running the rest of the tick. The old early
+                            # continue also skipped remote replication and the
+                            # wall-clock pacing sleep, creating a UDP flood.
+                            suppress_periodic_heartbeat = True
+
+                        local_state_kwargs = self._get_local_state_kwargs(ctx)
+                        weapon_type = local_state_kwargs["weapon_id"]
+                        ammo_bits = local_state_kwargs["ammo_count_bits"]
+                        ammo_mask = local_state_kwargs["ammo_count"]
+                        pt_bits = local_state_kwargs["primary_turret_bits"]
+                        pt_angle = local_state_kwargs["primary_turret_angle"]
+                        st_bits = local_state_kwargs["secondary_turret_bits"]
+                        st_angle = local_state_kwargs["secondary_turret_angle"]
+                        include_local_state = self._should_send_local_state(
                             ctx,
-                            tick=tick,
-                            entity_id=hb_entity_id,
-                            include_health=include_local_state,
-                            health=health_val,
-                            fuel=fuel_val,
-                            is_view_update=use_view,
-                            rot=hb_rot,
-                            pos=hb_pos,
-                        )
-
-                    if include_local_state:
-                        self._log_vitals(
-                            ctx,
-                        pkt_label,
-                        include_vitals=True,
-                        health=health_val,
-                        energy=fuel_val,
-                        weapon_id=weapon_type,
-                        note="heartbeat",
-                    )
-                    elif self.debug_vitals and ctx.session.tick % 300 == 0:
-                        self._log_vitals(
-                            ctx,
-                        pkt_label,
-                        include_vitals=False,
-                        health=health_val,
-                        energy=fuel_val,
-                        weapon_id=weapon_type,
-                        note="heartbeat local_state=0",
-                    )
-
-                    send_payload = not suppress_periodic_heartbeat
-                    if not suppress_periodic_heartbeat:
-                        self._maybe_send_view_update_loop(
-                            ctx,
-                            tick=tick,
-                            send_pos=send_pos,
-                            health_val=health_val,
-                            fuel_val=fuel_val,
-                            weapon_type=weapon_type,
-                            ammo_bits=ammo_bits,
-                            ammo_mask=ammo_mask,
-                            pt_bits=pt_bits,
-                            pt_angle=pt_angle,
-                            st_bits=st_bits,
-                            st_angle=st_angle,
-                        )
-
-                # SPAWN SETTLE: suppress the local-player heartbeat/correction for a brief
-                # window after spawn so the at-rest tank SLEEPS (RigidBody_should_sleep) instead
-                # of being re-woken every ~100ms (Replication.c:1124). A running suspension
-                # spring on a just-spawned tank samples Spring_calc_edge_angle's unguarded
-                # divide/asin (Physics.c:2214) and NaN-crashes the OG client ~1-in-2 on a
-                # real-GPU client. Spawn-at-rest removes the bounce; sleeping stops the spring
-                # from running at all during the vulnerable window. (2026-07-01.)
-                if getattr(self, "spawn_settle_heartbeat_suppress_s", 0.0) > 0.0:
-                    _since_spawn = now - float(getattr(ctx.session, "last_spawn_time", 0.0) or 0.0)
-                    if 0.0 <= _since_spawn < self.spawn_settle_heartbeat_suppress_s:
-                        send_payload = False
-
-                if self.send_player_updates and send_payload and payload is not None:
-                    # Determine transport for logging
-                    _transports = []
-                    # Try TCP first, fall back to UDP if TCP fails
-                    # Client may close TCP after spawn and use UDP only
-                    if self.send_updates_tcp and not tcp_failed and ctx.tcp_handler:
-                        try:
-                            ctx.tcp_handler.send(payload, log=False)
-                            _transports.append("TCP")
-                        except Exception as tcp_err:
-                            print(f"[TICK] Client {ctx.client_id}: TCP failed ({tcp_err}), switching to UDP-only")
-                            tcp_failed = True
-                            # A dead socket (conn-reset/bad-fd) on a client that has ALSO
-                            # stopped sending input is a crashed client, not a legit
-                            # TCP-closed-but-UDP-alive one -- reap it so it stops getting
-                            # ticked every frame (the [SEND] Error spam that starves the tick
-                            # loop and cascades connect-crashes under rapid reconnect). A live
-                            # UDP-only client keeps sending ACTION packets, so last_action
-                            # stays fresh and it is NOT reaped. (2026-06-30 zombie fix.)
-                            if self._is_conn_reset(tcp_err):
-                                last_action = float(getattr(ctx, "last_action_packet_time", 0.0) or 0.0)
-                                if last_action <= 0.0 or (now - last_action) > 3.0:
-                                    self._reap_dead_client(ctx, reason="heartbeat_tcp_dead_no_input")
-
-                    # Always send via UDP as well for reliability
-                    if self.send_updates_udp and self.udp_handler and ctx.session.udp_addr:
-                        self.udp_handler.send_to(payload, ctx.session.udp_addr)
-                        _transports.append("UDP")
-
-                    # Log packet for traffic analysis
-                    if self.pktlog.enabled:
-                        _log_ents = (0xFFFFFFFE,)
-                        _log_masks = (0,)
-                        self.pktlog.log(
-                            client_id=ctx.client_id,
-                            label=pkt_label,
-                            tick=tick,
-                            payload=payload,
-                            transport="+".join(_transports),
-                            entity_count=len(_log_ents),
-                            entity_ids=_log_ents,
-                            mask_bits=_log_masks,
-                            has_local_state=include_local_state,
-                            health=health_val if include_local_state else -1.0,
-                        )
-
-                    ctx.last_update_send = now
-                    ctx.last_sent_pos = send_pos
-                    ctx.last_sent_vel = ctx.player_vel
-                    ctx.last_sent_yaw = ctx.player_yaw
-
-                # Solo-local-player keepalive — feeds the OG client's organic
-                # STATE_REQUEST trigger (Replication.c:1173-1177 requires
-                # entity_count == 1 && final == local_player). Emits a
-                # single-entity UPDATE_ARRAY with the local player's current
-                # pos+rot at the configured cadence; no-op if disabled.
-                if (
-                    self.solo_local_keepalive_enabled
-                    and self.solo_local_keepalive_interval > 0
-                    and ctx.session.entity_id
-                    and ctx.session.udp_addr
-                ):
-                    keepalive_due = (now - ctx.last_solo_local_keepalive) >= self.solo_local_keepalive_interval
-                    if keepalive_due:
-                        ctx.last_solo_local_keepalive = now
-                        keep_pos = self._to_client_pos(ctx.player_pos)
-                        keep_rot = self._local_player_sync_rotation(ctx)
-                        keep_local_state = self._should_send_local_state(
-                            ctx,
-                            0,
-                            0,
+                            pt_bits,
+                            st_bits,
                             self.update_local_state_mode,
                         )
-                        keep_weapon = self._get_local_state_weapon_type(ctx) if keep_local_state else 0
-                        keep_ammo_bits, keep_ammo_mask = (
-                            self._get_local_state_ammo_bits(ctx) if keep_local_state else (0, 0)
-                        )
-                        (
-                            keep_pt_bits,
-                            keep_pt_angle,
-                            keep_st_bits,
-                            keep_st_angle,
-                        ) = (
-                            self._get_local_state_turret_bits(ctx)
-                            if keep_local_state
-                            else (0, 0.0, 0, 0.0)
-                        )
-                        keepalive_pkt = build_update_array_player_update(
-                            tick=tick,
-                            entity_id=ctx.session.entity_id,
-                            pos=keep_pos,
-                            vel=ctx.player_vel,
-                            rot=keep_rot,
-                            include_pos=True,
-                            include_vel=True,
-                            include_rot=True,
-                            include_local_state=keep_local_state,
-                            weapon_id=keep_weapon,
-                            health=self._get_health_value(ctx),
-                            fuel=self._get_energy_value(ctx),
-                            ammo_count_bits=keep_ammo_bits,
-                            ammo_count=keep_ammo_mask,
-                            primary_turret_bits=keep_pt_bits,
-                            primary_turret_angle=keep_pt_angle,
-                            secondary_turret_bits=keep_st_bits,
-                            secondary_turret_angle=keep_st_angle,
-                            turret_max=self.local_state_turret_max,
-                            turret_range=self.local_state_turret_range,
-                            is_manned=True,
-                        )
-                        self.udp_handler.send_to(keepalive_pkt, ctx.session.udp_addr)
-                        if self.pktlog.enabled:
-                            self.pktlog.log(
-                                client_id=ctx.client_id,
-                                label="SOLO_LOCAL_KEEPALIVE",
+
+                        # Heartbeat: dummy-entity packet (health only, no position override).
+                        # NOTE: Local player corrections were removed â€” the client runs
+                        # lockstep deterministic physics and overwrites any server position/
+                        # rotation corrections every frame. See server __init__ for details.
+                        if correction_due:
+                            payload, pkt_label, corr_pos, corr_rot, inc_pos, inc_rot = (
+                                self._build_empirical_correction_payload(
+                                    ctx,
+                                    tick=tick,
+                                    include_local_state=include_local_state,
+                                    health=health_val,
+                                    fuel=fuel_val,
+                                    weapon_type=weapon_type,
+                                    ammo_bits=ammo_bits,
+                                    ammo_mask=ammo_mask,
+                                    pt_bits=pt_bits,
+                                    pt_angle=pt_angle,
+                                    st_bits=st_bits,
+                                    st_angle=st_angle,
+                                    allow_suppression=True,
+                                )
+                            )
+                            if not payload:
+                                # The rotation this correction would carry already
+                                # matches what the client has, so the client's own
+                                # divergence gate would substitute its attitude and
+                                # the packet could not change anything. Rate-limit as
+                                # if we had sent, but do NOT clear the divergence
+                                # accumulators -- the divergence is real and unaddressed,
+                                # and clearing it would hide that.
+                                ctx.last_correction_send = now
+                                ctx.force_correction_once = False
+                                ctx.correction_suppressed_count = int(
+                                    getattr(ctx, "correction_suppressed_count", 0) or 0) + 1
+                                ctx.last_correction_suppressed_reason = pkt_label
+                                if (now - float(getattr(ctx, "last_correction_suppressed_log", 0.0)
+                                                or 0.0)) >= 5.0:
+                                    ctx.last_correction_suppressed_log = now
+                                    print(f"[CORRECTION] suppressed reason="
+                                          f"{correction_reason or 'unknown'} "
+                                          f"client={ctx.client_id} {pkt_label} "
+                                          f"count={ctx.correction_suppressed_count}")
+                            ctx.last_correction_send = now
+                            ctx.force_correction_once = False
+                            # Gate consumed the divergence: clear the accumulators so a
+                            # single correction settles the client before the next can fire.
+                            ctx.divergence_accum_pos = 0.0
+                            ctx.divergence_accum_heading = 0.0
+                            ctx.correction_send_count = int(getattr(ctx, "correction_send_count", 0) or 0) + 1
+                            if correction_reason == "movement_settled":
+                                ctx.last_settled_movement_correction_input_time = float(
+                                    getattr(ctx, "last_nonzero_move_input_time", 0.0) or 0.0
+                                )
+                                self._queue_settled_movement_correction_tail(ctx)
+                            # Decrement against the LIVE value, not the tick-entry
+                            # snapshot: the UDP thread may have re-queued a fresh
+                            # burst between snapshot and here, and a stale-snapshot
+                            # write-back would silently cancel it.
+                            live_burst_remaining = int(getattr(ctx, "correction_burst_remaining", 0) or 0)
+                            if live_burst_remaining > 0 and correction_reason == "burst":
+                                ctx.correction_burst_remaining = live_burst_remaining - 1
+                            if correction_reason == "movement":
+                                ctx.movement_correction_count = int(
+                                    getattr(ctx, "movement_correction_count", 0) or 0
+                                ) + 1
+                                ctx.last_movement_correction_send_time = now
+                            log_due = correction_reason != "movement" or (
+                                now - float(getattr(ctx, "last_movement_correction_log", 0.0) or 0.0)
+                            ) >= 1.0
+                            if log_due:
+                                if correction_reason == "movement":
+                                    ctx.last_movement_correction_log = now
+                                print(
+                                    f"[CORRECTION] reason={correction_reason or 'unknown'} "
+                                    f"mode={self.correction_mode} client={ctx.client_id} "
+                                    f"pos=({corr_pos[0]:.1f},{corr_pos[1]:.1f},{corr_pos[2]:.1f}) "
+                                    f"yaw={math.degrees(corr_rot[2]):.1f}deg "
+                                    f"inc_pos={int(inc_pos)} inc_rot={int(inc_rot)} "
+                                    f"burst_left={int(getattr(ctx, 'correction_burst_remaining', 0))}"
+                                )
+                        else:
+                            # Community cadence: the periodic beat is a zero-entity
+                            # VIEW_UPDATE (local_state only), like wulfram3.com sends.
+                            use_view = self.heartbeat_view_update or self._community_cadence_active()
+                            pkt_label = "VIEW_UPDATE_BEAT" if use_view else "UPDATE_ARRAY_BEAT"
+                            hb_rot = None
+                            if self.heartbeat_include_rot:
+                                hb_rot = self._local_player_sync_rotation(ctx)
+                            hb_pos = None
+                            if self.heartbeat_include_pos:
+                                hb_pos = self._to_client_pos(ctx.player_pos)
+                            # Send a mask=0 (health-only) heartbeat on the NULL/dummy entity so it
+                            # does NOT wake the local tank (see heartbeat_dummy_entity note). Only
+                            # when there is no pos/rot bit -- a transform-bearing heartbeat must use
+                            # the real entity.
+                            hb_entity_id = ctx.session.entity_id
+                            if (getattr(self, "heartbeat_dummy_entity", False)
+                                    and hb_rot is None and hb_pos is None):
+                                hb_entity_id = 0xFFFFFFFE
+                            payload = self._build_local_state_heartbeat(
+                                ctx,
                                 tick=tick,
-                                payload=keepalive_pkt,
-                                transport="UDP",
-                                entity_count=1,
-                                entity_ids=(ctx.session.entity_id,),
-                                mask_bits=(0b1010,),
-                                has_local_state=keep_local_state,
-                                health=self._get_health_value(ctx) if keep_local_state else -1.0,
+                                entity_id=hb_entity_id,
+                                include_health=include_local_state,
+                                health=health_val,
+                                fuel=fuel_val,
+                                is_view_update=use_view,
+                                rot=hb_rot,
+                                pos=hb_pos,
                             )
 
-                # Periodic TankPacket vitals refresh to stabilize HUD health/energy.
-                if self.tank_vitals and self.tank_vitals_heartbeat and ctx.session.udp_addr:
-                    now = time.monotonic()
-                    if (now - ctx.last_vitals_send) >= self.tank_vitals_interval:
-                        ctx.last_vitals_send = now
-                        vitals_packet = build_udp_tank_packet_wf(
-                            net_id=ctx.session.entity_id,
-                            unit_type=ctx.entity_type,
-                            team_id=ctx.session.team_id or 1,
-                            pos=self._to_client_pos(ctx.player_pos),
-                            rot=self._local_player_sync_rotation(ctx),
-                            tick=tick,
-                            include_vitals=True,
-                            weapon_id=self.weapon_id,
-                            health=health_val,
-                            energy=fuel_val,
-                        )
-                        self._log_vitals(
-                            ctx,
-                            "TANK_UDP_HEARTBEAT",
+                        if include_local_state:
+                            self._log_vitals(
+                                ctx,
+                            pkt_label,
                             include_vitals=True,
                             health=health_val,
                             energy=fuel_val,
-                            weapon_id=self.weapon_id,
-                            note=f"net_id={ctx.session.entity_id}",
+                            weapon_id=weapon_type,
+                            note="heartbeat",
                         )
-                        if self.udp_handler and ctx.session.udp_addr:
-                            self.udp_handler.send_to(vitals_packet, ctx.session.udp_addr)
+                        elif self.debug_vitals and ctx.session.tick % 300 == 0:
+                            self._log_vitals(
+                                ctx,
+                            pkt_label,
+                            include_vitals=False,
+                            health=health_val,
+                            energy=fuel_val,
+                            weapon_id=weapon_type,
+                            note="heartbeat local_state=0",
+                        )
+
+                        send_payload = not suppress_periodic_heartbeat
+                        if not suppress_periodic_heartbeat:
+                            self._maybe_send_view_update_loop(
+                                ctx,
+                                tick=tick,
+                                send_pos=send_pos,
+                                health_val=health_val,
+                                fuel_val=fuel_val,
+                                weapon_type=weapon_type,
+                                ammo_bits=ammo_bits,
+                                ammo_mask=ammo_mask,
+                                pt_bits=pt_bits,
+                                pt_angle=pt_angle,
+                                st_bits=st_bits,
+                                st_angle=st_angle,
+                            )
+
+                    # SPAWN SETTLE: suppress the local-player heartbeat/correction for a brief
+                    # window after spawn so the at-rest tank SLEEPS (RigidBody_should_sleep) instead
+                    # of being re-woken every ~100ms (Replication.c:1124). A running suspension
+                    # spring on a just-spawned tank samples Spring_calc_edge_angle's unguarded
+                    # divide/asin (Physics.c:2214) and NaN-crashes the OG client ~1-in-2 on a
+                    # real-GPU client. Spawn-at-rest removes the bounce; sleeping stops the spring
+                    # from running at all during the vulnerable window. (2026-07-01.)
+                    if getattr(self, "spawn_settle_heartbeat_suppress_s", 0.0) > 0.0:
+                        _since_spawn = now - float(getattr(ctx.session, "last_spawn_time", 0.0) or 0.0)
+                        if 0.0 <= _since_spawn < self.spawn_settle_heartbeat_suppress_s:
+                            send_payload = False
+
+                    # `payload` is falsy for both None and the empty bytes the
+                    # sub-epsilon correction guard returns, and neither may go on the
+                    # wire -- an empty UDP datagram is not a no-op to the client.
+                    if self.send_player_updates and send_payload and payload:
+                        # Determine transport for logging
+                        _transports = []
+                        # Try TCP first, fall back to UDP if TCP fails
+                        # Client may close TCP after spawn and use UDP only
+                        if self.send_updates_tcp and not tcp_failed and ctx.tcp_handler:
+                            try:
+                                ctx.tcp_handler.send(payload, log=False)
+                                _transports.append("TCP")
+                            except Exception as tcp_err:
+                                print(f"[TICK] Client {ctx.client_id}: TCP failed ({tcp_err}), switching to UDP-only")
+                                tcp_failed = True
+                                # A dead socket (conn-reset/bad-fd) on a client that has ALSO
+                                # stopped sending input is a crashed client, not a legit
+                                # TCP-closed-but-UDP-alive one -- reap it so it stops getting
+                                # ticked every frame (the [SEND] Error spam that starves the tick
+                                # loop and cascades connect-crashes under rapid reconnect). A live
+                                # UDP-only client keeps sending ACTION packets, so last_action
+                                # stays fresh and it is NOT reaped. (2026-06-30 zombie fix.)
+                                if self._is_conn_reset(tcp_err):
+                                    last_action = float(getattr(ctx, "last_action_packet_time", 0.0) or 0.0)
+                                    if last_action <= 0.0 or (now - last_action) > 3.0:
+                                        self._reap_dead_client(ctx, reason="heartbeat_tcp_dead_no_input")
+
+                        # Always send via UDP as well for reliability
+                        if self.send_updates_udp and self.udp_handler and ctx.session.udp_addr:
+                            self.udp_handler.send_to(payload, ctx.session.udp_addr)
+                            _transports.append("UDP")
+
+                        # Log packet for traffic analysis
+                        if self.pktlog.enabled:
+                            _log_ents = (0xFFFFFFFE,)
+                            _log_masks = (0,)
+                            self.pktlog.log(
+                                client_id=ctx.client_id,
+                                label=pkt_label,
+                                tick=tick,
+                                payload=payload,
+                                transport="+".join(_transports),
+                                entity_count=len(_log_ents),
+                                entity_ids=_log_ents,
+                                mask_bits=_log_masks,
+                                has_local_state=include_local_state,
+                                health=health_val if include_local_state else -1.0,
+                            )
+
+                        ctx.last_update_send = now
+                        ctx.last_sent_pos = send_pos
+                        ctx.last_sent_vel = ctx.player_vel
+                        ctx.last_sent_yaw = ctx.player_yaw
+
+                    # Solo-local-player keepalive — feeds the OG client's organic
+                    # STATE_REQUEST trigger (Replication.c:1173-1177 requires
+                    # entity_count == 1 && final == local_player). Emits a
+                    # single-entity UPDATE_ARRAY with the local player's current
+                    # pos+rot at the configured cadence; no-op if disabled.
+                    if (
+                        self.solo_local_keepalive_enabled
+                        and self.solo_local_keepalive_interval > 0
+                        and ctx.session.entity_id
+                        and ctx.session.udp_addr
+                    ):
+                        keepalive_due = (now - ctx.last_solo_local_keepalive) >= self.solo_local_keepalive_interval
+                        if keepalive_due:
+                            ctx.last_solo_local_keepalive = now
+                            keep_pos = self._to_client_pos(ctx.player_pos)
+                            keep_rot = self._local_player_sync_rotation(ctx)
+                            keep_local_state = self._should_send_local_state(
+                                ctx,
+                                0,
+                                0,
+                                self.update_local_state_mode,
+                            )
+                            keep_weapon = self._get_local_state_weapon_type(ctx) if keep_local_state else 0
+                            keep_ammo_bits, keep_ammo_mask = (
+                                self._get_local_state_ammo_bits(ctx) if keep_local_state else (0, 0)
+                            )
+                            (
+                                keep_pt_bits,
+                                keep_pt_angle,
+                                keep_st_bits,
+                                keep_st_angle,
+                            ) = (
+                                self._get_local_state_turret_bits(ctx)
+                                if keep_local_state
+                                else (0, 0.0, 0, 0.0)
+                            )
+                            keepalive_pkt = build_update_array_player_update(
+                                tick=tick,
+                                entity_id=ctx.session.entity_id,
+                                pos=keep_pos,
+                                vel=ctx.player_vel,
+                                rot=keep_rot,
+                                include_pos=True,
+                                include_vel=True,
+                                include_rot=True,
+                                include_local_state=keep_local_state,
+                                weapon_id=keep_weapon,
+                                health=self._get_health_value(ctx),
+                                fuel=self._get_energy_value(ctx),
+                                ammo_count_bits=keep_ammo_bits,
+                                ammo_count=keep_ammo_mask,
+                                primary_turret_bits=keep_pt_bits,
+                                primary_turret_angle=keep_pt_angle,
+                                secondary_turret_bits=keep_st_bits,
+                                secondary_turret_angle=keep_st_angle,
+                                turret_max=self.local_state_turret_max,
+                                turret_range=self.local_state_turret_range,
+                                is_manned=True,
+                            )
+                            self.udp_handler.send_to(keepalive_pkt, ctx.session.udp_addr)
                             if self.pktlog.enabled:
                                 self.pktlog.log(
                                     client_id=ctx.client_id,
-                                    label="TANK_VITALS",
+                                    label="SOLO_LOCAL_KEEPALIVE",
                                     tick=tick,
-                                    payload=vitals_packet,
+                                    payload=keepalive_pkt,
                                     transport="UDP",
-                                    has_local_state=True,
-                                    health=health_val,
-                                    extra="TankPacket",
+                                    entity_count=1,
+                                    entity_ids=(ctx.session.entity_id,),
+                                    mask_bits=(0b1010,),
+                                    has_local_state=keep_local_state,
+                                    health=self._get_health_value(ctx) if keep_local_state else -1.0,
                                 )
-                            print(
-                                "[VITALS] "
-                                f"client={ctx.client_id} net_id={ctx.session.entity_id} "
-                                f"tick={tick} addr={ctx.session.udp_addr}"
+
+                    # Periodic TankPacket vitals refresh to stabilize HUD health/energy.
+                    if self.tank_vitals and self.tank_vitals_heartbeat and ctx.session.udp_addr:
+                        now = time.monotonic()
+                        if (now - ctx.last_vitals_send) >= self.tank_vitals_interval:
+                            ctx.last_vitals_send = now
+                            vitals_packet = build_udp_tank_packet_wf(
+                                net_id=ctx.session.entity_id,
+                                unit_type=ctx.entity_type,
+                                team_id=ctx.session.team_id or 1,
+                                pos=self._to_client_pos(ctx.player_pos),
+                                rot=self._local_player_sync_rotation(ctx),
+                                tick=tick,
+                                include_vitals=True,
+                                weapon_id=self.weapon_id,
+                                health=health_val,
+                                energy=fuel_val,
                             )
-
-                # Track last sent player state for projectile alignment diagnostics.
-                # Use player_pos if send_pos not set (heartbeat-only mode)
-                if payload is not None:
-                    track_pos = send_pos if send_full_update else self._to_client_pos(ctx.player_pos)
-                    ctx.last_sent_player_state = {
-                        "time": time.monotonic(),
-                        "tick": tick,
-                        "pos": track_pos,
-                        "rot": self._local_player_sync_rotation(ctx),
-                        "vel": ctx.player_vel,
-                    }
-
-                # Log every 10 ticks to trace movement + health sends
-                if self.debug_sync and ctx.session.tick % 10 == 0:
-                    px, py, pz = ctx.player_pos
-                    vx, vy, vz = ctx.player_vel
-                    yaw_deg = math.degrees(ctx.player_yaw)
-                    print(f"[TICK] Client {ctx.client_id}: pos=({px:.2f},{py:.2f},{pz:.2f}) vel=({vx:.2f},{vy:.2f},{vz:.2f}) yaw={yaw_deg:.1f}")
-                    aim_recent = (time.monotonic() - ctx.player_aim_time) < self.viewpoint_timeout
-                    if not aim_recent:
-                        print(f"[VIEWPOINT-INPUT] yaw={yaw_deg:.1f}")
-                    pkt_type = "FULL" if send_full_update else ("VIEW_BEAT" if self.heartbeat_view_update else "BEAT")
-                    udp_addr = ctx.session.udp_addr if ctx.session.udp_addr else "NO_ADDR"
-                    # Verify health encoding in payload
-                    if payload and len(payload) > 7:
-                        if payload[0] == 0x0F:
-                            health_hex = payload[9:12].hex() if len(payload) > 11 else "??"
-                        else:
-                            health_hex = payload[5:8].hex()
-                    else:
-                        health_hex = "??"
-                    update_mask = self._extract_update_mask(payload) if payload else None
-                    if update_mask is None:
-                        mask_note = "?"
-                    else:
-                        mask_note = f"0x{update_mask:03x}"
-                    print(
-                        f"[TICK-HEALTH] t={ctx.session.tick} type={pkt_type} "
-                        f"udp={udp_addr} mask={mask_note} health_bytes={health_hex}"
-                    )
-
-                if _phase_timing:
-                    _phase_t_end = time.perf_counter()
-                    _iter_ms = (_phase_t_end - _phase_t0) * 1000.0
-                    if _iter_ms >= _phase_timing_threshold_ms:
-                        _upp_ms = (_phase_t_upp - _phase_t0) * 1000.0
-                        _rest_phys_ms = (_phase_t_phys - _phase_t_upp) * 1000.0
-                        _send_ms = (_phase_t_end - _phase_t_phys) * 1000.0
-                        _coll = getattr(ctx, "_upp_collision_ms", 0.0)
-                        _bld = getattr(ctx, "_upp_building_ms", 0.0)
-                        _att = getattr(ctx, "_upp_attitude_ms", 0.0)
-                        try:
-                            with open(_phase_timing_path, "a") as _ptf:
-                                _ptf.write(
-                                    f"tick={ctx.session.tick} step={ctx.physics_step_count} "
-                                    f"iter_ms={_iter_ms:.2f} upp_ms={_upp_ms:.2f} "
-                                    f"collision_ms={_coll:.2f} building_ms={_bld:.2f} "
-                                    f"attitude_ms={_att:.2f} "
-                                    f"rest_phys_ms={_rest_phys_ms:.2f} send_ms={_send_ms:.2f} "
-                                    f"pos=({ctx.player_pos[0]:.1f},{ctx.player_pos[1]:.1f},"
-                                    f"{ctx.player_pos[2]:.1f})\n"
+                            self._log_vitals(
+                                ctx,
+                                "TANK_UDP_HEARTBEAT",
+                                include_vitals=True,
+                                health=health_val,
+                                energy=fuel_val,
+                                weapon_id=self.weapon_id,
+                                note=f"net_id={ctx.session.entity_id}",
+                            )
+                            if self.udp_handler and ctx.session.udp_addr:
+                                self.udp_handler.send_to(vitals_packet, ctx.session.udp_addr)
+                                if self.pktlog.enabled:
+                                    self.pktlog.log(
+                                        client_id=ctx.client_id,
+                                        label="TANK_VITALS",
+                                        tick=tick,
+                                        payload=vitals_packet,
+                                        transport="UDP",
+                                        has_local_state=True,
+                                        health=health_val,
+                                        extra="TankPacket",
+                                    )
+                                print(
+                                    "[VITALS] "
+                                    f"client={ctx.client_id} net_id={ctx.session.entity_id} "
+                                    f"tick={tick} addr={ctx.session.udp_addr}"
                                 )
-                        except Exception:
-                            pass
+
+                    # Track last sent player state for projectile alignment diagnostics.
+                    # Use player_pos if send_pos not set (heartbeat-only mode)
+                    if payload is not None:
+                        track_pos = send_pos if send_full_update else self._to_client_pos(ctx.player_pos)
+                        ctx.last_sent_player_state = {
+                            "time": time.monotonic(),
+                            "tick": tick,
+                            "pos": track_pos,
+                            "rot": self._local_player_sync_rotation(ctx),
+                            "vel": ctx.player_vel,
+                        }
+
+                    # Log every 10 ticks to trace movement + health sends
+                    if self.debug_sync and ctx.session.tick % 10 == 0:
+                        px, py, pz = ctx.player_pos
+                        vx, vy, vz = ctx.player_vel
+                        yaw_deg = math.degrees(ctx.player_yaw)
+                        print(f"[TICK] Client {ctx.client_id}: pos=({px:.2f},{py:.2f},{pz:.2f}) vel=({vx:.2f},{vy:.2f},{vz:.2f}) yaw={yaw_deg:.1f}")
+                        aim_recent = (time.monotonic() - ctx.player_aim_time) < self.viewpoint_timeout
+                        if not aim_recent:
+                            print(f"[VIEWPOINT-INPUT] yaw={yaw_deg:.1f}")
+                        pkt_type = "FULL" if send_full_update else ("VIEW_BEAT" if self.heartbeat_view_update else "BEAT")
+                        udp_addr = ctx.session.udp_addr if ctx.session.udp_addr else "NO_ADDR"
+                        # Verify health encoding in payload
+                        if payload and len(payload) > 7:
+                            if payload[0] == 0x0F:
+                                health_hex = payload[9:12].hex() if len(payload) > 11 else "??"
+                            else:
+                                health_hex = payload[5:8].hex()
+                        else:
+                            health_hex = "??"
+                        update_mask = self._extract_update_mask(payload) if payload else None
+                        if update_mask is None:
+                            mask_note = "?"
+                        else:
+                            mask_note = f"0x{update_mask:03x}"
+                        print(
+                            f"[TICK-HEALTH] t={ctx.session.tick} type={pkt_type} "
+                            f"udp={udp_addr} mask={mask_note} health_bytes={health_hex}"
+                        )
+
+                    if _phase_timing:
+                        _phase_t_end = time.perf_counter()
+                        _iter_ms = (_phase_t_end - _phase_t0) * 1000.0
+                        if _iter_ms >= _phase_timing_threshold_ms:
+                            _upp_ms = (_phase_t_upp - _phase_t0) * 1000.0
+                            _rest_phys_ms = (_phase_t_phys - _phase_t_upp) * 1000.0
+                            _send_ms = (_phase_t_end - _phase_t_phys) * 1000.0
+                            _coll = getattr(ctx, "_upp_collision_ms", 0.0)
+                            _bld = getattr(ctx, "_upp_building_ms", 0.0)
+                            _att = getattr(ctx, "_upp_attitude_ms", 0.0)
+                            try:
+                                with open(_phase_timing_path, "a") as _ptf:
+                                    _ptf.write(
+                                        f"tick={ctx.session.tick} step={ctx.physics_step_count} "
+                                        f"iter_ms={_iter_ms:.2f} upp_ms={_upp_ms:.2f} "
+                                        f"collision_ms={_coll:.2f} building_ms={_bld:.2f} "
+                                        f"attitude_ms={_att:.2f} "
+                                        f"rest_phys_ms={_rest_phys_ms:.2f} send_ms={_send_ms:.2f} "
+                                        f"pos=({ctx.player_pos[0]:.1f},{ctx.player_pos[1]:.1f},"
+                                        f"{ctx.player_pos[2]:.1f})\n"
+                                    )
+                            except Exception:
+                                pass
 
                 # Wall-clock pacing: preserve a capped fixed-step backlog when late.
                 next_tick_time, sleep_dt = self._advance_tick_pacer(
@@ -4489,10 +4657,6 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
                 # Don't break - try to continue even with errors
                 time.sleep(0.1)
 
-        with ctx.tick_lock:
-            if ctx.tick_thread is current_thread:
-                ctx.tick_thread = None
-        print(f"[TICK] Tick loop ended for client {ctx.client_id}")
 
 
 def main():
