@@ -4727,17 +4727,38 @@ Examples:
         hard = False
         target_client_id = None
         numbers: list = []
+        yaw_override = None
+        expect_yaw = False
         for a in args:
             low = str(a).lower()
-            if low == 'hard':
+            if expect_yaw:
+                try:
+                    yaw_override = float(a)
+                except ValueError:
+                    return f"usage: resetprobe ... yaw <radians>  (bad yaw {a!r})"
+                expect_yaw = False
+            elif low == 'hard':
                 hard = True
+            elif low == 'yaw':
+                # Absolute yaw override, for the one experiment that needs a
+                # controlled ATTITUDE delta rather than a position delta: the
+                # local-player divergence gate at 0047d67e (0x0048bff0) can
+                # overwrite the record's rotation sample with the entity's own
+                # before 0047d670 copies it, and whether it always does so is
+                # open. A large deliberate yaw delta decides it.
+                expect_yaw = True
             elif low.startswith('c') and low[1:].isdigit():
                 target_client_id = int(low[1:])
             else:
                 try:
                     numbers.append(float(a))
                 except ValueError:
-                    return f"usage: resetprobe [hard] [c<id>] [dx dy dz]  (bad token {a!r})"
+                    return ("usage: resetprobe [hard] [c<id>] [dx dy dz] "
+                            f"[yaw <radians>]  (bad token {a!r})")
+        if expect_yaw:
+            return "usage: resetprobe ... yaw <radians>  (yaw needs a value)"
+        if yaw_override is not None and not hard:
+            return "Error: a yaw override only applies to shape B (add 'hard')"
         if numbers and len(numbers) != 3:
             return "usage: resetprobe [hard] [c<id>] [dx dy dz]  (delta needs 3 numbers)"
         delta = tuple(numbers) if numbers else None
@@ -4805,6 +4826,9 @@ Examples:
             # (0.0, player_yaw, 0.0), which put yaw in the PITCH slot.
             rot = tuple(float(v) for v in
                         self.server._local_player_sync_rotation(ctx))
+            if yaw_override is not None:
+                # (roll, pitch, yaw) -- yaw is the third component.
+                rot = (rot[0], rot[1], yaw_override)
             if delta is not None:
                 pos = tuple(p + d for p, d in zip(pos, delta))
             payload = build_update_array_teleport(
@@ -4812,7 +4836,9 @@ Examples:
             )
             shape = (f"B hard_snap bits=1+3+9 pos=({pos[0]:.3f},{pos[1]:.3f},"
                      f"{pos[2]:.3f}) rot=({rot[0]:.4f},{rot[1]:.4f},{rot[2]:.4f})"
-                     + (f" delta={delta}" if delta is not None else " delta=none"))
+                     + (f" delta={delta}" if delta is not None else " delta=none")
+                     + (f" yaw_override={yaw_override}" if yaw_override is not None
+                        else ""))
         else:
             payload = build_update_array_reset_probe(tick, entity_id)
             shape = "A probe bit=9"
