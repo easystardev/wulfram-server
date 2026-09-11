@@ -4691,8 +4691,9 @@ Examples:
     def _cmd_resetprobe(self, args: list) -> str:
         """Send one UPDATE_ARRAY that drives the client's direct/reset branch.
 
-        usage: resetprobe [c<id>]         -- shape A, bit 9 alone, CRASH-FREE
-               resetprobe hard [c<id>]    -- shape B, bits 1+3+9, CAN CRASH
+        usage: resetprobe [c<id>]                  -- shape A, bit 9 alone, CRASH-FREE
+               resetprobe hard [c<id>]             -- shape B, bits 1+3+9
+               resetprobe hard [c<id>] dx dy dz    -- shape B offset from current pose
 
         This is a capture instrument for the S1 ingress-ownership journal, whose
         requirement 2 could not be closed because the reset branch at 0047d3e9
@@ -4702,23 +4703,46 @@ Examples:
         Entity_reset_physics, whose call at 0047d6c2 requires record+0x50 and
         record+0x52 -- the presence fields that bits 1 and 3 set. Safe.
 
-        Shape B sets bits 1+3+9 and is the documented client-crash path: the
-        reset routes into an attitude slerp with an unclamped acos(dot), giving
-        NaN on a sub-epsilon delta, ~1 in 2 on a native ~60fps host and ~never on
-        a ~12fps WARP VM. It requires the literal word 'hard' so it cannot be
-        reached by accident. Run shape A first, always.
+        Shape B sets bits 1+3+9. It is DOCUMENTED as the client-crash path -- the
+        reset routes into an attitude slerp with an unclamped acos(dot), giving NaN
+        on a sub-epsilon delta. The 2026-09-10 captures
+        (analysis/moravec-s1/ingress-capture-v13-shapeB*) confirm the wire half:
+        the raw 0x58 record bytes show record+0x50 AND record+0x52 both set, which
+        is exactly the gate 0047d670 applies before its 0047d6c2 call to
+        Entity_reset_physics. What those captures do NOT show is the reset's
+        effects: entity rotation, every velocity triple, the whole physics body and
+        the interpolation record were byte-identical across the event, and only
+        position moved. So whether Entity_reset_physics actually ran is UNRESOLVED
+        pending an observer detour at 0047d6c2. Treat the crash warning as live.
+        It requires the literal word 'hard' so it cannot be reached by accident,
+        and it is VM only. Run shape A first, always.
+
+        The optional dx dy dz offsets the client's own pose. Omitted, the probe
+        snaps the entity to exactly where the server already believes it is, which
+        is the faithful hard-snap shape and the sub-epsilon attitude case.
         """
         if not self.server:
             return "Error: No server reference"
 
         hard = False
         target_client_id = None
+        numbers: list = []
         for a in args:
             low = str(a).lower()
             if low == 'hard':
                 hard = True
             elif low.startswith('c') and low[1:].isdigit():
                 target_client_id = int(low[1:])
+            else:
+                try:
+                    numbers.append(float(a))
+                except ValueError:
+                    return f"usage: resetprobe [hard] [c<id>] [dx dy dz]  (bad token {a!r})"
+        if numbers and len(numbers) != 3:
+            return "usage: resetprobe [hard] [c<id>] [dx dy dz]  (delta needs 3 numbers)"
+        delta = tuple(numbers) if numbers else None
+        if delta is not None and not hard:
+            return "Error: a position delta only applies to shape B (add 'hard')"
 
         ctx = None
         addr = None
@@ -4745,13 +4769,50 @@ Examples:
         tick = self.server._get_network_tick(ctx)
 
         if hard:
-            pose = getattr(self.server, "player_pose", {}) or {}
-            pos = tuple(pose.get("pos") or getattr(self.server, "player_pos", (0.0, 0.0, 0.0)))
-            rot = (0.0, float(getattr(self.server, "player_yaw", 0.0)), 0.0)
+            # Read the TARGET CLIENT's pose. This used to read
+            # `self.server.player_pose` / `player_pos` / `player_yaw`, which do not
+            # exist on the server object at all -- pose is per-client state on the
+            # client context -- so every shape-B probe ever sent carried the
+            # (0.0, 0.0, 0.0) getattr default. The 2026-09-10 capture shows exactly
+            # that: entity+0x0c went to the origin. A reset to the origin is a
+            # ~7000-unit teleport, which is the least interesting case and cannot
+            # reach the sub-epsilon attitude delta the NaN needs.
+            # Prefer ctx.player_pos: it is the field the tick writes, and
+            # server_tick.py:11904 writes it without touching
+            # player_pose["pos"], so the dict entry can lag. (Both returned the
+            # same value in the 2026-09-10 captures, so that lag is reasoned
+            # from the writers, not demonstrated.)
+            #
+            # What the captures DID show is separate and worth knowing before
+            # building a sub-epsilon probe: under this harness the server's
+            # authoritative pose does not advance at all. All three `players
+            # json` snapshots read [5050.0, 4950.0, 3.25] with
+            # nonzero_move_inputs 1, while the client's entity was at Z 12-15.
+            # So "snap to where the server thinks you are" is currently an ~8.7
+            # unit Z snap back to spawn, not a small delta. To aim a genuinely
+            # sub-epsilon reset, set the pose first (--pause-server-physics plus
+            # `pos c<id> x y z`, the --correction-target machinery) rather than
+            # trusting the tick to have tracked the client.
+            pose = getattr(ctx, "player_pose", {}) or {}
+            pos = tuple(float(v) for v in
+                        (getattr(ctx, "player_pos", None) or pose.get("pos") or
+                         (0.0, 0.0, 0.0)))
+            # Use the server's own body-rotation tuple rather than re-deriving
+            # one. It is (roll, pitch, yaw) with yaw from ctx.player_heading, and
+            # it is what the ordinary UPDATE_ARRAY / VIEW_UPDATE replication paths
+            # send -- mixing conventions is what made targeted correction fight
+            # replication before. The previous code here passed
+            # (0.0, player_yaw, 0.0), which put yaw in the PITCH slot.
+            rot = tuple(float(v) for v in
+                        self.server._local_player_sync_rotation(ctx))
+            if delta is not None:
+                pos = tuple(p + d for p, d in zip(pos, delta))
             payload = build_update_array_teleport(
                 tick, entity_id, pos=pos, rot=rot, hard_snap=True,
             )
-            shape = "B hard_snap bits=1+3+9"
+            shape = (f"B hard_snap bits=1+3+9 pos=({pos[0]:.3f},{pos[1]:.3f},"
+                     f"{pos[2]:.3f}) rot=({rot[0]:.4f},{rot[1]:.4f},{rot[2]:.4f})"
+                     + (f" delta={delta}" if delta is not None else " delta=none"))
         else:
             payload = build_update_array_reset_probe(tick, entity_id)
             shape = "A probe bit=9"
