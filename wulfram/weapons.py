@@ -1183,11 +1183,12 @@ def _projectile_rotation_from_velocity(vel: Tuple[float, float, float]) -> tuple
     if up_axis == "z":
         yaw = math.atan2(vy, vx) if (vx != 0.0 or vy != 0.0) else 0.0
         horiz = math.hypot(vx, vy)
-        pitch = math.atan2(vz, horiz) if horiz != 0.0 else 0.0
+        # Matrix3_from_euler_xyz maps local +X to Z=-sin(pitch).
+        pitch = math.atan2(-vz, horiz) if (horiz != 0.0 or vz != 0.0) else 0.0
     else:
         yaw = math.atan2(vz, vx) if (vx != 0.0 or vz != 0.0) else 0.0
         horiz = math.hypot(vx, vz)
-        pitch = math.atan2(vy, horiz) if horiz != 0.0 else 0.0
+        pitch = math.atan2(-vy, horiz) if (horiz != 0.0 or vy != 0.0) else 0.0
     return (0.0, pitch, yaw)
 
 
