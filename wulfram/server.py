@@ -124,7 +124,9 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
 
     def __init__(self, host: str = None, port: int = 2627):
         server_config.configure_core_server(self, host, port)
-        self.logger = PacketLogger()
+        # Full packet hex traces are indispensable during protocol work but become
+        # O(N^2) synchronous disk traffic in a many-client presentation run.
+        self.logger = PacketLogger() if os.environ.get("WULFRAM_PACKET_TRACE", "1") == "1" else None
         self.udp_handler: Optional[UDPHandler] = None
         self.running = False
         self.control_server = ControlServer(port=self.port + 1)
@@ -1680,7 +1682,13 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
         tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         tcp_sock.bind((self.host, self.port))
-        tcp_sock.listen(5)  # Allow multiple pending connections
+        try:
+            listen_backlog = int(os.environ.get("WULFRAM_LISTEN_BACKLOG", "5"))
+        except ValueError:
+            listen_backlog = 5
+        listen_backlog = max(1, min(256, listen_backlog))
+        tcp_sock.listen(listen_backlog)
+        print(f"[SERVER] TCP listen backlog={listen_backlog}")
 
         # Create UDP socket
         udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -4079,7 +4087,12 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
                                             "include_rot": include_rrot,
                                             "include_spin": include_rrot,
                                             "spin": (0.0, 0.0, other.angular_vel_yaw),
-                                            "include_entity_vitals": False,
+                                            "include_entity_vitals": self.remote_entity_vitals,
+                                            "speed_scale": self._get_health_value(other),
+                                            "fuel": self._get_energy_value(other),
+                                            "ammo_unit": 0 if int(getattr(other, "entity_type", -1)) == 0 else None,
+                                            "ammo_active_bits": 9 if int(getattr(other, "entity_type", -1)) == 0 else 0,
+                                            "ammo_active_mask": 1 if int(getattr(other, "entity_type", -1)) == 0 and self._tank_primary_replication_active(other) else 0,
                                         }
                                     )
                             if self.update_packet_type == "view":

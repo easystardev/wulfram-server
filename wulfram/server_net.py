@@ -652,7 +652,8 @@ class NetMixin:
         ctx.session.udp_verified = True
         ctx.session.last_udp_activity = time.monotonic()
         self.udp_addr_to_client[addr] = ctx
-        print(f"[UDP] Bound client {ctx.client_id} to {addr} via {reason}")
+        if old_addr != addr or os.environ.get("WULFRAM_DEBUG_UDP_BIND", "0") == "1":
+            print(f"[UDP] Bound client {ctx.client_id} to {addr} via {reason}")
         return True
 
     def _recover_udp_client(self, addr: tuple, *, allow_handshake: bool = False) -> Optional[ClientContext]:

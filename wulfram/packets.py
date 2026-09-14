@@ -1395,7 +1395,13 @@ def build_behavior_packet() -> bytes:
     # Section 1: Header (95 bytes)
     spawn_enabled = os.environ.get("WULFRAM_BEHAVIOR_SPAWN_ENABLED", "1").strip().lower()
     payload.append(0x00 if spawn_enabled in ("0", "false", "off", "no") else 0x01)
-    payload += pack_fixed16(5.0)
+    try:
+        spawn_delay = float(os.environ.get("WULFRAM_BEHAVIOR_SPAWN_DELAY", "5.0"))
+    except ValueError:
+        spawn_delay = 5.0
+    if not math.isfinite(spawn_delay) or spawn_delay <= 0.0:
+        spawn_delay = 5.0
+    payload += pack_fixed16(spawn_delay)
     payload += pack_fixed16(10.0)
     payload += pack_fixed16(10.0)
     payload += pack_fixed16(10.0)
