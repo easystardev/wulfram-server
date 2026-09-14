@@ -294,12 +294,29 @@ def main():
                        help='Number of log lines to show')
     parser.add_argument('--wf', action='store_true',
                        help='Enable wulf-forge compatibility mode (minimal server)')
+    parser.add_argument('--demo', action='store_true',
+                       help='Use the browser-demo bootstrap, fast spawn and complete local HUD state')
     args = parser.parse_args()
 
     # Set wulf-forge mode environment variable if requested
     if args.wf:
         os.environ['WULFRAM_WULFFORGE_MODE'] = '1'
         print("[MANAGER] Wulf-forge compatibility mode requested")
+    if args.demo:
+        demo = {
+            'WULFRAM_LOGIN_BOOTSTRAP': 'minimal',
+            'WULFRAM_TEAM_SWITCH_ENTRY_PACKETS': '1',
+            'WULFRAM_TANK_VITALS': '1',
+            'WULFRAM_UPDATE_LOCAL_STATE': 'force',
+            'WULFRAM_PLAYER_INFO_LOCAL_STATE': 'force',
+            'WULFRAM_ALLOW_UNSAFE_LOCAL_STATE': '1',
+            'WULFRAM_BEHAVIOR_SPAWN_DELAY': '0.05',
+            'WULFRAM_DEATH_AUTO_RESPAWN': '1',
+            'WULFRAM_DEATH_RESPAWN_DELAY_S': '0',
+            'WULFRAM_PROJECTILE_UPDATE_MODE': '2',
+        }
+        os.environ.update(demo)
+        print(f"[MANAGER] Browser demo mode: {demo}")
 
     if args.command == 'start':
         start_server(foreground=False)

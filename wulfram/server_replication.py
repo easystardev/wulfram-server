@@ -932,7 +932,8 @@ class ReplicationMixin:
         client (including one on loopback, e.g. play.bat) must get the local-state
         prefix or its end-of-packet local-player sync reads garbage health.
         """
-        if not handlers._is_og_client(ctx):
+        force_local_state = getattr(self, "update_local_state_mode", "wf") == "force"
+        if not force_local_state and not handlers._is_og_client(ctx):
             return False, {}
 
         return True, dict(
@@ -962,7 +963,8 @@ class ReplicationMixin:
         Gate on OG-vs-Python (not loopback) so a loopback OG client (play.bat)
         still gets the local-state prefix it needs.
         """
-        if not handlers._is_og_client(ctx):
+        force_local_state = getattr(self, "update_local_state_mode", "wf") == "force"
+        if not force_local_state and not handlers._is_og_client(ctx):
             return False, {}
 
         return True, dict(

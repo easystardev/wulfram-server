@@ -266,7 +266,7 @@ class CorrectionMixin:
             include_rot=True,
             include_local_state=include_local_state,
             include_entity_vitals=self.view_update_entity_vitals,
-            weapon_id=ls["weapon_id"],
+            weapon_id=ls.get("weapon_id", self._get_spawn_tank_weapon_type(ctx)),
             health=self._get_health_value(ctx),
             fuel=self._get_energy_value(ctx),
             ammo_count_bits=ammo_bits,
