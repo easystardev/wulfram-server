@@ -119,7 +119,11 @@ class CombatMixin:
                 if world_hit:
                     hit_kind, hit_pos, hit_detail = world_hit
                     delete_reason = hit_kind
-                    delete_with_effects = False
+                    # The pristine client DELETE_OBJECT handler invokes the
+                    # entity-type explosion path only when this byte is
+                    # nonzero. A world collision is an impact, not quiet
+                    # lifetime expiry, so preserve that authoritative trigger.
+                    delete_with_effects = True
                     with ctx.projectile_lock:
                         if proj in ctx.active_projectiles:
                             ctx.active_projectiles.remove(proj)
