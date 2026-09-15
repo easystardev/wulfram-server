@@ -311,9 +311,18 @@ def main():
             'WULFRAM_PLAYER_INFO_LOCAL_STATE': 'force',
             'WULFRAM_ALLOW_UNSAFE_LOCAL_STATE': '1',
             'WULFRAM_BEHAVIOR_SPAWN_DELAY': '0.05',
-            'WULFRAM_DEATH_AUTO_RESPAWN': '1',
-            'WULFRAM_DEATH_RESPAWN_DELAY_S': '0',
+            # Browser Runtime must submit the post-death spawn selection so it
+            # can set its local spawn-pending state. A simultaneous server-side
+            # respawn races that request and can leave the tile loading forever.
+            'WULFRAM_DEATH_AUTO_RESPAWN': '0',
             'WULFRAM_PROJECTILE_UPDATE_MODE': '2',
+            # Multi-pane presentation profile: absorb near-simultaneous joins,
+            # batch each viewer's entity replication, avoid trace-file I/O, and
+            # align server input selection to the client-authored action ticks.
+            'WULFRAM_LISTEN_BACKLOG': '64',
+            'WULFRAM_COMBINE_UPDATE_ARRAYS': '1',
+            'WULFRAM_PACKET_TRACE': '0',
+            'WULFRAM_USE_CLIENT_TICKS': '1',
         }
         os.environ.update(demo)
         print(f"[MANAGER] Browser demo mode: {demo}")
