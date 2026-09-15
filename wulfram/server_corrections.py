@@ -132,6 +132,15 @@ class CorrectionMixin:
         # expanded ammo/turret local-state on the correction packet itself.
         self._maybe_promote_remote_full_local_state(ctx, reason="state_request")
 
+        # The browser demo's local predictor can safely consume a full
+        # position/velocity/rotation VIEW_UPDATE.  Native OG clients cannot:
+        # their unclamped quaternion slerp can turn a tiny pos+rot correction
+        # into NaN.  Require both the demo opt-in and its generated tile-*
+        # username, in addition to loopback transport, before taking this path.
+        if self._browser_demo_local_reconcile_enabled(ctx):
+            self._send_stock_replay_reply(ctx, request_id=request_id, now=now)
+            return
+
         if getattr(self, "state_request_replay_reply", False):
             # Stock-protocol path (2026-09-02): one immediate VIEW_UPDATE reply
             # is the client's designed local-tank rubberband channel. See
@@ -168,6 +177,27 @@ class CorrectionMixin:
             self._queue_state_sync_correction_burst(ctx)
         elif getattr(self, "state_request_burst_enabled", False):
             self._maybe_queue_state_request_burst(ctx, now=now)
+
+    def _browser_demo_local_reconcile_enabled(self, ctx: ClientContext) -> bool:
+        if not getattr(self, "browser_demo_local_reconcile", False):
+            return False
+        if not handlers._tcp_peer_is_loopback(ctx) or not ctx.session:
+            return False
+        return str(getattr(ctx.session, "username", "") or "").startswith("tile-")
+
+    def _maybe_send_browser_demo_local_reconcile(
+        self, ctx: ClientContext, *, now: Optional[float] = None
+    ) -> bool:
+        if not self._browser_demo_local_reconcile_enabled(ctx):
+            return False
+        if now is None:
+            now = time.monotonic()
+        interval = float(
+            getattr(self, "browser_demo_local_reconcile_interval", 0.05) or 0.05
+        )
+        if (now - float(getattr(ctx, "last_state_sync_send", 0.0) or 0.0)) < interval:
+            return False
+        return self._send_stock_replay_reply(ctx, request_id=0, now=now)
 
     @serialized
     def _send_stock_replay_reply(
@@ -243,7 +273,18 @@ class CorrectionMixin:
             send_pos = self._to_client_pos(ctx.player_pos)
         if not all(math.isfinite(v) for v in (*send_pos, *rot, *vel)):
             return False
-        if handlers._is_loopback_client(ctx):
+        if self._browser_demo_local_reconcile_enabled(ctx):
+            # The gateway's independently bootstrapped iframe clocks can leave
+            # the translated server tick slightly in the future. The browser
+            # runtime uses the raw authoritative position for this explicitly
+            # gated path, so age only the eligibility wrapper enough to ensure
+            # immediate admission; it does not alter/extrapolate the payload.
+            lag = int(
+                getattr(self, "browser_demo_local_reconcile_timestamp_lag_ms", 5000)
+                or 0
+            )
+            view_timestamp = int(tick) - min(lag, int(tick))
+        elif handlers._is_loopback_client(ctx):
             view_timestamp = int(request_id or 0) & 0xFFFFFFFF
         else:
             view_timestamp = self._fresh_remote_view_update_timestamp(ctx, tick)
@@ -281,7 +322,25 @@ class CorrectionMixin:
             speed_scale=1.0,
             timestamp=view_timestamp,
         )
-        self.udp_handler.send_to(payload, ctx.session.udp_addr)
+        if self._browser_demo_local_reconcile_enabled(ctx):
+            # Send the tile correction over both delivery classes. The
+            # datagram copy keeps local prediction fresh; the reliable copy
+            # closes a loss burst. The browser rejects an older packet tick if
+            # the reliable copy arrives after a newer datagram. This remains
+            # tile+loopback gated; OG clients retain stock UDP-only behavior.
+            reliable_ok = self._send_packet_to_client(
+                ctx, payload, prefer_tcp=True, allow_udp_fallback=True
+            )
+            datagram_ok = False
+            try:
+                self.udp_handler.send_to(payload, ctx.session.udp_addr)
+                datagram_ok = True
+            except OSError:
+                pass
+            if not (reliable_ok or datagram_ok):
+                return False
+        else:
+            self.udp_handler.send_to(payload, ctx.session.udp_addr)
         ctx.last_state_sync_send = now
         ctx.state_sync_reply_count += 1
         ctx.last_state_sync_reply_time = now

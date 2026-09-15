@@ -3,6 +3,7 @@ extracted verbatim from WulframServer (server.py decomposition, step 8).
 Method-only mixin; shares state via `self`.
 """
 from __future__ import annotations
+from .observer_lifecycle import serialized
 
 import time
 from typing import Optional
@@ -13,22 +14,37 @@ from .packets import build_update_array_multi
 
 
 class RemoteSyncMixin:
-    def _send_remote_player_updates(self, ctx: ClientContext, tick: int, *, prefer_tcp: bool = True) -> None:
+    @serialized
+    def _send_remote_player_updates(
+        self,
+        ctx: ClientContext,
+        tick: int,
+        *,
+        prefer_tcp: bool = True,
+        subjects=None,
+    ) -> None:
         """Send other players' transforms to a client."""
+        if not self._world_viewer_ready(ctx) or not self.send_remote_updates:
+            return
         if not self._og_viewer_replication_enabled(ctx, "remote_updates"):
             return
         mode = self.remote_update_mode
         if mode in ("off", "none", "disabled"):
             return
+        # Demo tile snapshots are published by the subject's authoritative
+        # simulation step below. A viewer-owned timer can stall independently
+        # and later publish an older world image after a newer one.
+        if subjects is None and self._browser_demo_local_reconcile_enabled(ctx):
+            return
         include_pos = mode not in ("heartbeat", "mask0")
         include_vel = mode in ("pos_vel", "pos_vel_rot", "full", "all")
         include_rot = mode in ("pos_rot", "pos_vel_rot", "full", "all")
-        viewer_fuel = self._get_energy_value(ctx)
-        others = self._snapshot_in_game_clients()
+        others = self._snapshot_in_game_clients() if subjects is None else subjects
         if tick % 300 == 0:
             other_ids = [(c.client_id, c.session.entity_id or c.entity_id) for c in others if c is not ctx]
             print(f"[REMOTE-DBG] client={ctx.client_id} tick={tick} mode={mode} "
                   f"others={other_ids} known={ctx.known_entity_ids}")
+        combined_entities = []
         for other in others:
             if other is ctx:
                 continue
@@ -51,10 +67,7 @@ class RemoteSyncMixin:
                     (-other.player_heading if self.remote_yaw_negate else other.player_heading) + self.remote_yaw_offset,
                 )
             is_tank = int(getattr(other, "entity_type", -1)) == 0
-            payload = build_update_array_multi(
-                tick,
-                include_local_state=include_local_state,
-                entities=[dict(
+            entity = dict(
                     entity_id=entity_id,
                     is_manned=True,
                     pos=send_pos,
@@ -71,13 +84,36 @@ class RemoteSyncMixin:
                     ammo_unit=0 if is_tank else None,
                     ammo_active_bits=9 if is_tank else 0,
                     ammo_active_mask=1 if is_tank and self._tank_primary_replication_active(other) else 0,
-                )],
-                **local_state_kwargs,
-            )
+                )
+            if self.combine_update_arrays:
+                combined_entities.append(entity)
+                continue
+            payload = build_update_array_multi(tick, include_local_state=include_local_state,
+                                               entities=[entity], **local_state_kwargs)
             ok = self._send_packet_to_client(ctx, payload, prefer_tcp=prefer_tcp)
             if tick % 300 == 0:
                 print(f"[REMOTE-DBG] Sent entity={entity_id} -> client={ctx.client_id} "
                       f"pos={send_pos} is_manned=True mode={mode} ok={ok}")
+
+        if combined_entities:
+            include_local_state, local_state_kwargs = self._get_update_array_local_state_for_viewer(ctx)
+            payload = build_update_array_multi(tick, include_local_state=include_local_state,
+                                               entities=combined_entities, **local_state_kwargs)
+            self._send_packet_to_client(ctx, payload, prefer_tcp=prefer_tcp)
+
+    def _broadcast_browser_player_update(self, subject: ClientContext) -> None:
+        """Publish one authoritative subject step to every browser world view."""
+        if not subject.session or not subject.session.in_game or not subject.session.entity_id:
+            return
+        for viewer in self._snapshot_world_viewers():
+            if viewer is subject or not self._browser_demo_local_reconcile_enabled(viewer):
+                continue
+            self._send_remote_player_updates(
+                viewer,
+                self._get_network_tick(viewer),
+                prefer_tcp=False,
+                subjects=(subject,),
+            )
 
     def _remote_og_movement_input_delay_for_ctx(self, ctx: ClientContext) -> float:
         """Return the optional remote OG movement-only replay delay.

@@ -729,6 +729,28 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
         ).strip().lower()
         if self.state_sync_snapshot_mode not in ("remote_live", "live", "history"):
             self.state_sync_snapshot_mode = "remote_live"
+        # The reconstructed browser runtime has a safe VIEW_UPDATE reconcile
+        # implementation.  Keep positional correction opt-in and tied to the
+        # demo's explicit tile-* identity so a native OG client on loopback can
+        # never inherit the crash-prone pos+rot correction path by accident.
+        self.browser_demo_local_reconcile = os.environ.get(
+            "WULFRAM_BROWSER_DEMO_LOCAL_RECONCILE",
+            "0",
+        ).strip().lower() not in ("0", "off", "false", "no")
+        try:
+            self.browser_demo_local_reconcile_interval = max(
+                0.02,
+                float(os.environ.get("WULFRAM_BROWSER_DEMO_LOCAL_RECONCILE_INTERVAL", "0.05")),
+            )
+        except ValueError:
+            self.browser_demo_local_reconcile_interval = 0.05
+        try:
+            self.browser_demo_local_reconcile_timestamp_lag_ms = max(
+                0,
+                int(os.environ.get("WULFRAM_BROWSER_DEMO_LOCAL_RECONCILE_TIMESTAMP_LAG_MS", "5000")),
+            )
+        except ValueError:
+            self.browser_demo_local_reconcile_timestamp_lag_ms = 5000
         try:
             self.state_sync_correction_burst_count = int(
                 os.environ.get("WULFRAM_STATE_SYNC_CORRECTION_BURST", "6")
@@ -3829,6 +3851,15 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
 
                     tick = self._get_network_tick(ctx)
                     self._record_authoritative_state(ctx, tick=tick)
+                    # Browser viewers must observe the same authoritative step,
+                    # independent of their own iframe/tick-worker cadence.
+                    self._broadcast_browser_player_update(ctx)
+                    # Browser demo clients run the same local predictor but can
+                    # lose elapsed simulation time when the renderer stalls.
+                    # Keep their safe reconstructed reconcile path on the same
+                    # cadence as remote replication; native OG clients are
+                    # excluded by the explicit tile identity gate.
+                    self._maybe_send_browser_demo_local_reconcile(ctx, now=now)
                     # Debug: log tick value periodically
                     if ctx.session.tick % 300 == 0:
                         print(f"[TICK-DEBUG] Client {ctx.client_id}: network_tick={tick} client_tick={ctx.last_client_tick} offset={ctx.tick_offset}")
@@ -3989,7 +4020,19 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
                         self.remote_update_interval <= 0
                         or (now - ctx.last_remote_update_send) >= self.remote_update_interval
                     )
-                    if self.send_remote_updates and not self.combine_update_arrays and remote_due:
+                    # `combine_update_arrays` also combines all remote entities in
+                    # `_send_remote_player_updates`.  Only skip that packet when the
+                    # full-local branch below will actually emit its local+remote
+                    # combined packet.  The browser demo deliberately suppresses
+                    # full local transforms, so the old blanket combine guard froze
+                    # every remote tank at its definition/spawn pose.
+                    combined_with_full_local = (
+                        self.combine_update_arrays
+                        and self.send_player_updates
+                        and send_full_update
+                        and send_update
+                    )
+                    if self.send_remote_updates and not combined_with_full_local and remote_due:
                         ctx.last_remote_update_send = now
                         self._send_remote_player_updates(
                             ctx,

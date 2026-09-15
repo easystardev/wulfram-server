@@ -323,6 +323,21 @@ def main():
             'WULFRAM_COMBINE_UPDATE_ARRAYS': '1',
             'WULFRAM_PACKET_TRACE': '0',
             'WULFRAM_USE_CLIENT_TICKS': '1',
+            # The browser already owns its timing requests. Server-originated
+            # PING_REQUEST uses the host GetTickCount domain and poisons the
+            # iframe latency/correction eligibility estimator.
+            'WULFRAM_SERVER_PING_LOOP': '0',
+            # Generic positional replay remains unsafe for OG clients. The
+            # tile-only gate below owns this demo's correction stream and must
+            # remain active while the controlled tank is moving.
+            'WULFRAM_STATE_REQUEST_REPLAY_REPLY': '0',
+            'WULFRAM_STATE_REQUEST_REPLAY_DURING_MOVEMENT': '1',
+            # Reconstructed tile clients safely accept full VIEW_UPDATE local
+            # reconciliation.  The server additionally gates this to tile-*
+            # usernames so native OG loopback sessions retain rot-only safety.
+            'WULFRAM_BROWSER_DEMO_LOCAL_RECONCILE': '1',
+            'WULFRAM_BROWSER_DEMO_LOCAL_RECONCILE_INTERVAL': '0.05',
+            'WULFRAM_BROWSER_DEMO_LOCAL_RECONCILE_TIMESTAMP_LAG_MS': '5000',
         }
         os.environ.update(demo)
         print(f"[MANAGER] Browser demo mode: {demo}")
