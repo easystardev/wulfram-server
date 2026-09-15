@@ -1416,8 +1416,13 @@ def build_behavior_packet() -> bytes:
     payload += struct.pack(">I", 1)
     payload += pack_fixed16(1.0)
 
-    for _ in range(11):
+    # PacketHandler_BEHAVIOR reads ten targeting/power/marker values followed
+    # by g_targeting_max_distance. Keep the still-unrecovered presentation
+    # values isolated at their prior defaults, but do not advertise a 1 m
+    # target range to original or reconstructed clients.
+    for _ in range(10):
         payload += pack_fixed16(1.0)
+    payload += pack_fixed16(1000.0)
 
     payload.append(0x01)
     payload.append(0x01)

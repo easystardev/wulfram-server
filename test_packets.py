@@ -271,6 +271,7 @@ def test_behavior_packet():
     match = (
         payload[0] == 0x24
         and len(payload) >= 3116
+        and int.from_bytes(payload[1 + 89:1 + 93], "big", signed=True) / 65536.0 == 1000.0
         and len(parsed.weapon_units) == 4
         and spring_counts == [4, 4, 4, 4]
     )
