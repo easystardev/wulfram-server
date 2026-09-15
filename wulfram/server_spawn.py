@@ -375,7 +375,10 @@ class SpawnMixin:
             return pos
         for ring in range(1, 6):
             for k in range(8):
-                ang = (k / 8.0) * 2.0 * math.pi
+                # Keep separated tanks out of the cardinal firing lanes. The
+                # old first candidate was exactly +X, so a freshly spawned
+                # pulse from the original point immediately hit that tank.
+                ang = ((k + 0.5) / 8.0) * 2.0 * math.pi
                 px = x + math.cos(ang) * min_sep * ring
                 py = y + math.sin(ang) * min_sep * ring
                 if _clear(px, py):
