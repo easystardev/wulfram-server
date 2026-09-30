@@ -3,6 +3,7 @@ extracted verbatim from WulframServer (server.py decomposition, step 7).
 Method-only mixin; shares state via `self`.
 """
 from __future__ import annotations
+from .observer_lifecycle import FRAME_LOCK, serialized
 
 import math
 import os
@@ -11,7 +12,7 @@ import time
 import traceback
 from typing import Optional
 
-from . import handlers
+from . import handlers, tutorial_runtime
 from .client import ClientContext
 from .weapons import (
     EntityType,
@@ -65,7 +66,8 @@ class CombatMixin:
         # Start background thread for movement updates
         def update_loop():
             # === Projectile update mode ===
-            # Mode 0: No updates (let client simulate from spawn velocity)
+            # Mode 0: No network updates; server still simulates collision at
+            #         15 Hz while the client independently integrates flight.
             # Mode 1: Low rate updates (5 Hz)
             # Mode 2: Medium rate updates (15 Hz)
             # Mode 3: High rate updates (30 Hz)
@@ -73,23 +75,12 @@ class CombatMixin:
             delete_reason = "expired"
             delete_with_effects = False
 
-            if update_mode == 0:
-                # No updates - just wait for lifetime then clean up
-                time.sleep(proj.lifetime)
-                print(f"[PROJ] id={proj.entity_id} expired (no-update mode)")
-                with ctx.projectile_lock:
-                    if proj in ctx.active_projectiles:
-                        ctx.active_projectiles.remove(proj)
-                tick = self._get_network_tick(ctx)
-                self._broadcast_projectile_delete(
-                    proj,
-                    tick,
-                    with_effects=False,
-                    reason="expired",
-                )
-                return
-
-            update_rate = {1: 5.0, 2: 15.0, 3: 30.0}.get(update_mode, 15.0)
+            # Replication cadence and collision simulation are deliberately
+            # decoupled.  Mode 0 avoids the empirically harmful per-shell OG
+            # packet flood, but authoritative damage cannot be disabled with
+            # it: that would turn every visible shell into a harmless client-
+            # side effect.  Fifteen Hz matches the established medium path.
+            update_rate = {0: 15.0, 1: 5.0, 2: 15.0, 3: 30.0}.get(update_mode, 15.0)
             dt = 1.0 / update_rate
             duration = proj.lifetime
 
@@ -135,6 +126,12 @@ class CombatMixin:
                             f"[PROJ-WORLD] id={proj.entity_id} hit terrain "
                             f"at=({hit_pos[0]:.1f},{hit_pos[1]:.1f},{hit_pos[2]:.1f})"
                         )
+                        from . import tutorial_runtime
+                        tutorial_runtime.record_weapon_miss(
+                            self, ctx,
+                            weapon=getattr(proj.entity_type, "name", str(proj.entity_type)),
+                            reason="the ground",
+                        )
                     else:
                         fx_type = FX_IMPACT_BUILDING
                         print(
@@ -152,26 +149,27 @@ class CombatMixin:
                     }])
                     break
 
-                # Check collision with enemy players
-                hit_target = self._check_projectile_hit(proj, ctx)
-                if hit_target:
-                    try:
-                        self._apply_damage(hit_target, proj, ctx)
-                    except Exception as dmg_err:
-                        print(f"[COMBAT-ERROR] _apply_damage failed: {dmg_err}")
-                        import traceback
-                        traceback.print_exc()
-                    delete_reason = None
-                    with ctx.projectile_lock:
-                        if proj in ctx.active_projectiles:
-                            ctx.active_projectiles.remove(proj)
-                    break  # Stop update loop
+                with FRAME_LOCK:
+                    # Check collision with enemy players
+                    hit_target = self._check_projectile_hit(proj, ctx)
+                    if hit_target:
+                        try:
+                            self._apply_damage(hit_target, proj, ctx)
+                        except Exception as dmg_err:
+                            print(f"[COMBAT-ERROR] _apply_damage failed: {dmg_err}")
+                            import traceback
+                            traceback.print_exc()
+                        delete_reason = None
+                        with ctx.projectile_lock:
+                            if proj in ctx.active_projectiles:
+                                ctx.active_projectiles.remove(proj)
+                        break  # Stop update loop
 
                 # Send position update (dt=0 since we already advanced pos above)
                 # Build per-client packets so each viewer gets their OWN health
                 # in local_state (not the shooter's health).
                 sent_update_count = 0
-                if self.udp_handler:
+                if update_mode != 0 and self.udp_handler:
                     for target in self._snapshot_in_game_clients():
                         if not target.session.udp_addr or not target.session.translation_ack_received:
                             continue
@@ -210,7 +208,8 @@ class CombatMixin:
                     ctx.last_projectile_update_id = int(getattr(proj, "entity_id", 0) or 0)
                     ctx.last_projectile_update_targets = sent_update_count
 
-                if i % 15 == 0:  # Log every 0.5 sec at 30Hz
+                if i % max(1, int(update_rate)) == 0:
+                    tick = self._get_network_tick(ctx)
                     print(f"[PROJ] id={proj.entity_id} pos=({proj.pos[0]:.1f},{proj.pos[1]:.1f},{proj.pos[2]:.1f}) vel=({proj.vel[0]:.0f},{proj.vel[1]:.0f},{proj.vel[2]:.0f}) tick={tick}")
 
             # Remove from active list when done
@@ -315,6 +314,7 @@ class CombatMixin:
         )
         return best[1]
 
+    @serialized
     def _apply_damage(self, target: ClientContext, proj, attacker: ClientContext) -> None:
         """Apply damage from a projectile hit and broadcast effects.
 
@@ -324,7 +324,7 @@ class CombatMixin:
         4. If dead, send DELETE_OBJECT for target entity
         """
         # Guard: ignore hits on already-dead targets (overkill from queued projectiles)
-        if target.player_health <= 0.0:
+        if not target.running or not target.session.in_game or target.observer_transition or target.player_health <= 0.0:
             print(f"[COMBAT] Ignoring hit on already-dead c{target.client_id}")
             # Still delete the projectile
             tick = self._get_network_tick(attacker)
@@ -446,7 +446,7 @@ class CombatMixin:
                 self.udp_handler.send_to(c_pkt, client.session.udp_addr)
 
         # If target is dead, delete their entity with explosion and schedule respawn
-        if target.player_health <= 0.0:
+        if not target.running or not target.session.in_game or target.observer_transition or target.player_health <= 0.0:
             # Track kill/death stats
             attacker.kills += 1
             target.deaths += 1
@@ -464,27 +464,29 @@ class CombatMixin:
             # DELETE entity with explosion effects
             tick_del = self._get_network_tick(target)
             del_pkt = build_delete_object(tick_del, [target_entity_id], with_effects=True)
-            for client in self._snapshot_in_game_clients():
+            for client in self._snapshot_world_delete_viewers():
                 if not self._combat_observer_packets_allowed_for_client(client, attacker, target):
                     continue
-                self._send_packet_to_client(client, del_pkt, prefer_tcp=True)
+                self._send_packet_to_client(client, del_pkt if client.session.in_game else build_delete_object(self._get_network_tick(client), [target_entity_id], with_effects=True), prefer_tcp=True)
 
             # Stop tick loop (entity no longer exists on client)
             target.session.in_game = False
 
             # Remove from other clients' known entities so they re-create on respawn
-            for other in self._snapshot_in_game_clients():
+            for other in self._snapshot_world_delete_viewers():
                 if other is not target:
                     other.known_entity_ids.discard(target_entity_id)
+                    getattr(other, "_entity_create_times", {}).pop(target_entity_id, None)
 
             # Clear dead player's own known entities and retry tracking.
             # On respawn, _sync_clients_on_spawn will re-create all entities
             # for this player.  Without this, the stale known_entity_ids +
             # expired _entity_create_times retry window would cause
             # _send_entity_create to skip re-creation after respawn.
-            target.known_entity_ids.clear()
+            target.known_entity_ids.discard(target_entity_id)
+            getattr(target, "_entity_create_times", {}).pop(target_entity_id, None)
             if hasattr(target, '_entity_create_times'):
-                target._entity_create_times.clear()
+                target._entity_create_times.pop(target_entity_id, None)
 
             # Reset server-side state for next spawn
             target.player_health = 1.0
@@ -546,6 +548,15 @@ class CombatMixin:
         old_hp = float(event.get("old_health", 0.0) or 0.0)
         new_hp = float(event.get("new_health", 0.0) or 0.0)
         max_hp = float(event.get("max_health", 1.0) or 1.0)
+        from . import tutorial_runtime
+        tutorial_runtime.record_hit(
+            self, attacker, target_kind="building", target_id=int(building_oid),
+            weapon=getattr(proj.entity_type, "name", str(proj.entity_type)),
+            destroyed=bool(event.get("destroyed", False)),
+            old_health=old_hp, new_health=new_hp, max_health=max_hp,
+        )
+        if tutorial_runtime.is_protected_target(self, int(building_oid)):
+            self._building_health[int(building_oid)] = self._building_max_health[int(building_oid)]
         pct = (new_hp / max_hp * 100) if max_hp > 0 else 0.0
         btype_name = str(event.get("entity_type_name") or "UNKNOWN")
 
@@ -753,6 +764,46 @@ class CombatMixin:
         end_pos = self._from_client_pos(end_client_pos)
         return self._raycast_world(start_pos, end_pos)
 
+    def _turret_has_terrain_line_of_sight(self, building, target: ClientContext) -> bool:
+        """Return false when authored terrain genuinely blocks turret-to-tank sight."""
+        collision = getattr(self, "_terrain_grid_collision", None)
+        if collision is None:
+            return True
+        start = (
+            float(building.x),
+            float(building.y),
+            float(building.z) + 8.0,
+        )
+        end = tuple(float(value) for value in target.player_pos[:3])
+        dx = end[0] - start[0]
+        dy = end[1] - start[1]
+        dz = end[2] - start[2]
+        length = math.sqrt(dx * dx + dy * dy + dz * dz)
+        if length <= 1e-6:
+            return True
+        # Begin outside the turret's own footprint. Terrain is the only cover
+        # tested here; buildings keep their existing combat behavior.
+        muzzle = (
+            start[0] + dx / length * 12.0,
+            start[1] + dy / length * 12.0,
+            start[2] + dz / length * 12.0,
+        )
+        hit = collision.raycast(muzzle, end)
+        if hit is None:
+            return True
+        hit_distance = math.sqrt(
+            (hit.position[0] - muzzle[0]) ** 2
+            + (hit.position[1] - muzzle[1]) ** 2
+            + (hit.position[2] - muzzle[2]) ** 2
+        )
+        target_distance = math.sqrt(
+            (end[0] - muzzle[0]) ** 2
+            + (end[1] - muzzle[1]) ** 2
+            + (end[2] - muzzle[2]) ** 2
+        )
+        return hit_distance >= max(0.0, target_distance - 3.0)
+
+    @serialized
     def _update_turret_ai(self):
         """Turret AI: GUN_TURRET and LAUNCHER buildings fire at nearby enemies.
 
@@ -809,11 +860,15 @@ class CombatMixin:
                 dx = client.player_pos[0] - b.x
                 dy = client.player_pos[1] - b.y
                 dist_sq = dx * dx + dy * dy
+                if not self._turret_has_terrain_line_of_sight(b, client):
+                    continue
                 if dist_sq < best_dist_sq:
                     best_dist_sq = dist_sq
                     best_target = client
 
             if best_target is None:
+                continue
+            if tutorial_runtime.suppress_turret_fire(self, best_target, int(oid)):
                 continue
 
             # Fire! Apply hitscan damage + FX
@@ -873,17 +928,19 @@ class CombatMixin:
                 target_eid = best_target.session.entity_id or best_target.entity_id
                 tick_del = self._get_network_tick(best_target)
                 del_pkt = build_delete_object(tick_del, [target_eid], with_effects=True)
-                for client in in_game:
+                for client in self._snapshot_world_delete_viewers():
                     if not self._combat_observer_packets_allowed_for_client(client, best_target):
                         continue
-                    self._send_packet_to_client(client, del_pkt, prefer_tcp=True)
+                    self._send_packet_to_client(client, del_pkt if client.session.in_game else build_delete_object(self._get_network_tick(client), [target_eid], with_effects=True), prefer_tcp=True)
                 best_target.session.in_game = False
-                for other in in_game:
+                for other in self._snapshot_world_delete_viewers():
                     if other is not best_target:
                         other.known_entity_ids.discard(target_eid)
-                best_target.known_entity_ids.clear()
+                        getattr(other, "_entity_create_times", {}).pop(target_eid, None)
+                best_target.known_entity_ids.discard(target_eid)
+                getattr(best_target, "_entity_create_times", {}).pop(target_eid, None)
                 if hasattr(best_target, '_entity_create_times'):
-                    best_target._entity_create_times.clear()
+                    best_target._entity_create_times.pop(target_eid, None)
                 best_target.player_health = 1.0
                 best_target.player_vel = (0.0, 0.0, 0.0)
                 best_target.player_speed = 0.0
@@ -1054,6 +1111,42 @@ class CombatMixin:
             target = self._find_chain_gun_target(ctx, pos, rot)
             if target is not None:
                 self._apply_hitscan_damage(target, ctx, pos, weapon_name)
+            else:
+                # Chain Gun is hitscan, so building practice needs the same
+                # authoritative world ray used by projectile collision.
+                yaw = float(getattr(ctx, "player_heading", 0.0) or 0.0)
+                start = tuple(float(value) for value in pos[:3])
+                end = (start[0] + math.cos(yaw) * 120.0, start[1] + math.sin(yaw) * 120.0, start[2])
+                hit = self._raycast_world(start, end)
+                if hit is not None and hit[0] in {"building", "building-aabb"} and hit[2] is not None:
+                    oid = int(hit[2])
+                    event = self._apply_building_damage_amount(
+                        oid, 20.0, source=f"hitscan:{weapon_name}:c{ctx.client_id}",
+                        remove_dynamic_on_destroy=True, delete_participants=(ctx,),
+                    )
+                    if event.get("ok"):
+                        from . import tutorial_runtime
+                        tutorial_runtime.record_hit(
+                            self, ctx, target_kind="building", target_id=oid, weapon="CHAIN GUN",
+                            destroyed=bool(event.get("destroyed", False)),
+                            old_health=float(event.get("old_health", 0.0) or 0.0),
+                            new_health=float(event.get("new_health", 0.0) or 0.0),
+                            max_health=float(event.get("max_health", 1.0) or 1.0),
+                        )
+                        if tutorial_runtime.is_protected_target(self, oid):
+                            self._building_health[oid] = self._building_max_health[oid]
+                else:
+                    miss_kind = hit[0] if hit is not None else "none"
+                    print(
+                        f"[WEAPON-MISS] Chain Gun ray hit={miss_kind} "
+                        f"start=({start[0]:.1f},{start[1]:.1f},{start[2]:.1f}) "
+                        f"end=({end[0]:.1f},{end[1]:.1f},{end[2]:.1f}) "
+                        f"yaw={math.degrees(yaw):.1f}deg"
+                    )
+                    from . import tutorial_runtime
+                    tutorial_runtime.record_weapon_miss(
+                        self, ctx, weapon="CHAIN GUN", reason=miss_kind,
+                    )
         # Python-client-only debug feedback; suppress for OG clients.
         if ctx is not None and ctx.tcp_handler and self._debug_comm_allowed_for_client(ctx):
             if weapon_name == "Chain Gun":
@@ -1115,6 +1208,7 @@ class CombatMixin:
                 best = (along, target)
         return best[1] if best is not None else (nearest[1] if nearest is not None else None)
 
+    @serialized
     def _apply_hitscan_damage(
         self,
         target: ClientContext,
@@ -1123,7 +1217,7 @@ class CombatMixin:
         weapon_name: str,
     ) -> None:
         """Apply controlled-lane hitscan damage without projectile delete traffic."""
-        if target.player_health <= 0.0:
+        if not target.running or not target.session.in_game or target.observer_transition or target.player_health <= 0.0:
             return
 
         damage = 0.20
@@ -1135,6 +1229,11 @@ class CombatMixin:
         target.last_damage_amount = damage
         target.last_damage_old_health = old_health
         target.last_damage_new_health = new_health
+        from . import tutorial_runtime
+        tutorial_runtime.record_hit(
+            self, attacker, target_kind="player",
+            target_id=int(target.session.entity_id or target.entity_id), weapon=weapon_name,
+        )
 
         attacker_name = attacker.session.username or f"Player{attacker.client_id}"
         target_name = target.session.username or f"Player{target.client_id}"
@@ -1161,18 +1260,20 @@ class CombatMixin:
         target_entity_id = target.session.entity_id or target.entity_id
         tick_del = self._get_network_tick(target)
         del_pkt = build_delete_object(tick_del, [target_entity_id], with_effects=True)
-        for client in self._snapshot_in_game_clients():
+        for client in self._snapshot_world_delete_viewers():
             if not self._combat_observer_packets_allowed_for_client(client, attacker, target):
                 continue
-            self._send_packet_to_client(client, del_pkt, prefer_tcp=True)
+            self._send_packet_to_client(client, del_pkt if client.session.in_game else build_delete_object(self._get_network_tick(client), [target_entity_id], with_effects=True), prefer_tcp=True)
 
         target.session.in_game = False
-        for other in self._snapshot_in_game_clients():
+        for other in self._snapshot_world_delete_viewers():
             if other is not target:
                 other.known_entity_ids.discard(target_entity_id)
-        target.known_entity_ids.clear()
+                getattr(other, "_entity_create_times", {}).pop(target_entity_id, None)
+        target.known_entity_ids.discard(target_entity_id)
+        getattr(target, "_entity_create_times", {}).pop(target_entity_id, None)
         if hasattr(target, '_entity_create_times'):
-            target._entity_create_times.clear()
+            target._entity_create_times.pop(target_entity_id, None)
 
         target.player_health = 1.0
         target.player_vel = (0.0, 0.0, 0.0)

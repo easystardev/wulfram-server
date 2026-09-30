@@ -268,10 +268,17 @@ def test_behavior_packet():
     print(f"  Length: {len(payload)}")
     print(f"  Opcode: 0x{payload[0]:02X}")
     spring_counts = [len(s.points) for s in parsed.spring_states]
+    header_fixed = [
+        int.from_bytes(payload[1 + offset:1 + offset + 4], "big", signed=True) / 65536.0
+        for offset in range(49, 93, 4)
+    ]
     match = (
         payload[0] == 0x24
         and len(payload) >= 3116
-        and int.from_bytes(payload[1 + 89:1 + 93], "big", signed=True) / 65536.0 == 1000.0
+        and header_fixed == [
+            280.0, 25.0, 10000.0, 1.0, 300.0, 1000.0,
+            1.0, 900.0, 1400.0, 475.0, 1000.0,
+        ]
         and len(parsed.weapon_units) == 4
         and spring_counts == [4, 4, 4, 4]
     )

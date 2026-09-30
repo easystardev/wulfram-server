@@ -4,6 +4,7 @@ step 3). Method-only mixin; shares state via `self`. First chunk of the
 replication layer (the local-state heartbeat builders).
 """
 from __future__ import annotations
+from .observer_lifecycle import serialized
 
 import os
 import time
@@ -646,8 +647,11 @@ class ReplicationMixin:
                 allow_udp_fallback=False,
             )
 
+    @serialized
     def _send_entity_create(self, target_ctx: ClientContext, player_ctx: ClientContext, *, is_retry: bool = False) -> None:
         """Serialize create/retry bookkeeping for one receiving client."""
+        if not self._world_viewer_ready(target_ctx) or not player_ctx.running or not player_ctx.session.in_game or player_ctx.observer_transition:
+            return
         with target_ctx.entity_create_lock:
             self._send_entity_create_locked(target_ctx, player_ctx, is_retry=is_retry)
 
@@ -748,29 +752,18 @@ class ReplicationMixin:
             if phase == "RETRY" or int(elapsed) % 30 == 0:  # Log retries always, re-announces every 30s
                 print(f"[MULTI] Sent entity create {phase} -> client {target_ctx.client_id} ({elapsed:.1f}s since first)")
 
-    def _ensure_multiplayer_visibility(self, ctx: ClientContext) -> None:
-        """Ensure ctx sees other players and vice versa once translation is ready."""
-        if not ctx.session.translation_ack_received:
+    def _ensure_multiplayer_visibility(self, ctx):
+        if not self._world_viewer_ready(ctx):
             return
-        self._ensure_uplink_mvp_state(ctx)
-        others = [c for c in self._snapshot_in_game_clients() if c is not ctx]
-        if ctx.session.tick % 300 == 0 and others:
-            print(f"[MULTI-DBG] client={ctx.client_id} trans_ack={ctx.session.translation_ack_received} "
-                  f"others={[(o.client_id, o.session.entity_id or o.entity_id, o.session.translation_ack_received) for o in others]} "
-                  f"known={ctx.known_entity_ids}")
-        for other in others:
-            # Always try to exchange roster entries (idempotent).
-            self._send_roster_entry(ctx, other)
-            if other.session.translation_ack_received:
-                self._send_roster_entry(other, ctx)
-            # Entity creation is viewer-owned: this tick loop only announces
-            # `other` to its own `ctx`.  The other client's tick loop performs
-            # the reverse direction.  Sending both directions here made two
-            # independent tick threads race through `_entity_create_times` and
-            # emit duplicate DEFINITION retries a millisecond apart.  Repeating
-            # a create for an already-live OID can re-enter the OG client's
-            # creation/render path with partially initialized state.
-            self._send_entity_create(ctx, other)
+        if ctx.session.in_game:
+            self._ensure_uplink_mvp_state(ctx)
+        for subject in self._snapshot_in_game_clients():
+            if subject is not ctx:
+                self._send_entity_create(ctx, subject)
+        if ctx.session.in_game:
+            for viewer in self._snapshot_world_viewers():
+                if viewer is not ctx:
+                    self._send_entity_create(viewer, ctx)
 
     def _build_remote_sync_heartbeat_update(
         self,
@@ -933,7 +926,7 @@ class ReplicationMixin:
         prefix or its end-of-packet local-player sync reads garbage health.
         """
         force_local_state = getattr(self, "update_local_state_mode", "wf") == "force"
-        if not force_local_state and not handlers._is_og_client(ctx):
+        if not ctx.session.in_game or (not force_local_state and not handlers._is_og_client(ctx)):
             return False, {}
 
         return True, dict(
@@ -964,7 +957,7 @@ class ReplicationMixin:
         still gets the local-state prefix it needs.
         """
         force_local_state = getattr(self, "update_local_state_mode", "wf") == "force"
-        if not force_local_state and not handlers._is_og_client(ctx):
+        if not ctx.session.in_game or (not force_local_state and not handlers._is_og_client(ctx)):
             return False, {}
 
         return True, dict(

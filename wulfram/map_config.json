@@ -3,5 +3,45 @@
     "grid_rows": 1,
     "grid_cols": 1,
     "scale": 1.0
+  },
+  "micro-test-pad": {
+    "grid_rows": 11,
+    "grid_cols": 11,
+    "scale": 1.0
+  },
+  "training-orientation-course": {
+    "grid_rows": 11,
+    "grid_cols": 11,
+    "scale": 1.0
+  },
+  "training-driving-course": {
+    "grid_rows": 11,
+    "grid_cols": 11,
+    "scale": 1.0
+  },
+  "training-combat-range": {
+    "grid_rows": 11,
+    "grid_cols": 11,
+    "scale": 1.0
+  },
+  "training-logistics-base": {
+    "grid_rows": 11,
+    "grid_cols": 11,
+    "scale": 1.0
+  },
+  "training-outpost-defense": {
+    "grid_rows": 11,
+    "grid_cols": 11,
+    "scale": 1.0
+  },
+  "training-skirmish-capstone": {
+    "grid_rows": 11,
+    "grid_cols": 11,
+    "scale": 1.0
+  },
+  "training-skirmish-intro": {
+    "grid_rows": 11,
+    "grid_cols": 11,
+    "scale": 1.0
   }
 }

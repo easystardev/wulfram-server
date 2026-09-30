@@ -1417,12 +1417,22 @@ def build_behavior_packet() -> bytes:
     payload += pack_fixed16(1.0)
 
     # PacketHandler_BEHAVIOR reads ten targeting/power/marker values followed
-    # by g_targeting_max_distance. Keep the still-unrecovered presentation
-    # values isolated at their prior defaults, but do not advertise a 1 m
-    # target range to original or reconstructed clients.
-    for _ in range(10):
-        payload += pack_fixed16(1.0)
-    payload += pack_fixed16(1000.0)
+    # by g_targeting_max_distance. These values are decoded directly from the
+    # retained 2026-09-07 production BEHAVIOR capture. In particular, the
+    # Power Cell backup range is a gameplay input to the OG deployment gate;
+    # the old all-1.0 placeholder made non-power structures impossible to
+    # deploy even beside a friendly Power Cell.
+    for value in (
+        280.0,    # targeting focus radius
+        25.0,     # Power Cell backup range
+        10000.0,  # Power Cell max health
+        1.0,      # Power Cell effect radius
+        300.0, 1000.0, 1.0,  # marker ellipse
+        900.0, 1400.0,        # marker oval
+        475.0,                 # marker circle
+    ):
+        payload += pack_fixed16(value)
+    payload += pack_fixed16(1000.0)  # targeting max distance
 
     payload.append(0x01)
     payload.append(0x01)

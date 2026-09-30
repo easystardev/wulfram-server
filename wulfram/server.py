@@ -106,7 +106,7 @@ from .packets import (
     FX_IMPACT_BUILDING, FX_IMPACT_TERRAIN,
     get_behavior_tank_spring_local_offsets,
 )
-from . import handlers, build_uplink, building_lifecycle, match_flow, config as server_config
+from . import handlers, build_uplink, building_lifecycle, match_flow, tutorial_runtime, config as server_config
 from .pktlog import PacketLog
 
 class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, CombatMixin, RemoteSyncMixin, CorrectionMixin, TickMixin, NetMixin):
@@ -151,6 +151,7 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
         self._init_spawn_config()
         self._init_replication_config()
         self._init_map_config()
+        tutorial_runtime.load_for_server(self)
         # Load building entities for collision detection
         self._building_entities = {}
         self._building_health = {}  # oid -> health (1.0 = full, 0.0 = destroyed)
@@ -387,6 +388,7 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
                 f"model_contact_normal={self._terrain_grid_collision.model_contact_normal_source}"
             )
         self._load_map_buildings()
+        tutorial_runtime.resolve_targets(self)
         try:
             self._dynamic_building_next_oid = int(os.environ.get("WULFRAM_DYNAMIC_BUILDING_BASE_OID", "30000"), 0)
         except ValueError:
@@ -1265,6 +1267,8 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
     def _regen_player_energy(self, ctx: Optional[ClientContext], dt: float) -> None:
         """Regenerate player energy over time."""
         if ctx is None or dt <= 0.0 or self.player_energy_regen <= 0.0:
+            return
+        if tutorial_runtime.suppress_passive_energy(self, ctx):
             return
         max_energy = self.player_energy_max if self.player_energy_max > 0.0 else 100.0
         ctx.player_energy = min(max_energy, ctx.player_energy + (self.player_energy_regen * dt))
@@ -2951,9 +2955,9 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
         FUEL_RATE = 2.0           # energy per tick (absolute)
         ENERGY_RATE = 3.0         # energy per tick (absolute, faster)
 
-        near_repair = False
-        near_fuel = False
-        near_energy = False
+        near_repair = None
+        near_fuel = None
+        near_energy = None
 
         for oid, b in self._building_entities.items():
             # Skip destroyed buildings
@@ -2974,20 +2978,35 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
                 continue
 
             if b.entity_type == EntityType.REPAIR_BUILDING:
-                near_repair = True
+                if near_repair is None or dist_sq < near_repair[0]:
+                    near_repair = (dist_sq, oid)
             elif b.entity_type == EntityType.FUEL_BUILDING:
-                near_fuel = True
+                if near_fuel is None or dist_sq < near_fuel[0]:
+                    near_fuel = (dist_sq, oid)
             elif b.entity_type == EntityType.ENERGY_BUILDING:
-                near_energy = True
+                if near_energy is None or dist_sq < near_energy[0]:
+                    near_energy = (dist_sq, oid)
 
         if near_repair and ctx.player_health < 1.0:
+            old_health = ctx.player_health
             ctx.player_health = min(1.0, ctx.player_health + REPAIR_RATE)
+            tutorial_runtime.record_service(
+                self, ctx, service="repair", target_id=near_repair[1], delta=ctx.player_health - old_health,
+            )
 
         max_energy = self.player_energy_max if self.player_energy_max > 0.0 else 100.0
         if near_fuel and ctx.player_energy < max_energy:
+            old_energy = ctx.player_energy
             ctx.player_energy = min(max_energy, ctx.player_energy + FUEL_RATE)
+            tutorial_runtime.record_service(
+                self, ctx, service="fuel", target_id=near_fuel[1], delta=ctx.player_energy - old_energy,
+            )
         if near_energy and ctx.player_energy < max_energy:
+            old_energy = ctx.player_energy
             ctx.player_energy = min(max_energy, ctx.player_energy + ENERGY_RATE)
+            tutorial_runtime.record_service(
+                self, ctx, service="energy", target_id=near_energy[1], delta=ctx.player_energy - old_energy,
+            )
 
         self._try_cargo_pickup(ctx)
         self._update_deconstruction()
@@ -3031,8 +3050,30 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
                 ctype = int(crate.get("cargo_type", 0) or 0)
                 if ctype == 0:
                     continue
+                fixture_binding = str(crate.get("tutorial_binding", "") or "")
+                if crate.get("tutorial_map"):
+                    ctx.tutorial_fixture_cargo = {
+                        "tutorial_map": str(crate.get("tutorial_map")),
+                        "tutorial_binding": fixture_binding,
+                        "tutorial_owner_client_id": int(crate.get("tutorial_owner_client_id", 0) or 0),
+                        "tutorial_owner_epoch": int(crate.get("tutorial_owner_epoch", 0) or 0),
+                        "tutorial_native_map": bool(crate.get("tutorial_native_map", False)),
+                        # Preserve the course-specific drop lockout while the crate is
+                        # carried.  Without this field, drop_carried_cargo falls back
+                        # to the global five-second cooldown and the slow OG input
+                        # path can re-pick the crate before the learner drives away.
+                        "tutorial_repickup_cooldown_s": float(
+                            crate.get("tutorial_repickup_cooldown_s", 0.0) or 0.0
+                        ),
+                        "source_oid": int(oid),
+                    }
                 self._set_player_carry(ctx, cargo_type=ctype, cargo_count=1, has_uplink=False)
-                self._broadcast_building_delete(int(oid), prefer_tcp=False)
+                tutorial_runtime.record_logistics_event(
+                    self, ctx, action="cargo_pickup", oid=int(oid), entity_type=ctype,
+                    position=crate.get("pos", ctx.player_pos), fixture_binding=fixture_binding,
+                )
+                if not crate.get("tutorial_native_map"):
+                    self._broadcast_building_delete(int(oid), prefer_tcp=False)
                 self._dropped_cargo.pop(oid, None)
                 print(f"[CARGO] Client {ctx.client_id} picked up dropped crate oid={oid} type={ctype}")
                 return True
@@ -3053,6 +3094,10 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
         if cargo_type == 0:
             return False
         self._set_player_carry(ctx, cargo_type=cargo_type, cargo_count=1, has_uplink=False)
+        tutorial_runtime.record_logistics_event(
+            self, ctx, action="cargo_pickup", oid=int(ship.get("oid", 0) or 0),
+            entity_type=cargo_type, position=ship.get("pos", ctx.player_pos), fixture_binding="",
+        )
         build_uplink.ship_set_cargo_available(self, ship, available - 1)
         if float(ship.get("next_replenish", 0.0) or 0.0) <= 0.0:
             ship["next_replenish"] = time.monotonic() + float(getattr(self, "ship_replenish_s", 0.0) or 0.0)
@@ -3851,6 +3896,7 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
 
                     tick = self._get_network_tick(ctx)
                     self._record_authoritative_state(ctx, tick=tick)
+                    tutorial_runtime.update_player(self, ctx, now=now)
                     # Browser viewers must observe the same authoritative step,
                     # independent of their own iframe/tick-worker cadence.
                     self._broadcast_browser_player_update(ctx)

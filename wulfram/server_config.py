@@ -915,11 +915,11 @@ class ConfigMixin:
         # Projectile update mode:
         # 0=no updates after spawn, 1=5Hz, 2=15Hz (default), 3=30Hz
         try:
-            self.projectile_update_mode = int(os.environ.get("WULFRAM_PROJECTILE_UPDATE_MODE", "2"))
+            self.projectile_update_mode = int(os.environ.get("WULFRAM_PROJECTILE_UPDATE_MODE", "0"))
         except ValueError:
-            self.projectile_update_mode = 2
+            self.projectile_update_mode = 0
         if self.projectile_update_mode < 0 or self.projectile_update_mode > 3:
-            self.projectile_update_mode = 2
+            self.projectile_update_mode = 0
         try:
             self.projectile_collision_radius = abs(float(os.environ.get("WULFRAM_PROJECTILE_COLLISION_RADIUS", "2.0")))
         except ValueError:

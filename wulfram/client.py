@@ -7,6 +7,7 @@ Each connected client gets its own ClientContext with:
 - Player pose tracking
 - Weapon/jump jet systems
 """
+from .observer_lifecycle import serialized
 
 import time
 import threading
@@ -38,6 +39,7 @@ class ClientContext:
     # Session and transport
     session: "Session" = None
     tcp_handler: "TCPHandler" = None
+    udp_socket: Any = None  # Session-owned server destination, advertised in HELLO1.
 
     # Entity assignment
     entity_id: int = 0
@@ -180,6 +182,13 @@ class ClientContext:
     last_projectile_update_id: int = 0
     last_projectile_update_targets: int = 0
 
+    observer_transition: bool = False
+    observer_worker_starts: int = 0
+    observer_worker_generation: int = 0
+    observer_steps: int = 0
+    observer_local_entries: int = 0
+    observer_pacing_resets: int = 0
+
     # Thread management
     tick_thread: Optional[threading.Thread] = None
     ping_thread: Optional[threading.Thread] = None
@@ -277,6 +286,7 @@ class ClientContext:
         if self.vehicle_physics is None:
             self.vehicle_physics = VehiclePhysics()
 
+    @serialized
     def reset(self):
         """Reset client state for reconnection."""
         self.running = False

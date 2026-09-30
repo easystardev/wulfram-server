@@ -9,7 +9,7 @@ import struct
 import time
 from typing import Any, Optional
 
-from . import handlers
+from . import handlers, tutorial_runtime
 from .building_collision import BuildingEntity
 from .packets import (
     build_carrying_info,
@@ -447,6 +447,7 @@ def deploy_carried_cargo(server: object, ctx: object) -> dict[str, Any]:
     if carried <= 0:
         return {"ok": False, "error": "not_carrying"}
     team_id = int(ctx.session.team_id or 1)
+    fixture = getattr(ctx, "tutorial_fixture_cargo", None)
     heading = float(getattr(ctx, "player_heading", 0.0) or 0.0)
     x, y, z = _deploy_pos_in_front(server, ctx)
     oid = server._allocate_dynamic_building_oid()
@@ -461,6 +462,7 @@ def deploy_carried_cargo(server: object, ctx: object) -> dict[str, Any]:
         "player_entity_id": ctx.session.entity_id or ctx.entity_id,
         "created_at": time.time(),
         "source": "deploy_cargo",
+        "tutorial_fixture": dict(fixture) if isinstance(fixture, dict) else None,
     }
     server._rebuild_static_world_raycast_index()
     sent = server._broadcast_dynamic_entity_definition(
@@ -468,7 +470,14 @@ def deploy_carried_cargo(server: object, ctx: object) -> dict[str, Any]:
         pos=building.pos, heading=heading, is_static=True,
     )
     if sent > 0:
+        tutorial_runtime.record_logistics_event(
+            server, ctx, action="cargo_deploy", oid=oid, entity_type=carried,
+            position=building.pos,
+            fixture_binding=str((fixture or {}).get("tutorial_binding", "")),
+        )
         _consume_one_carried(server, ctx)
+        if isinstance(fixture, dict):
+            ctx.tutorial_fixture_cargo = None
         timeout = float(getattr(server, "construction_timeout", 0.0) or 0.0)
         if timeout > 0.0:
             server._building_construction[oid] = time.monotonic() + timeout
@@ -496,14 +505,42 @@ def drop_carried_cargo(server: object, ctx: object) -> dict[str, Any]:
     if carried <= 0:
         return {"ok": False, "error": "not_carrying"}
     team_id = int(ctx.session.team_id or 1)
+    fixture = getattr(ctx, "tutorial_fixture_cargo", None)
     x, y, z = _deploy_pos_in_front(server, ctx)
-    oid = server._drop_cargo_crate((x, y, z), carried, team_id)
+    # Runtime creation of type 0x13 currently corrupts the OG renderer before
+    # the contained-building subtype is initialized.  A native-map tutorial
+    # fixture therefore keeps the real DROP_REQUEST/cooldown/OID lifecycle but
+    # withholds only the unsafe replacement-create packet.
+    native_tutorial = isinstance(fixture, dict) and bool(fixture.get("tutorial_native_map"))
+    if native_tutorial:
+        oid = int(server._dropped_cargo_next_oid)
+        server._dropped_cargo_next_oid = oid + 1
+        server._dropped_cargo[oid] = {
+            "pos": (x, y, z), "cargo_type": carried, "team_id": team_id,
+        }
+    else:
+        oid = server._drop_cargo_crate((x, y, z), carried, team_id)
     if oid:
         cooldown = float(getattr(server, "cargo_drop_repickup_cooldown_s", 5.0) or 0.0)
+        if isinstance(fixture, dict):
+            cooldown = max(
+                cooldown,
+                float(fixture.get("tutorial_repickup_cooldown_s", 0.0) or 0.0),
+            )
         crate = server._dropped_cargo.get(oid)
-        if crate is not None and cooldown > 0.0:
-            crate["pickup_after"] = time.monotonic() + cooldown
+        if crate is not None:
+            if cooldown > 0.0:
+                crate["pickup_after"] = time.monotonic() + cooldown
+            if isinstance(fixture, dict):
+                crate.update(fixture)
+        tutorial_runtime.record_logistics_event(
+            server, ctx, action="cargo_drop", oid=oid, entity_type=carried,
+            position=(x, y, z),
+            fixture_binding=str((fixture or {}).get("tutorial_binding", "")),
+        )
         _consume_one_carried(server, ctx)
+        if isinstance(fixture, dict):
+            ctx.tutorial_fixture_cargo = None
     print(f"[DROP] client {ctx.client_id} dropped type={carried} oid={oid} at ({x:.0f},{y:.0f})")
     return {"ok": bool(oid), "oid": oid, "entity_type": carried, "pos": [x, y, z]}
 
@@ -905,4 +942,3 @@ def handle_comm_message_request(
         f"type=2 text={text!r} result={event.get('result')}"
     )
     return event
-

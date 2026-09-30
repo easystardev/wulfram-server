@@ -14,6 +14,10 @@ from .physics import _extract_euler_angles, _matrix3_from_euler_xyz, _normalize_
 from .weapons import BehaviorSlot, EntityType, VEHICLE_PHYSICS_CONFIGS
 from .world_collision import TerrainContact
 from .packets import get_ticks
+from .tank_mobility import tank_forward_mobility
+from .tank_controller import jet_physics
+from .input_window import average_controls
+from wulfram2_protocol.codec import pack_fixed16, unpack_fixed16
 from wulfram2_protocol.entities import (
     JUMP_JET_CONFIGS,
     JUMP_JET_SPAWN_LOCKOUT,
@@ -496,6 +500,8 @@ class TickMixin:
                 "tank_spring_attitude_damping",
                 veh_cfg.angular_damping if veh_cfg else 2.0,
             )
+            jet_attitude = self._tank_jet_physics(ctx)
+            jets_off = jet_attitude is not None and not jet_attitude.active
             if (
                 getattr(self, "tank_spring_attitude_model", "force") == "force"
                 and suspension_lift is not None
@@ -512,7 +518,7 @@ class TickMixin:
                     float(dt),
                     float(suspension_lift),
                     damping=damping,
-                    point_forces=suspension_point_forces,
+                    point_forces=([0.0] * len(samples) if jets_off else suspension_point_forces),
                     point_blend_factors=suspension_point_blend_factors,
                     integration_model=getattr(
                         self,
@@ -530,7 +536,7 @@ class TickMixin:
                     float(body_vel[0]),
                     float(body_vel[1]),
                     float(dt),
-                    stiffness=getattr(self, "tank_spring_attitude_stiffness", 40.0),
+                    stiffness=(0.0 if jets_off else getattr(self, "tank_spring_attitude_stiffness", 40.0)),
                     damping=damping,
                 )
             roll = _normalize_angle_client(step.roll)
@@ -624,11 +630,28 @@ class TickMixin:
         # Our turn_sign = -1.0 achieves the same inversion.
         return self.turn_sign * turn_input
 
+    def _tank_jet_physics(self, ctx: ClientContext, general_mobility=1.0):
+        if (not getattr(self, "tank_jet_physics_enabled", False)
+                or ctx.entity_type != EntityType.TANK or self.up_axis != "z"):
+            return None
+        from .packets import BEHAVIOR_TURN_RATE, BEHAVIOR_SUSPENSION_DAMPENING
+        slots = getattr(getattr(ctx, "weapon_system", None), "behavior_slots", None)
+        throttle = float(slots[5]) if slots is not None else .824
+        # Section-4 fixed fields 3/4 are minimum throttle / additional drag.
+        # Use the fixed16 values actually transmitted, not their old labels.
+        minimum = unpack_fixed16(pack_fixed16(BEHAVIOR_TURN_RATE))
+        additional = unpack_fixed16(pack_fixed16(BEHAVIOR_SUSPENSION_DAMPENING))
+        return jet_physics(throttle, minimum, .2, additional, .4, general_mobility)
+
     def _compute_turn_torque(self, ctx: ClientContext, raw_input: float) -> float:
         """Compute yaw torque from normalized raw input using client-equivalent f32 math."""
         # Client: entity[0x50] += turn_mobility * (float)turn_adjust * yaw_axis
         # turn_adjust is read as double then cast to float32 before multiply.
         from .physics import _f32
+
+        jet = self._tank_jet_physics(ctx)
+        if jet is not None and not jet.active:
+            return 0.0
 
         veh_cfg = VEHICLE_PHYSICS_CONFIGS.get(ctx.entity_type)
         turn_adj = veh_cfg.turn_adjust if veh_cfg else self.turn_adjust
@@ -4808,7 +4831,7 @@ class TickMixin:
                 inertia_half_extents=inertia_half_extents,
                 mass=collision_config["mass"],
                 friction=(
-                    collision_config["friction"]
+                    getattr(ctx, "tank_runtime_friction", collision_config["friction"])
                     if friction_override is None
                     else friction_override
                 ),
@@ -10861,6 +10884,9 @@ class TickMixin:
         for other in self._snapshot_in_game_clients():
             if other is ctx:
                 continue
+            native = getattr(self, "native_physics", None)
+            if native is not None and native.manages(other):
+                continue  # Native body must not receive a second legacy impulse.
             if not other.session or not other.session.in_game:
                 continue
 
@@ -11070,7 +11096,7 @@ class TickMixin:
 
         now = time.monotonic()
         ws = ctx.weapon_system
-        turn_input = self._get_raw_turn_input(ctx)
+        turn_input = self._normalize_turn_input_value(ctx, ws.behavior_slots[BehaviorSlot.TURNING])
         fwd_input = self._normalize_behavior_axis_value(
             ctx,
             ws.behavior_slots[BehaviorSlot.MOVING_FORWARD],
@@ -11103,6 +11129,9 @@ class TickMixin:
                     "time": now,
                     "fwd": float(fwd_input),
                     "strafe": float(strafe_input),
+                    "turn": float(turn_input),
+                    "previous": {key: float(ctx.last_decoded_input.get(key, 0.0))
+                                 for key in ("turn", "fwd", "strafe")},
                     "packet_type": packet_type,
                     "client_tick": int(client_tick or 0),
                     "action_sequence": int(ctx.action_packet_count),
@@ -11120,6 +11149,27 @@ class TickMixin:
         if abs(fwd_input) > 0.05 or abs(strafe_input) > 0.05:
             ctx.nonzero_move_input_count += 1
             ctx.last_nonzero_move_input_time = now
+
+    def _prepare_physics_input_window(self, ctx, start, end):
+        ctx.physics_input_window = None
+        mode = getattr(self, "input_window_mode", "off")
+        if mode == "off" or ctx.injected_input is not None or ctx.injected_turn is not None:
+            return
+        history = list(getattr(ctx, "movement_input_history", []) or [])
+        fallback = getattr(ctx, "last_decoded_input", {})
+        delay = self._remote_og_movement_input_delay_for_ctx(ctx)
+        sampled = average_controls(history, start - delay, end - delay, fallback)
+        timeout = float(getattr(self, "input_stale_timeout_s", 0.0) or 0.0)
+        stale = (timeout > 0 and ctx.last_action_packet_time > 0
+                 and time.monotonic() - ctx.last_action_packet_time > timeout)
+        if stale:
+            sampled = dict.fromkeys(("turn", "fwd", "strafe"), 0.0)
+        ctx.debug_input_window = {"start": start, "end": end, "delay": delay,
+                                  "mode": mode, "clock": "server_arrival",
+                                  "average": sampled, "stale": stale,
+                                  "samples": len(history)}
+        if mode == "apply":
+            ctx.physics_input_window = sampled
 
     def _select_delayed_movement_input(
         self,
@@ -11799,8 +11849,9 @@ class TickMixin:
         angular before position). heading_override passes the OLD (pre-integration) heading so
         thrust direction uses it — also faithful, since decompile TankVehicle_apply_physics
         accumulates the impulse (entity+0x24) BEFORE RigidBody_step runs.
-        NOTE: linear_damp is hardcoded 1.5 (env-overridable), not parsed from BEHAVIOR; the
-        decompile reads per-entity PhysicsConfig+0x78. 1.5 is OG-tank-verified; non-tank may differ.
+        Tank drag now follows jet state and transmitted BEHAVIOR: base drag plus
+        added drag while jets run, 2.0 when off. Non-tanks and the explicit legacy
+        path retain the driving/coasting environment settings.
 
         Entity layout:
           entity[0x0c] = position (persistent)
@@ -11876,9 +11927,13 @@ class TickMixin:
                 delay_s=movement_input_delay_s,
             )
 
-        if abs(throttle_input) < 0.05:
+        averaged = getattr(ctx, "physics_input_window", None)
+        if averaged is not None and ctx.injected_input is None:
+            throttle_input, strafe_input = averaged["fwd"], averaged["strafe"]
+            movement_input_source = "time_averaged_action_window"
+        if averaged is None and abs(throttle_input) < 0.05:
             throttle_input = 0.0
-        if abs(strafe_input) < 0.05:
+        if averaged is None and abs(strafe_input) < 0.05:
             strafe_input = 0.0
 
         # Per-vehicle-type physics from shared config (decompile-verified)
@@ -11891,8 +11946,13 @@ class TickMixin:
         linear_damp = self.linear_damp_driving if has_input else self.linear_damp_coasting
         vel_x, vel_y, vel_z = ctx.player_vel
 
-        # Decompile-backed flat-ground mobility gate from Tank_compute_mobility_factors:
-        # forward mobility ramps from 0.4 at rest toward 1.0 as current speed rises.
+        longitudinal_mobility = (
+            ctx.entity_type == EntityType.TANK
+            and self.up_axis == "z"
+            and getattr(self, "tank_longitudinal_mobility_enabled", True)
+        )
+        forward_speed = None
+        # Entity+0xD4 is fuel, not speed. Keep the legacy path for A/B capture.
         if ctx.entity_type == EntityType.TANK:
             current_speed = ctx.player_speed
             if current_speed <= 0.0:
@@ -11910,8 +11970,8 @@ class TickMixin:
             turn_mobility = self._tank_altitude_mobility(ctx)
             forward_mobility *= turn_mobility
 
-            # Decompile slope mobility (Vehicles.c:1148-1161)
-            if self.terrain and self.terrain_pitch_enabled:
+            # Legacy interpretation of 0x004f9790: actually longitudinal velocity.
+            if not longitudinal_mobility and self.terrain and self.terrain_pitch_enabled:
                 _heading = heading_override if heading_override is not None else ctx.player_heading
                 avg_up_s, _ = self._sample_tank_surface_state(ctx, _heading)
                 if abs(avg_up_s[2]) > 1e-6:
@@ -11936,6 +11996,13 @@ class TickMixin:
             )
             forward_mobility = 1.0
             turn_mobility = 1.0
+
+        jet_state = self._tank_jet_physics(ctx, turn_mobility)
+        if jet_state is not None:
+            linear_damp = jet_state.damping
+            ctx.tank_runtime_friction = jet_state.friction
+        else:
+            ctx.__dict__.pop("tank_runtime_friction", None)
 
         yaw = heading_override if heading_override is not None else ctx.player_heading
         cos_yaw = math.cos(yaw)
@@ -11981,11 +12048,27 @@ class TickMixin:
             drive_basis_source = "y_up"
             vertical_idx = 1
 
+        if longitudinal_mobility:
+            # The original rotates +X by entity Euler, independently of terrain
+            # normals and the optional terrain-aligned drive approximation.
+            mobility_forward, _ = tank_body_matrix_drive_basis(
+                yaw,
+                roll=float(ctx.player_pose.get("roll", 0.0) or 0.0),
+                pitch=float(ctx.player_pose.get("pitch", 0.0) or 0.0),
+            )
+            forward_mobility, forward_speed = tank_forward_mobility(
+                (vel_x, vel_y, vel_z), mobility_forward, throttle_input,
+                veh_config.max_velocity if veh_config else 80.0,
+                current_fuel, low_fuel_level, turn_mobility,
+            )
+
         # Per-frame impulse (like entity[0x24], zeroed each frame by controller)
         fwd_impulse = throttle_input * move_adjust * forward_mobility
         strafe_impulse = (
             strafe_input * strafe_adjust * forward_mobility * turn_mobility
         )
+        if jet_state is not None and not jet_state.active:
+            fwd_impulse = strafe_impulse = 0.0
 
         impulse_x = forward[0] * fwd_impulse + right[0] * strafe_impulse
         impulse_y = forward[1] * fwd_impulse + right[1] * strafe_impulse
@@ -12068,6 +12151,13 @@ class TickMixin:
 
         # Add gravity to vertical impulse (matches GUESS3_Transform_accelerate_z)
         gravity = self.gravity
+        if jet_state is not None:
+            from .packets import BEHAVIOR_GRAVITY, BEHAVIOR_GRAVITY_PCT
+            # Controller adds gravity*(1-pct), outer entity step subtracts
+            # gravity. This applies even when throttle is zero. Header gravity
+            # is 100 on our wire, not Baffler's 160 or the legacy server's 50.
+            gravity_pct = unpack_fixed16(pack_fixed16(BEHAVIOR_GRAVITY_PCT))
+            gravity = -BEHAVIOR_GRAVITY * gravity_pct
         terrain_ground_level = None
         if self.terrain and self.up_axis == "z":
             terrain_ground_level = self._terrain_physics_ground_z_at(
@@ -12198,6 +12288,7 @@ class TickMixin:
             and self.terrain is not None
             and self.up_axis == "z"
             and not use_ground_override
+            and (jet_state is None or jet_state.active)
         ):
             if not self.terrain_pitch_enabled:
                 avg_up, _clearance_ratio = self._sample_tank_surface_state(ctx, yaw)
@@ -12223,7 +12314,7 @@ class TickMixin:
                 )
             else:
                 veh_cfg = VEHICLE_PHYSICS_CONFIGS.get(ctx.entity_type)
-                slot5 = (
+                slot5 = jet_state.throttle if jet_state is not None else (
                     self._normalize_behavior_axis_value(
                         ctx,
                         tank_softbody_control_slot_value(ctx.weapon_system.behavior_slots),
@@ -12257,10 +12348,12 @@ class TickMixin:
                     ),
                     gravity=gravity,
                     physics_timestep_factor=(
-                        OG_PHYSICS_TIMESTEP_FACTOR if gravity < 0.0 else 0.0
+                        BEHAVIOR_GRAVITY if jet_state is not None else
+                        (OG_PHYSICS_TIMESTEP_FACTOR if gravity < 0.0 else 0.0)
                     ),
                     max_altitude=veh_cfg.max_altitude if veh_cfg else 3.25,
-                    gravity_pct=veh_cfg.gravity_pct if veh_cfg else 1.0,
+                    gravity_pct=(gravity_pct if jet_state is not None else
+                                 (veh_cfg.gravity_pct if veh_cfg else 1.0)),
                     damping=getattr(self, "tank_suspension_damping", 6.0),
                     scalar_stretch_ratio=softbody_scalar_stretch_ratio,
                     scalar_stretch_source=softbody_scalar_stretch_source,
@@ -12278,6 +12371,7 @@ class TickMixin:
             and self.up_axis == "z"
             and self.terrain is not None
             and not use_ground_override
+            and jet_state is None
         ):
             configured_contact_damp = max(
                 0.0,
@@ -12805,6 +12899,7 @@ class TickMixin:
             "raw_forward_input_current": raw_throttle_input,
             "raw_strafe_input_current": raw_strafe_input,
             "movement_input_source": movement_input_source,
+            "input_window": dict(getattr(ctx, "debug_input_window", {}) or {}),
             "movement_input_delay_s": movement_input_delay_s,
             "movement_input_selection": dict(
                 getattr(ctx, "debug_last_movement_input_selection", {}) or {}
@@ -12831,6 +12926,8 @@ class TickMixin:
             "current_speed": current_speed,
             "current_fuel": current_fuel if ctx.entity_type == EntityType.TANK else None,
             "forward_mobility": forward_mobility,
+            "mobility_model": "longitudinal" if longitudinal_mobility else "legacy",
+            "forward_speed": forward_speed,
             "turn_mobility": turn_mobility,
             "terrain_up": avg_up if self.terrain and self.up_axis == "z" and self.terrain_pitch_enabled else (0.0, 0.0, 1.0),
             "terrain_clearance_ratio": _clearance_ratio if self.terrain and self.up_axis == "z" and self.terrain_pitch_enabled else 1.0,
@@ -12967,6 +13064,10 @@ class TickMixin:
             "ground_override_released": ground_override_released,
             "ground_override_release_reason": ground_override_release_reason,
             "linear_damp": linear_damp,
+            "jet_physics": None if jet_state is None else {
+                "throttle": jet_state.throttle, "active": jet_state.active,
+                "damping": jet_state.damping, "friction": jet_state.friction,
+            },
             "horizontal_damp": horizontal_damp,
             "tank_ground_contact_damp": tank_ground_contact_damp,
             "acceleration": (acc_x, acc_y, acc_z),

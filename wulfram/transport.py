@@ -135,6 +135,12 @@ class UDPHandler:
         self.sock = sock
         self.logger = logger
         self.client_addr: Optional[Tuple[str, int]] = None
+        import threading
+        self.channels_lock = threading.Lock()
+        self.channels = {}  # socket -> TCP context; HELLO1 advertises this socket's port
+        self.received_owner = None
+        self._receive_cursor = 0
+        self.peer_owner = lambda addr: None
         # Per-send "[UDP SEND] <pkt> to <addr>" lines are a heartbeat-frequency
         # firehose (~66KB/s with a few clients) that fills disk on a public
         # server. Gate them behind an opt-in flag; default OFF in production.
@@ -145,13 +151,43 @@ class UDPHandler:
         """Bind to address."""
         self.sock.bind(addr)
 
+    def open_channel(self, ctx):
+        """Assign an original-compatible HELLO1 UDP destination to one TCP owner."""
+        channel = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            channel.bind((self.sock.getsockname()[0], 0))
+            channel.settimeout(0.1)
+            with self.channels_lock:
+                self.channels[channel] = ctx
+                ctx.udp_socket = channel
+            return channel.getsockname()[1]
+        except BaseException:
+            channel.close()
+            raise
+
+    def close_channel(self, ctx):
+        with self.channels_lock:
+            channel = getattr(ctx, 'udp_socket', None)
+            if channel is not None and self.channels.get(channel) is ctx:
+                del self.channels[channel]
+                ctx.udp_socket = None
+                channel.close()
+
+    def close_channels(self):
+        with self.channels_lock:
+            owners = list(self.channels.values())
+        for owner in owners:
+            self.close_channel(owner)
+
     def send_to(self, data: bytes, addr: Tuple[str, int], log: bool = True):
         """Send UDP packet to address."""
         if len(data) == 0:
             return
 
         try:
-            self.sock.sendto(data, addr)
+            owner = self.peer_owner(addr)
+            channel = getattr(owner, 'udp_socket', None) or self.sock
+            channel.sendto(data, addr)
 
             if log and self.log_sends and len(data) > 0:
                 packet_type = data[0]
@@ -170,7 +206,30 @@ class UDPHandler:
         Returns (data, addr) or (None, None) on error.
         """
         try:
-            data, addr = self.sock.recvfrom(bufsize)
+            import select
+            self.received_owner = None
+            with self.channels_lock:
+                channels = dict(self.channels)
+            sockets = [self.sock, *channels]
+            ready, _, _ = select.select(sockets, [], [], 0.1)
+            if not ready:
+                return None, None
+            ready = set(ready)
+            unverified = {
+                channel for channel in ready
+                if channels.get(channel) is not None
+                and not getattr(getattr(channels[channel], 'session', None), 'udp_verified', False)
+            }
+            eligible = unverified or ready
+            start = self._receive_cursor % len(sockets)
+            for offset in range(len(sockets)):
+                index = (start + offset) % len(sockets)
+                if sockets[index] in eligible:
+                    channel = sockets[index]
+                    self._receive_cursor = (index + 1) % len(sockets)
+                    break
+            data, addr = channel.recvfrom(bufsize)
+            self.received_owner = channels.get(channel)
 
             if len(data) > 0:
                 packet_type = data[0]

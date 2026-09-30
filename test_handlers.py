@@ -19792,6 +19792,7 @@ def test_cargo_deploy_and_drop_request():
             self._dynamic_building_sources = {}
             self._building_construction = {}
             self._dropped_cargo = {}
+            self._dropped_cargo_next_oid = 40000
             self._next_oid = 30000
             self.broadcasts = []
 
@@ -19836,7 +19837,7 @@ def test_cargo_deploy_and_drop_request():
         return SimpleNamespace(
             client_id=1, entity_id=0x14EA, cargo_type=25, cargo_count=1, has_uplink=False,
             player_heading=0.0, player_pos=(4950.0, 5100.0, 5.0),
-            session=SimpleNamespace(team_id=2, entity_id=0x14EA),
+            session=SimpleNamespace(team_id=2, entity_id=0x14EA, in_game=True, local_epoch=1),
         )
 
     # --- mode 1: deploy builds the carried type in front of the player + consumes cargo
@@ -19860,14 +19861,45 @@ def test_cargo_deploy_and_drop_request():
     # --- mode 0: drop spawns a crate + consumes cargo + sets a re-pickup cooldown
     srv3 = Srv()
     ctx3 = mk_ctx()
+    ctx3.tutorial_fixture_cargo = {
+        "tutorial_map": "training-logistics-base",
+        "tutorial_binding": "power-cell-crate",
+        "tutorial_repickup_cooldown_s": 30.0,
+    }
     r3 = build_uplink.handle_drop_request(srv3, ctx3, 0)
     assert r3["ok"] is True, r3
     crate_oid = r3["oid"]
     assert crate_oid in srv3._dropped_cargo, "drop did not spawn a crate"
     crate = srv3._dropped_cargo[crate_oid]
     assert crate["cargo_type"] == 25, crate
-    assert crate.get("pickup_after", 0.0) > _t.monotonic(), "drop must set a re-pickup cooldown"
+    assert crate.get("pickup_after", 0.0) - _t.monotonic() > 25.0, (
+        "tutorial drop must honor its longer re-pickup cooldown"
+    )
     assert ctx3.cargo_type == 0 and ctx3.cargo_count == 0, "drop must consume the carried box"
+
+    # The runtime pickup path must copy the tutorial-specific cooldown onto the
+    # carried marker; this is what lets the following drop retain the long lockout.
+    srv4 = Srv()
+    srv4.cargo_pickup_range = 30.0
+    srv4._uplink_ships = {}
+    srv4._dropped_cargo[41000] = {
+        "pos": (4950.0, 5100.0, 5.0),
+        "cargo_type": 25,
+        "team_id": 2,
+        "tutorial_map": "training-logistics-base",
+        "tutorial_binding": "power-cell-crate",
+        "tutorial_owner_client_id": 1,
+        "tutorial_owner_epoch": 1,
+        "tutorial_native_map": True,
+        "tutorial_repickup_cooldown_s": 30.0,
+    }
+    ctx4 = mk_ctx(); ctx4.cargo_type = 0; ctx4.cargo_count = 0
+    assert WulframServer._try_cargo_pickup(srv4, ctx4) is True
+    assert ctx4.tutorial_fixture_cargo["tutorial_repickup_cooldown_s"] == 30.0
+    r4 = build_uplink.handle_drop_request(srv4, ctx4, 0)
+    assert r4["ok"] is True, r4
+    crate4 = srv4._dropped_cargo[r4["oid"]]
+    assert crate4.get("pickup_after", 0.0) - _t.monotonic() > 25.0, crate4
 
     print("test_cargo_deploy_and_drop_request: PASSED")
     return True
@@ -19898,6 +19930,20 @@ def test_death_auto_respawn_schedules_delayed_spawn():
     # ON: schedules delayed auto-spawn on the preserved team
     srv = Srv()
     ctx = mk_ctx()
+    srv.tutorial_definition = {"map": "test-map"}
+    srv._dropped_cargo = {}
+    srv._dynamic_building_sources = {
+        30000: {"tutorial_fixture": {
+            "tutorial_map": "test-map", "tutorial_owner_client_id": ctx.client_id,
+        }},
+        30001: {"source": "normal"},
+    }
+    removed = []
+    srv._remove_dynamic_building_record = lambda oid: (
+        removed.append(oid), srv._dynamic_building_sources.pop(oid, None)
+    )
+    srv._broadcast_building_delete = lambda *args, **kwargs: None
+    ctx.tutorial_state = {"evidence": {"fixture_applied": False}}
     t0 = _t.monotonic()
     team = WulframServer._enter_death_deploy_state(srv, ctx)
     assert team == 2, team
@@ -19905,6 +19951,9 @@ def test_death_auto_respawn_schedules_delayed_spawn():
     assert ctx.session.delayed_spawn_time >= t0 + 6.5, ctx.session.delayed_spawn_time
     assert ctx.pending_respawn_pos == (5050.0, 5050.0, 5.0), getattr(ctx, "pending_respawn_pos", None)
     assert ctx.session.in_game is False
+    assert removed == [30000]
+    assert set(srv._dynamic_building_sources) == {30001}
+    assert ctx.tutorial_state is None
     # does NOT force TEAM_SELECT (matches _do_respawn so _auto_join_team fires)
     assert ctx.session.phase == Phase.IN_GAME, ctx.session.phase
 

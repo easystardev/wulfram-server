@@ -2,6 +2,7 @@
 Session layer: Per-connection state machine.
 Tracks phase transitions: Handshake → Login → TeamSelect → Spawn → InGame
 """
+from .observer_lifecycle import world_reset, serialized
 
 from enum import Enum, auto
 from dataclasses import dataclass, field
@@ -30,6 +31,9 @@ class Session:
     - Entity assignment
     - Tick counter for replication
     """
+    world_epoch: int = 0
+    local_epoch: int = 0
+
     # Connection state
     phase: Phase = Phase.DISCONNECTED
     connected_at: float = field(default_factory=time.monotonic)
@@ -86,6 +90,7 @@ class Session:
     pending_spawn_points: bool = False
     spawn_points_sent: bool = False
 
+    @world_reset
     def reset(self):
         """Reset session to initial state."""
         self.phase = Phase.DISCONNECTED
@@ -152,16 +157,20 @@ class Session:
             print(f"[SESSION] Invalid transition: {self.phase.name} -> {new_phase.name}")
             return False
 
+    @serialized
     def enter_game(self, entity_id: int, team_id: int):
         """Set up session for in-game state."""
+        self.local_epoch += 1
         self.entity_id = entity_id
         self.team_id = team_id
         self.in_game = True
         self.tick = 0
         self.transition_to(Phase.IN_GAME)
 
+    @serialized
     def leave_game(self):
         """Clean up game state."""
+        self.local_epoch += 1
         self.in_game = False
         self.entity_id = 0
         self.tick = 0

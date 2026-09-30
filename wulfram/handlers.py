@@ -627,17 +627,19 @@ def handle_reincarnate_tcp(server: "WulframServer", ctx: "ClientContext", packet
     session.team_id = team_id
     if session.player_id == 0:
         session.player_id = ctx.entity_id
-    _send_team_switch_roster(server, ctx, team_id)
-    _send_team_switch_update_stats(server, ctx, team_id)
 
     # Mirror wulf-forge: acknowledge team switch/spawn intent with REINCARNATE code 0x11.
     if getattr(server, "team_switch_send_reincarnate", True):
         tcp.send(build_reincarnate(0x11, ""))
 
-    _send_post_reincarnate_entry_packets(server, ctx)
+    ordered = getattr(server, "team_switch_send_entry_packets", True)
+    if ordered and not _send_post_reincarnate_entry_packets(server, ctx):
+        return
+    _send_team_switch_roster(server, ctx, team_id)
+    _send_team_switch_update_stats(server, ctx, team_id, ordered=ordered)
 
 
-def _send_post_reincarnate_entry_packets(server: "WulframServer", ctx: "ClientContext") -> None:
+def _send_post_reincarnate_entry_packets(server: "WulframServer", ctx: "ClientContext") -> bool:
     """Send the canonical team-entry packets after REINCARNATE."""
     session = ctx.session
     if session.player_id == 0:
@@ -647,18 +649,20 @@ def _send_post_reincarnate_entry_packets(server: "WulframServer", ctx: "ClientCo
             f"[GAME] Client {ctx.client_id}: Post-team-switch entry packets disabled "
             "(WULFRAM_TEAM_SWITCH_ENTRY_PACKETS=0)"
         )
-        return
+        return False
 
-    _safe_tcp_send(
+    if not _safe_tcp_send(
         ctx,
         build_player(entity_id=session.player_id, spectator=False),
         label="post_reincarnate_player",
-    )
-    _safe_tcp_send(ctx, build_game_clock(), label="post_reincarnate_game_clock")
+    ):
+        return False
+    if not _safe_tcp_send(ctx, build_game_clock(), label="post_reincarnate_game_clock"):
+        return False
 
     if not session.roster_sent:
         name = session.username or f"Player{ctx.client_id}"
-        _safe_tcp_send(
+        if not _safe_tcp_send(
             ctx,
             build_add_to_roster(
                 player_id=session.player_id,
@@ -667,16 +671,19 @@ def _send_post_reincarnate_entry_packets(server: "WulframServer", ctx: "ClientCo
                 team=session.team_id if session.team_id else 0,
             ),
             label="post_reincarnate_add_to_roster",
-        )
+        ):
+            return False
         session.roster_sent = True
 
     if not session.world_stats_sent:
-        _safe_tcp_send(
+        if not _safe_tcp_send(
             ctx,
             server.build_world_stats_packet(),
             label="post_reincarnate_world_stats",
-        )
+        ):
+            return False
         session.world_stats_sent = True
+    return True
 
 
 def _send_team_switch_roster(
@@ -719,8 +726,10 @@ def _send_team_switch_update_stats(
     ctx: "ClientContext",
     team_id: int,
     addr: Optional[tuple] = None,
+    *,
+    ordered: bool = False,
 ) -> None:
-    """Send the roster stats/team update that OG sees during team switch."""
+    """Send team stats after local identity/roster on the same ordered stream."""
     if not getattr(server, "team_switch_send_update_stats", True):
         return
 
@@ -736,7 +745,9 @@ def _send_team_switch_update_stats(
     else:
         packet = build_update_stats(player_id=player_id, entity_id=player_id, team_id=team_id)
     target_addr = addr or session.udp_addr
-    transport = getattr(server, "team_switch_update_stats_transport", "udp")
+    # PLAYER/roster precede this packet on TCP; an independent UDP send can overtake them.
+    # Disabled entry-packet probes retain the configured experimental transport.
+    transport = "tcp" if ordered else getattr(server, "team_switch_update_stats_transport", "udp")
 
     if transport in ("udp", "auto") and server.udp_handler and target_addr:
         try:
@@ -778,11 +789,14 @@ def handle_udp_d_handshake(server: "WulframServer", ctx: Optional["ClientContext
     if ctx is None:
         ctx = server._recover_udp_client(addr, allow_handshake=True)
 
-    if ctx:
+    if ctx and server._bind_udp_client(ctx, addr, reason="d_handshake"):
         ctx.session.udp_d_handshake_received = True
-        ctx.session.udp_verified = True
-        server._bind_udp_client(ctx, addr, reason="d_handshake")
+        if parsed["kind"] == "empirical":
+            from .transport_clock import record_handshake
+            record_handshake(server, ctx, addr, parsed["sequence"])
         print(f"[UDP] Registered client {ctx.client_id} with UDP addr {addr}")
+    else:
+        return  # No stream setup or verified state for an unowned endpoint.
 
     # ACK
     ack = b'\x02' + b'\x00' + struct.pack(">I", int(time.monotonic() * 1000) & 0xFFFFFFFF)
@@ -910,6 +924,28 @@ def _player_chat_cmd_help(server: "WulframServer", ctx: "ClientContext", args: l
     _send_chat_reply(ctx, f"Commands: {listing} -- type the bare word (e.g. respawn), no leading ! or /")
 
 
+def _player_chat_cmd_tutorial(server: "WulframServer", ctx: "ClientContext", args: list) -> None:
+    """Show or reset the current map tutorial for this player."""
+    from . import tutorial_runtime
+    action = args[0].lower() if args else "status"
+    if action in {"reset", "restart"}:
+        tutorial_runtime.reset_player(server, ctx, announce=True)
+        return
+    if action == "retry":
+        _send_chat_reply(ctx, tutorial_runtime.retry_player(server, ctx))
+        return
+    if action == "hint":
+        _send_chat_reply(ctx, tutorial_runtime.hint_for_player(server, ctx))
+        return
+    if action == "confirm":
+        _send_chat_reply(ctx, tutorial_runtime.confirm_player(server, ctx))
+        return
+    if action not in {"status", "show"}:
+        _send_chat_reply(ctx, "Usage: tutorial [status|hint|retry|reset|confirm]")
+        return
+    _send_chat_reply(ctx, tutorial_runtime.status_for_player(server, ctx))
+
+
 # Player-facing chat command table. Each handler receives (server, ctx, args)
 # and may ONLY act on the player's own ctx — no operator/privileged commands are
 # reachable from the chat path. Extend by adding entries here (e.g. /who later).
@@ -917,10 +953,12 @@ PLAYER_CHAT_COMMANDS = {
     "respawn": _player_chat_cmd_respawn,
     "rs": _player_chat_cmd_respawn,
     "help": _player_chat_cmd_help,
+    "tutorial": _player_chat_cmd_tutorial,
+    "lesson": _player_chat_cmd_tutorial,
 }
 
 # Canonical command names shown by help (aliases like rs are omitted).
-PLAYER_CHAT_COMMANDS_HELP = ("respawn", "help")
+PLAYER_CHAT_COMMANDS_HELP = ("respawn", "tutorial", "help")
 
 # Optional leading punctuation the SERVER will strip if a prefixed command does
 # arrive (e.g. from the Python client, which does no client-side parsing). NOTE:
@@ -1148,27 +1186,20 @@ def handle_team_switch(server: "WulframServer", ctx: "ClientContext", team_id: i
     session.team_id = team_id
     if session.player_id == 0:
         session.player_id = ctx.entity_id
-    _send_team_switch_roster(server, ctx, team_id)
-    _send_team_switch_update_stats(server, ctx, team_id, addr)
 
-    # Wulf-forge-style ACK: REINCARNATE(code=17) should be seen on UDP for
-    # reliable entry-map -> world transition. Fall back to TCP only when UDP
-    # address is not yet known.
+    # The negotiated UDP mode for 0x25 is 3: raw application bytes are not a
+    # complete UDP frame. Use the same ordered TCP path as handle_reincarnate;
+    # the original REINCARNATE handler reads code/string after common dispatch.
+    # Keep this before PLAYER/GAME_CLOCK/WORLD_STATS on that stream.
     if getattr(server, "team_switch_send_reincarnate", True):
-        rein = build_reincarnate(0x11, "")
-        sent_rein = False
-        if server.udp_handler and addr:
-            try:
-                server.udp_handler.send_to(rein, addr)
-                sent_rein = True
-                print(f"[UDP] Team {team_id} switch acked with REINCARNATE 0x11 (UDP)")
-            except Exception as ex:
-                print(f"[UDP] Failed to send team-switch REINCARNATE over UDP: {ex}")
-        if not sent_rein and ctx.tcp_handler:
-            if _safe_tcp_send(ctx, rein, label="team_switch_reincarnate_ack"):
-                print(f"[TCP] Team {team_id} switch acked with REINCARNATE 0x11 (fallback)")
+        if not _safe_tcp_send(ctx, build_reincarnate(0x11, ""), label="team_switch_reincarnate_ack"):
+            return
 
-    _send_post_reincarnate_entry_packets(server, ctx)
+    ordered = getattr(server, "team_switch_send_entry_packets", True)
+    if ordered and not _send_post_reincarnate_entry_packets(server, ctx):
+        return
+    _send_team_switch_roster(server, ctx, team_id)
+    _send_team_switch_update_stats(server, ctx, team_id, addr, ordered=ordered)
     # No auto-spawn here: selecting a team only acks + sends roster/stats. The player
     # deploys by clicking a map flag, which sends REINCARNATE subtype 0x00 ->
     # handle_spawn_at_point (see handle_reincarnate_udp).

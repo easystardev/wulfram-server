@@ -3,13 +3,14 @@ entry-transition, and death/deploy, extracted verbatim from WulframServer
 (server.py decomposition, step 4). Method-only mixin; shares state via `self`.
 """
 from __future__ import annotations
+from .observer_lifecycle import serialized, local_death, spawn_transition
 
 import math
 import os
 import time
 from typing import Optional
 
-from . import handlers
+from . import handlers, tutorial_runtime
 from .client import ClientContext
 from .physics import _matrix3_from_euler_xyz
 from .session import Phase
@@ -111,6 +112,7 @@ class SpawnMixin:
                 return (map_spawn["x"], map_spawn["y"], map_spawn["z"])
         return self._get_builtin_flat_spawn_pos()
 
+    @local_death
     def _enter_death_deploy_state(self, target: ClientContext) -> int:
         """Put a just-killed client into the death/deploy screen WITHOUT auto-spawning.
 
@@ -134,6 +136,12 @@ class SpawnMixin:
 
         Returns the preserved team_id (for logging/assertions).
         """
+        # Death starts a fresh local incarnation. Remove only this learner's
+        # tutorial-owned cargo/buildings now, rather than leaving them alive until
+        # a later redeploy or disconnect. Normal construction has no tutorial
+        # ownership metadata and is deliberately preserved.
+        tutorial_runtime.record_player_death(self, target)
+        tutorial_runtime.cleanup_player(self, target)
         if target.weapon_system is not None:
             target.weapon_system.reset_input_state()
         sess = target.session
@@ -201,6 +209,7 @@ class SpawnMixin:
         )
         return preserved_team
 
+    @serialized
     def _kill_player_for_deploy(self, target: ClientContext, *, attacker: ClientContext = None,
                                 reason: str = "control") -> None:
         """Full death sequence ending in the GOAL-4 death/deploy state (no auto-spawn).
@@ -233,18 +242,20 @@ class SpawnMixin:
         # but leaves the player stuck IN-GAME with no death UI -- there is no
         # death-without-delete path in the OG client. "Keep team on death" needs a
         # client-side re-assert of g_player_team after the delete, not a server tweak.
-        for client in self._snapshot_in_game_clients():
+        for client in self._snapshot_world_delete_viewers():
             if not self._combat_observer_packets_allowed_for_client(client, *participants):
                 continue
-            self._send_packet_to_client(client, del_pkt, prefer_tcp=True)
+            self._send_packet_to_client(client, del_pkt if client.session.in_game else build_delete_object(self._get_network_tick(client), [target_entity_id], with_effects=True), prefer_tcp=True)
 
         target.session.in_game = False
-        for other in self._snapshot_in_game_clients():
+        for other in self._snapshot_world_delete_viewers():
             if other is not target:
                 other.known_entity_ids.discard(target_entity_id)
-        target.known_entity_ids.clear()
+                getattr(other, "_entity_create_times", {}).pop(target_entity_id, None)
+        target.known_entity_ids.discard(target_entity_id)
+        getattr(target, "_entity_create_times", {}).pop(target_entity_id, None)
         if hasattr(target, '_entity_create_times'):
-            target._entity_create_times.clear()
+            target._entity_create_times.pop(target_entity_id, None)
 
         target.player_health = 1.0
         target.player_vel = (0.0, 0.0, 0.0)
@@ -390,6 +401,7 @@ class SpawnMixin:
         print(f"[SPAWN] Client {ctx.client_id}: could not find clear spawn near ({x:.1f},{y:.1f})")
         return pos
 
+    @spawn_transition
     def _spawn_wf_style(self, ctx: ClientContext, team_id: int, net_id: Optional[int] = None,
                          unit_type: int = 0,
                          pos: Optional[tuple] = None,
@@ -401,6 +413,10 @@ class SpawnMixin:
         Wulf-Forge's /s spawn only sends a single TankPacket (0x18) -
         no UPDATE_ARRAY, no separate PLAYER_INFO, no entity pre-creation.
         """
+        from .spawn_fixture import consume_placement
+        fixture_pos = consume_placement(ctx, team_id)
+        if fixture_pos is not None:
+            pos = fixture_pos
         net_id = net_id or (ctx.session.player_id or ctx.entity_id)
         ctx.session.player_id = net_id
         ctx.session.team_id = team_id
@@ -582,7 +598,7 @@ class SpawnMixin:
         if not ctx.session.translation_ack_received:
             wait_until = time.monotonic() + 2.0
             while not ctx.session.translation_ack_received and time.monotonic() < wait_until:
-                time.sleep(0.05)
+                yield (0.05)
             if not ctx.session.translation_ack_received:
                 print("[SPAWN] WARNING: TRANSLATION_ACK not received before TankPacket")
 
@@ -655,7 +671,7 @@ class SpawnMixin:
             # Entity_create_from_network path which does NOT call
             # LocalPlayer_initialize â†’ entry map stays.  200ms gives ~6
             # frames at 30fps for the client to process the UPDATE_ARRAY.
-            time.sleep(0.20)
+            yield (0.20)
         spawn_tick = self._get_network_tick(ctx)
         tank_packet = build_udp_tank_packet_wf(
             net_id=net_id,
@@ -712,7 +728,7 @@ class SpawnMixin:
                     # and the first TankPacket is reliably received on
                     # localhost.  Keep env var for optional override.
                     for i in range(spawn_retransmits):
-                        time.sleep(0.05)
+                        yield (0.05)
                         retransmit_tick = self._get_network_tick(ctx)
                         retransmit_packet = build_udp_tank_packet_wf(
                             net_id=net_id,
@@ -739,7 +755,7 @@ class SpawnMixin:
                     print("[SPAWN] Suppressing immediate spawn bootstrap heartbeat UPDATE_ARRAY")
                 elif self._suppress_remote_spawn_bootstrap_heartbeat(ctx):
                     if self.update_local_state_mode == "wf" and not handlers._is_loopback_client(ctx):
-                        time.sleep(0.05)
+                        yield (0.05)
                         hb_tick = self._get_network_tick(ctx)
                         hb_packet = self._build_remote_spawn_bootstrap_heartbeat(
                             ctx,
@@ -753,7 +769,7 @@ class SpawnMixin:
                     else:
                         print("[SPAWN] Suppressing immediate remote bootstrap heartbeat UPDATE_ARRAY")
                 else:
-                    time.sleep(0.05)
+                    yield (0.05)
                     hb_tick = self._get_network_tick(ctx)
                     hb_packet = self._build_local_state_heartbeat(
                         ctx,
@@ -936,6 +952,10 @@ class SpawnMixin:
         if self._ensure_tick_loop(ctx):
             print(f"[SPAWN] Started tick loop (local_state_updates={self.update_local_state_mode})")
 
+        if False:
+            yield 0
+
+    @spawn_transition
     def _spawn_wf_minimal(self, ctx: ClientContext, team_id: int, net_id: int, addr: tuple):
         """
         Absolutely minimal spawn - just TankPacket (wulf-forge style).
@@ -993,3 +1013,6 @@ class SpawnMixin:
         if self.udp_handler:
             self.udp_handler.send_to(tank_packet, addr)
             print(f"[SPAWN] Sent minimal TankPacket (vitals={int(self.tank_vitals)}) to {addr}")
+
+        if False:
+            yield 0

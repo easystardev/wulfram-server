@@ -4,6 +4,7 @@ WulframServer (server.py decomposition, networking layer). Method-only mixin;
 shares state via `self`. The accept/UDP/game/tick LOOPS stay in the core.
 """
 from __future__ import annotations
+from .observer_lifecycle import FRAME_LOCK, serialized
 
 import math
 import os
@@ -14,7 +15,7 @@ import time
 import traceback
 from typing import Any, Optional
 
-from . import build_uplink, handlers
+from . import build_uplink, handlers, tutorial_runtime
 from .client import ClientContext
 from .codec import BitReader
 from .session import FEATURES, Phase
@@ -341,6 +342,8 @@ class NetMixin:
 
         subtype = data[1]
         if subtype == 0x00 and len(data) >= 6:
+            from .transport_clock import bootstrap_ack
+            bootstrap_ack(self, ctx, data, addr)
             timestamp = struct.unpack(">I", data[2:6])[0]
             if self.debug_udp_raw:
                 print(f"[UDP] D_ACK subtype=0 ts={timestamp} from {addr}")
@@ -440,15 +443,10 @@ class NetMixin:
                         ctx = matched
                         print(f"[UDP] HELLO_ACK matched by session key -> client {ctx.client_id}")
 
-                # Fallback: find a client waiting for UDP verification
+                # Constant original identifies carry no TCP identity. Shared-port
+                # compatibility may recover only one eligible same-IP session.
                 if ctx is None:
-                    from .session import Phase
-                    with self.clients_lock:
-                        for c in self.clients.values():
-                            if c.session and c.session.phase == Phase.HANDSHAKE and not c.session.udp_verified:
-                                ctx = c
-                                print(f"[UDP] Matched HELLO_ACK to client {ctx.client_id} in HANDSHAKE state (heuristic)")
-                                break
+                    ctx = self._recover_udp_client(addr, allow_handshake=True)
 
                 if ctx:
                     self._bind_udp_client(ctx, addr, reason="udp_hello_ack")
@@ -460,6 +458,8 @@ class NetMixin:
                 key = data[4:].decode('ascii', errors='ignore').strip('\x00')
                 matched = self.session_key_to_client.get(key)
                 if matched:
+                    if ctx is not None and matched is not ctx:
+                        return  # A key cannot override the receiving TCP-owned port.
                     if self._bind_udp_client(matched, addr, reason=f"session_key '{key}'"):
                         ctx = matched
                 else:
@@ -636,6 +636,12 @@ class NetMixin:
 
     def _bind_udp_client(self, ctx: ClientContext, addr: tuple, *, reason: str) -> bool:
         """Bind a UDP endpoint to a client without stealing another active mapping."""
+        with self.clients_lock:
+            if not ctx.running or self.clients.get(ctx.client_id) is not ctx:
+                return False
+            return self._bind_udp_client_locked(ctx, addr, reason=reason)
+
+    def _bind_udp_client_locked(self, ctx: ClientContext, addr: tuple, *, reason: str) -> bool:
         current = self.udp_addr_to_client.get(addr)
         if current is not None and current is not ctx:
             print(
@@ -674,6 +680,8 @@ class NetMixin:
             for c in self.clients.values():
                 if not c or not c.running or not c.session:
                     continue
+                if getattr(c, 'udp_socket', None) is not None:
+                    continue  # Never infer ownership of a dedicated destination.
                 if not c.client_addr or c.client_addr[0] != ip:
                     continue
                 if c.session.phase == Phase.DISCONNECTED:
@@ -824,17 +832,27 @@ class NetMixin:
             traceback.print_exc()
         finally:
             # Preserve UDP addr before session reset so we can clean mapping safely.
-            udp_addr = ctx.session.udp_addr
-            disconnected_entity_id = ctx.session.entity_id or ctx.entity_id
-            was_in_game = bool(ctx.session.in_game and disconnected_entity_id)
-            ctx.running = False
-            ctx.session.in_game = False
+            with FRAME_LOCK:
+                udp_addr = ctx.session.udp_addr
+                disconnected_entity_id = ctx.session.entity_id or ctx.entity_id
+                was_in_game = bool(ctx.session.in_game and disconnected_entity_id)
+                ctx.running = False
+                ctx.session.in_game = False
+                ctx.session.local_epoch += 1
+                ctx.session.world_epoch += 1
+            self.udp_handler.close_channel(ctx)
             self._stop_ping_loop(ctx)
 
             # Remove from client tracking
             with self.clients_lock:
                 if ctx.client_id in self.clients:
                     del self.clients[ctx.client_id]
+
+            # Tutorial cargo/buildings are per-learner fixtures, not persistent
+            # world construction. Remove them after this context leaves the
+            # viewer list so DELETE_OBJECT is sent only to remaining clients.
+            with FRAME_LOCK:
+                tutorial_runtime.cleanup_player(self, ctx)
 
             if was_in_game:
                 self._broadcast_disconnected_player_delete(ctx, disconnected_entity_id)
@@ -891,6 +909,15 @@ class NetMixin:
             adv_port = int(os.environ.get("WULFRAM_ADVERTISE_UDP_PORT", "") or self.port)
         except ValueError:
             adv_port = self.port
+        # Original HELLO1 explicitly selects the UDP destination port (4f/Net
+        # bootstrap evidence in the endpoint ownership finding). Unique server
+        # destinations correlate constant "Hello There" with the TCP session.
+        # A fixed external port/proxy cannot forward these dynamic destinations;
+        # retain shared-port compatibility there, rejecting ambiguous identifies.
+        # Allocate before client type is known: hybrid loopback connections can
+        # later turn out to be OG clients, and both clients honor HELLO1's port.
+        if not adv_host and not os.environ.get('WULFRAM_ADVERTISE_UDP_PORT', '').strip():
+            adv_port = self.udp_handler.open_channel(ctx)
         print(
             f"[HANDSHAKE] Client {ctx.client_id}: mode={'og' if use_og_handshake else 'minimal'} "
             f"UDP config {udp_addr}:{adv_port}"
@@ -908,6 +935,7 @@ class NetMixin:
             ctx.tcp_handler.send(build_identified_udp())
         else:
             print(f"[HANDSHAKE] Client {ctx.client_id} UDP verification timeout")
+            raise ConnectionAbortedError("UDP ownership was not established; refusing login")
 
         # Mirror Wulf-Forge: send HELLO verified (subcmd 0x03) after UDP setup
         ctx.tcp_handler.send(build_hello_verified())
@@ -1067,6 +1095,8 @@ class NetMixin:
     def _handle_want_updates(self, ctx: ClientContext, packet: bytes):
         """Handle WANT_UPDATES - client is ready for game data."""
         handlers.handle_want_updates(self, ctx, packet)
+        if ctx.running and ctx.session.want_updates_received:
+            self._ensure_tick_loop(ctx)
 
     def _auto_join_team(self, ctx: ClientContext, team_id: int):
         """Auto-spawn after WANT_UPDATES using Wulf-Forge-style UDP TANK."""
@@ -1104,6 +1134,7 @@ class NetMixin:
         """Handle REINCARNATE - player wants to spawn."""
         handlers.handle_reincarnate_tcp(self, ctx, packet)
 
+    @serialized
     def _handle_viewpoint_info(self, ctx: Optional[ClientContext], data: bytes, addr: tuple):
         """
         Handle VIEWPOINT_INFO (0x35) - contains camera/view orientation (not position).
@@ -1210,6 +1241,7 @@ class NetMixin:
                 if self.debug_viewpoint:
                     print(f"[VIEWPOINT-ERR] Failed to decode (double): {e}")
 
+    @serialized
     def _handle_action_dump(self, ctx: Optional[ClientContext], data: bytes, addr: tuple):
         """
         Handle ACTION_DUMP packet (0x09).
@@ -1226,6 +1258,8 @@ class NetMixin:
                 self._sync_tick_offset(ctx, client_tick)
             except struct.error:
                 pass
+        if not ctx.running or ctx.observer_transition or not ctx.session.in_game:
+            return
         if ctx.weapon_system.decode_action_dump(data):
             ctx.last_action_dump_time = time.monotonic()
             self._record_client_action_telemetry(ctx, "ACTION_DUMP", client_tick)
@@ -1287,6 +1321,7 @@ class NetMixin:
                     f"len={len(data)} data={ctx.last_action_dump_decode_fail_hex}"
                 )
 
+    @serialized
     def _handle_action_update(self, ctx: Optional[ClientContext], data: bytes, addr: tuple):
         """
         Handle ACTION_UPDATE packet (0x0A).
@@ -1304,6 +1339,8 @@ class NetMixin:
                 self._sync_tick_offset(ctx, client_tick)
             except struct.error:
                 pass
+        if not ctx.running or ctx.observer_transition or not ctx.session.in_game:
+            return
         if ctx.weapon_system.decode_action_update(data):
             ctx.last_action_dump_time = time.monotonic()
             self._record_client_action_telemetry(ctx, "ACTION_UPDATE", client_tick)
