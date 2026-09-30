@@ -203,7 +203,8 @@ class VehiclePhysics:
             capped at 5; uniform time_per_step with the remainder on the last step
           - Each outer substep: TankVehicle_apply_physics() (Vehicles.c:1336, re-adds
             torque) via vehicle-client VTable+0x0C, then physics tick
-          - Torque ACCUMULATES across outer substeps (entity[0x50] += torque each time)
+          - Physics_tick_entities (004f8550) clears force and torque after each
+            outer step; each controller invocation supplies fresh torque.
 
         Inner: GUESS5_Physics_substep_integrate_angular (Game/Simulation/Physics.c:5264)
           - max substep = 0.04s (40ms), or dt*0.5 if dt > 0.08s (Physics.c:5298-5300)
@@ -229,10 +230,9 @@ class VehiclePhysics:
         remaining_ms = elapsed_ms
 
         for i in range(outer_count):
-            # Client: TankVehicle_apply_physics() ADDS torque each outer substep
-            # entity[0x50] += torque (accumulated, NOT zeroed between outer substeps)
-            # So substep i sees (i+1) * torque
-            accumulated_torque = torque * (i + 1)
+            # 004f8550 clears entity+48/+4c/+50 before the next outer step.
+            # The old (i+1)*torque multiplied yaw acceleration during long frames.
+            accumulated_torque = torque
 
             # Last substep gets remainder, others get floor-divided dt
             if i == outer_count - 1:

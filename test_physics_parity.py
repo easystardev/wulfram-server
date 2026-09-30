@@ -6,6 +6,12 @@ shared-kernel convergence (Track 2) in docs/architecture/shared-core-design.md. 
 change that perturbs VehiclePhysics' per-step result — including pointing the server
 at a shared sim_kernel — must reproduce physics_parity_golden.json bit-for-bit.
 
+2026-09-07 intentional correction: original 004f8550 resets torque between outer
+steps. 1,344 erroneous long-frame outputs were replaced; the remaining 12,696
+outputs and every case input were preserved. See the fixture revision metadata
+and docs/physics-core-followthrough-2026-09-07.md. This regression fixture alone
+is not an independent original-client oracle.
+
 Comparison is EXACT IEEE-754 hex (no tolerance): determinism is the contract.
 
 Usage:  uv run python test_physics_parity.py   (or gen_physics_golden.py to (re)freeze)

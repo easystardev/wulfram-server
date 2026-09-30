@@ -153,6 +153,7 @@ def main() -> int:
         records.append({**c, "out": _run_case(c)})
     payload = {
         "kernel": "VehiclePhysics rotation pipeline (server/wulfram/physics.py)",
+        "force_reset_contract": "004f8550 clears force/torque after every outer step (2026-09-07 correction)",
         "damp_coeff": DAMP_COEFF,
         "encoding": "IEEE-754 double, big-endian hex (exact)",
         "case_count": len(records),
