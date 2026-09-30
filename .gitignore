@@ -10,3 +10,8 @@ repomix-output.xml
 
 # Volatile live golden-capture (regenerable; frozen snapshot is the committed oracle)
 ch2-og-corpus.kernel.ndjson
+
+# local run output and machine-local config (hygiene 2026-09-30)
+runs/
+pulse-vm-single-offset12
+native-physics.json
