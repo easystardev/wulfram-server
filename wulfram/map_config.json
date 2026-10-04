@@ -43,5 +43,15 @@
     "grid_rows": 11,
     "grid_cols": 11,
     "scale": 1.0
+  },
+  "basewar-tron": {
+    "grid_rows": 6,
+    "grid_cols": 6,
+    "scale": 1.0
+  },
+  "basewar-tron-assault": {
+    "grid_rows": 6,
+    "grid_cols": 6,
+    "scale": 1.0
   }
 }
