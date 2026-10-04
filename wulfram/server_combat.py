@@ -1335,6 +1335,24 @@ class CombatMixin:
             ctx, pos, rot, range_limit=range_limit,
             hit_radius=combat_profile.AUTOCANNON_LANE_RADIUS, lane_only=True,
         )
+        runtime = getattr(self, "_upstream_turret_runtime", None)
+        if runtime is not None and runtime.projectiles:
+            # CAP: an enemy launcher hunter nearer than the vehicle in the lane
+            # takes the shot (upstream defenders shot hunters down this way).
+            yaw = float(getattr(ctx, "player_heading", 0.0) or 0.0)
+            max_along = range_limit
+            if target is not None:
+                tp = tuple(float(v) for v in target.player_pos[:3])
+                max_along = (tp[0] - start[0]) * math.cos(yaw) + (tp[1] - start[1]) * math.sin(yaw)
+            team = int(getattr(getattr(ctx, "session", None), "team_id", 0) or 0)
+            shot = runtime.shoot_in_lane(
+                team, start, yaw, range_limit=range_limit,
+                lane_radius=combat_profile.AUTOCANNON_LANE_RADIUS, max_along=max_along, shot_dt=shot_dt,
+            )
+            if shot is not None:
+                if shot["destroyed"]:
+                    print(f"[COMBAT] c{ctx.client_id} shot down hunter {shot['oid']}")
+                return
         if target is not None:
             tp = tuple(float(v) for v in target.player_pos[:3])
             distance = math.sqrt(sum((a - b) ** 2 for a, b in zip(tp, start)))

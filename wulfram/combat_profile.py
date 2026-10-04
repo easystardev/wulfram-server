@@ -141,6 +141,14 @@ HUNTER_TURN_RATE_DEG_S = 3.0      # GUESS from CAP post-snap turn p50 0.3 / p90 
 HUNTER_LIFETIME_S = 20.0          # GUESS cap; CAP lifetimes 9.7-19.3 s (terrain impact ends most)
 HUNTER_DAMAGE_HP = 200.0          # GUIDE (unobserved upstream: 0 hits in 79 hunters)
 HUNTER_HIT_RADIUS = 15.0          # GUESS: the server's vehicle hit sphere
+# Guidance fit (artifacts/server-fixes-2026-10-03/hunter_fit.py): climb 2.15 s, snap onto the
+# target's current position, then turn toward it at <= HUNTER_TURN_RATE_DEG_S reproduces 62
+# captured launcher hunters to 1.9 u median path error; any cap >= 3 deg/s fits equally
+# (the captured line-of-sight rates stay below it). Replayed with our tron terrain, all 25
+# terrain-ended 10-03 flights end in terrain within 0.01 s (median) of the capture
+# (hunter_replay.py). Upstream's "0 hits" = terrain (25/32) + shot down by the target (7/32).
+HUNTER_HP = 25.0                  # INF: 7 hunters shot down by the target's autocannon, 33 health
+                                  # steps vs the CAP autocannon curve: 25.4 median (22.2-27.7 p10-p90)
 
 TURRET_MUZZLE_DZ = 8.0            # our server's gun-turret LOS muzzle height (kept)
 POWER_CELL_RADIUS = 280.0         # BEH 0x00679180 (INF: power-cell coverage radius)

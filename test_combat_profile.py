@@ -554,6 +554,142 @@ class ServerIntegrationTests(unittest.TestCase):
             self.server._fire_upstream_autocannon(attacker, attacker.player_pos, (0.0, 0.0, 0.0))
         self.assertEqual(off_lane.player_health, 1.0)
 
+    def test_upstream_autocannon_shoots_down_a_nearer_hunter(self):
+        attacker, target = self._duel((400.0, 0.0))
+        attacker.session.team_id = 2
+        target.session.team_id = 1
+        rt = uc.UpstreamTurretRuntime(self.server, network=False)
+        hunter = uc.TurretProjectile(
+            entity_id=50002, kind=uc.LAUNCHER, entity_type=EntityType.HUNTER, team=1, turret_oid=7,
+            turret_name="L", target=attacker, target_oid=4343, pos=(200.0, 3.0, 90.0), vel=(-95.0, 0.0, 0.0),
+            spawn_t=0.0, lifetime=20.0, damage_hp=200.0, hit_radius=15.0, hp=cp.HUNTER_HP)
+        rt.projectiles.append(hunter)
+        self.server._upstream_turret_runtime = rt
+        try:
+            with patch.dict(os.environ, UPSTREAM):
+                self.server._fire_upstream_autocannon(attacker, attacker.player_pos, (0.0, 0.0, 0.0))
+            self.assertEqual(target.player_health, 1.0)  # the hunter took the shot
+            self.assertAlmostEqual(hunter.hp, cp.HUNTER_HP - cp.autocannon_shot_hp(math.dist((200, 3, 90), (0, 0, 10)), 0.1))
+            hunter.hp = 0.5
+            attacker._upstream_autocannon_last_shot = None
+            with patch.dict(os.environ, UPSTREAM):
+                self.server._fire_upstream_autocannon(attacker, attacker.player_pos, (0.0, 0.0, 0.0))
+            self.assertNotIn(hunter, rt.projectiles)
+            self.assertEqual(rt.stats.shot_down[uc.LAUNCHER], 1)
+        finally:
+            self.server._upstream_turret_runtime = None
+
+
+class HunterShootdownTests(unittest.TestCase):
+    """CAP: upstream defenders shot launcher hunters down with the autocannon (INF 25 HP)."""
+
+    def _runtime_with_hunter(self, pos):
+        server = FakeServer({}, [])
+        rt = uc.UpstreamTurretRuntime(server, network=False)
+        proj = uc.TurretProjectile(
+            entity_id=50001, kind=uc.LAUNCHER, entity_type=EntityType.HUNTER, team=1, turret_oid=7,
+            turret_name="L", target=None, target_oid=0, pos=pos, vel=(-95.0, 0.0, 0.0), spawn_t=0.0,
+            lifetime=cp.HUNTER_LIFETIME_S, damage_hp=cp.HUNTER_DAMAGE_HP, hit_radius=cp.HUNTER_HIT_RADIUS,
+            hp=cp.HUNTER_HP)
+        rt.projectiles.append(proj)
+        return rt, proj
+
+    def test_hunter_hp_and_lane(self):
+        self.assertEqual(cp.HUNTER_HP, 25.0)
+        rt, proj = self._runtime_with_hunter((300.0, 5.0, 120.0))
+        # wrong team, behind, off-lane, or beyond a nearer vehicle: no effect
+        self.assertIsNone(rt.shoot_in_lane(1, (0, 0, 0), 0.0, range_limit=730, lane_radius=12, max_along=730, shot_dt=0.1))
+        self.assertIsNone(rt.shoot_in_lane(2, (0, 0, 0), math.pi, range_limit=730, lane_radius=12, max_along=730, shot_dt=0.1))
+        self.assertIsNone(rt.shoot_in_lane(2, (0, 0, 0), math.radians(20), range_limit=730, lane_radius=12, max_along=730, shot_dt=0.1))
+        self.assertIsNone(rt.shoot_in_lane(2, (0, 0, 0), 0.0, range_limit=730, lane_radius=12, max_along=250, shot_dt=0.1))
+        shots = 0
+        while proj in rt.projectiles:
+            res = rt.shoot_in_lane(2, (0, 0, 0), 0.0, range_limit=730, lane_radius=12, max_along=730, shot_dt=0.1)
+            shots += 1
+            self.assertAlmostEqual(res["hp"], cp.autocannon_shot_hp(math.dist(proj.pos, (0, 0, 0)), 0.1))
+        # 25 HP at ~323 u: DPS 44 -> ~0.57 s of fire, as the captured 0.5-0.9 s drops
+        self.assertEqual(shots, math.ceil(25.0 / cp.autocannon_shot_hp(math.dist((300, 5, 120), (0, 0, 0)), 0.1)))
+        self.assertEqual(rt.stats.shot_down[uc.LAUNCHER], 1)
+
+    def test_flak_shells_cannot_be_shot(self):
+        rt, proj = self._runtime_with_hunter((300.0, 0.0, 10.0))
+        proj.hp = 0.0
+        self.assertIsNone(rt.shoot_in_lane(2, (0, 0, 0), 0.0, range_limit=730, lane_radius=12, max_along=730, shot_dt=0.1))
+
+
+class CapturedHunterReplayTests(unittest.TestCase):
+    """Replays captured upstream launcher hunters (2026-10-03, map tron) through the runtime
+    with the server's real tron terrain. Upstream: 0 hits; the terrain-ended flights must end in
+    terrain at the captured time, and the two the target shot down must be stoppable."""
+
+    @classmethod
+    def setUpClass(cls):
+        import contextlib
+        import io
+        import json
+        from wulfram.server import WulframServer
+        with patch.dict(os.environ, {"WULFRAM_MAP_NAME": "tron"}), contextlib.redirect_stdout(io.StringIO()):
+            cls.terrain = WulframServer(host="127.0.0.1", port=0)._terrain_grid_collision
+        cls.fixture = json.loads((HERE / "testdata" / "upstream_hunter_replays.json").read_text())["hunters"]
+
+    @staticmethod
+    def _target_at(track, t):
+        i = min(len(track) - 1, max(0, int(t / 0.2)))
+        j = min(len(track) - 1, i + 1)
+        a = 0.0 if j == i else max(0.0, min(1.0, (t - track[i][0]) / (track[j][0] - track[i][0])))
+        return tuple(track[i][k] + a * (track[j][k] - track[i][k]) for k in (1, 2, 3))
+
+    def _replay(self, h, defend_from=None):
+        track = h["target"]
+        tank = make_client(1, *self._target_at(track, 0.0))
+        server = FakeServer({}, [tank])
+        server._terrain_grid_collision = self.terrain
+        rt = uc.UpstreamTurretRuntime(server, network=False)
+        proj = uc.TurretProjectile(
+            entity_id=50001, kind=uc.LAUNCHER, entity_type=EntityType.HUNTER, team=1, turret_oid=7,
+            turret_name="L", target=tank, target_oid=tank.entity_id, pos=tuple(h["spawn"]),
+            vel=(0.0, 0.0, cp.HUNTER_SPEED), spawn_t=0.0, lifetime=cp.HUNTER_LIFETIME_S,
+            damage_hp=cp.HUNTER_DAMAGE_HP, hit_radius=cp.HUNTER_HIT_RADIUS, hp=cp.HUNTER_HP)
+        rt.projectiles.append(proj)
+        rt._last_step = 0.0
+        t, closest = 0.0, float("inf")
+        while rt.projectiles and t < 30.0:
+            t = round(t + uc.STEP_S, 6)
+            tank.player_pos = self._target_at(track, min(t, track[-1][0]))
+            if defend_from is not None and t >= defend_from and abs(t * 10 - round(t * 10)) < 1e-6:
+                yaw = math.atan2(proj.pos[1] - tank.player_pos[1], proj.pos[0] - tank.player_pos[0])
+                rt.shoot_in_lane(2, tank.player_pos, yaw, range_limit=cp.AUTOCANNON_MAX_RANGE,
+                                 lane_radius=cp.AUTOCANNON_LANE_RADIUS, max_along=1e9, shot_dt=0.1)
+            rt._step_projectiles(t, [tank])
+            if proj in rt.projectiles:
+                closest = min(closest, math.dist(proj.pos, tank.player_pos))
+        s = rt.stats
+        end = "hit" if server.hits else "terrain" if s.terrain else "shot down" if s.shot_down else "expired"
+        return end, t, closest
+
+    def test_terrain_ended_launches_miss_like_upstream(self):
+        rows = [h for h in self.fixture if h["observed_end"] == "terrain"]
+        self.assertGreaterEqual(len(rows), 8)
+        self.assertTrue(any(h["target_speed_med"] == 0.0 for h in rows))  # parked targets too
+        self.assertTrue(any(h["target_speed_med"] > 40.0 for h in rows))
+        ends = []
+        for h in rows:
+            end, t, closest = self._replay(h)
+            ends.append(end)
+            self.assertEqual(end, "terrain", h["oid"])
+            self.assertAlmostEqual(t, h["observed_life"], delta=0.5, msg=h["oid"])
+            self.assertAlmostEqual(closest, h["observed_closest"], delta=max(15.0, 0.15 * h["observed_closest"]),
+                                   msg=h["oid"])
+        self.assertEqual(ends.count("hit"), 0)  # upstream: 0 hits
+
+    def test_shot_down_launches_need_the_defence(self):
+        for h in (h for h in self.fixture if h["observed_end"] == "shot down"):
+            self.assertEqual(self._replay(h)[0], "hit", h["oid"])  # why the target shot them down
+            # the target opened fire 8 s after launch (CAP shootdowns: 8.6-12.2 s)
+            end, t, _ = self._replay(h, defend_from=8.0)
+            self.assertEqual(end, "shot down", h["oid"])
+            self.assertLess(t, h["observed_life"] + 1.0, h["oid"])
+
 
 class StaticBuildingRaycastTests(unittest.TestCase):
     """Regression: the static-building quadtree filed each building in the

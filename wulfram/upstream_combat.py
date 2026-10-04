@@ -36,7 +36,7 @@ import struct
 import time
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 from wulfram2_protocol.entities import EntityType
 
@@ -170,6 +170,7 @@ class TurretProjectile:
     snapped: bool = False         # hunters: left the vertical climb
     last_sent_vel: tuple = (0.0, 0.0, 0.0)
     last_sent_t: float = 0.0
+    hp: float = 0.0               # > 0: can be shot down (launcher hunters, INF 25 HP)
 
 
 @dataclass
@@ -179,9 +180,11 @@ class EngagementStats:
     damage_hp: Counter = field(default_factory=Counter)    # kind -> HP dealt
     expired: Counter = field(default_factory=Counter)      # kind -> lifetime ends
     terrain: Counter = field(default_factory=Counter)      # kind -> terrain impacts
+    shot_down: Counter = field(default_factory=Counter)    # kind -> destroyed by player fire
 
     def as_dict(self) -> dict:
-        return {name: dict(getattr(self, name)) for name in ("shots", "hits", "damage_hp", "expired", "terrain")}
+        return {name: dict(getattr(self, name))
+                for name in ("shots", "hits", "damage_hp", "expired", "terrain", "shot_down")}
 
 
 class UpstreamTurretRuntime:
@@ -362,8 +365,44 @@ class UpstreamTurretRuntime:
             target=target, target_oid=self._client_oid(target),
             pos=pos, vel=(0.0, 0.0, cp.HUNTER_SPEED), spawn_t=now,
             lifetime=cp.HUNTER_LIFETIME_S, damage_hp=cp.HUNTER_DAMAGE_HP,
-            hit_radius=cp.HUNTER_HIT_RADIUS,
+            hit_radius=cp.HUNTER_HIT_RADIUS, hp=cp.HUNTER_HP,
         ), clients)
+
+    # ------------------------------------------------------------- shootdown
+    def shoot_in_lane(self, shooter_team: int, origin: Sequence[float], yaw: float, *,
+                      range_limit: float, lane_radius: float, max_along: float,
+                      shot_dt: float) -> Optional[dict]:
+        """Credit one player autocannon shot to the nearest enemy hunter in the lane.
+
+        CAP: upstream defenders shot launcher hunters down with the autocannon (health fell
+        in 0.1 s steps; the shooter's target field held the hunter's oid). The lane is judged
+        in the ground plane, like the server's vehicle lane (no aim pitch on the server).
+        Only hunters nearer than ``max_along`` (the vehicle in the lane, if any) are eligible.
+        """
+        fx, fy = math.cos(yaw), math.sin(yaw)
+        best = None
+        for proj in self.projectiles:
+            if proj.hp <= 0.0 or proj.team == shooter_team:
+                continue
+            rx, ry = proj.pos[0] - origin[0], proj.pos[1] - origin[1]
+            along = rx * fx + ry * fy
+            if along < 0.0 or along > min(range_limit, max_along):
+                continue
+            if rx * rx + ry * ry - along * along > lane_radius * lane_radius:
+                continue
+            if best is None or along < best[0]:
+                best = (along, proj)
+        if best is None:
+            return None
+        proj = best[1]
+        distance = math.dist(proj.pos, tuple(origin[:3]))
+        hp = cp.autocannon_shot_hp(distance, shot_dt)
+        proj.hp -= hp
+        destroyed = proj.hp <= 0.0
+        if destroyed:
+            self.stats.shot_down[proj.kind] += 1
+            self._remove(proj, "shot down", self.server._snapshot_in_game_clients() if self.network else [])
+        return {"oid": proj.entity_id, "hp": hp, "remaining": max(0.0, proj.hp), "destroyed": destroyed}
 
     # ----------------------------------------------------------- projectiles
     def _launch(self, proj: TurretProjectile, clients: list) -> None:
@@ -446,6 +485,8 @@ class UpstreamTurretRuntime:
         for _ in range(steps):
             t += STEP_S
             for proj in list(self.projectiles):
+                if proj not in self.projectiles:
+                    continue  # shot down by player fire on another thread
                 if t <= proj.spawn_t:
                     continue  # launched later in this update; not airborne yet
                 if t - proj.spawn_t >= proj.lifetime:
