@@ -43,6 +43,18 @@ class SpawnMixin:
             {"oid": 5004, "team": 2, "x": 160.0, "y": 10.0, "z": 150.0},
         ]
 
+    def _chosen_respawn_point(self, ctx, team_id: int) -> Optional[dict]:
+        """The spawn point this client last picked, if it still exists for its team."""
+        if not self.use_map_spawn_points:
+            return None
+        oid = int(getattr(ctx, "last_spawn_point_id", 0) or 0)
+        if not oid:
+            return None
+        for sp in self.get_spawn_points():
+            if int(sp.get("oid", 0)) == oid and sp.get("team") == team_id:
+                return sp
+        return None
+
     def _pick_spawn_point(self, team_id: int) -> Optional[dict]:
         """Pick the first spawn point for the requested team."""
         if not self.use_map_spawn_points:
@@ -157,7 +169,12 @@ class SpawnMixin:
         # spawn fires through _auto_join_team. Delay is live-tunable (`deathdelay`).
         if getattr(self, "death_auto_respawn", False):
             delay = float(getattr(self, "death_respawn_delay_s", 5.0) or 0.0)
-            spawn = self._pick_spawn_point(preserved_team)
+            # Honour the pad the player last picked on the deploy map (the
+            # client conveys it in REINCARNATE spawn, handle_spawn_at_point);
+            # fall back to the team's first pad. During the countdown a new
+            # flag click still wins (handle_spawn_at_point accepts it).
+            chooser = getattr(self, "_chosen_respawn_point", None)
+            spawn = (chooser(target, preserved_team) if chooser else None) or self._pick_spawn_point(preserved_team)
             if spawn:
                 target.pending_respawn_pos = (spawn["x"], spawn["y"], spawn["z"])
             sess.delayed_spawn_team = preserved_team

@@ -19972,6 +19972,86 @@ def test_death_auto_respawn_schedules_delayed_spawn():
     return True
 
 
+def _respawn_pad_server():
+    server = WulframServer.__new__(WulframServer)
+    server.map_name = "basewar-tron-assault"
+    server.up_axis = "z"
+    server.spawn_height = 5.0
+    server.use_map_spawn_points = True
+    server.force_default_spawn_pos = False
+    server.default_flat_spawn_pos = None
+    server.spawn_allow_point_override = False
+    server.spawn_point_override_min_interval = 0.0
+    server.death_auto_respawn = True
+    server.death_respawn_delay_s = 5.0
+    server.tutorial_definition = None
+    server._dropped_cargo = {}
+    server._dynamic_building_sources = {}
+    server._get_configured_default_spawn_pos = lambda: None
+    server.get_spawn_points = lambda: [
+        {"oid": 5006, "team": 2, "x": 3086.8, "y": 1413.0, "z": 20.5},   # default (first) pad
+        {"oid": 5008, "team": 2, "x": 3721.2, "y": 5517.6, "z": 0.4},    # NE pad
+        {"oid": 5009, "team": 2, "x": 1776.7, "y": 4320.3, "z": 0.0},    # west pad
+        {"oid": 6001, "team": 1, "x": 2800.0, "y": 5000.0, "z": 0.0},
+    ]
+    return server
+
+
+def test_death_auto_respawn_returns_to_the_chosen_pad():
+    """VM run 2026-10-03: every death respawned on the default far-south pad 5006
+    although the player had deployed on 5009/5008. The pad the client picked
+    (REINCARNATE spawn -> handle_spawn_at_point) is now remembered and reused."""
+    server = _respawn_pad_server()
+    captured = {}
+    server._spawn_wf_style = lambda ctx, team_id, pos=None, **kw: captured.update(team_id=team_id, pos=pos)
+    ctx = ClientContext(client_id=1, client_addr=("10.10.10.2", 50000), session=Session(), entity_id=0x14EA)
+    handle_spawn_at_point(server, ctx, 5009, 0, ("10.10.10.2", 50000))
+    assert captured["pos"] == (1776.7, 4320.3, 0.0), captured
+    assert ctx.last_spawn_point_id == 5009
+    ctx.session.team_id = 2  # set by the real _spawn_wf_style
+    ctx.session.in_game = True
+    ctx.session.phase = Phase.IN_GAME
+    WulframServer._enter_death_deploy_state(server, ctx)
+    assert ctx.pending_respawn_pos == (1776.7, 4320.3, 0.0), ctx.pending_respawn_pos
+    # A pad of another team (or one that no longer exists) falls back to the default.
+    ctx.last_spawn_point_id = 6001
+    ctx.session.in_game = True
+    WulframServer._enter_death_deploy_state(server, ctx)
+    assert ctx.pending_respawn_pos == (3086.8, 1413.0, 20.5), ctx.pending_respawn_pos
+    print("test_death_auto_respawn_returns_to_the_chosen_pad: PASSED")
+    return True
+
+
+def test_pad_click_during_respawn_countdown_is_honoured():
+    """Upstream (capture 2026-09-18): death at +670.8 s, the client sent REINCARNATE
+    spawn at +703.0 s and spawned on that pad. During our death=respawn countdown a
+    flag click used to be rejected as 'Already spawned' (phase stays IN_GAME)."""
+    server = _respawn_pad_server()
+    captured = {}
+    server._spawn_wf_style = lambda ctx, team_id, pos=None, **kw: captured.update(team_id=team_id, pos=pos)
+    sent = []
+    ctx = ClientContext(client_id=1, client_addr=("10.10.10.2", 50000), session=Session(), entity_id=0x14EA)
+    ctx.tcp_handler = type("T", (), {"send": lambda self, pkt: sent.append(pkt)})()
+    ctx.session.team_id = 2
+    ctx.session.in_game = True
+    ctx.session.phase = Phase.IN_GAME
+    WulframServer._enter_death_deploy_state(server, ctx)
+    assert ctx.session.delayed_spawn_team == 2 and ctx.session.phase == Phase.IN_GAME
+    handle_spawn_at_point(server, ctx, 5008, 0, ("10.10.10.2", 50000))
+    assert captured.get("pos") == (3721.2, 5517.6, 0.4), captured
+    assert ctx.session.delayed_spawn_team == 0 and ctx.session.delayed_spawn_time == 0.0
+    assert ctx.pending_respawn_pos is None
+    assert ctx.last_spawn_point_id == 5008
+    # Outside a countdown an IN_GAME click is still a duplicate.
+    captured.clear()
+    ctx.session.in_game = True
+    ctx.session.phase = Phase.IN_GAME
+    handle_spawn_at_point(server, ctx, 5009, 0, ("10.10.10.2", 50000))
+    assert captured == {}, captured
+    print("test_pad_click_during_respawn_countdown_is_honoured: PASSED")
+    return True
+
+
 def test_match_flow_clock_and_round_end():
     """Match flow (Phase 3 slice 4): GAME_CLOCK uses the inverted active flag (running
     -> 0), the round timer counts down, and round end announces a winner (most team
@@ -20415,6 +20495,8 @@ def main():
         test_cargo_deploy_and_drop_request,
         test_match_flow_clock_and_round_end,
         test_death_auto_respawn_schedules_delayed_spawn,
+        test_death_auto_respawn_returns_to_the_chosen_pad,
+        test_pad_click_during_respawn_countdown_is_honoured,
     ]
 
     passed = 0

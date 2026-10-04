@@ -1212,6 +1212,20 @@ def handle_spawn_at_point(server: "WulframServer", ctx: "ClientContext", spawn_p
     now = time.monotonic()
     in_game = session.in_game or session.phase == Phase.IN_GAME
     spawn_override = False
+    # Death auto-respawn countdown (death=respawn keeps phase IN_GAME but clears
+    # in_game and arms delayed_spawn_*): a flag click on the deploy map is the
+    # player's pad choice, as upstream (capture 2026-09-18: death at +670.8 s,
+    # REINCARNATE spawn at +703.0 s, spawned on that pad). Treat it as a fresh deploy.
+    if (in_game and not session.in_game and session.delayed_spawn_team
+            and float(session.delayed_spawn_time or 0.0) > 0.0):
+        print(
+            f"[SPAWN] Client {ctx.client_id}: pad chosen during the respawn countdown "
+            f"(point={spawn_point_id})"
+        )
+        ctx.pending_respawn_pos = None
+        if session.phase == Phase.IN_GAME:
+            session.transition_to(Phase.TEAM_SELECT)
+        in_game = False
 
     # Some clients can remain on entry-map UI after auto-spawn and then send an
     # explicit spawn-point click. Allow a guarded override for that case.
@@ -1285,6 +1299,7 @@ def handle_spawn_at_point(server: "WulframServer", ctx: "ClientContext", spawn_p
     if selected:
         team_id = selected.get("team", ctx.session.team_id or 2)
         requested_pos = (selected["x"], selected["y"], selected["z"])
+        ctx.last_spawn_point_id = int(spawn_point_id)
     else:
         team_id = ctx.session.team_id or 2
         requested_pos = None

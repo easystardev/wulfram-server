@@ -241,6 +241,9 @@ class ClientContext:
 
     # Pending respawn position (set by respawn command, consumed by auto_join_team)
     pending_respawn_pos: Optional[tuple] = None
+    # Spawn point (pad oid) the client last picked on the deploy map; death
+    # auto-respawn returns there while the pad exists for the team.
+    last_spawn_point_id: int = 0
     # Server-injected movement input override (fwd, strafe) - persists until cleared
     injected_input: Optional[tuple] = None
     # Server-injected turn input override - persists until cleared
