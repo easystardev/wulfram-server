@@ -713,10 +713,17 @@ class ConfigMixin:
             self.player_energy_max = 100.0
         if self.player_energy_max <= 0.0:
             self.player_energy_max = 100.0
+        # WULFRAM_COMBAT_PROFILE=upstream-2026-10 defaults regeneration to the
+        # measured 2.9 %/s (CAP) unless WULFRAM_PLAYER_ENERGY_REGEN is set.
+        from . import combat_profile as _combat_profile
+        regen_default = (
+            _combat_profile.ENERGY_REGEN_PCT_S * self.player_energy_max / 100.0
+            if _combat_profile.is_upstream() else 10.0
+        )
         try:
-            self.player_energy_regen = float(os.environ.get("WULFRAM_PLAYER_ENERGY_REGEN", "10.0"))
+            self.player_energy_regen = float(os.environ.get("WULFRAM_PLAYER_ENERGY_REGEN", str(regen_default)))
         except ValueError:
-            self.player_energy_regen = 10.0
+            self.player_energy_regen = regen_default
         if self.player_energy_regen < 0.0:
             self.player_energy_regen = 0.0
         # VIEW_UPDATE is an auxiliary replay/correction path. Primary gameplay

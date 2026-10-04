@@ -176,6 +176,10 @@ def building_type_id_for_cargo(entity_type: int) -> int:
 
 
 def building_max_health_for_type(entity_type: int) -> float:
+    from . import combat_profile
+    if combat_profile.is_upstream():
+        # BEHAVIOR Section 3 HP of the community server (2026-10-03).
+        return combat_profile.entity_max_hp(entity_type, 1000.0)
     max_health = {
         EntityType.GUN_TURRET: 1200.0,
         EntityType.LAUNCHER: 1200.0,

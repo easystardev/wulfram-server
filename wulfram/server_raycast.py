@@ -562,8 +562,9 @@ class RaycastMixin:
         terrain_hit = None
         terrain_dist_sq = None
         clipped_end = end_pos
-        if self._terrain_grid_collision is not None:
-            terrain_hit = self._terrain_grid_collision.raycast(start_pos, end_pos)
+        terrain_collision = getattr(self, "_terrain_grid_collision", None)
+        if terrain_collision is not None:
+            terrain_hit = terrain_collision.raycast(start_pos, end_pos)
             if terrain_hit is not None:
                 clipped_end = terrain_hit.position
                 terrain_dist_sq = (

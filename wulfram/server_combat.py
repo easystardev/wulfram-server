@@ -12,7 +12,7 @@ import time
 import traceback
 from typing import Optional
 
-from . import handlers, tutorial_runtime
+from . import combat_profile, handlers, tutorial_runtime
 from .client import ClientContext
 from .weapons import (
     EntityType,
@@ -52,6 +52,13 @@ class CombatMixin:
 
         # Convert to client/world coordinates once so spawn + updates stay aligned.
         server_pos = proj.pos
+        upstream = combat_profile.is_upstream()
+        if upstream and proj.entity_type in (EntityType.PULSE_SHELL, EntityType.HUNTER):
+            # CAP: the upstream server adds the shooter's velocity (pulse launch
+            # speeds 160-300 u/s vs nominal 210; hunters 122-167 vs 95).
+            svx, svy, svz = (float(v) for v in (getattr(ctx, "player_vel", None) or (0.0, 0.0, 0.0))[:3])
+            if all(math.isfinite(v) for v in (svx, svy, svz)):
+                proj.vel = (proj.vel[0] + svx, proj.vel[1] + svy, proj.vel[2] + svz)
         if self.debug_projectiles:
             self._log_projectile_aim(ctx, proj, server_pos)
         proj.pos = self._to_client_pos(server_pos)
@@ -95,6 +102,11 @@ class CombatMixin:
 
                 if proj.entity_type == EntityType.CALTROP:
                     self._steer_caltrop_projectile(proj, ctx, dt)
+                elif upstream and proj.entity_type == EntityType.THUMPER:
+                    # CAP: thumper vz falls at ~24 u/s^2.
+                    proj.vel = (proj.vel[0], proj.vel[1], proj.vel[2] - combat_profile.THUMPER_GRAVITY * dt)
+                elif upstream and proj.entity_type in (EntityType.PIERCER, EntityType.HUNTER):
+                    self._steer_upstream_missile(proj, ctx, dt)
 
                 # Update projectile position for hit detection
                 # (build_projectile_update_packet also updates proj.pos,
@@ -140,6 +152,11 @@ class CombatMixin:
                         )
                         # Apply damage to building
                         self._apply_building_damage(hit_detail, proj, ctx, hit_pos)
+                    if upstream:
+                        self._apply_upstream_pulse_splash(
+                            proj, ctx, hit_pos,
+                            exclude_building=hit_detail if hit_kind != "terrain" else None,
+                        )
 
                     # Send impact FX via TRANSIENT_ARRAY only to viewers that
                     # can safely accept the current 0x0D path.
@@ -155,6 +172,11 @@ class CombatMixin:
                     if hit_target:
                         try:
                             self._apply_damage(hit_target, proj, ctx)
+                            if upstream:
+                                self._apply_upstream_pulse_splash(
+                                    proj, ctx, self._from_client_pos(proj.pos),
+                                    exclude_target=hit_target,
+                                )
                         except Exception as dmg_err:
                             print(f"[COMBAT-ERROR] _apply_damage failed: {dmg_err}")
                             import traceback
@@ -350,6 +372,11 @@ class CombatMixin:
             EntityType.FLAK_SHELL: 0.10,     # 10% — flak
         }
         damage = _PROJECTILE_DAMAGE.get(proj.entity_type, 0.20)
+        upstream = combat_profile.is_upstream()
+        if upstream:
+            hp = self._upstream_projectile_vehicle_hp(proj.entity_type)
+            if hp is not None:
+                damage = combat_profile.hp_to_health_fraction(hp, int(getattr(target, "entity_type", 0) or 0))
         old_health = target.player_health
         target.player_health = round(max(0.0, old_health - damage), 6)
         new_health = target.player_health
@@ -528,6 +555,12 @@ class CombatMixin:
             EntityType.FLAK_SHELL: 20.0,
         }
         damage = _PROJECTILE_BUILDING_DAMAGE.get(proj.entity_type, 50.0)
+        if combat_profile.is_upstream():
+            upstream_hp = self._upstream_projectile_building_hp(proj.entity_type)
+            if upstream_hp is not None:
+                damage = upstream_hp
+            if damage <= 0.0:
+                return
         attacker_name = attacker.session.username or f"Player{attacker.client_id}"
         # Capture building state before apply_damage_amount may remove it -- a
         # destroyed player-built structure drops a pickup-able cargo crate.
@@ -586,6 +619,110 @@ class CombatMixin:
                     and self._debug_comm_allowed_for_client(client)
                 ):
                     client.tcp_handler.send(chat_pkt)
+
+    # ------------------------------------------------------------------
+    # WULFRAM_COMBAT_PROFILE=upstream-2026-10 helpers (see combat_profile.py
+    # for every value's source tag).
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _upstream_projectile_vehicle_hp(entity_type) -> Optional[float]:
+        """Upstream HP a projectile does to a vehicle; None keeps the legacy value."""
+        return {
+            EntityType.PULSE_SHELL: combat_profile.PULSE_DIRECT_HP,      # CAP
+            EntityType.PIERCER: combat_profile.PIERCER_DAMAGE_HP,        # CAP
+            EntityType.HUNTER: combat_profile.PLAYER_HUNTER_DAMAGE_HP,   # GUIDE (unobserved)
+            EntityType.CALTROP: combat_profile.CALTROP_DAMAGE_HP,        # CAP
+            EntityType.MINE: combat_profile.MINE_DAMAGE_HP,              # GUIDE (unobserved)
+            EntityType.FLAK_SHELL: combat_profile.FLAK_SHELL_DAMAGE_HP,  # CAP
+            # THUMPER / SHORT_MISSILE / HEAVY_MISSILE: unobserved -> legacy value.
+        }.get(entity_type)
+
+    @staticmethod
+    def _upstream_projectile_building_hp(entity_type) -> Optional[float]:
+        """Upstream HP a projectile does to a building on a direct hit."""
+        return {
+            EntityType.PULSE_SHELL: combat_profile.PULSE_DIRECT_HP,      # CAP (299.7 on a flak turret)
+            EntityType.PIERCER: combat_profile.PIERCER_DAMAGE_HP,        # CAP (same on all types)
+            EntityType.HUNTER: combat_profile.PLAYER_HUNTER_DAMAGE_HP,   # GUIDE
+            EntityType.CALTROP: 0.0,  # GUIDE: targets vehicles and caltrops only
+            EntityType.MINE: 0.0,     # GUIDE: useless against buildings
+        }.get(entity_type)
+
+    def _apply_upstream_pulse_splash(self, proj, attacker: ClientContext, center_server: tuple, *,
+                                     exclude_target=None, exclude_building=None) -> None:
+        """Pulse-shell splash (INF fit) on enemy vehicles and buildings near a burst.
+
+        GUESS: splash spares the shooter and his team; upstream friendly fire is
+        enabled in BEHAVIOR but splash on friendlies was never observed.
+        """
+        if proj.entity_type != EntityType.PULSE_SHELL or not combat_profile.is_upstream():
+            return
+        radius = combat_profile.PULSE_SPLASH_RADIUS
+        team = int(getattr(attacker.session, "team_id", 0) or 0)
+        cx, cy, cz = (float(v) for v in center_server[:3])
+        for target in self._snapshot_in_game_clients():
+            if target is attacker or target is exclude_target:
+                continue
+            if int(getattr(target.session, "team_id", 0) or 0) == team:
+                continue
+            if not target.running or not target.session.in_game or target.player_health <= 0.0:
+                continue
+            tx, ty, tz = (float(v) for v in target.player_pos[:3])
+            distance = math.sqrt((tx - cx) ** 2 + (ty - cy) ** 2 + (tz - cz) ** 2)
+            hp = combat_profile.pulse_splash_hp(distance)
+            if hp <= 0.0:
+                continue
+            fraction = combat_profile.hp_to_health_fraction(hp, int(getattr(target, "entity_type", 0) or 0))
+            self._apply_hitscan_damage(target, attacker, (cx, cy, cz), "Pulse Splash", damage=fraction)
+        for oid, b in list(self._building_entities.items()):
+            if oid == exclude_building or int(getattr(b, "team_id", 0) or 0) == team:
+                continue
+            if self._building_health.get(oid, 0.0) <= 0.0:
+                continue
+            distance = math.sqrt((b.x - cx) ** 2 + (b.y - cy) ** 2 + (b.z - cz) ** 2)
+            if distance >= radius:
+                continue
+            hp = combat_profile.pulse_splash_hp(distance)
+            if hp > 0.0:
+                self._apply_building_damage_amount(
+                    int(oid), hp, source=f"splash:{int(getattr(proj, 'entity_id', 0) or 0)}",
+                    remove_dynamic_on_destroy=True, delete_participants=(attacker,),
+                )
+
+    def _steer_upstream_missile(self, proj, owner_ctx: ClientContext, dt: float) -> None:
+        """Homing for player piercers/hunters (CAP: the velocity turns toward the target).
+
+        GUESS: the lock is the nearest enemy vehicle within the 1000-u targeting
+        range (BEH) inside a 60-degree cone of the missile's heading, chosen on
+        the first update and kept while it lives.
+        """
+        target = getattr(proj, "homing_target", None)
+        if target is None and not getattr(proj, "homing_locked", False):
+            proj.homing_locked = True
+            team = int(getattr(owner_ctx.session, "team_id", 0) or 0)
+            best = None
+            for client in self._snapshot_in_game_clients():
+                if client is owner_ctx or int(getattr(client.session, "team_id", 0) or 0) == team:
+                    continue
+                if client.player_health <= 0.0:
+                    continue
+                cpos = self._to_client_pos(client.player_pos)
+                rel = (cpos[0] - proj.pos[0], cpos[1] - proj.pos[1], cpos[2] - proj.pos[2])
+                dist = math.sqrt(rel[0] ** 2 + rel[1] ** 2 + rel[2] ** 2)
+                if dist > combat_profile.MISSILE_LOCK_RANGE:
+                    continue
+                if combat_profile.angle_between(proj.vel, rel) > math.radians(60.0):
+                    continue
+                if best is None or dist < best[0]:
+                    best = (dist, client)
+            target = best[1] if best else None
+            proj.homing_target = target
+        if target is None or target.player_health <= 0.0 or not target.session.in_game:
+            return
+        rate = (combat_profile.PIERCER_TURN_RATE_DEG_S if proj.entity_type == EntityType.PIERCER
+                else combat_profile.HUNTER_TURN_RATE_DEG_S)
+        want = combat_profile.direction_to(proj.pos, self._to_client_pos(target.player_pos))
+        proj.vel = combat_profile.steer_toward(proj.vel, want, math.radians(rate) * dt)
 
     def _get_projectile_collision_radius(self, proj) -> float:
         radius = self.projectile_collision_radius
@@ -812,11 +949,23 @@ class CombatMixin:
 
         GUN_TURRET: range 120u, fire every 2.0s, 8% damage per shot
         LAUNCHER: range 200u, fire every 3.0s, 15% damage per shot
+
+        WULFRAM_COMBAT_PROFILE=upstream-2026-10 replaces this placeholder with
+        the measured community-server defences (upstream_combat.py).
         """
         if not self._building_entities:
             return
 
         now = time.monotonic()
+
+        if combat_profile.is_upstream():
+            runtime = getattr(self, "_upstream_turret_runtime", None)
+            if runtime is None:
+                from .upstream_combat import UpstreamTurretRuntime
+                runtime = UpstreamTurretRuntime(self)
+                self._upstream_turret_runtime = runtime
+            runtime.update(now)
+            return
 
         _TURRET_CONFIG = {
             EntityType.GUN_TURRET: {
@@ -901,57 +1050,68 @@ class CombatMixin:
                         self.udp_handler.send_to(impact_pkt, client.session.udp_addr)
 
             # Apply damage to target
-            damage = config['damage']
-            old_health = best_target.player_health
-            best_target.player_health = max(0.0, old_health - damage)
-            target_name = best_target.session.username or f"Player{best_target.client_id}"
             btype_name = getattr(b.entity_type, 'name', str(b.entity_type))
-            best_target.last_damage_time = now
-            best_target.last_damage_source = f"turret:{btype_name}:oid={oid}"
-            best_target.last_damage_amount = damage
-            best_target.last_damage_old_health = old_health
-            best_target.last_damage_new_health = best_target.player_health
-            print(
-                f"[TURRET] {btype_name} oid={oid} hit {target_name} "
-                f"for {damage*100:.0f}% "
-                f"({old_health*100:.0f}% -> {best_target.player_health*100:.0f}%)"
-            )
+            self._apply_turret_hit(best_target, config['damage'], oid=oid,
+                                   source_name=btype_name, now=now)
 
-            if best_target.player_health <= 0.0 and old_health > 0.0:
-                # Turret killed the player
-                best_target.deaths += 1
-                self._broadcast_player_stats(best_target, participants=(best_target,))
-                print(f"[TURRET] {btype_name} oid={oid} KILLED {target_name}")
-                self._broadcast_kill_feed(f"{target_name} was destroyed by a {btype_name}")
+    def _apply_turret_hit(self, best_target: ClientContext, damage: float, *, oid: int,
+                          source_name: str, now: float, hp: Optional[float] = None) -> None:
+        """Apply one defence hit (``damage`` on the 0..1 health scale).
 
-                # Death sequence: DELETE with effects + respawn
-                target_eid = best_target.session.entity_id or best_target.entity_id
-                tick_del = self._get_network_tick(best_target)
-                del_pkt = build_delete_object(tick_del, [target_eid], with_effects=True)
-                for client in self._snapshot_world_delete_viewers():
-                    if not self._combat_observer_packets_allowed_for_client(client, best_target):
-                        continue
-                    self._send_packet_to_client(client, del_pkt if client.session.in_game else build_delete_object(self._get_network_tick(client), [target_eid], with_effects=True), prefer_tcp=True)
-                best_target.session.in_game = False
-                for other in self._snapshot_world_delete_viewers():
-                    if other is not best_target:
-                        other.known_entity_ids.discard(target_eid)
-                        getattr(other, "_entity_create_times", {}).pop(target_eid, None)
-                best_target.known_entity_ids.discard(target_eid)
-                getattr(best_target, "_entity_create_times", {}).pop(target_eid, None)
-                if hasattr(best_target, '_entity_create_times'):
-                    best_target._entity_create_times.pop(target_eid, None)
-                best_target.player_health = 1.0
-                best_target.player_vel = (0.0, 0.0, 0.0)
-                best_target.player_speed = 0.0
-                best_target.angular_vel_yaw = 0.0
-                best_target.world_collision_ref_pos = best_target.player_pos
-                best_target.world_collision_bounds_dirty = False
-                if best_target.vehicle_physics:
-                    best_target.vehicle_physics.reset()
-                # GOAL 4: death/deploy state, no auto-spawn (turret kill). Redeploy on
-                # flag-click on the preserved team.
-                self._enter_death_deploy_state(best_target)
+        Shared by the legacy placeholder turret AI and the upstream-profile
+        runtime (gun hits, flak shells, hunters). ``hp`` is informational.
+        """
+        old_health = best_target.player_health
+        best_target.player_health = max(0.0, old_health - damage)
+        target_name = best_target.session.username or f"Player{best_target.client_id}"
+        btype_name = source_name
+        best_target.last_damage_time = now
+        best_target.last_damage_source = f"turret:{btype_name}:oid={oid}"
+        best_target.last_damage_amount = damage
+        best_target.last_damage_old_health = old_health
+        best_target.last_damage_new_health = best_target.player_health
+        hp_note = f" [{hp:.1f} HP]" if hp is not None else ""
+        print(
+            f"[TURRET] {btype_name} oid={oid} hit {target_name} "
+            f"for {damage*100:.0f}%{hp_note} "
+            f"({old_health*100:.0f}% -> {best_target.player_health*100:.0f}%)"
+        )
+
+        if best_target.player_health <= 0.0 and old_health > 0.0:
+            # Turret killed the player
+            best_target.deaths += 1
+            self._broadcast_player_stats(best_target, participants=(best_target,))
+            print(f"[TURRET] {btype_name} oid={oid} KILLED {target_name}")
+            self._broadcast_kill_feed(f"{target_name} was destroyed by a {btype_name}")
+
+            # Death sequence: DELETE with effects + respawn
+            target_eid = best_target.session.entity_id or best_target.entity_id
+            tick_del = self._get_network_tick(best_target)
+            del_pkt = build_delete_object(tick_del, [target_eid], with_effects=True)
+            for client in self._snapshot_world_delete_viewers():
+                if not self._combat_observer_packets_allowed_for_client(client, best_target):
+                    continue
+                self._send_packet_to_client(client, del_pkt if client.session.in_game else build_delete_object(self._get_network_tick(client), [target_eid], with_effects=True), prefer_tcp=True)
+            best_target.session.in_game = False
+            for other in self._snapshot_world_delete_viewers():
+                if other is not best_target:
+                    other.known_entity_ids.discard(target_eid)
+                    getattr(other, "_entity_create_times", {}).pop(target_eid, None)
+            best_target.known_entity_ids.discard(target_eid)
+            getattr(best_target, "_entity_create_times", {}).pop(target_eid, None)
+            if hasattr(best_target, '_entity_create_times'):
+                best_target._entity_create_times.pop(target_eid, None)
+            best_target.player_health = 1.0
+            best_target.player_vel = (0.0, 0.0, 0.0)
+            best_target.player_speed = 0.0
+            best_target.angular_vel_yaw = 0.0
+            best_target.world_collision_ref_pos = best_target.player_pos
+            best_target.world_collision_bounds_dirty = False
+            if best_target.vehicle_physics:
+                best_target.vehicle_physics.reset()
+            # GOAL 4: death/deploy state, no auto-spawn (turret kill). Redeploy on
+            # flag-click on the preserved team.
+            self._enter_death_deploy_state(best_target)
 
     def _get_aim_rotation(self, ctx: ClientContext) -> tuple:
         """Return (pitch, yaw, source) for aiming/projectiles."""
@@ -1107,7 +1267,9 @@ class CombatMixin:
                 "thrust": float(tank_softbody_control_slot_value(ws.behavior_slots)),
                 "jumpjet": float(ws.behavior_slots[BehaviorSlot.JUMPJET]),
             }
-        if ctx is not None and weapon_name == "Chain Gun":
+        if ctx is not None and weapon_name == "Chain Gun" and combat_profile.is_upstream():
+            self._fire_upstream_autocannon(ctx, pos, rot)
+        elif ctx is not None and weapon_name == "Chain Gun":
             target = self._find_chain_gun_target(ctx, pos, rot)
             if target is not None:
                 self._apply_hitscan_damage(target, ctx, pos, weapon_name)
@@ -1156,6 +1318,44 @@ class CombatMixin:
                 msg = build_chat_message(f"*{weapon_name.lower()} fired*", source_id=ctx.session.player_id or ctx.entity_id)
             ctx.tcp_handler.send(msg)
 
+    def _fire_upstream_autocannon(self, ctx: ClientContext, pos: tuple, rot: tuple) -> None:
+        """Upstream autocannon: hitscan with DPS = 78.9 - 0.108 d (CAP fit).
+
+        Each shot credits the time since the previous one (capped), so damage per
+        second follows the measured curve whatever the trigger cadence is.
+        """
+        now = time.monotonic()
+        default_dt = float(getattr(getattr(ctx, "weapon_system", None), "chain_gun_cooldown", 0.1) or 0.1)
+        last = getattr(ctx, "_upstream_autocannon_last_shot", None)
+        shot_dt = default_dt if last is None else max(0.0, now - last)
+        ctx._upstream_autocannon_last_shot = now
+        range_limit = combat_profile.AUTOCANNON_MAX_RANGE
+        start = tuple(float(value) for value in pos[:3])
+        target = self._find_chain_gun_target(
+            ctx, pos, rot, range_limit=range_limit,
+            hit_radius=combat_profile.AUTOCANNON_LANE_RADIUS, lane_only=True,
+        )
+        if target is not None:
+            tp = tuple(float(v) for v in target.player_pos[:3])
+            distance = math.sqrt(sum((a - b) ** 2 for a, b in zip(tp, start)))
+            hp = combat_profile.autocannon_shot_hp(distance, shot_dt)
+            if hp > 0.0:
+                fraction = combat_profile.hp_to_health_fraction(hp, int(getattr(target, "entity_type", 0) or 0))
+                self._apply_hitscan_damage(target, ctx, pos, "Chain Gun", damage=fraction)
+            return
+        yaw = float(getattr(ctx, "player_heading", 0.0) or 0.0)
+        end = (start[0] + math.cos(yaw) * range_limit, start[1] + math.sin(yaw) * range_limit, start[2])
+        hit = self._raycast_world(start, end)
+        if hit is not None and hit[0] in {"building", "building-aabb"} and hit[2] is not None:
+            oid = int(hit[2])
+            distance = math.sqrt(sum((a - b) ** 2 for a, b in zip(hit[1], start)))
+            hp = combat_profile.autocannon_shot_hp(distance, shot_dt)
+            if hp > 0.0:
+                self._apply_building_damage_amount(
+                    oid, hp, source=f"hitscan:Chain Gun:c{ctx.client_id}",
+                    remove_dynamic_on_destroy=True, delete_participants=(ctx,),
+                )
+
     def _find_chain_gun_target(
         self,
         attacker: ClientContext,
@@ -1164,6 +1364,7 @@ class CombatMixin:
         *,
         range_limit: float = 120.0,
         hit_radius: float = 12.0,
+        lane_only: bool = False,
     ) -> ClientContext | None:
         """Return the closest in-game target inside the current Chain Gun lane."""
         try:
@@ -1201,11 +1402,18 @@ class CombatMixin:
             along = rel[0] * forward[0] + rel[1] * forward[1] + rel[2] * forward[2]
             if along < 0.0 or along > range_limit:
                 continue
-            lateral_sq = max(0.0, distance_sq - along * along)
+            if lane_only:
+                # The server tracks heading but not aim pitch, so judge the
+                # lane in the ground plane (long-range shots cross terrain).
+                lateral_sq = max(0.0, rel[0] * rel[0] + rel[1] * rel[1] - along * along)
+            else:
+                lateral_sq = max(0.0, distance_sq - along * along)
             if lateral_sq > hit_radius * hit_radius:
                 continue
             if best is None or along < best[0]:
                 best = (along, target)
+        if lane_only:
+            return best[1] if best is not None else None
         return best[1] if best is not None else (nearest[1] if nearest is not None else None)
 
     @serialized
@@ -1215,12 +1423,14 @@ class CombatMixin:
         attacker: ClientContext,
         hit_pos: tuple,
         weapon_name: str,
+        damage: float = 0.20,
     ) -> None:
-        """Apply controlled-lane hitscan damage without projectile delete traffic."""
+        """Apply controlled-lane hitscan damage without projectile delete traffic.
+
+        ``damage`` is on the 0..1 health scale (legacy default 20 %).
+        """
         if not target.running or not target.session.in_game or target.observer_transition or target.player_health <= 0.0:
             return
-
-        damage = 0.20
         old_health = target.player_health
         target.player_health = round(max(0.0, old_health - damage), 6)
         new_health = target.player_health

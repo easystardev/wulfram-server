@@ -44,6 +44,7 @@ from .server_raycast import RaycastMixin, _StaticWorldRayNode
 from .server_replication import ReplicationMixin
 from .server_spawn import SpawnMixin
 from .server_combat import CombatMixin
+from . import combat_profile
 from .server_remote import RemoteSyncMixin
 from .server_corrections import CorrectionMixin
 from .server_tick import TickMixin
@@ -2577,6 +2578,7 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
             return
 
         buildings = {}
+        crate_oids = set()  # 'c <code>' lines: undeployed cargo crates, not live buildings
         aligned_count = 0
         oid = 10001  # Offset from spawn point OIDs (5001+)
         for line in lines:
@@ -2628,9 +2630,12 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
                 team_id=team,
                 heading=heading,
             )
+            if data_start == 2:
+                crate_oids.add(oid)
             oid += 1
 
         self._building_entities = buildings
+        self._building_crate_oids = crate_oids
 
         # Initialize building health from decompile entity health table (VA 0x4E3B00)
         _BUILDING_MAX_HEALTH = {
@@ -2645,8 +2650,13 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
         }
         self._building_health = {}
         self._building_max_health = {}
+        upstream_hp = combat_profile.is_upstream()
         for oid, b in buildings.items():
-            max_hp = _BUILDING_MAX_HEALTH.get(b.entity_type, 2000.0)
+            if upstream_hp:
+                # BEHAVIOR Section 3 HP of the community server (combat_profile).
+                max_hp = combat_profile.entity_max_hp(b.entity_type, 1000.0)
+            else:
+                max_hp = _BUILDING_MAX_HEALTH.get(b.entity_type, 2000.0)
             self._building_health[oid] = max_hp
             self._building_max_health[oid] = max_hp
 

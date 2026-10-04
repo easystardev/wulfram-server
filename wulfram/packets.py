@@ -1498,11 +1498,18 @@ def build_behavior_packet() -> bytes:
 
     assert len(payload) == 95 + 2340, f"After Section 2: expected 2435, got {len(payload)}"
 
-    # Section 3: Unit Stats (468 bytes)
-    for _ in range(39):
+    # Section 3: Unit Stats (468 bytes). The u32 is the per-type max HP the
+    # client multiplies the 10-bit health by (EntityTypeInfo +0x48). The
+    # upstream combat profile sends the community server's values (BEH 10-03).
+    from . import combat_profile as _combat_profile
+    _upstream_combat = _combat_profile.is_upstream()
+    for _type_index in range(39):
         payload += pack_fixed16(1.0)
         payload += pack_fixed16(100.0)
-        payload += struct.pack(">I", 100)
+        if _upstream_combat:
+            payload += struct.pack(">I", _combat_profile.UPSTREAM_ENTITY_HP[_type_index])
+        else:
+            payload += struct.pack(">I", 100)
 
     assert len(payload) == 95 + 2340 + 468, f"After Section 3: expected 2903, got {len(payload)}"
 
@@ -1558,12 +1565,17 @@ def build_behavior_packet() -> bytes:
 
     # Section 6: Active Vehicle Physics
     section6_start = len(payload)
+    # Upstream combat profile: the community server raised the vehicle speed
+    # caps to tank values[3] = 120 and scout values[4] = 140 (BEH 10-03). The
+    # server's tank governor reads the same number (combat_profile).
+    tank_max_velocity = _combat_profile.TANK_MAX_VELOCITY if _upstream_combat else 80.0
+    scout_max_velocity = _combat_profile.SCOUT_MAX_VELOCITY if _upstream_combat else 85.0
     for i in range(3):
         if not BEHAVIOR_ACTIVE_EXTRAS:
             payload += pack_fixed16(4.5)
             payload += pack_fixed16(85.0)
             payload += pack_fixed16(69.7)
-            payload += pack_fixed16(80.0)
+            payload += pack_fixed16(tank_max_velocity)
             payload += pack_fixed16(2000.0)
             payload += pack_fixed16(BEHAVIOR_MAX_ALTITUDE)
             payload += pack_fixed16(BEHAVIOR_GRAVITY_PCT)
@@ -1573,7 +1585,7 @@ def build_behavior_packet() -> bytes:
             payload += pack_fixed16(4.5)
             payload += pack_fixed16(85.0)
             payload += pack_fixed16(69.7)
-            payload += pack_fixed16(80.0)
+            payload += pack_fixed16(tank_max_velocity)
             payload += pack_fixed16(2000.0)
             payload += pack_fixed16(BEHAVIOR_MAX_ALTITUDE)
             payload += pack_fixed16(BEHAVIOR_GRAVITY_PCT)
@@ -1582,7 +1594,7 @@ def build_behavior_packet() -> bytes:
             payload += pack_fixed16(85.0)
             payload += pack_fixed16(38.0)
             payload += pack_fixed16(72.0)
-            payload += pack_fixed16(85.0)
+            payload += pack_fixed16(scout_max_velocity)
             payload += pack_fixed16(2000.0)
             payload += pack_fixed16(4.9)
             payload += pack_fixed16(3.5)
@@ -1785,15 +1797,31 @@ def build_transient_array(events: list, *, legacy: bool = None) -> bytes:
 
         bw.write_bits(type_bits, fx_type & ((1 << type_bits) - 1))
 
+        # Upstream form (opt-in via a 'source_oid' key): the client reads a u32
+        # source oid when has_pos == 0 (or for type 0x27), per
+        # GUESS6_PacketHandler_TRANSIENT_ARRAY. The 2026-10-03 capture's gun-turret
+        # shot is {type 5, has_pos 0, u32 turret oid, has_entity 1, entity 0}.
+        # Events without the key keep their historical (frozen-golden) bytes.
+        upstream_oid = 'source_oid' in ev
         if pos is not None:
             bw.write_bits(1, 1)  # has_pos = 1
+            if upstream_oid and (fx_type & 0xFF) == 0x27:
+                bw.write_bits(32, int(ev['source_oid']) & 0xFFFFFFFF)
             for v in pos:
                 raw = quantize_float(float(v), pos_max, pos_range, pos_bits)
                 bw.write_bits(pos_bits, raw)
         else:
             bw.write_bits(1, 0)  # has_pos = 0
+            if upstream_oid:
+                bw.write_bits(32, int(ev['source_oid']) & 0xFFFFFFFF)
 
-        if eid:
+        if 'has_entity' in ev:
+            if ev['has_entity']:
+                bw.write_bits(1, 1)
+                bw.write_bits(entity_bits, int(eid or 0) & ((1 << entity_bits) - 1))
+            else:
+                bw.write_bits(1, 0)
+        elif eid:
             bw.write_bits(1, 1)  # has_entity = 1
             bw.write_bits(entity_bits, eid & ((1 << entity_bits) - 1))
         else:
@@ -1803,10 +1831,13 @@ def build_transient_array(events: list, *, legacy: bool = None) -> bytes:
     return bytes([0x0D]) + bw.get_bytes()
 
 
-def decode_transient_array(packet: bytes, *, legacy: bool = None) -> list:
+def decode_transient_array(packet: bytes, *, legacy: bool = None, upstream: bool = False) -> list:
     """Decode a TRANSIENT_ARRAY (0x0D) packet, sourcing field widths from the
     same quantizer table the encoder used (CH4 round-trip). Returns the event
-    list: [{type, pos|None, entity_id}]. Inverse of build_transient_array."""
+    list: [{type, pos|None, entity_id}]. Inverse of build_transient_array.
+
+    ``upstream=True`` follows the client handler exactly: a u32 source oid is
+    read when has_pos == 0 or the type is 0x27 (returned as ``source_oid``)."""
     from wulfram2_protocol.codec import BitReader, dequantize_float
 
     if not packet or packet[0] != 0x0D:
@@ -1821,7 +1852,10 @@ def decode_transient_array(packet: bytes, *, legacy: bool = None) -> list:
     for _ in range(count):
         fx_type = br.read_bits(type_bits)
         ev = {"type": fx_type, "pos": None, "entity_id": 0}
-        if br.read_bits(1):
+        has_pos = br.read_bits(1)
+        if upstream and (fx_type == 0x27 or not has_pos):
+            ev["source_oid"] = br.read_bits(32)
+        if has_pos or (upstream and fx_type == 0x27):
             ev["pos"] = tuple(
                 dequantize_float(br.read_bits(pos_bits), pos_max, pos_range, pos_bits)
                 for _ in range(3)

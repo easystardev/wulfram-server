@@ -15,6 +15,7 @@ from .weapons import BehaviorSlot, EntityType, VEHICLE_PHYSICS_CONFIGS
 from .world_collision import TerrainContact
 from .packets import get_ticks
 from .tank_mobility import tank_forward_mobility
+from . import combat_profile
 from .tank_controller import jet_physics
 from .input_window import average_controls
 from wulfram2_protocol.codec import pack_fixed16, unpack_fixed16
@@ -11983,7 +11984,7 @@ class TickMixin:
                 cos_y = math.cos(_heading)
                 sin_y = math.sin(_heading)
                 slope_fwd = slope_dx * cos_y + slope_dy * sin_y
-                max_vel = veh_config.max_velocity if veh_config else 80.0
+                max_vel = combat_profile.tank_governor_max_velocity(veh_config.max_velocity if veh_config else 80.0)
                 slope_factor = tank_slope_mobility_factor(
                     slope_fwd, throttle_input, max_vel)
                 forward_mobility *= slope_factor
@@ -12058,7 +12059,7 @@ class TickMixin:
             )
             forward_mobility, forward_speed = tank_forward_mobility(
                 (vel_x, vel_y, vel_z), mobility_forward, throttle_input,
-                veh_config.max_velocity if veh_config else 80.0,
+                combat_profile.tank_governor_max_velocity(veh_config.max_velocity if veh_config else 80.0),
                 current_fuel, low_fuel_level, turn_mobility,
             )
 

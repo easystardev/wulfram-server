@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Optional, Tuple, Callable, List
 
 from .codec import BitReader
+from . import combat_profile
 from wulfram2_protocol.hud_state import HUD_FRACTION_MAX, HUD_FRACTION_RANGE
 from .packets import (
     VEC_POS_MAX, VEC_POS_RANGE,
@@ -166,6 +167,9 @@ class WeaponSystem:
             },
         }
 
+        if combat_profile.is_upstream():
+            self._apply_upstream_combat_profile()
+
         # Legacy alias for pulse shell speed
         self.pulse_shell_speed: float = self.projectile_configs[WeaponType.PULSE_CANNON]["speed"]
 
@@ -263,6 +267,40 @@ class WeaponSystem:
         # Current weapon (from slot 4, read in update())
         # Default to chain gun (original game default — Space fires autocannon)
         self.current_weapon: int = 0  # WeaponType.CHAIN_GUN
+
+    def _apply_upstream_combat_profile(self) -> None:
+        """WULFRAM_COMBAT_PROFILE=upstream-2026-10: measured speeds/lifetimes/refire.
+
+        Refire comes from the upstream BEHAVIOR weapon table (the client's own
+        cooldowns); speeds and lifetimes from the captures. Energy is on the
+        server's 0..100 scale: pulse 10 % per shell; the autocannon costs its
+        gross 5.8 %/s (net -2.9 %/s with regeneration running). The ammo
+        weapons cost no energy upstream (Mu ammo is not modelled here).
+        """
+        cfg = self.projectile_configs
+        cfg[WeaponType.PULSE_CANNON].update(
+            speed=combat_profile.PULSE_SPEED, lifetime=combat_profile.PULSE_LIFETIME_S,
+            cooldown=combat_profile.PULSE_REFIRE_S)
+        cfg[WeaponType.PIERCER].update(
+            speed=combat_profile.PIERCER_SPEED, lifetime=combat_profile.PIERCER_LIFETIME_S,
+            cooldown=combat_profile.PIERCER_REFIRE_S)
+        cfg[WeaponType.THUMPER].update(
+            speed=combat_profile.THUMPER_SPEED, cooldown=combat_profile.THUMPER_REFIRE_S)
+        cfg[WeaponType.HUNTER_SEEKER].update(
+            speed=combat_profile.PLAYER_HUNTER_SPEED, lifetime=combat_profile.PLAYER_HUNTER_LIFETIME_S,
+            cooldown=combat_profile.PLAYER_HUNTER_REFIRE_S)
+        cfg[WeaponType.MINE].update(cooldown=combat_profile.MINE_REFIRE_S)
+        cfg[EntityType.CALTROP].update(lifetime=combat_profile.CALTROP_LIFETIME_S)
+        self.pulse_cannon_cooldown = combat_profile.PULSE_REFIRE_S
+        self.weapon_energy_costs.update({
+            WeaponType.CHAIN_GUN: combat_profile.AUTOCANNON_GROSS_ENERGY_PCT_S * self.chain_gun_cooldown,
+            WeaponType.PULSE_CANNON: combat_profile.PULSE_ENERGY_PCT,
+            WeaponType.PIERCER: 0.0,
+            WeaponType.THUMPER: 0.0,
+            WeaponType.HUNTER_SEEKER: 0.0,
+            WeaponType.MINE: 0.0,
+            EntityType.CALTROP: 0.0,
+        })
 
     def on_input_feedback(self):
         """Called when an INPUT_FEEDBACK packet is received. Counts frames between dumps."""

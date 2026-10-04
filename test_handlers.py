@@ -4233,8 +4233,11 @@ def test_udp_team_switch_orders_stats_after_player():
 
     handle_team_switch(server, ctx, 1, ("10.10.10.2", 59507))
 
-    assert [payload[0] for payload, _ in server.udp_handler.sent] == [0x25]
-    assert [payload[0] for payload in ctx.tcp_handler.sent] == [0x17, 0x2F, 0x1C]
+    # Since 214f1af the REINCARNATE ack (0x25) rides the same ordered TCP stream
+    # (handlers.py: UDP mode 3 cannot carry it as a complete frame), so nothing goes
+    # over UDP and UPDATE_STATS (0x1C) follows REINCARNATE -> PLAYER -> GAME_CLOCK.
+    assert [payload[0] for payload, _ in server.udp_handler.sent] == []
+    assert [payload[0] for payload in ctx.tcp_handler.sent] == [0x25, 0x17, 0x2F, 0x1C]
     assert session.team_id == 1
     print("test_udp_team_switch_orders_stats_after_player: PASSED")
     return True
