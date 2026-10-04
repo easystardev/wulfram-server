@@ -151,18 +151,22 @@ class RaycastMixin:
             if building is None:
                 continue
             radius = self._get_building_quadtree_radius(building)
-            west = (building.x - radius) < mid_x
-            east = (building.x + radius) > mid_x
-            north = (building.y - radius) < mid_y
-            south = (building.y + radius) > mid_y
-            if west and north:
-                buckets[2].append(eid)
-            if west and south:
-                buckets[3].append(eid)
-            if east and north:
+            # Quadrant index matches _static_world_origin_quadrant and
+            # child_bounds: bit 0 = low-y half, bit 1 = low-x half.  (The
+            # previous low_y/high_y naming was swapped, which filed every
+            # building in the y-mirrored child so rays never reached it.)
+            low_x = (building.x - radius) < mid_x
+            high_x = (building.x + radius) > mid_x
+            low_y = (building.y - radius) < mid_y
+            high_y = (building.y + radius) > mid_y
+            if high_x and high_y:
                 buckets[0].append(eid)
-            if east and south:
+            if high_x and low_y:
                 buckets[1].append(eid)
+            if low_x and high_y:
+                buckets[2].append(eid)
+            if low_x and low_y:
+                buckets[3].append(eid)
 
         non_empty = [bucket for bucket in buckets if bucket]
         if len(non_empty) <= 1:

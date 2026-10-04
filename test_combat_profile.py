@@ -555,6 +555,99 @@ class ServerIntegrationTests(unittest.TestCase):
         self.assertEqual(off_lane.player_health, 1.0)
 
 
+class StaticBuildingRaycastTests(unittest.TestCase):
+    """Regression: the static-building quadtree filed each building in the
+    y-mirrored quadrant, so world rays (projectiles, autocannon) never hit a
+    static building.  Uses the committed default map (crossroads)."""
+
+    GUN_OID = 10006
+    GUN_POS = (5150.2509765625, 4947.73095703125, 18.33122253418)
+
+    @classmethod
+    def setUpClass(cls):
+        from wulfram.server import WulframServer
+        cls.server = WulframServer(host="127.0.0.1", port=0)
+
+    def _brute(self, start, end):
+        s = self.server
+        seg = math.dist(start, end)
+        best = None
+        for oid, b in s._building_entities.items():
+            hit = s._raycast_static_building_candidate(b, oid, start, end, seg_len=seg)
+            if hit is not None and (best is None or hit[3] < best[3]):
+                best = hit
+        return best
+
+    def test_quadtree_matches_brute_force_for_every_building(self):
+        s = self.server
+        self.assertGreater(len(s._building_entities), 8)  # the index really splits
+        s._rebuild_static_world_raycast_index()
+        self.assertIsNotNone(s._static_world_raycast_root.children)
+        point_hits = 0
+        for oid, b in s._building_entities.items():
+            for ang in (0.0, 45.0, 90.0, 135.0):
+                c, sn = math.cos(math.radians(ang)), math.sin(math.radians(ang))
+                start = (b.x - 60.0 * c, b.y - 60.0 * sn, b.z)
+                end = (b.x + 60.0 * c, b.y + 60.0 * sn, b.z)
+                tree = s._raycast_static_buildings(start, end)
+                brute = self._brute(start, end)
+                self.assertEqual(tree and tree[2], brute and brute[2], (oid, ang))
+                self.assertIsNotNone(tree, (oid, ang))
+            # Point query (zero-length ray) uses the same index; it must agree
+            # with a linear scan (a mesh centre may legitimately be empty).
+            point = tree[1]  # the surface point the last ray hit
+            tree_pt = s._raycast_static_buildings(point, point)
+            brute_pt = {o for o, bb in s._building_entities.items()
+                        if s._point_hits_static_building(bb, point) is not None}
+            if tree_pt is None:
+                self.assertEqual(brute_pt, set(), oid)
+            else:
+                self.assertIn(tree_pt[2], brute_pt, oid)
+                point_hits += 1
+        self.assertGreater(point_hits, 0)
+
+    def _fly_pulse(self, start, vel, steps=40, rate=15.0):
+        """Step a pulse shell like the server's update loop (15 Hz) and return the first world hit."""
+        s = self.server
+        pos = s._to_client_pos(start)
+        for _ in range(steps):
+            nxt = tuple(pos[i] + vel[i] / rate for i in range(3))
+            hit = s._check_projectile_world_hit(pos, nxt)
+            if hit is not None:
+                return hit
+            pos = nxt
+        return None
+
+    def _direct_hit_damage(self, env):
+        from wulfram2_protocol.entities import Projectile
+        s = self.server
+        b = s._building_entities[self.GUN_OID]
+        self.assertEqual(int(b.entity_type), int(EntityType.GUN_TURRET))
+        self.assertAlmostEqual(b.x, self.GUN_POS[0], places=2)
+        self.assertAlmostEqual(b.y, self.GUN_POS[1], places=2)
+        start = (b.x - 120.0, b.y, b.z)
+        hit = self._fly_pulse(start, (210.0, 0.0, 0.0))
+        self.assertIsNotNone(hit)
+        self.assertIn(hit[0], {"building", "building-aabb"})
+        self.assertEqual(hit[2], self.GUN_OID)
+        attacker = SimpleNamespace(client_id=9, session=SimpleNamespace(username="shooter", team_id=1))
+        s._building_health[self.GUN_OID] = 525.0
+        s._building_max_health[self.GUN_OID] = 525.0
+        proj = Projectile(entity_id=57, entity_type=EntityType.PULSE_SHELL, owner_id=9, team=1,
+                          pos=hit[1], vel=(210.0, 0.0, 0.0), spawn_time=0.0, lifetime=6.0)
+        with patch.dict(os.environ, env):
+            if not env:
+                os.environ.pop(cp.PROFILE_ENV, None)
+            s._apply_building_damage(self.GUN_OID, proj, attacker, hit[1])
+        return 525.0 - s._building_health[self.GUN_OID]
+
+    def test_direct_pulse_hit_on_static_gun_turret_upstream(self):
+        self.assertAlmostEqual(self._direct_hit_damage(UPSTREAM), cp.PULSE_DIRECT_HP, places=3)
+
+    def test_direct_pulse_hit_on_static_gun_turret_legacy(self):
+        self.assertAlmostEqual(self._direct_hit_damage({}), 50.0, places=3)
+
+
 if __name__ == "__main__":
     result = unittest.main(exit=False, verbosity=1).result
     sys.exit(0 if result.wasSuccessful() else 1)
