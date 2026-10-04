@@ -161,6 +161,14 @@ PULSE_LIFETIME_S = 6.0            # CAP: life caps at ~6.0 s (max 6.06)
 PULSE_DIRECT_HP = 300.0           # CAP: 299.9 / 300.4 / 299.9 on tanks; 299.7 on a flak turret
 PULSE_REFIRE_S = 0.6              # BEH tank slot 4: 600 ms
 PULSE_ENERGY_PCT = 10.0           # CAP: -100/1023 per shell
+# Shell direction (artifacts/server-fixes-2026-10-03/shell_aim.py, 68 pulse shells, both
+# captures): the launch direction equals the shooter's streamed orientation -- yaw = rot[2],
+# elevation = -rot[1] -- to 0.0 deg median (|err| p90 0.3 deg on 10-03, 0.85 deg on 09-18).
+# Upstream fires along the hull like our 'body' + body-pitch aim source; its hull pitch
+# spans -23..+56 deg because the player's lean axis (ACTION slot 6, client
+# TankController_update 0x004f9e20: lean = axis6 * 1.4137) pitches the tank, which our
+# physics does not model (see the server-fixes README).
+PULSE_MUZZLE_FORWARD = 14.0       # CAP: spawn 14.0 u along the 3-D aim (p10-p90 13.5-14.5, n=49)
 # INF: piecewise-linear fit to CAP splash samples (centre distances +-10 u):
 # ~300 within ~10 u, 130-140 at 10-20 u, 50-80 at 35-55 u, 15-27 at 60-75 u,
 # none seen beyond ~75 u. One building hit ~9 u off-centre did 181.

@@ -412,6 +412,26 @@ class WeaponAndBehaviorTests(unittest.TestCase):
         self.assertEqual(ws.projectile_configs[WeaponType.HUNTER_SEEKER]["speed"], 95.0)
         self.assertEqual(ws.weapon_energy_costs[WeaponType.PULSE_CANNON], 10.0)
         self.assertEqual(ws.pulse_shell_speed, 210.0)
+        self.assertEqual(ws.projectile_spawn_offset, 14.0)  # CAP muzzle
+
+    def test_pulse_follows_the_full_hull_orientation(self):
+        """CAP (68 shells): launch direction = shooter yaw and pitch (nose-down positive), muzzle
+        14 u along that 3-D direction."""
+        with patch.dict(os.environ, {**UPSTREAM, "WULFRAM_PROJECTILE_BARREL_UP": "0",
+                                     "WULFRAM_PROJECTILE_BARREL_RIGHT": "0"}):
+            ws = WeaponSystem()
+        ws.player_pos = (100.0, 200.0, 30.0)
+        yaw, pitch = math.radians(30.0), math.radians(21.86)  # captured shot 388358: rot[1] 21.86
+        ws.player_rot = (0.0, pitch, yaw)
+        ws.use_pitch, ws.up_axis = True, "z"
+        proj = ws._fire_pulse_cannon()
+        v = proj.vel
+        elev = math.degrees(math.atan2(v[2], math.hypot(v[0], v[1])))
+        self.assertAlmostEqual(elev, -21.86, places=3)
+        self.assertAlmostEqual(math.degrees(math.atan2(v[1], v[0])), 30.0, places=3)
+        self.assertAlmostEqual(math.sqrt(sum(c * c for c in v)), 210.0, places=3)
+        off = [proj.pos[i] - ws.player_pos[i] for i in range(3)]
+        self.assertAlmostEqual(math.sqrt(sum(c * c for c in off)), 14.0, places=3)
 
     def test_behavior_speed_caps_and_hp(self):
         from client.wulfram_client.network.behavior import parse_behavior

@@ -205,6 +205,9 @@ class WeaponSystem:
             self.projectile_spawn_offset = float(os.environ.get("WULFRAM_PROJECTILE_SPAWN_OFFSET", "5.5"))
         except ValueError:
             self.projectile_spawn_offset = 5.5
+        if combat_profile.is_upstream():
+            # CAP muzzle: 14.0 u along the 3-D aim (overrides the .env pin of 12).
+            self.projectile_spawn_offset = combat_profile.PULSE_MUZZLE_FORWARD
         try:
             self.projectile_barrel_right = float(os.environ.get("WULFRAM_PROJECTILE_BARREL_RIGHT", "-0.25"))
         except ValueError:
