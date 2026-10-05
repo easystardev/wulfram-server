@@ -109,3 +109,63 @@ def test_worker_failure_stops_native_client(live):
     with pytest.raises(NativePhysicsError):
         service.publish(ctx)
     assert not ctx.running
+
+
+class _FlakyWorld:
+    """Fake worker: the first world's advance() fails like the 2026-10-05 pipe timeout."""
+    opened = 0
+
+    def __init__(self, *args, **kwargs):
+        type(self).opened += 1
+        self.generation = type(self).opened
+
+    def advance(self, ms):
+        if self.generation == 1:
+            raise NativePhysicsError("TimeoutExpired: worker timed out after 2 seconds")
+        return {"tick": 1, "bodies": []}
+
+    def remove(self, oid):
+        pass
+
+    def close(self):
+        pass
+
+
+def _fake_server():
+    return SimpleNamespace(map_name="crossroads", _snapshot_in_game_clients=lambda: [],
+                           _building_entities={}, _building_health={}, input_stale_timeout_s=0)
+
+
+def test_worker_failure_restarts_instead_of_latching():
+    import time
+    _FlakyWorld.opened = 0
+    service = NativeLiveWorld(_fake_server(), "unused.exe", factory=_FlakyWorld)
+    service.start()
+    try:
+        deadline = time.monotonic() + 3
+        while service.frames == 0 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert service.frames > 0
+        assert service.error is None
+        assert service.restarts == 1
+        assert _FlakyWorld.opened == 2
+        assert service.status()["thread_alive"]
+    finally:
+        service.close()
+
+
+def test_restart_storm_still_latches():
+    import time
+    class AlwaysFails(_FlakyWorld):
+        def advance(self, ms):
+            raise NativePhysicsError("worker exited")
+    service = NativeLiveWorld(_fake_server(), "unused.exe", factory=AlwaysFails)
+    service.start()
+    try:
+        deadline = time.monotonic() + 3
+        while service.error is None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert service.error is not None
+        assert service.restarts == service.RESTART_LIMIT
+    finally:
+        service.close()

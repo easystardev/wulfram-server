@@ -46,6 +46,8 @@ class NativeLiveWorld:
         self.frames = 0
         self.last_tick = 0
         self.dropped_wall_ms = 0
+        self.restarts = 0
+        self.last_restart_error = None
         self._open()
 
     def _open(self):
@@ -83,12 +85,42 @@ class NativeLiveWorld:
         self.thread = threading.Thread(target=self._run, name="native-physics-world", daemon=True)
         self.thread.start()
 
+    # A single slow/failed worker reply (a host stall over the 2 s pipe budget, or the
+    # worker exiting) used to latch self.error for the life of the server: every later
+    # spawn then had ctx.running cleared in publish() and the OG client was dropped at
+    # join and exited (2026-10-05, round E2 "crash on join"). Re-open the worker instead
+    # -- still native, never a legacy fallback -- and latch only when restarts storm.
+    RESTART_LIMIT = int(os.environ.get("WULFRAM_NATIVE_RESTART_LIMIT", "5"))
+    RESTART_WINDOW_S = 600.0
+
+    def _restart_after(self, exc, restarts):
+        now = time.monotonic()
+        restarts[:] = [t for t in restarts if now - t < self.RESTART_WINDOW_S]
+        if len(restarts) >= self.RESTART_LIMIT:
+            return False
+        restarts.append(now)
+        self.restarts += 1
+        self.last_restart_error = f"{type(exc).__name__}: {exc}"
+        print(f"[NATIVE] worker failed ({self.last_restart_error}); restarting "
+              f"({len(restarts)}/{self.RESTART_LIMIT} in {int(self.RESTART_WINDOW_S)} s)")
+        from .observer_lifecycle import FRAME_LOCK
+        with FRAME_LOCK:
+            self._open()
+        return True
+
     def _run(self):
         period = self.step_ms / 1000
         deadline = time.perf_counter() + period
+        restarts = []
         try:
             while not self.stop_event.wait(max(0, deadline - time.perf_counter())):
-                self.step()
+                try:
+                    self.step()
+                except Exception as exc:
+                    if self.stop_event.is_set() or not self._restart_after(exc, restarts):
+                        raise
+                    deadline = time.perf_counter() + period
+                    continue
                 deadline += period
                 # Never replay seconds of stale held controls after a stall.
                 now = time.perf_counter()
@@ -250,6 +282,7 @@ class NativeLiveWorld:
         return {"backend": "native", "map": self.map_name, "frames": self.frames,
                 "tick": self.last_tick, "tanks": len(self.members), "static_bodies": len(self.statics),
                 "step_ms": self.step_ms, "error": self.error, "dropped_wall_ms": self.dropped_wall_ms,
+                "restarts": self.restarts, "last_restart_error": self.last_restart_error,
                 "thread_alive": self.thread is not None and self.thread.is_alive()}
 
     def close(self):
