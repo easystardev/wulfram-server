@@ -533,15 +533,40 @@ def test_dock_pin_off_never_calls_policy():
     srv = _knob_server()
     ctx = _knob_ctx()
     for i in range(5):
-        assert srv._dock_pin_step(ctx, 1.0 + 0.05 * i, 10 + i) is False  # real should_pin would raise
+        assert srv._dock_pin_step(ctx, 1.0 + 0.05 * i, 10 + i) is False
     srv.dock_pin_enabled = True
     srv.dock_pin_clients = frozenset({"10.0.0.5"})
+    seen = []
+    orig = dock_pin.should_pin
+    dock_pin.should_pin = lambda inputs: seen.append(inputs) or False
     try:
         srv._dock_pin_step(ctx, 2.0, 50)
-    except NotImplementedError:
-        pass  # knob on: the user's (unwritten) policy is consulted
-    else:
-        raise AssertionError("should_pin was not called with WULFRAM_DOCK_PIN=1")
+    finally:
+        dock_pin.should_pin = orig
+    assert seen, "should_pin was not called with WULFRAM_DOCK_PIN=1"
+
+
+def _pin_inputs(**kw):
+    base = dict(enabled_for_client=True, grounded=True, speed=0.5, seconds_since_thrust=1.0,
+                move_input_active=False, pinned=False, divergence_pos=0.0, is_native_client=False)
+    base.update(kw)
+    return dock_pin.DockPinInputs(**base)
+
+
+def test_should_pin_policy():
+    sp = dock_pin.should_pin
+    assert sp(_pin_inputs())                                   # touchdown after the lag
+    assert sp(_pin_inputs(seconds_since_thrust=float("inf")))  # spawned at rest
+    assert not sp(_pin_inputs(enabled_for_client=False))
+    assert not sp(_pin_inputs(move_input_active=True))
+    assert not sp(_pin_inputs(move_input_active=True, pinned=True))  # input always releases
+    assert not sp(_pin_inputs(grounded=False))
+    assert not sp(_pin_inputs(seconds_since_thrust=0.3))
+    assert sp(_pin_inputs(speed=10.0))                         # OG: upstream's no speed limit
+    assert not sp(_pin_inputs(speed=10.0, is_native_client=True))
+    assert sp(_pin_inputs(pinned=True, grounded=False, divergence_pos=1.9))  # burst holds
+    assert not sp(_pin_inputs(pinned=True, divergence_pos=2.1))              # OG cap
+    assert not sp(_pin_inputs(pinned=True, divergence_pos=0.3, is_native_client=True))
 
 
 def test_dock_pin_wiring_latch_emit_release():

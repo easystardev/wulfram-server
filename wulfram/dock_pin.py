@@ -40,15 +40,32 @@ class DockPinInputs:
     dock_target: int = 0
 
 
+# Upstream's touchdown lag: the burst starts ~0.55-1.1 s after thrust release.
+TOUCHDOWN_DELAY_S = 0.55
+# How far the server pose may drift from the latched pin before the burst stops.
+# OG: stay under its ~2.3 u ignore band, so a pin is never a hard snap (upstream's pin was
+# a no-op on OG too). Native: it snaps to every record, so keep the drift tiny.
+MAX_DIVERGENCE_OG = 2.0
+MAX_DIVERGENCE_NATIVE = 0.25
+# Starting a pin on a native client latches the server pose it will snap to; refuse while
+# the tank is still sliding fast enough for that to be visible. OG gets upstream's no-limit.
+MAX_START_SPEED_NATIVE = 2.0
+
+
 def should_pin(s: DockPinInputs) -> bool:
     """Return True to send (or keep sending) the pinned pose this tick, False to end or skip.
 
-    TODO(user): the policy. Trade-offs:
-    - Upstream starts at touchdown with NO strict speed threshold (it pinned tanks still moving
-      8-12 u/s) and ends only on move input. Copying that exactly is most faithful.
-    - Our pin pose is the server's, not the client's: a large divergence_pos means the pin is a
-      real correction. Native clients snap to every record; OG clients ignore < ~2.3 u and
-      hard-snap above it. Do you cap divergence, require low speed, or both?
-    - move_input_active must always end the burst (upstream never pins a moving tank on input).
+    Upstream-faithful start/stop (touchdown after the thrust-release lag; ends only on move
+    input), plus two guards because our latched pose is the server's, not the client's:
+    a divergence cap that ends the burst before it becomes a correction, and a start-speed
+    limit for native clients, which snap to every record.
     """
-    raise NotImplementedError
+    if not s.enabled_for_client or s.move_input_active:
+        return False
+    native = s.is_native_client
+    if s.pinned:
+        cap = MAX_DIVERGENCE_NATIVE if native else MAX_DIVERGENCE_OG
+        return s.divergence_pos <= cap
+    if not s.grounded or s.seconds_since_thrust < TOUCHDOWN_DELAY_S:
+        return False
+    return not native or s.speed <= MAX_START_SPEED_NATIVE
