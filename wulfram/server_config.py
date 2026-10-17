@@ -89,6 +89,83 @@ def init_upstream_1016_profile(server) -> None:
     )
     server.dock_pin_interval_s = _env_float("WULFRAM_DOCK_PIN_INTERVAL_S", 0.05, 0.01)
     server.dock_grounded_vz = _env_float("WULFRAM_DOCK_GROUNDED_VZ", 1.0, 0.0)
+    init_native_client_profile(server)
+
+
+def init_native_client_profile(server) -> None:
+    """Native WulframClient.exe ``--no-mods`` bring-up knobs. ALL DEFAULT OFF.
+
+    Tag: community/native (the community wulfram3.com native client run without
+    its session-provider mod; NOT legacy wulfram2.exe behaviour, NOT a sync
+    knob).  Evidence: D:\\work\\upstream-1016\\ghidra\\RESULT.md (client RE of the
+    "Loading world" -> Ready gate) and D:\\work\\upstream-1016\\vm\\RESULT.md.
+
+    Every knob acts only on sessions ``wulfram.native_session`` classifies as
+    native (key pushed unsolicited + ``13 01 <key>`` identify, and/or a window-0
+    client D_HANDSHAKE, and for the login-burst items the credential-only 0x21/03
+    shape).  OG wulfram2.exe sessions are byte-identical with any knob on.
+
+    WULFRAM_NATIVE_NOMODS_PROFILE=1 -- umbrella: flips the default of every knob
+        below to on (each can still be forced off with =0;
+        WULFRAM_NATIVE_SERVER_D_HANDSHAKE defaults to "empty").
+    WULFRAM_NATIVE_IDENTIFIED_UDP=1 -- also send IDENTIFIED_UDP 0x4D on UDP after
+        the bind (client flag +0x20fa is set only by a UDP 0x4D; without it the
+        native client never sends its 0x21 login).
+    WULFRAM_NATIVE_HELLO_VERIFIED_UDP=1 -- also send HELLO ``13 03`` on UDP in the
+        login burst (only a UDP 13 03 sets +0x20fc/state 7 and starts the client
+        D_HANDSHAKE).
+    WULFRAM_NATIVE_UDP_PING_REPLY=1 -- answer the native client's UDP 0x0B pings
+        regardless of WULFRAM_UDP_PING_REPLY_HOSTS (else "Connection timed out"
+        about 15 s after login).
+    WULFRAM_NATIVE_LOGIN_WORLD_STATS=1 -- WORLD_STATS 0x16 once in the login burst
+        (the native client sends no BPS, so the BPS-gated send never fires;
+        0x16 is the only setter of +0x2102/+0x2103).  It also resets the client's
+        readiness, so it is never re-sent afterwards (world_stats_sent latch).
+    WULFRAM_NATIVE_SHORT_ACK=1 -- D_ACK the native client's reliable records
+        (0x33 ``33 SSSS 0009 00000001`` etc.) with the 5-byte ``02 01 <op> <u16 seq>``;
+        the client releases its ordered window only on that form.  Overrides
+        WULFRAM_UDP_ACK_FORM for native sessions only.
+    WULFRAM_NATIVE_SERVER_D_HANDSHAKE=empty|og_safe (1 = empty; off by default) --
+        server D_HANDSHAKE for native clients: ``03 seq window nGroups nRoutes``
+        with no groups/routes (empty) or the OG tables minus any route the
+        client rejects (opcode < 5 with mode != 0, mode 2, duplicates); always
+        its own datagram, no trailing bytes.
+    WULFRAM_NATIVE_UDP_SINGLE_MESSAGE=1 -- never put two messages in one UDP
+        datagram to a native session (UDPHandler splits leading control records
+        and a D_HANDSHAKE into their own datagrams).
+    WULFRAM_NATIVE_PHYSICS_SESSION=1 -- answer the c2s 0x54 GENERIC
+        ``portable_physics_v2`` (WPC2) / ``_v1`` (WPC1) want with one s2c 0x56
+        physics session on TCP after TRANSLATION (the client's +0x2100 readiness
+        flag).  WULFRAM_NATIVE_PHYSICS_SESSION_NAME (default "wulfram-server"),
+        WULFRAM_NATIVE_PHYSICS_SESSION_TICK_MS (default = server tick, 33 at
+        30 Hz).  Body from ``wulfram.physics_session``; its field table is
+        PROVISIONAL (placeholder values, not the client's defaults).
+    """
+    umbrella = _env_flag("WULFRAM_NATIVE_NOMODS_PROFILE")
+    default = "1" if umbrella else "0"
+    server.native_identified_udp = _env_flag("WULFRAM_NATIVE_IDENTIFIED_UDP", default)
+    server.native_hello_verified_udp = _env_flag("WULFRAM_NATIVE_HELLO_VERIFIED_UDP", default)
+    server.native_udp_ping_reply = _env_flag("WULFRAM_NATIVE_UDP_PING_REPLY", default)
+    server.native_login_world_stats = _env_flag("WULFRAM_NATIVE_LOGIN_WORLD_STATS", default)
+    server.native_short_ack = _env_flag("WULFRAM_NATIVE_SHORT_ACK", default)
+    shake = os.environ.get(
+        "WULFRAM_NATIVE_SERVER_D_HANDSHAKE", "empty" if umbrella else "off"
+    ).strip().lower()
+    if shake in ("1", "true", "on", "yes"):
+        shake = "empty"
+    server.native_server_d_handshake = shake if shake in ("empty", "og_safe") else ""
+    server.native_udp_single_message = _env_flag("WULFRAM_NATIVE_UDP_SINGLE_MESSAGE", default)
+    server.native_physics_session = _env_flag("WULFRAM_NATIVE_PHYSICS_SESSION", default)
+    server.native_physics_session_name = (
+        os.environ.get("WULFRAM_NATIVE_PHYSICS_SESSION_NAME", "wulfram-server").strip() or "wulfram-server"
+    )
+    try:
+        server.native_physics_session_tick_ms = int(os.environ.get("WULFRAM_NATIVE_PHYSICS_SESSION_TICK_MS", "0"))
+    except ValueError:
+        server.native_physics_session_tick_ms = 0
+    udp = getattr(server, "udp_handler", None)
+    if udp is not None:
+        udp.native_single_message = server.native_udp_single_message
 
 
 class ConfigMixin:

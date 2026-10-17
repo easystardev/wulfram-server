@@ -187,15 +187,26 @@ class UDPHandler:
         try:
             owner = self.peer_owner(addr)
             channel = getattr(owner, 'udp_socket', None) or self.sock
-            channel.sendto(data, addr)
+            datagrams = [data]
+            if getattr(self, "native_single_message", False) and owner is not None:
+                # community/native WULFRAM_NATIVE_UDP_SINGLE_MESSAGE: one message
+                # per datagram for native sessions (OG sessions never get here).
+                from . import native_session
+                if native_session.is_native_session(owner):
+                    datagrams = native_session.split_single_message(data)
+                    if len(datagrams) > 1:
+                        print(f"[UDP SEND] native single-message split {len(data)} B "
+                              f"-> {[len(d) for d in datagrams]} to {addr}")
+            for datagram in datagrams:
+                channel.sendto(datagram, addr)
 
-            if log and self.log_sends and len(data) > 0:
-                packet_type = data[0]
-                pkt_name = get_packet_name(packet_type)
-                print(f"[UDP SEND] {pkt_name} to {addr}")
+                if log and self.log_sends and len(datagram) > 0:
+                    packet_type = datagram[0]
+                    pkt_name = get_packet_name(packet_type)
+                    print(f"[UDP SEND] {pkt_name} to {addr}")
 
-            if self.logger and len(data) > 0:
-                self.logger.log_send(data[0], data, "UDP")
+                if self.logger and len(datagram) > 0:
+                    self.logger.log_send(datagram[0], datagram, "UDP")
 
         except Exception as e:
             print(f"[UDP SEND] Error: {e}")

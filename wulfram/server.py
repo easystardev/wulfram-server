@@ -109,6 +109,7 @@ from .packets import (
     get_behavior_tank_spring_local_offsets,
 )
 from . import handlers, build_uplink, building_lifecycle, match_flow, tutorial_runtime, config as server_config
+from . import native_session
 from .pktlog import PacketLog
 
 class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, CombatMixin, RemoteSyncMixin, CommunityWireMixin, CorrectionMixin, TickMixin, NetMixin):
@@ -1726,6 +1727,8 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
 
         self.udp_handler = UDPHandler(udp_sock, self.logger)
         self.udp_handler.peer_owner = self.udp_addr_to_client.get
+        # community/native: WULFRAM_NATIVE_UDP_SINGLE_MESSAGE (default off).
+        self.udp_handler.native_single_message = bool(getattr(self, "native_udp_single_message", False))
 
         # Start UDP listener thread (set running first to avoid race)
         from .native_live import configured_service
@@ -2827,6 +2830,8 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
                 ctx.tcp_handler.send(tank_packet)
             elif pkt_type == PacketType.HELLO:
                 self._handle_hello(ctx, packet)
+            elif pkt_type == 0x54 and handlers.maybe_send_physics_session(self, ctx, packet):
+                pass  # community/native portable_physics want answered with 0x56
             else:
                 print(f"[GAME] Unhandled packet 0x{pkt_type:02X}")
 
@@ -2872,11 +2877,16 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
         if self.udp_ping_reply_allow_all:
             return True
 
+        # community/native: WULFRAM_NATIVE_UDP_PING_REPLY answers native sessions
+        # (window-0 / pushed-key identify) whatever the host allowlist says.
+        if getattr(self, "native_udp_ping_reply", False) and native_session.is_native_session(ctx):
+            return True
+
+        # Only the session holds the UDP endpoint.  (ClientContext has no
+        # ``udp_addr``; reading it crashed on pings that arrive before the bind.)
         addr = None
         if ctx.session and ctx.session.udp_addr:
             addr = ctx.session.udp_addr
-        elif ctx.udp_addr:
-            addr = ctx.udp_addr
 
         if not addr:
             return False
@@ -3261,8 +3271,13 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
             _default("ship_status_interval_s", max(0.0, float(os.environ.get("WULFRAM_SHIP_STATUS_INTERVAL_S", "0"))))
         except ValueError:
             _default("ship_status_interval_s", 0.0)
+        if not hasattr(self, "native_identified_udp"):
+            from .server_config import init_native_client_profile
+            init_native_client_profile(self)
         if not hasattr(self, "local_vu_entity"):
-            server_config.init_upstream_1016_profile(self)
+            # `server_config` here is wulfram.config; the profile lives in wulfram.server_config.
+            from .server_config import init_upstream_1016_profile
+            init_upstream_1016_profile(self)
 
         # 2026-09-02 stock-protocol STATE_REQUEST replay reply (see
         # server_config._init_correction_config / server_corrections).

@@ -94,6 +94,13 @@ class Session:
     last_udp_activity: float = 0.0  # For dead connection detection
     pending_spawn_points: bool = False
     spawn_points_sent: bool = False
+    # Native-client (community/native) bookkeeping; see wulfram.native_session.
+    # How the UDP endpoint was first bound ("hello_key" = 13 01 <key>,
+    # "hello_there" = OG 0x08), whether the HELLO2 key had to be pushed
+    # unsolicited, and whether the 0x56 physics session went out.
+    udp_identify_kind: str = ""
+    hello_key_pushed: bool = False
+    physics_session_sent: bool = False
 
     @world_reset
     def reset(self):
@@ -139,6 +146,9 @@ class Session:
         self.last_udp_activity = 0.0
         self.pending_spawn_points = False
         self.spawn_points_sent = False
+        self.udp_identify_kind = ""
+        self.hello_key_pushed = False
+        self.physics_session_sent = False
 
     def transition_to(self, new_phase: Phase) -> bool:
         """

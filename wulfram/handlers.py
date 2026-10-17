@@ -20,7 +20,9 @@ from .packets import (
     build_behavior_packet, build_translation_packet, build_game_clock,
     build_ping_request,
     build_motd, build_reincarnate,
+    build_hello_verified,
 )
+from . import native_session
 
 if TYPE_CHECKING:
     from .server import WulframServer
@@ -172,11 +174,55 @@ def _parse_legacy_client_d_handshake(data: bytes) -> Optional[dict]:
     }
 
 
-def _build_server_d_handshake(ctx: Optional["ClientContext"]) -> bytes:
+def _native_d_handshake_routes() -> tuple:
+    """OG private routes minus every route the native client rejects.
+
+    Native apply step (``FUN_1401499b0`` idx 1): a duplicate opcode, mode 2, or
+    ``opcode < 5 and mode != 0`` throws "Unsupported stream route".  Opcodes are
+    limited to <= 0x56 and modes to <= 3 by its parser.
+    """
+    seen = set()
+    routes = []
+    for packet_id, mode in _OG_D_HANDSHAKE_PRIVATE_MODES:
+        if packet_id in seen or mode == 2 or mode > 3 or packet_id > 0x56:
+            continue
+        if packet_id < 5 and mode != 0:
+            continue
+        seen.add(packet_id)
+        routes.append((packet_id, mode))
+    return tuple(routes)
+
+
+def _build_native_server_d_handshake(variant: str, sequence: int, receive_window: int) -> bytes:
+    """``03 seq window nGroups{str,n,u32 ops} nRoutes{u32 op,u32 mode}``, no tail."""
+    if variant == "og_safe":
+        groups = _OG_D_HANDSHAKE_STREAMS
+        routes = _native_d_handshake_routes()
+    else:  # "empty": the VM run-18 layout the client accepted
+        groups = ()
+        routes = ()
+    payload = bytearray(struct.pack(">III", sequence, receive_window, len(groups)))
+    for name, indices in groups:
+        payload += _pack_lp_string(name) + struct.pack(">I", len(indices))
+        for channel_id in indices:
+            payload += struct.pack(">I", channel_id)
+    payload += struct.pack(">I", len(routes))
+    for packet_id, delivery_mode in routes:
+        payload += struct.pack(">II", packet_id, delivery_mode)
+    return b"\x03" + bytes(payload)
+
+
+def _build_server_d_handshake(ctx: Optional["ClientContext"], server=None) -> bytes:
     """Build a server D_HANDSHAKE with empirical OG stream/private mappings."""
     sequence = int(time.monotonic() * 1000) & 0xFFFFFFFF
     # Original ServiceLayer advertises its sequence window here, not a player ID.
     receive_window = 15
+
+    # community/native WULFRAM_NATIVE_SERVER_D_HANDSHAKE (default off): a
+    # window-0 (native) client gets a layout its route rules accept.
+    variant = getattr(server, "native_server_d_handshake", "") if server is not None else ""
+    if variant and is_native_stream_client(ctx):
+        return _build_native_server_d_handshake(variant, sequence, receive_window)
 
     payload = bytearray()
     payload += struct.pack(">I", sequence)
@@ -247,13 +293,23 @@ def is_native_stream_client(ctx: Optional["ClientContext"]) -> bool:
     return bool(shake) and int(shake.get("receive_window", -1)) == 0
 
 
-def use_framed_stream_ack(ctx: Optional["ClientContext"]) -> bool:
+def use_framed_stream_ack(ctx: Optional["ClientContext"], server=None) -> bool:
     """WULFRAM_UDP_ACK_FORM = auto (default) | framed | short.
 
     ``short`` is today's 5-byte ``02 01 <op> <seq>`` (what the OG client gets);
     ``framed`` is the upstream server's 9-byte ``02 <srv seq> 0009 01 <op> <seq>``.
     ``auto`` picks framed only for a native-shaped (window 0) client.
+
+    community/native WULFRAM_NATIVE_SHORT_ACK=1 (``server.native_short_ack``)
+    forces ``short`` for native sessions: the native ``--no-mods`` client
+    releases its ordered window only on a sub-1 ACK (ghidra RESULT.md Q2).
     """
+    if (
+        server is not None
+        and getattr(server, "native_short_ack", False)
+        and native_session.is_native_session(ctx)
+    ):
+        return False
     mode = os.environ.get("WULFRAM_UDP_ACK_FORM", "auto").strip().lower()
     if mode == "short" or ctx is None:
         return False
@@ -439,7 +495,30 @@ def _send_og_login_bootstrap(server: "WulframServer", ctx: "ClientContext") -> N
     ):
         tcp.send(build_translation_packet())
         session.translation_sent = True
+    native_login = native_session.is_native_credential_login(ctx)
+    # community/native WULFRAM_NATIVE_HELLO_VERIFIED_UDP: only a UDP 13 03 moves
+    # the native client to state 7 and makes it send its D_HANDSHAKE.
+    if (
+        native_login
+        and getattr(server, "native_hello_verified_udp", False)
+        and getattr(server, "udp_handler", None)
+        and session.udp_addr
+    ):
+        server.udp_handler.send_to(build_hello_verified(), session.udp_addr)
+        print(f"[LOGIN] Client {ctx.client_id}: HELLO 13 03 also sent on UDP")
     tcp.send(build_player(entity_id=session.player_id, spectator=True))
+    # community/native WULFRAM_NATIVE_LOGIN_WORLD_STATS: the native client sends
+    # no BPS, and WORLD_STATS is its only +0x2102/+0x2103 setter.  It also resets
+    # the client's readiness, so it goes out exactly once, here, before any 0x33
+    # can exist; the world_stats_sent latch keeps every later sender quiet.
+    if (
+        native_login
+        and getattr(server, "native_login_world_stats", False)
+        and not session.world_stats_sent
+    ):
+        tcp.send(server.build_world_stats_packet())
+        session.world_stats_sent = True
+        print(f"[LOGIN] Client {ctx.client_id}: WORLD_STATS sent once in login burst")
 
 
 # ============ TCP Handlers ============
@@ -945,7 +1024,8 @@ def handle_udp_d_handshake(server: "WulframServer", ctx: Optional["ClientContext
     server.udp_handler.send_to(ack, addr)
     print(f"[UDP SEND] D_ACK to {addr}")
 
-    server_handshake = _build_server_d_handshake(ctx)
+    # Own datagram, nothing after it (the native demux rejects a D_HANDSHAKE tail).
+    server_handshake = _build_server_d_handshake(ctx, server)
     server.udp_handler.send_to(server_handshake, addr)
     print(
         f"[UDP SEND] D_HANDSHAKE seq={struct.unpack('>I', server_handshake[1:5])[0]} "
@@ -1484,11 +1564,52 @@ def handle_spawn_at_point(server: "WulframServer", ctx: "ClientContext", spawn_p
     server._spawn_wf_style(ctx, team_id=team_id, pos=pos, unit_type=unit_type)
 
 
+def maybe_send_physics_session(server: "WulframServer", ctx: "ClientContext", packet: bytes) -> bool:
+    """community/native WULFRAM_NATIVE_PHYSICS_SESSION: answer a portable_physics want.
+
+    The native ``--no-mods`` client advertises c2s 0x54 GENERIC
+    ``"portable_physics_v2", "", 1`` then ``"_v1"`` on TCP after TRANSLATION and
+    waits for one s2c 0x56 physics session (its +0x2100 readiness flag; it never
+    parses a 0x54 reply).  Sent once per session on TCP: WPC2 for the v2 want,
+    WPC1 for a v1-only client.  Returns True when the packet was a
+    portable_physics want this path consumed; False (nothing sent) otherwise, so
+    the caller keeps its old handling and the OG client is unaffected.
+    """
+    if not getattr(server, "native_physics_session", False):
+        return False
+    want = native_session.portable_physics_want(packet)
+    if not want:
+        return False
+    session = ctx.session
+    if session.physics_session_sent:
+        return True
+    if not session.translation_sent:
+        print(f"[PHYSICS] Client {ctx.client_id}: {want} want before TRANSLATION; not answered")
+        return True
+    from . import physics_session
+
+    tick_ms = int(getattr(server, "native_physics_session_tick_ms", 0) or 0)
+    if tick_ms <= 0:
+        tick_ms = physics_session.tick_ms_for_rate(getattr(server, "tick_rate_hz", 30.0))
+    magic = "WPC2" if want == native_session.PORTABLE_PHYSICS_V2 else "WPC1"
+    body = physics_session.encode_physics_session(
+        physics_session.CLIENT_DEFAULT_FIELDS,
+        magic=magic,
+        tick_ms=tick_ms,
+        config_name=getattr(server, "native_physics_session_name", physics_session.DEFAULT_CONFIG_NAME),
+    )
+    ctx.tcp_handler.send(body)
+    session.physics_session_sent = True
+    print(f"[PHYSICS] Client {ctx.client_id}: 0x56 physics session {magic} tick_ms={tick_ms} "
+          f"len={len(body)} sent on TCP (PROVISIONAL field table)")
+    return True
+
+
 def send_udp_ack(server: "WulframServer", ctx: Optional["ClientContext"], addr: tuple, packet_id: int, seq_num: int, subcmd: int = 1):
     """Send an OG-shaped UDP D_ACK (0x02)."""
     if not server.udp_handler:
         return
-    if subcmd == 1 and use_framed_stream_ack(ctx):
+    if subcmd == 1 and use_framed_stream_ack(ctx, server):
         # Upstream-server shape, observed acking every native-client "Player
         # requests" packet on 2026-10-16: 02 <u16 server seq> 0009 01 <op> <u16 seq>.
         session = ctx.session

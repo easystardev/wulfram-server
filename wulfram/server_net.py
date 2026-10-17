@@ -15,7 +15,7 @@ import time
 import traceback
 from typing import Any, Optional
 
-from . import build_uplink, handlers, tutorial_runtime
+from . import build_uplink, handlers, native_session, tutorial_runtime
 from .client import ClientContext
 from .codec import BitReader
 from .session import FEATURES, Phase
@@ -473,7 +473,9 @@ class NetMixin:
                     ctx = self._recover_udp_client(addr, allow_handshake=True)
 
                 if ctx:
-                    self._bind_udp_client(ctx, addr, reason="udp_hello_ack")
+                    first = not ctx.session.udp_verified
+                    if self._bind_udp_client(ctx, addr, reason="udp_hello_ack") and first:
+                        ctx.session.udp_identify_kind = native_session.IDENTIFY_KIND_HELLO_THERE
 
         elif pkt_type == 0x13:
             # Session key â€” use to deterministically bind UDP addr â†’ client
@@ -484,8 +486,11 @@ class NetMixin:
                 if matched:
                     if ctx is not None and matched is not ctx:
                         return  # A key cannot override the receiving TCP-owned port.
+                    first = not matched.session.udp_verified
                     if self._bind_udp_client(matched, addr, reason=f"session_key '{key}'"):
                         ctx = matched
+                        if first:
+                            ctx.session.udp_identify_kind = native_session.IDENTIFY_KIND_HELLO_KEY
                 elif (
                     ctx is not None
                     and getattr(ctx, 'udp_socket', None) is not None
@@ -499,7 +504,8 @@ class NetMixin:
                     # ANOTHER session was already refused above.
                     print(f"[UDP] Session key from {addr}: len={len(key)} unknown; "
                           f"binding by advertised destination (client {ctx.client_id})")
-                    self._bind_udp_client(ctx, addr, reason="udp_identify_channel_owner")
+                    if self._bind_udp_client(ctx, addr, reason="udp_identify_channel_owner"):
+                        ctx.session.udp_identify_kind = native_session.IDENTIFY_KIND_HELLO_KEY
                 else:
                     print(f"[UDP] Session key from {addr}: '{key}' (NO MATCH)")
 
@@ -1010,12 +1016,24 @@ class NetMixin:
                 self.session_key_to_client[ctx.session.session_key] = ctx
                 print(f"[HANDSHAKE] Client {ctx.client_id}: no UDP identify after "
                       f"{key_fallback_s:.1f}s -> session key fallback (HELLO2 unsolicited)")
+                ctx.session.hello_key_pushed = True
                 ctx.tcp_handler.send(build_hello_session_key(ctx.session.session_key))
             time.sleep(0.1)
 
         if ctx.session.udp_verified:
             print(f"[HANDSHAKE] Client {ctx.client_id} UDP verified")
             ctx.tcp_handler.send(build_identified_udp())
+            # community/native WULFRAM_NATIVE_IDENTIFIED_UDP: the native client's
+            # +0x20fa flag is set only by a 0x4D that arrives on UDP.
+            if (
+                getattr(self, "native_identified_udp", False)
+                and native_session.is_native_identify_session(ctx)
+                and self.udp_handler
+                and ctx.session.udp_addr
+            ):
+                self.udp_handler.send_to(build_identified_udp(), ctx.session.udp_addr)
+                print(f"[HANDSHAKE] Client {ctx.client_id}: IDENTIFIED_UDP also sent on UDP "
+                      f"to {ctx.session.udp_addr}")
         else:
             print(f"[HANDSHAKE] Client {ctx.client_id} UDP verification timeout")
             raise ConnectionAbortedError("UDP ownership was not established; refusing login")
@@ -1157,8 +1175,9 @@ class NetMixin:
             elif pkt_type == PacketType.LOGIN_REQUEST:
                 self._handle_login_request(ctx, packet)
             elif pkt_type == 0x54:
-                # Voice data request - ignore
-                pass
+                # Voice data request - ignore.  community/native: a
+                # portable_physics want may be answered with 0x56 (knob-gated).
+                handlers.maybe_send_physics_session(self, ctx, packet)
             else:
                 print(f"[LOGIN] Ignoring packet 0x{pkt_type:02X}")
 
