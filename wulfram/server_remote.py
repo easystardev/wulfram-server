@@ -5,12 +5,13 @@ Method-only mixin; shares state via `self`.
 from __future__ import annotations
 from .observer_lifecycle import serialized
 
+import os
 import time
 from typing import Optional
 
 from . import handlers
 from .client import ClientContext
-from .packets import build_update_array_multi
+from .packets import build_update_array_multi, build_update_array_split
 
 
 class RemoteSyncMixin:
@@ -45,6 +46,8 @@ class RemoteSyncMixin:
             print(f"[REMOTE-DBG] client={ctx.client_id} tick={tick} mode={mode} "
                   f"others={other_ids} known={ctx.known_entity_ids}")
         combined_entities = []
+        # WULFRAM_UA_SPLIT_BYTES (default 0): upstream's per-tick byte-budget split.
+        split_bytes = int(getattr(self, "ua_split_bytes", 0) or 0)
         for other in others:
             if other is ctx:
                 continue
@@ -85,7 +88,7 @@ class RemoteSyncMixin:
                     ammo_active_bits=9 if is_tank else 0,
                     ammo_active_mask=1 if is_tank and self._tank_primary_replication_active(other) else 0,
                 )
-            if self.combine_update_arrays:
+            if self.combine_update_arrays or split_bytes > 0:
                 combined_entities.append(entity)
                 continue
             payload = build_update_array_multi(tick, include_local_state=include_local_state,
@@ -97,9 +100,14 @@ class RemoteSyncMixin:
 
         if combined_entities:
             include_local_state, local_state_kwargs = self._get_update_array_local_state_for_viewer(ctx)
-            payload = build_update_array_multi(tick, include_local_state=include_local_state,
-                                               entities=combined_entities, **local_state_kwargs)
-            self._send_packet_to_client(ctx, payload, prefer_tcp=prefer_tcp)
+            if split_bytes > 0:
+                payloads = build_update_array_split(tick, split_bytes, include_local_state=include_local_state,
+                                                    entities=combined_entities, **local_state_kwargs)
+            else:
+                payloads = [build_update_array_multi(tick, include_local_state=include_local_state,
+                                                     entities=combined_entities, **local_state_kwargs)]
+            for payload in payloads:
+                self._send_packet_to_client(ctx, payload, prefer_tcp=prefer_tcp)
 
     def _broadcast_browser_player_update(self, subject: ClientContext) -> None:
         """Publish one authoritative subject step to every browser world view."""
@@ -140,7 +148,20 @@ class RemoteSyncMixin:
         if reason in ("heartbeat", "action_update", "action_dump"):
             return False
         spawn_time = getattr(ctx.session, "last_spawn_time", 0.0) or 0.0
-        if spawn_time > 0.0 and (time.monotonic() - spawn_time) < self.remote_full_local_state_delay:
+        delay = self.remote_full_local_state_delay
+        if reason == "post_spawn" and handlers.is_native_stream_client(ctx):
+            # The OG client is promoted by its first STATE_REQUEST.  The upstream
+            # native client (window-0 D_HANDSHAKE) never sends STATE_REQUEST, so
+            # without this it would stay on the spawn-safe path (no periodic
+            # heartbeat) for the whole session.  0 or negative disables.
+            try:
+                native_delay = float(os.environ.get("WULFRAM_NATIVE_FULL_LOCAL_STATE_DELAY_S", "1.0"))
+            except ValueError:
+                native_delay = 1.0
+            if native_delay <= 0.0:
+                return False
+            delay = native_delay
+        if spawn_time > 0.0 and (time.monotonic() - spawn_time) < delay:
             return False
         ctx.remote_full_local_state_ready = True
         ctx._spawn_safe_heartbeat_suppressed_logged = False

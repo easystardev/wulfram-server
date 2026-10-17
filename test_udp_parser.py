@@ -179,7 +179,9 @@ def test_packet_names_cover_previous_unknowns() -> bool:
         0x04: "D_SET_START",
         0x0C: "STATE_REQUEST",
         0x10: "UPDATE_ARRAY_STREAM",
-        0x23: "REQUEST_START",
+        0x23: "MOTD",
+        0x44: "SQUAD_DEFINITION",
+        0x45: "SQUAD_MEMBER",
         0x40: "INPUT_FEEDBACK",
         0x60: "DEBUG_SYNC",
     }

@@ -1844,7 +1844,19 @@ class CombatMixin:
         if ctx is None or len(data) < 2:
             return
 
-        # Parse the packet
+        framed = handlers.parse_framed_weapon_demand(data)
+        if framed is not None:
+            # OG / native stream form: a refuel-pad ammo buy (amount > 0) or sell
+            # (amount < 0) for an inventory slot (sender 0x00426470), NOT a weapon
+            # selection. The old fixed-offset parse read the stream header as
+            # mode/slot, always hit "invalid slot", and so did nothing; it stays a
+            # gameplay no-op (no inventory/Mu model here) but is now recorded.
+            ctx.last_weapon_demand = (framed["mode"], framed["slot"], framed["amount"])
+            print(f"[WEAPON] WEAPON_DEMAND seq={framed['seq']} mode={framed['mode']} "
+                  f"slot={framed['slot']} amount={framed['amount']}")
+            return
+
+        # Python test-client unframed form: [opcode:1] [mode:1] [slot:4] [param:4]
         mode = data[1] if len(data) > 1 else 0
         slot = struct.unpack(">I", data[2:6])[0] if len(data) >= 6 else 0
         param = struct.unpack(">i", data[6:10])[0] if len(data) >= 10 else 0

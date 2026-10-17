@@ -46,6 +46,7 @@ from .server_spawn import SpawnMixin
 from .server_combat import CombatMixin
 from . import combat_profile
 from .server_remote import RemoteSyncMixin
+from .server_community import CommunityWireMixin
 from .server_corrections import CorrectionMixin
 from .server_tick import TickMixin
 from .server_net import NetMixin
@@ -110,7 +111,7 @@ from .packets import (
 from . import handlers, build_uplink, building_lifecycle, match_flow, tutorial_runtime, config as server_config
 from .pktlog import PacketLog
 
-class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, CombatMixin, RemoteSyncMixin, CorrectionMixin, TickMixin, NetMixin):
+class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, CombatMixin, RemoteSyncMixin, CommunityWireMixin, CorrectionMixin, TickMixin, NetMixin):
     """
     Wulfram2 game server emulator with multi-client support.
 
@@ -2950,6 +2951,9 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
         Service radius ~40 units from building center. Only active if building
         is alive and on the same team as the player.
         """
+        # Nearest serving friendly FUEL/REPAIR pad (or None); read only by the
+        # opt-in DOCKING stream / dock pin (server_community).
+        ctx.supply_pad_oid = None
         if not self._building_entities:
             return
 
@@ -2996,6 +3000,10 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
             elif b.entity_type == EntityType.ENERGY_BUILDING:
                 if near_energy is None or dist_sq < near_energy[0]:
                     near_energy = (dist_sq, oid)
+
+        pads = [p for p in (near_fuel, near_repair) if p]
+        if pads:
+            ctx.supply_pad_oid = min(pads)[1]
 
         if near_repair and ctx.player_health < 1.0:
             old_health = ctx.player_health
@@ -3253,6 +3261,8 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
             _default("ship_status_interval_s", max(0.0, float(os.environ.get("WULFRAM_SHIP_STATUS_INTERVAL_S", "0"))))
         except ValueError:
             _default("ship_status_interval_s", 0.0)
+        if not hasattr(self, "local_vu_entity"):
+            server_config.init_upstream_1016_profile(self)
 
         # 2026-09-02 stock-protocol STATE_REQUEST replay reply (see
         # server_config._init_correction_config / server_corrections).
@@ -4097,11 +4107,10 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
                         )
 
                     # Community profile: SHIP_STATUS + SUPPLY_SHIP_INFO for every supply ship
-                    # at a steady interval (wulfram3.com: 1 Hz per ship, UDP).
-                    _ship_iv = float(getattr(self, "ship_status_interval_s", 0.0) or 0.0)
-                    if _ship_iv > 0 and (now - float(getattr(ctx, "last_ship_status_send", 0.0) or 0.0)) >= _ship_iv:
-                        ctx.last_ship_status_send = now
-                        self._send_periodic_ship_status(ctx)
+                    # at a steady interval (wulfram3.com: 1 Hz per ship), plus the opt-in
+                    # upstream-1016 emitters (ship repeat, dock pin, DOCKING stream).
+                    # All no-ops at their defaults (server_community.CommunityWireMixin).
+                    self._community_wire_step(ctx, now, tick)
 
                     if self.send_player_updates and send_full_update and send_update:
                         # Send UPDATE_ARRAY with position/velocity
@@ -4438,31 +4447,36 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
                             # VIEW_UPDATE (local_state only), like wulfram3.com sends.
                             use_view = self.heartbeat_view_update or self._community_cadence_active()
                             pkt_label = "VIEW_UPDATE_BEAT" if use_view else "UPDATE_ARRAY_BEAT"
-                            hb_rot = None
-                            if self.heartbeat_include_rot:
-                                hb_rot = self._local_player_sync_rotation(ctx)
-                            hb_pos = None
-                            if self.heartbeat_include_pos:
-                                hb_pos = self._to_client_pos(ctx.player_pos)
-                            # Send a mask=0 (health-only) heartbeat on the NULL/dummy entity so it
-                            # does NOT wake the local tank (see heartbeat_dummy_entity note). Only
-                            # when there is no pos/rot bit -- a transform-bearing heartbeat must use
-                            # the real entity.
-                            hb_entity_id = ctx.session.entity_id
-                            if (getattr(self, "heartbeat_dummy_entity", False)
-                                    and hb_rot is None and hb_pos is None):
-                                hb_entity_id = 0xFFFFFFFE
-                            payload = self._build_local_state_heartbeat(
-                                ctx,
-                                tick=tick,
-                                entity_id=hb_entity_id,
-                                include_health=include_local_state,
-                                health=health_val,
-                                fuel=fuel_val,
-                                is_view_update=use_view,
-                                rot=hb_rot,
-                                pos=hb_pos,
-                            )
+                            if getattr(self, "local_vu_entity", False):
+                                # WULFRAM_LOCAL_VU_ENTITY: upstream's one-record dirty-bits VU.
+                                pkt_label = "VIEW_UPDATE_LOCAL_VITALS"
+                                payload = self._build_community_local_vu(ctx, tick, now)
+                            else:
+                                hb_rot = None
+                                if self.heartbeat_include_rot:
+                                    hb_rot = self._local_player_sync_rotation(ctx)
+                                hb_pos = None
+                                if self.heartbeat_include_pos:
+                                    hb_pos = self._to_client_pos(ctx.player_pos)
+                                # Send a mask=0 (health-only) heartbeat on the NULL/dummy entity so it
+                                # does NOT wake the local tank (see heartbeat_dummy_entity note). Only
+                                # when there is no pos/rot bit -- a transform-bearing heartbeat must use
+                                # the real entity.
+                                hb_entity_id = ctx.session.entity_id
+                                if (getattr(self, "heartbeat_dummy_entity", False)
+                                        and hb_rot is None and hb_pos is None):
+                                    hb_entity_id = 0xFFFFFFFE
+                                payload = self._build_local_state_heartbeat(
+                                    ctx,
+                                    tick=tick,
+                                    entity_id=hb_entity_id,
+                                    include_health=include_local_state,
+                                    health=health_val,
+                                    fuel=fuel_val,
+                                    is_view_update=use_view,
+                                    rot=hb_rot,
+                                    pos=hb_pos,
+                                )
 
                         if include_local_state:
                             self._log_vitals(

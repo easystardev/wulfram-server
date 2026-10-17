@@ -89,8 +89,12 @@ def test_binding_does_not_steal_or_accept_stale_context():
     assert not value._bind_udp_client(a,('127.0.0.1',50002),reason='stale')
 
 
-def test_unverified_handshake_cannot_advance_to_login(monkeypatch):
+@pytest.mark.parametrize('fallback', ['0', '1.0'])
+def test_unverified_handshake_cannot_advance_to_login(monkeypatch, fallback):
     import wulfram.server_net as network
+    # The native-client HELLO2 key fallback may push a key, but an unidentified
+    # session must still never reach LOGIN.
+    monkeypatch.setenv('WULFRAM_HELLO_KEY_FALLBACK_S', fallback)
     value=server(); c=context(1); value.clients={1:c}; sent=[]
     c.tcp_handler=SimpleNamespace(send=sent.append)
     value.public_addr='127.0.0.1'; value.port=2627
@@ -104,4 +108,8 @@ def test_unverified_handshake_cannot_advance_to_login(monkeypatch):
     with pytest.raises(ConnectionAbortedError,match='ownership'):
         value._do_handshake(c)
     assert c.session.phase is Phase.HANDSHAKE
-    assert len(sent)==1 and sent[0][:2]==b'\x13\x01'
+    assert sent[0][:2]==b'\x13\x01'
+    if fallback == '0':
+        assert len(sent)==1
+    else:
+        assert [p[:2] for p in sent[1:]]==[b'\x13\x02']

@@ -17,6 +17,80 @@ from wulfram2_protocol.hud_state import (
 from .session import FEATURES
 
 
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).strip().lower() in ("1", "true", "on", "yes")
+
+
+def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
+    try:
+        return max(minimum, float(os.environ.get(name, str(default))))
+    except ValueError:
+        return float(default)
+
+
+def init_upstream_1016_profile(server) -> None:
+    """Upstream wulfram3.com 2026-10-16 wire-profile knobs. ALL DEFAULT OFF.
+
+    Part of the community profile (``_init_community_profile_config``). Measured in
+    D:\\work\\upstream-1016\\sync\\RESULT.md (09-18 OG capture and 10-16 native capture);
+    the wiring lives in ``server_community.CommunityWireMixin``. With every knob at
+    its default the wire is byte-identical to before.
+
+    WULFRAM_LOCAL_VU_ENTITY=1 -- the periodic local heartbeat becomes upstream's
+        VIEW_UPDATE: ONE local-tank record carrying only the changed mask bits 5-8
+        (5 health, 6 ammo block, 7 energy, 8 target) plus local_state. Never motion
+        bits 1-4, never bit 9. Sent every WULFRAM_LOCAL_STATE_ACTIVE_INTERVAL_S
+        (0.05) while health or energy is below full and something changed; at most
+        WULFRAM_LOCAL_STATE_IDLE_INTERVAL_S apart regardless (that floor record
+        carries bits 5+7). Upstream's idle gap: p50 0.342 s on 09-18 (OG client).
+        OG evidence: the OG wulfram2.exe received ~10,500 such records from upstream
+        on 09-18 (masks 128/160/480/192/32/64/224).
+    WULFRAM_UA_SPLIT_BYTES=N (0 = off; upstream 1200) -- combine all remote entity
+        records of a tick and split them greedily into UPDATE_ARRAY datagrams of at
+        most N bytes, each with the same tick and its own local_state. Pair with
+        WULFRAM_REMOTE_UPDATE_INTERVAL=0.05 (20 ticks/s). OG evidence: upstream sent
+        the OG exactly this layout on 09-18 (25% of ticks in 2 datagrams).
+    WULFRAM_DOCKING_STREAM=1 -- DOCKING 0x38 [u32 server ms][u32 pad id][u8 1] every
+        WULFRAM_DOCKING_INTERVAL_S (0.05) while the tank is grounded within service
+        range of a friendly FUEL/REPAIR pad, then one [..][0] on leaving. OG
+        evidence: the OG received DOCKING with fuel-pad (134403) and repair-pad
+        targets from upstream on 09-18 (1.6/s).
+        (The former cargo-config comment "DOCKING 0x38 has no OG client handler" was
+        wrong: azurefishy Network.c:1548 registers PacketHandler_DOCKING.)
+    WULFRAM_SHIP_STATUS_REPEAT_MS=N (0 = off; upstream 34-50) -- after each
+        WULFRAM_SHIP_STATUS_INTERVAL_S all-ships SHIP_STATUS+SUPPLY_SHIP_INFO batch,
+        send the same batch once more N ms later (upstream does; reason unknown).
+        WULFRAM_SHIP_STATUS_TRANSPORT=udp|tcp (default udp, today's behaviour;
+        upstream uses tcp). OG evidence: OG received both from upstream on 09-18.
+    WULFRAM_DOCK_PIN=1 + WULFRAM_DOCK_PIN_CLIENTS=<ip>[,<ip>...] (empty = nobody) --
+        upstream's at-rest pin: latch the local pose, send it every
+        WULFRAM_DOCK_PIN_INTERVAL_S (0.05) as a local VIEW_UPDATE with bits 1-4+9
+        (vel 0, spin 0) plus dirty bits 5-8, DOCKING [ms][0 or pad][1] alongside,
+        then one release record (bits 2+4, vel/spin 0) and DOCKING [..][0]. Policy is
+        ``wulfram.dock_pin.should_pin`` (called once per tick per in-game client
+        while WULFRAM_DOCK_PIN=1, never when 0). NOT OG-safe by default: our latched
+        pose is the server's, a real correction on the documented bit 1+3+9 path.
+    """
+    server.local_vu_entity = _env_flag("WULFRAM_LOCAL_VU_ENTITY")
+    try:
+        server.ua_split_bytes = max(0, int(os.environ.get("WULFRAM_UA_SPLIT_BYTES", "0")))
+    except ValueError:
+        server.ua_split_bytes = 0
+    if 0 < server.ua_split_bytes < 64:
+        server.ua_split_bytes = 64
+    server.docking_stream = _env_flag("WULFRAM_DOCKING_STREAM")
+    server.docking_interval_s = _env_float("WULFRAM_DOCKING_INTERVAL_S", 0.05, 0.01)
+    server.ship_status_repeat_s = _env_float("WULFRAM_SHIP_STATUS_REPEAT_MS", 0.0) / 1000.0
+    transport = os.environ.get("WULFRAM_SHIP_STATUS_TRANSPORT", "udp").strip().lower()
+    server.ship_status_transport = "tcp" if transport == "tcp" else "udp"
+    server.dock_pin_enabled = _env_flag("WULFRAM_DOCK_PIN")
+    server.dock_pin_clients = frozenset(
+        part.strip() for part in os.environ.get("WULFRAM_DOCK_PIN_CLIENTS", "").split(",") if part.strip()
+    )
+    server.dock_pin_interval_s = _env_float("WULFRAM_DOCK_PIN_INTERVAL_S", 0.05, 0.01)
+    server.dock_grounded_vz = _env_float("WULFRAM_DOCK_GROUNDED_VZ", 1.0, 0.0)
+
+
 class ConfigMixin:
     """Config / env-parsing init methods for WulframServer (method-only mixin)."""
 
@@ -221,6 +295,7 @@ class ConfigMixin:
             self.ship_status_interval_s = max(0.0, float(os.environ.get("WULFRAM_SHIP_STATUS_INTERVAL_S", "0")))
         except ValueError:
             self.ship_status_interval_s = 0.0
+        init_upstream_1016_profile(self)
 
     def _init_correction_config(self):
         # ── OG-faithful GATED-RARE correction gate (GOAL 2, 2026-06-02) ──────
@@ -881,7 +956,8 @@ class ConfigMixin:
         except ValueError:
             self.match_clock_interval_s = 5.0
         # Supply-ship cargo as a finite, replenishing resource (the OG cargo_times
-        # mechanism; DOCKING 0x38 has no OG client handler). The ship holds up to
+        # mechanism; DOCKING 0x38 is unrelated to it -- it IS an OG client handler,
+        # azurefishy Network.c:1548, see init_upstream_1016_profile). The ship holds up to
         # ship_cargo_capacity boxes; each pickup depletes one; one box restocks every
         # ship_replenish_s seconds. So cargo isn't infinite.
         try:

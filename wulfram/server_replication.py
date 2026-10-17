@@ -333,6 +333,10 @@ class ReplicationMixin:
                    below full -- the wulfram3.com VIEW_UPDATE local_state cadence
                    (docs/sync-comparison-2026-09-03.md section 3b).
         """
+        if getattr(self, "local_vu_entity", False):
+            # WULFRAM_LOCAL_VU_ENTITY: evaluated every active interval; the builder
+            # sends only dirty fields and applies the idle floor itself.
+            return float(getattr(self, "local_state_active_interval_s", 0.05))
         if not self._community_cadence_active():
             return float(self.update_heartbeat_interval)
         if self._vitals_full(ctx):
@@ -340,10 +344,14 @@ class ReplicationMixin:
         return float(getattr(self, "local_state_active_interval_s", 0.05))
 
     def _send_periodic_ship_status(self, ctx: ClientContext) -> int:
-        """Rebroadcast SHIP_STATUS + SUPPLY_SHIP_INFO for every known supply ship (UDP)."""
+        """Rebroadcast SHIP_STATUS + SUPPLY_SHIP_INFO for every known supply ship.
+
+        UDP by default; WULFRAM_SHIP_STATUS_TRANSPORT=tcp matches upstream.
+        """
         ships = getattr(self, "_uplink_ships", None) or {}
         if not ships or not ctx.session or not ctx.session.in_game:
             return 0
+        prefer_tcp = getattr(self, "ship_status_transport", "udp") == "tcp"
         sent = 0
         for team_id, ship in list(ships.items()):
             try:
@@ -352,7 +360,7 @@ class ReplicationMixin:
             except Exception:
                 continue
             for payload in (status, info):
-                if self._send_packet_to_client(ctx, payload, prefer_tcp=False):
+                if self._send_packet_to_client(ctx, payload, prefer_tcp=prefer_tcp):
                     sent += 1
         return sent
 

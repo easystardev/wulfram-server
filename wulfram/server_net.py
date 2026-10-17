@@ -30,6 +30,7 @@ from .packets import (
     build_login_status,
     build_ping_reply,
     build_player_info,
+    get_ticks,
 )
 from wulfram2_protocol.entities import ACTION_ANALOG_SLOTS, ACTION_DUMP_CONTROL_SLOTS
 
@@ -282,8 +283,18 @@ class NetMixin:
                 yield data[cursor:cursor+pkt_len]
                 cursor += pkt_len
 
-            elif pkt_type == 0x2E:  # WEAPON_DEMAND - ~10 bytes
-                pkt_len = min(10, len(data) - cursor)
+            elif pkt_type == 0x2E:  # WEAPON_DEMAND
+                # OG (09-18 capture) and the native client both send it on their
+                # reliable stream: 2e <seq u16> <len u16 = 0x000e> <u8 mode>
+                # <u32 slot> <i32 amount> = 14 bytes. The Python test clients
+                # send the unframed 10-byte 2e <u8 mode> <u32 slot> <i32 param>.
+                if (
+                    len(data) - cursor >= 14
+                    and struct.unpack_from(">H", data, cursor + 3)[0] == 14
+                ):
+                    pkt_len = 14
+                else:
+                    pkt_len = min(10, len(data) - cursor)
                 yield data[cursor:cursor+pkt_len]
                 cursor += pkt_len
 
@@ -315,6 +326,19 @@ class NetMixin:
                         end += 1
                     yield data[cursor:end]
                     cursor = end
+
+            elif (
+                pkt_type in handlers.client_declared_stream_opcodes(ctx)
+                and handlers.ack_declared_stream_packets_enabled(ctx)
+                and cursor + 5 <= len(data)
+                and 5 <= struct.unpack_from(">H", data, cursor + 3)[0] <= len(data) - cursor
+            ):
+                # A packet the client's own D_HANDSHAKE placed on a stream (e.g. the
+                # native client's "Player requests" 0x42/0x47/0x49): stream framing
+                # opcode + seq(u16) + len(u16), so later packets stay parseable.
+                pkt_len = struct.unpack_from(">H", data, cursor + 3)[0]
+                yield data[cursor:cursor + pkt_len]
+                cursor += pkt_len
 
             else:
                 # Unknown packet - consume rest of datagram
@@ -462,6 +486,20 @@ class NetMixin:
                         return  # A key cannot override the receiving TCP-owned port.
                     if self._bind_udp_client(matched, addr, reason=f"session_key '{key}'"):
                         ctx = matched
+                elif (
+                    ctx is not None
+                    and getattr(ctx, 'udp_socket', None) is not None
+                    and not ctx.session.udp_verified
+                    and os.environ.get("WULFRAM_UDP_IDENTIFY_CHANNEL_OWNER", "1") != "0"
+                ):
+                    # Upstream native client identifies with 0x13 01 <key> instead of
+                    # the OG constant "Hello There" (0x08).  It arrived on the
+                    # per-session destination advertised in this owner's HELLO1, which
+                    # is exactly the correlation the 0x08 path trusts; a key that names
+                    # ANOTHER session was already refused above.
+                    print(f"[UDP] Session key from {addr}: len={len(key)} unknown; "
+                          f"binding by advertised destination (client {ctx.client_id})")
+                    self._bind_udp_client(ctx, addr, reason="udp_identify_channel_owner")
                 else:
                     print(f"[UDP] Session key from {addr}: '{key}' (NO MATCH)")
 
@@ -596,9 +634,24 @@ class NetMixin:
             self._handle_input_feedback(ctx, data, addr)
 
         elif pkt_type == 0x2E:
-            # WEAPON_DEMAND - fire button pressed
+            # WEAPON_DEMAND (refuel-pad buy/sell or Python-client weapon select)
             print(f"[UDP] WEAPON_DEMAND from {addr} (len={len(data)}) data={data.hex()}")
-            self._handle_weapon_demand(ctx, data, addr)
+            framed = handlers.parse_framed_weapon_demand(data)
+            if framed is not None:
+                seq_num = framed["seq"]
+                if ctx is not None and handlers.client_declared_reliable(ctx, 0x2E):
+                    # Declared mode 3 by the client's own D_HANDSHAKE (OG private
+                    # mode table and the native "Player requests" stream both do);
+                    # upstream wulfram3.com ACKs it, we used to leave it unACKed.
+                    self._send_udp_ack(ctx, addr, 0x2E, seq_num)
+                if ctx is not None and getattr(ctx, "_last_weapon_demand_seq", None) == seq_num:
+                    pass  # stream retransmit of a demand already applied
+                else:
+                    if ctx is not None:
+                        ctx._last_weapon_demand_seq = seq_num
+                    self._handle_weapon_demand(ctx, data, addr)
+            else:
+                self._handle_weapon_demand(ctx, data, addr)
 
         elif pkt_type == 0x0B:
             # Client ping request: reply on 0x0C with the same request payload.
@@ -629,6 +682,16 @@ class NetMixin:
 
         else:
             print(f"[UDP] Packet 0x{pkt_type:02X} from {addr} (len={len(data)})")
+            if (
+                ctx is not None
+                and len(data) >= 5
+                and pkt_type in handlers.client_declared_stream_opcodes(ctx)
+                and handlers.ack_declared_stream_packets_enabled(ctx)
+            ):
+                # Unhandled, but the client declared it reliable on its stream:
+                # ACK the stream sequence so it is not retried forever.
+                seq_num = struct.unpack(">H", data[1:3])[0]
+                self._send_udp_ack(ctx, addr, pkt_type, seq_num)
 
         # Track last UDP activity for mapped clients regardless of packet type.
         if ctx:
@@ -926,8 +989,28 @@ class NetMixin:
         ctx.session.udp_config_sent_time = time.monotonic()
 
         # Wait for UDP verification
-        timeout = time.monotonic() + 5.0
+        start = time.monotonic()
+        timeout = start + 5.0
+        # The OG client identifies UDP at once with its constant 0x08 "Hello There"
+        # and only later REQUESTS the session key (c2s 0x13/02).  The upstream native
+        # client never requests it: upstream pushes HELLO1 + HELLO2 unsolicited and
+        # the client identifies with 0x13 01 <key>.  If an OG-mode session has not
+        # identified after WULFRAM_HELLO_KEY_FALLBACK_S, push the key once (the OG
+        # path has bound long before this fires; 0 disables).
+        try:
+            key_fallback_s = float(os.environ.get("WULFRAM_HELLO_KEY_FALLBACK_S", "1.0"))
+        except ValueError:
+            key_fallback_s = 1.0
+        key_fallback_sent = not use_og_handshake or key_fallback_s <= 0.0
         while not ctx.session.udp_verified and time.monotonic() < timeout:
+            if not key_fallback_sent and time.monotonic() - start >= key_fallback_s:
+                key_fallback_sent = True
+                if not ctx.session.session_key:
+                    ctx.session.session_key = secrets.token_hex(32)
+                self.session_key_to_client[ctx.session.session_key] = ctx
+                print(f"[HANDSHAKE] Client {ctx.client_id}: no UDP identify after "
+                      f"{key_fallback_s:.1f}s -> session key fallback (HELLO2 unsolicited)")
+                ctx.tcp_handler.send(build_hello_session_key(ctx.session.session_key))
             time.sleep(0.1)
 
         if ctx.session.udp_verified:
@@ -959,8 +1042,17 @@ class NetMixin:
         # UNPROMPTED (Login_begin_authentication @0x00461b30 sends LOGIN 0x21 straight out once
         # both credential globals are populated). So: listen first, and only prompt if nothing
         # arrives -- which serves both clients without the server having to guess.
+        pending_login_packets: list[bytes] = []
         if not FEATURES.auto_login:
-            ctx.tcp_handler.send(build_login_status(5))  # Code 5 = request handle
+            # Upstream native client (2026-10-16) sends its credentialed 0x21/03
+            # UNPROMPTED right after HELLO 0 (no 0x21/01 -> "password required" round
+            # trip).  Listen briefly before prompting: if such a LOGIN_REQUEST is
+            # already here, never send the status-5 handle prompt it did not ask for.
+            # The listen ends at the first OG fingerprint (HELLO 0x13/02 request) or
+            # any LOGIN_REQUEST, so the OG path sees the same server output order.
+            unprompted = self._collect_unprompted_login(ctx, pending_login_packets)
+            if not unprompted:
+                ctx.tcp_handler.send(build_login_status(5))  # Code 5 = request handle
 
         if FEATURES.auto_login:
             # Wait briefly for client's LOGIN_REQUEST which carries the username,
@@ -1042,7 +1134,10 @@ class NetMixin:
 
         # Wait for packets
         while ctx.session.phase == Phase.LOGIN:
-            packet = ctx.tcp_handler.recv()
+            if pending_login_packets:
+                packet = pending_login_packets.pop(0)
+            else:
+                packet = ctx.tcp_handler.recv()
             if packet is None:
                 raise ConnectionError("Client disconnected during login")
 
@@ -1050,7 +1145,12 @@ class NetMixin:
                 continue
 
             pkt_type = packet[0]
-            print_packet("RECV", pkt_type, packet)
+            if pkt_type == PacketType.LOGIN_REQUEST:
+                # Never log the credential/password bytes.
+                print(f"[RECV] LOGIN_REQUEST (0x21) | Len={len(packet)} | "
+                      f"sub=0x{packet[1] if len(packet) > 1 else 0:02X} (body redacted)")
+            else:
+                print_packet("RECV", pkt_type, packet)
 
             if pkt_type == PacketType.HELLO:
                 self._handle_hello(ctx, packet)
@@ -1061,6 +1161,52 @@ class NetMixin:
                 pass
             else:
                 print(f"[LOGIN] Ignoring packet 0x{pkt_type:02X}")
+
+    def _collect_unprompted_login(self, ctx: ClientContext, pending: list) -> bool:
+        """Buffer early TCP packets; True if a credentialed LOGIN_REQUEST arrived unprompted.
+
+        Window: WULFRAM_LOGIN_UNPROMPTED_WAIT_S (default 0.35 s, 0 disables).  Stops
+        early on any LOGIN_REQUEST or on HELLO 0x13/02 (the OG key request - the
+        native client never sends it).  Buffered packets are replayed, in order, by
+        the caller's normal login loop, so nothing is reordered or dropped.
+        """
+        try:
+            wait_s = float(os.environ.get("WULFRAM_LOGIN_UNPROMPTED_WAIT_S", "0.35"))
+        except ValueError:
+            wait_s = 0.35
+        if wait_s <= 0.0:
+            return False
+        tcp = ctx.tcp_handler
+        deadline = time.monotonic() + wait_s
+        found = False
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    break
+                tcp.sock.settimeout(max(0.01, remaining))
+                packet = tcp.recv()
+                if packet is None:
+                    if tcp.closed:
+                        raise ConnectionError("Client disconnected during login")
+                    break  # timeout
+                pending.append(packet)
+                if not packet:
+                    continue
+                if packet[0] == PacketType.LOGIN_REQUEST:
+                    found = len(packet) >= 2 and packet[1] in (0x02, 0x03, 0x04)
+                    break
+                if packet[0] == PacketType.HELLO and len(packet) >= 2 and packet[1] == 0x02:
+                    break
+        finally:
+            try:
+                tcp.sock.settimeout(None)
+            except OSError:
+                pass
+        if found:
+            print(f"[LOGIN] Client {ctx.client_id}: unprompted LOGIN_REQUEST "
+                  f"sub=0x{pending[-1][1]:02X} -> skipping status-5 handle prompt")
+        return found
 
     def _handle_hello(self, ctx: ClientContext, packet: bytes):
         """Handle HELLO packets during login."""
@@ -1251,6 +1397,7 @@ class NetMixin:
         if ctx is None:
             return
 
+        data = self._normalize_action_tick(ctx, data, 1)
         client_tick = 0
         if len(data) >= 5:
             try:
@@ -1332,6 +1479,7 @@ class NetMixin:
 
         if self.debug_sync:
             print(f"[UDP] ACTION_UPDATE received: len={len(data)} data={data.hex()}")
+        data = self._normalize_action_tick(ctx, data, 2)
         client_tick = 0
         if len(data) >= 6:
             try:
@@ -1404,6 +1552,59 @@ class NetMixin:
                     f"[UDP] ACTION_UPDATE decode failed c{ctx.client_id}: "
                     f"len={len(data)} data={ctx.last_action_update_decode_fail_hex}"
                 )
+
+    # Probe window for _normalize_action_tick.
+    ACTION_TICK_PROBE_PACKETS = 12
+    ACTION_TICK_PROBE_MIN_WALL_MS = 40
+
+    def _normalize_action_tick(self, ctx: ClientContext, data: bytes, offset: int) -> bytes:
+        """Return ``data`` with its ACTION header tick in the client-millisecond domain.
+
+        OG wulfram2.exe writes its millisecond clock into the ACTION_UPDATE /
+        ACTION_DUMP header (~1000 ticks per wall second).  The upstream native client
+        (2026-10-16) writes a per-packet sequence number there instead (+1 per packet,
+        ~155/s), shared by ACTION_UPDATE and ACTION_DUMP.  Everything downstream
+        (tick offset, fire-pose history, client_frame_dt, turn/move integral
+        reconciliation) reads that field as milliseconds, so a sequence-domain
+        client gets its tick replaced by the server arrival millisecond (strictly
+        increasing).  Clock-domain clients (OG) are returned unchanged.  The domain is
+        classified once per connection from the first packets' tick-vs-wall rate.
+        WULFRAM_ACTION_TICK_NORMALIZE=0 disables.
+        """
+        if len(data) < offset + 4 or os.environ.get("WULFRAM_ACTION_TICK_NORMALIZE", "1") == "0":
+            return data
+        domain = getattr(ctx, "action_tick_domain", "")
+        now_ms = get_ticks()
+        if not domain:
+            raw = struct.unpack_from(">I", data, offset)[0]
+            probe = getattr(ctx, "action_tick_probe", None)
+            if probe is None:
+                probe = []
+                ctx.action_tick_probe = probe
+            probe.append((raw, now_ms))
+            if len(probe) > self.ACTION_TICK_PROBE_PACKETS:
+                del probe[0]
+            if len(probe) >= self.ACTION_TICK_PROBE_PACKETS:
+                span_wall = (probe[-1][1] - probe[0][1]) & 0xFFFFFFFF
+                span_tick = (probe[-1][0] - probe[0][0]) & 0xFFFFFFFF
+                if span_wall >= self.ACTION_TICK_PROBE_MIN_WALL_MS and span_tick < 0x80000000:
+                    ratio = span_tick / span_wall
+                    if ratio < 0.4:
+                        domain = "sequence"
+                    elif ratio > 0.6:
+                        domain = "clock"
+                    if domain:
+                        ctx.action_tick_domain = domain
+                        probe.clear()
+                        print(f"[TICK] action tick domain client={ctx.client_id}: {domain} "
+                              f"(ticks/ms={ratio:.3f} over {span_wall}ms)")
+        if domain != "sequence":
+            return data
+        synth = max(now_ms, (int(getattr(ctx, "action_tick_synth_last", 0)) + 1) & 0xFFFFFFFF) & 0xFFFFFFFF
+        if synth == 0:
+            synth = 1
+        ctx.action_tick_synth_last = synth
+        return data[:offset] + struct.pack(">I", synth) + data[offset + 4:]
 
     def _handle_input_feedback(self, ctx: Optional[ClientContext], data: bytes, addr: tuple):
         """

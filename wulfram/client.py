@@ -129,6 +129,13 @@ class ClientContext:
     last_nonzero_move_input_time: float = 0.0
     last_decoded_input: dict = field(default_factory=dict)
     movement_input_history: Any = field(default_factory=lambda: deque(maxlen=180))
+    # ACTION_UPDATE/ACTION_DUMP header "tick" domain: "" = still probing,
+    # "clock" = client millisecond clock (OG wulfram2.exe), "sequence" = a
+    # per-packet counter (upstream native client 2026-10-16). See
+    # NetMixin._normalize_action_tick.
+    action_tick_domain: str = ""
+    action_tick_probe: list = field(default_factory=list)
+    action_tick_synth_last: int = 0
     input_feedback_count: int = 0
     last_input_feedback_time: float = 0.0
     state_request_count: int = 0

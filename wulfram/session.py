@@ -48,6 +48,9 @@ class Session:
     login_password_requested: bool = False
     login_game_service_requested: bool = False
     login_complete: bool = False
+    # Shape of the accepted LOGIN_REQUEST ("credential_only" = upstream native
+    # client's handle + single credential); never the credential itself.
+    login_shape: str = ""
 
     # Player state
     player_id: int = 0
@@ -84,6 +87,8 @@ class Session:
     udp_outgoing_seq: int = 0
     udp_config_sent_time: float = 0.0
     udp_d_handshake_received: bool = False
+    # Parsed client D_HANDSHAKE (receive_window, streams, private_modes).
+    client_d_handshake: Optional[dict] = None
     translation_ack_received: bool = False
     translation_ack_time: float = 0.0
     last_udp_activity: float = 0.0  # For dead connection detection
@@ -103,6 +108,7 @@ class Session:
         self.login_password_requested = False
         self.login_game_service_requested = False
         self.login_complete = False
+        self.login_shape = ""
         self.player_id = 0
         self.entity_id = 0
         self.team_id = 0
@@ -127,6 +133,7 @@ class Session:
         self.udp_outgoing_seq = 0
         self.udp_config_sent_time = 0.0
         self.udp_d_handshake_received = False
+        self.client_d_handshake = None
         self.translation_ack_received = False
         self.translation_ack_time = 0.0
         self.last_udp_activity = 0.0

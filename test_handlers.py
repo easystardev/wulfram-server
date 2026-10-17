@@ -3424,6 +3424,12 @@ def test_send_tank_uses_local_player_sync_rotation():
     reader.read_bits(5)   # weapon
     reader.read_bits(10)  # health
     reader.read_bits(10)  # energy
+    # Weapon 0's active-ammo mask + HUD fraction: the OG PLAYER_INFO reader
+    # (0x0046d260 -> UpdateArray_read_local_player_state) consumes them too.
+    from wulfram.packets import tank_local_state_widths
+    for width in tank_local_state_widths(0):
+        if width:
+            reader.read_bits(width)
     reader.read_bits(32)  # unit_type
     assert reader.read_bits(32) == 0x14EA
     reader.read_bits(8)   # flags
@@ -3474,7 +3480,11 @@ def test_spawn_wf_minimal_uses_local_player_sync_rotation():
     assert len(captured) == 1
     payload, addr = captured[0]
     assert addr == ("10.10.10.2", 51126)
-    decoded = decode_tank_packet(payload)
+    # Weapon 0 with vitals carries ammo/HUD bits sized by our BEHAVIOR; decode with the
+    # tables this server sends, as the OG reader does.
+    from wulfram.packets import build_behavior_packet, build_translation_packet
+    decoded = decode_tank_packet(payload, qtable=parse_translation(build_translation_packet()),
+                                 behavior_config=parse_behavior(build_behavior_packet()))
     assert decoded is not None
     net_id, unit_type, team_id, pos, rot, health, energy = decoded
     assert net_id == 0x14EA

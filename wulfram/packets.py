@@ -551,6 +551,65 @@ def build_player_info(entity_oid: int, vehicle_type: int, pos: Tuple[float, floa
     return b'\x18' + bw.get_bytes()
 
 
+_TANK_WEAPON_CAPS_CACHE: Optional[List[Tuple[int, int, int, int]]] = None
+
+
+def tank_local_state_widths(weapon_id: int, weapon_caps=None) -> Tuple[int, int, int]:
+    """(active-ammo bits, primary HUD bits, secondary HUD bits) the OG reads for weapon_id.
+
+    Mirrors UpdateArray_read_local_player_state: the ammo width is the BEHAVIOR
+    weapon row's active-capable slot count; the two 8-bit HUD fractions are
+    present for weapon types with weapon_def+0x170 (type 0) / +0x68 (type 1).
+    ``weapon_caps`` defaults to the counts of the BEHAVIOR packet this server sends.
+    """
+    global _TANK_WEAPON_CAPS_CACHE
+    from wulfram2_protocol.entities import (
+        LOCAL_STATE_PRIMARY_TURRET_WEAPON_TYPES,
+        LOCAL_STATE_SECONDARY_TURRET_WEAPON_TYPES,
+    )
+    from wulfram2_protocol.hud_state import HUD_FRACTION_BITS
+    if weapon_caps is None:
+        if _TANK_WEAPON_CAPS_CACHE is None:
+            _TANK_WEAPON_CAPS_CACHE = get_behavior_weapon_capability_counts()
+        weapon_caps = _TANK_WEAPON_CAPS_CACHE
+    weapon_id = int(weapon_id)
+    ammo = int(weapon_caps[weapon_id][2]) if 0 <= weapon_id < len(weapon_caps) else 0
+    primary = HUD_FRACTION_BITS if weapon_id in LOCAL_STATE_PRIMARY_TURRET_WEAPON_TYPES else 0
+    secondary = HUD_FRACTION_BITS if weapon_id in LOCAL_STATE_SECONDARY_TURRET_WEAPON_TYPES else 0
+    return ammo, primary, secondary
+
+
+def _write_tank_local_state(bw, include: bool, *, weapon_id: int, health: float, energy: float,
+                            health_mult_bits: Optional[int] = None,
+                            energy_mult_bits: Optional[int] = None,
+                            ammo_count_bits: Optional[int] = None, ammo_count: int = 0,
+                            primary_turret_bits: Optional[int] = None,
+                            primary_turret_angle: float = 0.0,
+                            secondary_turret_bits: Optional[int] = None,
+                            secondary_turret_angle: float = 0.0) -> None:
+    """The 0x18 local-state block, exactly as the OG reader consumes it."""
+    bw.write_bits(1, 1 if include else 0)
+    if not include:
+        return
+    if health_mult_bits is None:
+        health_mult_bits = _encode_health_bits(health, total_bits=10)
+    if energy_mult_bits is None:
+        energy_mult_bits = _encode_health_bits(energy, total_bits=10, max_val=ENERGY_MAX, range_val=ENERGY_RANGE)
+    bw.write_bits(5, weapon_id & 0x1F)
+    bw.write_bits(10, health_mult_bits & 0x3FF)
+    bw.write_bits(10, energy_mult_bits & 0x3FF)
+    d_ammo, d_primary, d_secondary = tank_local_state_widths(weapon_id)
+    ammo_bits = d_ammo if ammo_count_bits is None else int(ammo_count_bits)
+    p_bits = d_primary if primary_turret_bits is None else int(primary_turret_bits)
+    s_bits = d_secondary if secondary_turret_bits is None else int(secondary_turret_bits)
+    if ammo_bits > 0:
+        bw.write_bits(ammo_bits, int(ammo_count) & ((1 << ammo_bits) - 1))
+    if p_bits > 0:
+        bw.write_bits(p_bits, _compress_value(primary_turret_angle, HUD_FRACTION_MAX, HUD_FRACTION_RANGE, total_bits=p_bits))
+    if s_bits > 0:
+        bw.write_bits(s_bits, _compress_value(secondary_turret_angle, HUD_FRACTION_MAX, HUD_FRACTION_RANGE, total_bits=s_bits))
+
+
 def build_udp_tank_packet_wf(
     net_id: int,
     unit_type: int,
@@ -565,33 +624,41 @@ def build_udp_tank_packet_wf(
     energy: float = 1.0,
     health_mult_bits: Optional[int] = None,
     energy_mult_bits: Optional[int] = None,
-    include_firing_mask: bool = False,
-    firing_mask_13bits: int = 0,
-    include_extras: bool = False,
-    extra_a_bits: int = 1,
-    extra_b_bits: int = 1,
+    ammo_count_bits: Optional[int] = None,
+    ammo_count: int = 0,
+    primary_turret_bits: Optional[int] = None,
+    primary_turret_angle: float = 0.0,
+    secondary_turret_bits: Optional[int] = None,
+    secondary_turret_angle: float = 0.0,
 ) -> bytes:
-    """Build a UDP TANK packet (0x18) using the Wulf-Forge bit layout."""
+    """Build a UDP TANK / PLAYER_INFO packet (0x18).
+
+    Layout = what the OG handler 0x0046d260 reads (azurefishy Handlers.c
+    PacketHandler_PLAYER_INFO): u32 state tick, the FULL
+    UpdateArray_read_local_player_state block, u32 entity type, u32 net id,
+    u8 subtype/team, 3x fixed16.16 position, 3x fixed16.16 rotation.
+
+    The local-state block is presence(1) [weapon(5) health(10) energy(10)
+    active-ammo mask(width from the BEHAVIOR weapon row) HUD fraction(8, if
+    weapon_def+0x170) HUD fraction(8, if weapon_def+0x68)]. Before 2026-10-17
+    this builder stopped after energy, so for a weapon type with ammo or HUD
+    bits the OG read unit type / net id shifted. Widths left as None are taken
+    from our BEHAVIOR (see ``tank_local_state_widths``); for the default spawn
+    weapon type 2 they are all 0, so default output is unchanged.
+    """
     if tick is None:
         tick = get_ticks()
 
     bw = BitWriter()
     bw.write_bits(32, tick)
-
-    bw.write_bits(1, 1 if include_vitals else 0)
-    if include_vitals:
-        if health_mult_bits is None:
-            health_mult_bits = _encode_health_bits(health, total_bits=10)
-        if energy_mult_bits is None:
-            energy_mult_bits = _encode_health_bits(energy, total_bits=10, max_val=ENERGY_MAX, range_val=ENERGY_RANGE)
-        bw.write_bits(5, weapon_id & 0x1F)
-        bw.write_bits(10, health_mult_bits & 0x3FF)
-        bw.write_bits(10, energy_mult_bits & 0x3FF)
-        if include_firing_mask:
-            bw.write_bits(13, firing_mask_13bits & 0x1FFF)
-        if include_extras:
-            bw.write_bits(8, extra_a_bits & 0xFF)
-            bw.write_bits(8, extra_b_bits & 0xFF)
+    _write_tank_local_state(
+        bw, include_vitals,
+        weapon_id=weapon_id, health=health, energy=energy,
+        health_mult_bits=health_mult_bits, energy_mult_bits=energy_mult_bits,
+        ammo_count_bits=ammo_count_bits, ammo_count=ammo_count,
+        primary_turret_bits=primary_turret_bits, primary_turret_angle=primary_turret_angle,
+        secondary_turret_bits=secondary_turret_bits, secondary_turret_angle=secondary_turret_angle,
+    )
 
     bw.write_bits(32, unit_type & 0xFFFFFFFF)
     bw.write_bits(32, net_id & 0xFFFFFFFF)
@@ -614,19 +681,22 @@ def build_tank(entity_type: int, oid: int, pos: Tuple[float, float, float],
 def build_tank_packet(net_id: int, unit_type: int, pos: Tuple[float, float, float],
                       rot: Tuple[float, float, float] = (0.0, 0.0, 0.0),
                       flags: int = 1, include_vitals: bool = True,
-                      health: float = 1.0, energy: float = 1.0) -> bytes:
-    """Build TankPacket (0x18) matching Wulf-Forge's format exactly."""
+                      health: float = 1.0, energy: float = 1.0,
+                      weapon_id: int = 0,
+                      tick: Optional[int] = None) -> bytes:
+    """Build TankPacket (0x18); same OG layout as ``build_udp_tank_packet_wf``.
+
+    Historically weapon type 0 was hard-coded and the block stopped after
+    energy. Weapon 0 has 9 active-ammo bits and an 8-bit HUD fraction under our
+    BEHAVIOR, so with include_vitals=True (WULFRAM_TANK_VITALS=1) the OG read
+    17 bits too early. Those bits are now written.
+    """
     import time
-    ticks = int(time.monotonic() * 1000) & 0xFFFFFFFF
+    ticks = (int(time.monotonic() * 1000) if tick is None else int(tick)) & 0xFFFFFFFF
 
     bw = BitWriter()
     bw.write_bits(32, ticks)
-    bw.write_bits(1, 1 if include_vitals else 0)
-
-    if include_vitals:
-        bw.write_bits(5, 0)
-        bw.write_bits(10, _encode_health_bits(health, total_bits=10))
-        bw.write_bits(10, _encode_health_bits(energy, total_bits=10, max_val=ENERGY_MAX, range_val=ENERGY_RANGE))
+    _write_tank_local_state(bw, include_vitals, weapon_id=weapon_id, health=health, energy=energy)
 
     bw.write_bits(32, unit_type)
     bw.write_bits(32, net_id)
@@ -977,6 +1047,67 @@ def build_update_array_multi(tick: int,
         _write_update_array_entity(bw, **ent)
 
     return b'\x0E' + tick_bytes + bw.get_bytes()
+
+
+def _entity_record_bits(ent: dict) -> int:
+    bw = BitWriter()
+    _write_update_array_entity(bw, **ent)
+    return len(bw.buffer) * 8 + bw.bit_index
+
+
+def build_update_array_split(tick: int,
+                             budget_bytes: int,
+                             *,
+                             include_local_state: bool,
+                             entities: Optional[list] = None,
+                             **local_state_kwargs) -> List[bytes]:
+    """Combined UPDATE_ARRAY datagrams for one tick, split by a byte budget.
+
+    Upstream wulfram3.com (2026-09-18 and 2026-10-16 captures): one tick's
+    records are packed greedily into a first datagram of at most ~1200 B
+    (p50 1184, max 1200), the rest spill into a second (and rarely a third);
+    every datagram carries the same tick value and its own local_state block.
+    A record that alone exceeds the budget still goes out, alone. At most 255
+    records per datagram (8-bit count). Returns [] for no entities.
+    """
+    entities = list(entities or [])
+    if not entities:
+        return []
+    probe = BitWriter()
+    _write_local_player_state(probe, include_local_state, include_ammo_turrets=include_local_state,
+                              **local_state_kwargs)
+    head_bits = len(probe.buffer) * 8 + probe.bit_index + 8  # local state + entity count
+    budget_bits = max(0, (int(budget_bytes) - 5) * 8)       # opcode + u32 tick
+    groups: list = []
+    current: list = []
+    used = head_bits
+    for ent in entities:
+        bits = _entity_record_bits(ent)
+        if current and (used + bits > budget_bits or len(current) >= 255):
+            groups.append(current)
+            current, used = [], head_bits
+        current.append(ent)
+        used += bits
+    if current:
+        groups.append(current)
+    return [
+        build_update_array_multi(tick, include_local_state=include_local_state,
+                                 entities=group, **local_state_kwargs)
+        for group in groups
+    ]
+
+
+def build_docking(stamp_ms: int, dock_target: int, docked: bool) -> bytes:
+    """DOCKING (0x38): [u32 server ms clock][u32 dock target][u8 docked].
+
+    Measured on wulfram3.com (sync lane, 2026-09-18 + 2026-10-16): field 1 is a
+    millisecond clock in the UPDATE_ARRAY tick domain (not a ship id), field 2
+    is 0 for a ground dock or the FUEL_BUILDING / REPAIR_BUILDING pad entity id,
+    field 3 is 1 while docked (20 Hz) and 0 once on release. The OG client
+    registers PacketHandler_DOCKING for 0x38 (azurefishy Network.c:1548).
+    """
+    return (b"\x38" + struct.pack(">II", int(stamp_ms) & 0xFFFFFFFF, int(dock_target) & 0xFFFFFFFF)
+            + (b"\x01" if docked else b"\x00"))
 
 
 def build_view_update_multi(tick: int,

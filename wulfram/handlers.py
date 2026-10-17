@@ -79,7 +79,12 @@ def _parse_empirical_client_d_handshake(data: bytes, *, allow_trailing: bool = F
         offset += 4
         receive_window = struct.unpack_from(">I", data, offset)[0]
         offset += 4
-        if not 1 <= receive_window <= 32767:
+        # The OG client advertises 15. The upstream native client (2026-10-16
+        # WulframClient.exe) advertises 0 with a single "Player requests" stream;
+        # 0 is a legal value here (the server never sizes its send path from it),
+        # so accept it rather than demoting the handshake to the legacy parser
+        # (which skipped the transport-clock bootstrap and the stream table).
+        if not 0 <= receive_window <= 32767:
             return None
         stream_count = struct.unpack_from(">I", data, offset)[0]
         offset += 4
@@ -189,6 +194,110 @@ def _build_server_d_handshake(ctx: Optional["ClientContext"]) -> bytes:
         payload += struct.pack(">II", packet_id, delivery_mode)
 
     return b"\x03" + bytes(payload)
+
+
+def client_declared_stream_opcodes(ctx: Optional["ClientContext"]) -> frozenset:
+    """Opcodes the client's own D_HANDSHAKE put on a stream or a private mode."""
+    session = getattr(ctx, "session", None)
+    shake = getattr(session, "client_d_handshake", None) if session is not None else None
+    if not shake:
+        return frozenset()
+    ops = {op for _, indices in shake.get("streams", ()) for op in indices}
+    ops.update(op for op, _ in shake.get("private_modes", ()))
+    return frozenset(op for op in ops if 0 <= op <= 0xFF)
+
+
+def client_declared_reliable(ctx: Optional["ClientContext"], opcode: int) -> bool:
+    """True when the client's own D_HANDSHAKE declares ``opcode`` reliable.
+
+    Reliable = private delivery mode 3, or listed on one of its streams (the
+    native client's "Player requests" stream is all mode 3). The OG client's
+    private table carries (0x2E, 3); the native client lists 0x2E on its stream.
+    """
+    session = getattr(ctx, "session", None)
+    shake = getattr(session, "client_d_handshake", None) if session is not None else None
+    if not shake:
+        return False
+    if any(op == opcode and mode == 3 for op, mode in shake.get("private_modes", ())):
+        return True
+    return any(opcode in indices for _, indices in shake.get("streams", ()))
+
+
+def parse_framed_weapon_demand(data: bytes) -> Optional[dict]:
+    """Parse the 14-byte stream-framed WEAPON_DEMAND (0x2E), else None.
+
+    Wire (OG 09-18 capture, e.g. ``2e 0001 000e 00 00000005 00000001``):
+    opcode, u16 stream seq, u16 length (=14), then the body the OG sender
+    0x00426470 writes: u8 demand mode, u32 inventory slot, i32 amount
+    (+1 / +9999 buy, -1 / -10003 sell).
+    """
+    if len(data) != 14 or data[0] != 0x2E or struct.unpack_from(">H", data, 3)[0] != 14:
+        return None
+    seq, _length, mode, slot, amount = struct.unpack_from(">HHBIi", data, 1)
+    return {"seq": seq, "mode": mode, "slot": slot, "amount": amount}
+
+
+def is_native_stream_client(ctx: Optional["ClientContext"]) -> bool:
+    """True when the client's D_HANDSHAKE has the upstream native shape (window 0).
+
+    Protocol-observed, not address- or name-based: the OG client advertises 15.
+    """
+    session = getattr(ctx, "session", None)
+    shake = getattr(session, "client_d_handshake", None) if session is not None else None
+    return bool(shake) and int(shake.get("receive_window", -1)) == 0
+
+
+def use_framed_stream_ack(ctx: Optional["ClientContext"]) -> bool:
+    """WULFRAM_UDP_ACK_FORM = auto (default) | framed | short.
+
+    ``short`` is today's 5-byte ``02 01 <op> <seq>`` (what the OG client gets);
+    ``framed`` is the upstream server's 9-byte ``02 <srv seq> 0009 01 <op> <seq>``.
+    ``auto`` picks framed only for a native-shaped (window 0) client.
+    """
+    mode = os.environ.get("WULFRAM_UDP_ACK_FORM", "auto").strip().lower()
+    if mode == "short" or ctx is None:
+        return False
+    if mode == "framed":
+        return getattr(ctx, "session", None) is not None
+    return is_native_stream_client(ctx)
+
+
+def ack_declared_stream_packets_enabled(ctx: Optional["ClientContext"]) -> bool:
+    """Whether to ACK otherwise-unhandled packets on the client's declared streams.
+
+    WULFRAM_ACK_DECLARED_STREAM_PACKETS = auto (default) | 1 | 0.  ``auto`` enables
+    it only for a client whose D_HANDSHAKE advertised receive window 0 (the
+    upstream native client); the OG client (window 15) keeps today's behaviour.
+    """
+    mode = os.environ.get("WULFRAM_ACK_DECLARED_STREAM_PACKETS", "auto").strip().lower()
+    if mode in ("0", "false", "off", "no"):
+        return False
+    session = getattr(ctx, "session", None)
+    shake = getattr(session, "client_d_handshake", None) if session is not None else None
+    if not shake:
+        return False
+    if mode in ("1", "true", "on", "yes"):
+        return True
+    return is_native_stream_client(ctx)
+
+
+def validate_login_credential(server, ctx, username: str, credential: str, sub_type: int) -> bool:
+    """Pluggable login credential policy.
+
+    The server has no account system: like the OG password field, any credential
+    is accepted unless an operator installs ``server.login_credential_validator``
+    (a callable ``(ctx, username, credential, sub_type) -> bool``).  Upstream's
+    native client sends one 24-char base64url credential minted by the wulfram3
+    launcher; we deliberately do NOT invent upstream token validation here.
+    """
+    validator = getattr(server, "login_credential_validator", None)
+    if validator is None:
+        return True
+    try:
+        return bool(validator(ctx, username, credential, sub_type))
+    except Exception as exc:  # noqa: BLE001 - a broken policy must fail closed
+        print(f"[LOGIN] credential validator error: {exc!r}")
+        return False
 
 
 def _tcp_peer_is_loopback(ctx: "ClientContext") -> bool:
@@ -318,6 +427,18 @@ def _send_og_login_bootstrap(server: "WulframServer", ctx: "ClientContext") -> N
     if FEATURES.send_behavior_packet and not session.behavior_sent:
         tcp.send(build_behavior_packet())
         session.behavior_sent = True
+    # Upstream native client (credential-only 0x21/03): upstream sends TRANSLATION
+    # in the login burst and the client ACKs it (0x33) BEFORE it sends WANT_UPDATES,
+    # so it must not be held back until WANT_UPDATES as it is for the OG client
+    # (see the docstring).  WULFRAM_NATIVE_LOGIN_TRANSLATION=0 restores the OG order.
+    if (
+        getattr(session, "login_shape", "") == "credential_only"
+        and FEATURES.send_translation_packet
+        and not session.translation_sent
+        and os.environ.get("WULFRAM_NATIVE_LOGIN_TRANSLATION", "1") != "0"
+    ):
+        tcp.send(build_translation_packet())
+        session.translation_sent = True
     tcp.send(build_player(entity_id=session.player_id, spectator=True))
 
 
@@ -404,8 +525,16 @@ def handle_login_request(server: "WulframServer", ctx: "ClientContext", packet: 
             _, offset = decode_lp_string(packet, offset)
         _, offset = decode_lp_string(packet, offset)  # server name
 
+    # Upstream native client (2026-10-16): 0x21/03 = handle + ONE credential, no
+    # machine-MD5 list and no unique_identifier, sent unprompted.  Same success
+    # path as the OG 0x21/03; only the shape is recorded (never the value).
+    session.login_shape = (
+        "credential_only" if sub_type == 0x03 and extra_count is None and offset >= len(packet)
+        else f"sub_{sub_type:02x}"
+    )
     if extra_count is None:
-        print(f"[LOGIN] Client {ctx.client_id}: sub_type=0x{sub_type:02X} user={username}")
+        print(f"[LOGIN] Client {ctx.client_id}: sub_type=0x{sub_type:02X} user={username} "
+              f"shape={session.login_shape} credential_len={len(password)}")
     else:
         print(f"[LOGIN] Client {ctx.client_id}: sub_type=0x{sub_type:02X} user={username} extra_count={extra_count}")
 
@@ -426,6 +555,9 @@ def handle_login_request(server: "WulframServer", ctx: "ClientContext", packet: 
 
     # Final login success
     if sub_type in (0x00, 0x02, 0x03, 0x04) or session.login_game_service_requested:
+        if not validate_login_credential(server, ctx, username, password, sub_type):
+            print(f"[LOGIN] Client {ctx.client_id}: credential rejected by policy")
+            raise ConnectionAbortedError("login credential rejected")
         print(f"[LOGIN] Client {ctx.client_id}: Login successful!")
         session.login_complete = True
         session.transition_to(Phase.TEAM_SELECT)
@@ -792,6 +924,16 @@ def handle_udp_d_handshake(server: "WulframServer", ctx: Optional["ClientContext
     if ctx and server._bind_udp_client(ctx, addr, reason="d_handshake"):
         ctx.session.udp_d_handshake_received = True
         if parsed["kind"] == "empirical":
+            ctx.session.client_d_handshake = {
+                "receive_window": parsed["receive_window"],
+                "streams": parsed["streams"],
+                "private_modes": parsed["private_modes"],
+            }
+            print(
+                f"[UDP] Client {ctx.client_id} D_HANDSHAKE window={parsed['receive_window']} "
+                f"streams={[name for name, _ in parsed['streams']]} "
+                f"declared_opcodes={sorted(client_declared_stream_opcodes(ctx))}"
+            )
             from .transport_clock import record_handshake
             record_handshake(server, ctx, addr, parsed["sequence"])
         print(f"[UDP] Registered client {ctx.client_id} with UDP addr {addr}")
@@ -1346,7 +1488,14 @@ def send_udp_ack(server: "WulframServer", ctx: Optional["ClientContext"], addr: 
     """Send an OG-shaped UDP D_ACK (0x02)."""
     if not server.udp_handler:
         return
-    if subcmd == 1:
+    if subcmd == 1 and use_framed_stream_ack(ctx):
+        # Upstream-server shape, observed acking every native-client "Player
+        # requests" packet on 2026-10-16: 02 <u16 server seq> 0009 01 <op> <u16 seq>.
+        session = ctx.session
+        session.udp_outgoing_seq = (int(session.udp_outgoing_seq) + 1) & 0xFFFF or 1
+        payload = (b"\x02" + struct.pack(">HH", session.udp_outgoing_seq, 9)
+                   + bytes((0x01, packet_id & 0xFF)) + struct.pack(">H", seq_num & 0xFFFF))
+    elif subcmd == 1:
         payload = bytes((0x02, 0x01, packet_id & 0xFF)) + struct.pack(">H", seq_num & 0xFFFF)
     elif subcmd == 2:
         timestamp = int(time.monotonic() * 1000) & 0xFFFFFFFF
