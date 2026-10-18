@@ -519,6 +519,12 @@ class SpawnMixin:
                 phys_ground = self._terrain_physics_ground_z_at(spawn_pos[0], spawn_pos[1])
                 if phys_ground is not None:
                     settled_z = phys_ground + float(getattr(self, "spawn_settle_ride_height", 3.35))
+            # community/native WULFRAM_NATIVE_COMMUNITY_PHYSICS: spawn at the native
+            # client's hover rest (terrain + 4.447 at jet 0.8); None for OG sessions.
+            community = getattr(self, "community_physics", None)
+            community_z = community.spawn_z(ctx, spawn_pos) if community is not None else None
+            if community_z is not None:
+                settled_z = community_z
             if settled_z is not None:
                 if abs(spawn_pos[2] - settled_z) > 0.05:
                     print(f"[SPAWN] Settling tank spawn Z {spawn_pos[2]:.1f} -> {settled_z:.1f} "

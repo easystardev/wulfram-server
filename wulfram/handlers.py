@@ -1586,20 +1586,27 @@ def maybe_send_physics_session(server: "WulframServer", ctx: "ClientContext", pa
     if not session.translation_sent:
         print(f"[PHYSICS] Client {ctx.client_id}: {want} want before TRANSLATION; not answered")
         return True
-    from . import physics_session
+    from . import community_physics, physics_session
 
     tick_ms = int(getattr(server, "native_physics_session_tick_ms", 0) or 0)
     if tick_ms <= 0:
+        # community/native WULFRAM_NATIVE_COMMUNITY_PHYSICS: the sidecar's fixed grid
+        # (40 ms) when that knob is on; 0 (no opinion) otherwise.
+        tick_ms = community_physics.session_tick_ms(server)
+    if tick_ms <= 0:
         tick_ms = physics_session.tick_ms_for_rate(getattr(server, "tick_rate_hz", 30.0))
     magic = "WPC2" if want == native_session.PORTABLE_PHYSICS_V2 else "WPC1"
+    fields = physics_session.CLIENT_DEFAULT_FIELDS
     body = physics_session.encode_physics_session(
-        physics_session.CLIENT_DEFAULT_FIELDS,
+        fields,
         magic=magic,
         tick_ms=tick_ms,
         config_name=getattr(server, "native_physics_session_name", physics_session.DEFAULT_CONFIG_NAME),
     )
     ctx.tcp_handler.send(body)
     session.physics_session_sent = True
+    session.physics_session_tick_ms = tick_ms
+    session.physics_session_fields = tuple(physics_session.fields_for_magic(fields, magic))
     print(f"[PHYSICS] Client {ctx.client_id}: 0x56 physics session {magic} tick_ms={tick_ms} "
           f"len={len(body)} sent on TCP (PROVISIONAL field table)")
     return True

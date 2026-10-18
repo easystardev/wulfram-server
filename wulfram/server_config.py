@@ -166,6 +166,11 @@ def init_native_client_profile(server) -> None:
     udp = getattr(server, "udp_handler", None)
     if udp is not None:
         udp.native_single_message = server.native_udp_single_message
+    # WULFRAM_NATIVE_COMMUNITY_PHYSICS=1 (default off, NOT part of the umbrella: it
+    # needs the separately launched sidecar) -- native sessions' tanks are stepped
+    # by the community physics sidecar; see wulfram.community_physics.
+    from . import community_physics
+    community_physics.configure(server)
 
 
 class ConfigMixin:

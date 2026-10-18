@@ -3705,10 +3705,16 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
                     old_heading = ctx.player_heading
                     move_dt = 0.0
                     move_heading = old_heading
+                    # community/native WULFRAM_NATIVE_COMMUNITY_PHYSICS (default off): a
+                    # native session's tank is stepped by the community physics sidecar;
+                    # None / False for every OG session, so this is inert for them.
+                    community = getattr(self, "community_physics", None)
+                    community_managed = community is not None and community.advance(ctx)
                     native = getattr(self, "native_physics", None)
-                    native_managed = native is not None and native.manages(ctx)
+                    native_managed = (not community_managed) and native is not None and native.manages(ctx)
                     if native_managed:
                         native.publish(ctx)
+                    if native_managed or community_managed:
                         n_phys_steps = 0
                         phys_accumulator = 0.0
                         turn_integral_reconcile = None
@@ -3848,7 +3854,7 @@ class WulframServer(ConfigMixin, RaycastMixin, ReplicationMixin, SpawnMixin, Com
                         ctx._fwd_actual_input_integral = 0.0
                     if _phase_timing:
                         _phase_t_upp = time.perf_counter()
-                    if not native_managed:
+                    if not (native_managed or community_managed):
                         self._resolve_entity_entity_collisions(ctx)
                     self._update_player_aim(ctx)
                     self._regen_player_energy(ctx, physics_dt)

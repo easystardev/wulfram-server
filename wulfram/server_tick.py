@@ -10888,6 +10888,8 @@ class TickMixin:
             native = getattr(self, "native_physics", None)
             if native is not None and native.manages(other):
                 continue  # Native body must not receive a second legacy impulse.
+            if getattr(other, "community_physics_active", False):
+                continue  # community/native: the sidecar owns that body (no tank-tank model yet).
             if not other.session or not other.session.in_game:
                 continue
 

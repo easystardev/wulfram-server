@@ -101,6 +101,10 @@ class Session:
     udp_identify_kind: str = ""
     hello_key_pushed: bool = False
     physics_session_sent: bool = False
+    # community/native: the tick_ms and field table that 0x56 actually carried
+    # (the community physics sidecar must simulate with exactly these).
+    physics_session_tick_ms: int = 0
+    physics_session_fields: tuple = ()
 
     @world_reset
     def reset(self):
@@ -149,6 +153,8 @@ class Session:
         self.udp_identify_kind = ""
         self.hello_key_pushed = False
         self.physics_session_sent = False
+        self.physics_session_tick_ms = 0
+        self.physics_session_fields = ()
 
     def transition_to(self, new_phase: Phase) -> bool:
         """

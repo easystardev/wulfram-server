@@ -79,7 +79,8 @@ class NativeLiveWorld:
 
     @staticmethod
     def manages(ctx):
-        return int(ctx.entity_type) == 0
+        # community/native: a tank the community physics sidecar owns is not ours.
+        return int(ctx.entity_type) == 0 and not getattr(ctx, "community_physics_active", False)
 
     def start(self):
         self.thread = threading.Thread(target=self._run, name="native-physics-world", daemon=True)
