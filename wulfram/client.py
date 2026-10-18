@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional, Any
 
 from .physics import VehiclePhysics
+from wulfram2_protocol.entities import EntityType, vehicle_max_fuel
 
 if TYPE_CHECKING:
     from .session import Session
@@ -77,7 +78,9 @@ class ClientContext:
     rigid_body_target_rot: Optional[tuple] = None
     rigid_body_interp_tolerance: float = 0.003
     rigid_body_last_interp_tick: int = 0
-    player_fuel: float = 33000.0
+    # Default entity_type is the tank; spawn refills to the spawned type's max
+    # (vehicle_max_fuel: tank 33000, scout 13000).
+    player_fuel: float = vehicle_max_fuel(EntityType.TANK)
     player_energy: float = 100.0
     player_health: float = 1.0  # Normalized 0.0-1.0, used for HUD health display
 

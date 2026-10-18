@@ -15,6 +15,7 @@ from .client import ClientContext
 from .physics import _matrix3_from_euler_xyz
 from .session import Phase
 from .weapons import EntityType
+from wulfram2_protocol.entities import vehicle_max_fuel
 from .packets import (
     build_delete_object,
     build_add_to_roster,
@@ -442,6 +443,8 @@ class SpawnMixin:
         # (entries are otherwise cached once per session via known_roster_ids).
         self._invalidate_roster_for_player(ctx)
         ctx.entity_type = unit_type
+        # Spawn with the spawned vehicle's full tank (tank 33000, scout 13000).
+        ctx.player_fuel = vehicle_max_fuel(unit_type)
 
         # Reset position tracking to spawn location.
         spawn_pos = self._resolve_spawn_pos(team_id, explicit_pos=pos)

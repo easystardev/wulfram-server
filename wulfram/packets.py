@@ -1645,16 +1645,22 @@ def build_behavior_packet() -> bytes:
     assert len(payload) == 95 + 2340 + 468, f"After Section 3: expected 2903, got {len(payload)}"
 
     # Section 4: Vehicle Physics (72 bytes)
-    for _ in range(2):
+    # Entry 0 = tank, entry 1 = medic/scout. legacy (original wulfram2.exe):
+    # GUESS5_EntityParams_create overrides the scout entry with 0.15 / 1.1 and
+    # max_fuel 13000 (tank 0.05 / 1.3 / 33000). The 2026-09-07 production
+    # capture carries the same scout values, so this is not community-only.
+    for _type_index in range(2):
+        _is_scout = _type_index == 1
         payload += pack_fixed16(20.0)
         payload += pack_fixed16(4.0)
         payload += struct.pack(">I", 700)
         payload += struct.pack(">I", 550)
         payload += pack_fixed16(BEHAVIOR_GROUND_FRICTION)
-        payload += pack_fixed16(BEHAVIOR_TURN_RATE)
-        payload += pack_fixed16(BEHAVIOR_SUSPENSION_DAMPENING)
+        payload += pack_fixed16(0.15 if _is_scout else BEHAVIOR_TURN_RATE)
+        payload += pack_fixed16(1.1 if _is_scout else BEHAVIOR_SUSPENSION_DAMPENING)
         payload += struct.pack(">I", 0)
-        payload += struct.pack(">I", 33000)  # max_fuel (NOT mass — mass is in collision table: 6700)
+        # max_fuel (NOT mass — mass is in collision table: 6700)
+        payload += struct.pack(">I", 13000 if _is_scout else 33000)
 
     assert len(payload) == 95 + 2340 + 468 + 72, f"After Section 4: expected 2975, got {len(payload)}"
 

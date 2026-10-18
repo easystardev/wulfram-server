@@ -26,6 +26,7 @@ import time
 from typing import Optional, Callable, Dict, Any
 
 from .physics import _matrix3_from_euler_xyz
+from wulfram2_protocol.entities import vehicle_max_fuel
 from .session import Session, Phase, FEATURES
 from .packets import (
     PacketType, get_packet_name,
@@ -2231,7 +2232,8 @@ Examples:
                     else None,
                     "fuel": round(float(getattr(ctx, "player_fuel", 0.0) or 0.0), 3),
                     "fuel_pct": round(
-                        max(0.0, min(1.0, float(getattr(ctx, "player_fuel", 0.0) or 0.0) / 33000.0))
+                        max(0.0, min(1.0, float(getattr(ctx, "player_fuel", 0.0) or 0.0)
+                                     / vehicle_max_fuel(getattr(ctx, "entity_type", 0))))
                         * 100.0,
                         3,
                     ),
@@ -4264,6 +4266,7 @@ Examples:
         if active_ctx:
             active_ctx.entity_id = entity_id
             active_ctx.entity_type = vehicle_type
+            active_ctx.player_fuel = vehicle_max_fuel(vehicle_type)
             active_ctx.player_pos = (x, y, z)
             active_ctx.player_vel = (0.0, 0.0, 0.0)
             active_ctx.player_health = 1.0

@@ -12064,7 +12064,14 @@ class TickMixin:
             )
 
         # Per-frame impulse (like entity[0x24], zeroed each frame by controller)
-        fwd_impulse = throttle_input * move_adjust * forward_mobility
+        # legacy (original wulfram2.exe): MedicVehicle_apply_physics scales by
+        # move_backward (+0x20) when throttle <= 0; the tank config leaves
+        # move_backward_adjust None and reverses with move_adjust.
+        fwd_scale = move_adjust
+        backward_adjust = veh_config.move_backward_adjust if veh_config else None
+        if backward_adjust is not None and throttle_input <= 0.0:
+            fwd_scale = backward_adjust
+        fwd_impulse = throttle_input * fwd_scale * forward_mobility
         strafe_impulse = (
             strafe_input * strafe_adjust * forward_mobility * turn_mobility
         )
@@ -12078,8 +12085,9 @@ class TickMixin:
 
         # TankVehicle_apply_physics clamps the movement vector against the same
         # move_adjust scalar used to build forward motion, not the separate
-        # max_velocity field.
-        move_cap = move_adjust
+        # max_velocity field. legacy (original wulfram2.exe): the medic/scout
+        # caps at move_forward * 1.25 (veh_config.move_cap_scale).
+        move_cap = move_adjust * (veh_config.move_cap_scale if veh_config else 1.0)
         move_mag = math.sqrt(
             impulse_x * impulse_x + impulse_y * impulse_y + impulse_z * impulse_z
         )
